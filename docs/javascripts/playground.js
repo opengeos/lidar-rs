@@ -717,9 +717,14 @@
       });
     }
 
-    // Invalidate cached GIF when ping-pong option changes
+    // Invalidate cached GIF when ping-pong option changes; refresh if preview is open
     $("lp-pingpong").addEventListener("change", () => {
       cachedGifUrl = null;
+      const gifImg = $("lp-gif");
+      if (gifImg) gifImg.removeAttribute("src");
+      if (gifDetails && gifDetails.open && currentSim) {
+        ensureGifUrl().catch((e) => setStatus(`GIF preview failed: ${errMsg(e)}`, true));
+      }
     });
 
     // Interactive inundation player controls

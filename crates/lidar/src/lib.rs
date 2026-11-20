@@ -51,8 +51,8 @@ pub mod region;
 pub mod slicing;
 
 pub use animation::{
-    AnimateInundationOptions, AnimateInundationResult, HillshadeOptions, animate_inundation,
-    animate_inundation_to_bytes, compute_hillshade_rgb,
+    ANIMATION_BANNER_HEIGHT, AnimateInundationOptions, AnimateInundationResult, HillshadeOptions,
+    animate_inundation, animate_inundation_to_bytes, compute_hillshade_rgb,
 };
 pub use catchment::{
     CatchmentHierarchyOptions, CatchmentHierarchyRecord, CatchmentHierarchyResult, CatchmentRecord,

@@ -371,6 +371,48 @@ fn discover_flood_frames(in_flood_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(frames)
 }
 
+/// Pixel height of the status banner prepended to animated inundation GIF frames.
+pub const ANIMATION_BANNER_HEIGHT: usize = 22;
+
+fn compute_gif_dimensions(
+    sw: usize,
+    sh: usize,
+    options: &AnimateInundationOptions,
+) -> Result<(usize, usize, usize)> {
+    if !options.water_alpha.is_finite() || !(0.0..=1.0).contains(&options.water_alpha) {
+        return Err(Error::InvalidArgument(format!(
+            "water_alpha must be in [0.0, 1.0], got {}",
+            options.water_alpha
+        )));
+    }
+    if sw == 0 || sh == 0 {
+        return Err(Error::InvalidArgument("input DEM is empty".into()));
+    }
+    let (dw, dh) = match options.max_dimension {
+        Some(max_dim) if max_dim > 0 && (sw > max_dim || sh > max_dim) => {
+            if sw >= sh {
+                let nh = ((sh as f64) * (max_dim as f64) / (sw as f64))
+                    .round()
+                    .max(1.0) as usize;
+                (max_dim, nh)
+            } else {
+                let nw = ((sw as f64) * (max_dim as f64) / (sh as f64))
+                    .round()
+                    .max(1.0) as usize;
+                (nw, max_dim)
+            }
+        }
+        _ => (sw, sh),
+    };
+    let total_h = dh + ANIMATION_BANNER_HEIGHT;
+    if dw > u16::MAX as usize || total_h > u16::MAX as usize {
+        return Err(Error::InvalidArgument(format!(
+            "animation frame dimensions ({dw}x{total_h}) exceed GIF u16 limit (65535); set max_dimension"
+        )));
+    }
+    Ok((dw, dh, total_h))
+}
+
 /// Shared internal GIF renderer used by both [`animate_inundation`] (disk frames -> file)
 /// and [`animate_inundation_to_bytes`] (in-memory `fill_time` -> byte buffer).
 fn render_inundation_gif<W, F>(
@@ -389,42 +431,10 @@ where
             "num_steps must be in 1..=10000, got {num_steps}"
         )));
     }
-    if !options.water_alpha.is_finite() || !(0.0..=1.0).contains(&options.water_alpha) {
-        return Err(Error::InvalidArgument(format!(
-            "water_alpha must be in [0.0, 1.0], got {}",
-            options.water_alpha
-        )));
-    }
     let sw = dem.width();
     let sh = dem.height();
-    if sw == 0 || sh == 0 {
-        return Err(Error::InvalidArgument("input DEM is empty".into()));
-    }
-
-    let (dw, dh) = match options.max_dimension {
-        Some(max_dim) if max_dim > 0 && (sw > max_dim || sh > max_dim) => {
-            if sw >= sh {
-                let nh = ((sh as f64) * (max_dim as f64) / (sw as f64))
-                    .round()
-                    .max(1.0) as usize;
-                (max_dim, nh)
-            } else {
-                let nw = ((sw as f64) * (max_dim as f64) / (sh as f64))
-                    .round()
-                    .max(1.0) as usize;
-                (nw, max_dim)
-            }
-        }
-        _ => (sw, sh),
-    };
-
-    let banner_h = 22usize;
-    let total_h = dh + banner_h;
-    if dw > u16::MAX as usize || total_h > u16::MAX as usize {
-        return Err(Error::InvalidArgument(format!(
-            "animation frame dimensions ({dw}x{total_h}) exceed GIF u16 limit (65535); set max_dimension"
-        )));
-    }
+    let (dw, dh, total_h) = compute_gif_dimensions(sw, sh, options)?;
+    let banner_h = ANIMATION_BANNER_HEIGHT;
 
     let base_rgb_full = compute_hillshade_rgb(dem, &options.hillshade);
     let base_rgb = downscale_rgb(&base_rgb_full, sw, sh, dw, dh);
@@ -528,6 +538,16 @@ pub fn animate_inundation(
     let dem = load_raster::<f64>(in_dem, None)?;
     let sw = dem.width();
     let sh = dem.height();
+
+    // Validate options, frame count, and output dimensions before touching the filesystem
+    // so invalid inputs never create an empty/partial output GIF.
+    if frames.is_empty() || frames.len() > 10_000 {
+        return Err(Error::InvalidArgument(format!(
+            "num_steps must be in 1..=10000, got {}",
+            frames.len()
+        )));
+    }
+    let _ = compute_gif_dimensions(sw, sh, options)?;
 
     // Validate dimensions of every flood frame upfront (dropping each raster immediately)
     // so errors never leave a truncated GIF and peak memory stays O(pixels) rather than

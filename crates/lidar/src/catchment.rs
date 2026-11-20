@@ -764,11 +764,13 @@ fn paint_unclaimed_catchment_area(
     hir_data: &mut [f64],
     labels: &[u32],
     cat_area_by_id: &HashMap<u32, f64>,
+    min_value: f64,
 ) {
     for (dst, &lbl) in hir_data.iter_mut().zip(labels.iter()) {
         if *dst == 0.0
             && lbl > 0
             && let Some(&area) = cat_area_by_id.get(&lbl)
+            && area >= min_value
             && area > 0.0
         {
             *dst = area;
@@ -935,7 +937,9 @@ pub fn delineate_catchment_hierarchy(
         };
 
         let stats = compute_level_catchment_stats(&dem, &flowdirs, cell_area, *level, &labels)?;
-        paint_unclaimed_catchment_area(&mut hir_data_f64, &labels, &stats.cat_area_by_id);
+        // On-disk catchment_hir.tif stores rounded u32 areas (NoData=0), so only claim cells
+        // whose rounded value is >= 1 (area >= 0.5).
+        paint_unclaimed_catchment_area(&mut hir_data_f64, &labels, &stats.cat_area_by_id, 0.5);
 
         let mut area_ratio_by_id: HashMap<u32, (f64, f64)> = HashMap::new();
         let mut rec_by_id: HashMap<u32, CatchmentHierarchyRecord> = HashMap::new();
@@ -1122,7 +1126,7 @@ pub fn delineate_catchment_hierarchy_in_memory(
         }
         let labels: Vec<u32> = raw_labels.iter().map(|&l| remap[l as usize]).collect();
         let stats = compute_level_catchment_stats(dem, &flowdirs, cell_area, level, &labels)?;
-        paint_unclaimed_catchment_area(&mut hir_data, &labels, &stats.cat_area_by_id);
+        paint_unclaimed_catchment_area(&mut hir_data, &labels, &stats.cat_area_by_id, 0.0);
         all_records.extend(stats.records);
     }
 

@@ -13,7 +13,7 @@ use terrio::{RasterWriteOptions, VectorWriteOptions};
 use wasm_bindgen::prelude::*;
 
 use lidar::{
-    AnimateInundationOptions, HillshadeOptions, InundationPipelineOptions,
+    ANIMATION_BANNER_HEIGHT, AnimateInundationOptions, HillshadeOptions, InundationPipelineOptions,
     SimulateInundationOptions, animate_inundation_to_bytes, compute_hillshade_rgb,
     delineate_catchments_in_memory, delineate_depressions_in_memory, delineate_mounts_in_memory,
     extract_sink_labels_from_raster, extract_sinks_in_memory, flip_dem as core_flip_dem,
@@ -685,13 +685,13 @@ impl InundationOutput {
         };
         let total_pixels = (total_frames as u64)
             .saturating_mul(dw as u64)
-            .saturating_mul((dh + 22) as u64);
+            .saturating_mul((dh + ANIMATION_BANNER_HEIGHT) as u64);
         if total_pixels > MAX_WASM_GIF_FRAME_PIXELS {
             return Err(to_js_err(format!(
                 "GIF export requires {total_frames} frames at {dw}x{} ({total_pixels} frame-pixels), \
                  exceeding the browser budget of {MAX_WASM_GIF_FRAME_PIXELS}; increase time_step, \
                  reduce duration, or set a smaller max_dim",
-                dh + 22
+                dh + ANIMATION_BANNER_HEIGHT
             )));
         }
 
