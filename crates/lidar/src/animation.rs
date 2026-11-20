@@ -414,6 +414,33 @@ pub fn animate_inundation(
         )));
     }
 
+    // Preload and validate all binary flood masks BEFORE creating the output GIF so a
+    // dimension mismatch or read error never leaves a truncated file on disk.
+    let mut masks: Vec<Vec<bool>> = Vec::with_capacity(frames.len());
+    for fpath in &frames {
+        let flood = load_raster::<f64>(fpath, None)?;
+        if flood.width() != sw || flood.height() != sh {
+            return Err(Error::DimensionMismatch(format!(
+                "flood frame {} ({}x{}) does not match DEM ({sw}x{sh})",
+                fpath.display(),
+                flood.width(),
+                flood.height()
+            )));
+        }
+        let fnd = flood.no_data();
+        let fdata = flood.data();
+        let mut mask = vec![false; dw * dh];
+        for y in 0..dh {
+            let sy = (y * sh / dh).min(sh - 1);
+            for x in 0..dw {
+                let sx = (x * sw / dw).min(sw - 1);
+                let v = fdata[sy * sw + sx];
+                mask[y * dw + x] = v.is_finite() && !v.rd_eq(fnd) && v > 0.0;
+            }
+        }
+        masks.push(mask);
+    }
+
     let base_rgb_full = compute_hillshade_rgb(&dem, &options.hillshade);
     let base_rgb = downscale_rgb(&base_rgb_full, sw, sh, dw, dh);
 
@@ -439,32 +466,6 @@ pub fn animate_inundation(
     let alpha = options.water_alpha;
     let inv_alpha = 1.0 - alpha;
     let [wr, wg, wb] = options.water_rgb;
-
-    // Preload binary flood masks so ping-pong playback doesn't re-read GeoTIFFs.
-    let mut masks: Vec<Vec<bool>> = Vec::with_capacity(frames.len());
-    for fpath in &frames {
-        let flood = load_raster::<f64>(fpath, None)?;
-        if flood.width() != sw || flood.height() != sh {
-            return Err(Error::DimensionMismatch(format!(
-                "flood frame {} ({}x{}) does not match DEM ({sw}x{sh})",
-                fpath.display(),
-                flood.width(),
-                flood.height()
-            )));
-        }
-        let fnd = flood.no_data();
-        let fdata = flood.data();
-        let mut mask = vec![false; dw * dh];
-        for y in 0..dh {
-            let sy = (y * sh / dh).min(sh - 1);
-            for x in 0..dw {
-                let sx = (x * sw / dw).min(sw - 1);
-                let v = fdata[sy * sw + sx];
-                mask[y * dw + x] = v.is_finite() && !v.rd_eq(fnd) && v > 0.0;
-            }
-        }
-        masks.push(mask);
-    }
 
     // Build playback sequence: rising (0..N), and if ping_pong, decreasing (N-2..=0).
     let mut sequence: Vec<(usize, bool)> = (0..masks.len()).map(|i| (i, true)).collect();
@@ -585,5 +586,31 @@ mod tests {
         assert_eq!(res.height, 42); // 20 + 22 banner
         let bytes = std::fs::read(&gif_path).unwrap();
         assert!(bytes.starts_with(b"GIF89a"));
+    }
+
+    #[test]
+    fn dimension_mismatch_leaves_no_partial_gif() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dem_path = tmp.path().join("dem.tif");
+        let flood_dir = tmp.path().join("flood");
+        std::fs::create_dir_all(&flood_dir).unwrap();
+
+        let dem = Array2D::from_vec(10, 10, vec![100.0; 100]).unwrap();
+        let bad_flood = Array2D::from_vec(5, 5, vec![1u32; 25]).unwrap();
+        save_raster(&dem, &dem_path, None, false).unwrap();
+        save_raster(&bad_flood, flood_dir.join("flood_01.tif"), None, false).unwrap();
+
+        let gif_path = tmp.path().join("should_not_exist.gif");
+        let err = animate_inundation(
+            &dem_path,
+            &flood_dir,
+            &gif_path,
+            &AnimateInundationOptions::default(),
+        );
+        assert!(err.is_err());
+        assert!(
+            !gif_path.exists(),
+            "partial GIF should not be created on error"
+        );
     }
 }

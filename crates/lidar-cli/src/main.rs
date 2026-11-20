@@ -336,7 +336,7 @@ enum Commands {
         /// Rainfall intensity in cm/h
         #[arg(long, default_value_t = 5.0)]
         rain_intensity: f64,
-        /// Optional refined/partially-filled DEM (dem.tif) for sink volume and catchment calculation
+        /// Optional refined/partially-filled DEM (dem.tif); required to compute sink volume, cat_area, time_inund, and rank (otherwise left 0 / unranked)
         #[arg(long)]
         refined_dem: Option<PathBuf>,
         /// Print summary as JSON

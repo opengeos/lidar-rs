@@ -9,7 +9,7 @@
 //! [`richdem::fill_depressions_epsilon`], and all raster/vector I/O uses [`terrio`]
 //! with zero ArcPy or GDAL dependencies.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -358,29 +358,36 @@ fn is_raster_extension(path: &Path) -> bool {
     )
 }
 
-/// Loads a sink raster (integer IDs or elevation mask) or rasterizes a sink polygon
-/// vector onto `dem`'s exact grid, returning 1-based sink labels (`0` = background).
+/// Loads a sink raster (dense 1..=N integer region IDs or elevation mask) or rasterizes
+/// a sink polygon vector onto `dem`'s exact grid, returning 1-based sink labels (`0` = background).
 fn load_or_rasterize_sink_labels(in_sink: &Path, dem: &Array2D<f64>) -> Result<Vec<u32>> {
     if is_raster_extension(in_sink) {
         let sink_arr = load_raster::<f64>(in_sink, None)?;
         validate_same_grid(dem, &sink_arr, "sink raster")?;
         let nd = sink_arr.no_data();
-        let mut all_int = true;
-        let mut has_pos = false;
+        let mut all_pos_int = true;
+        let mut unique_ids: HashSet<u32> = HashSet::new();
+        let mut max_id = 0u32;
         for &v in sink_arr.data() {
             if !v.is_finite() || v.rd_eq(nd) || v == 0.0 {
                 continue;
             }
-            has_pos = true;
             if v < 0.0 || v.fract() != 0.0 || v > u32::MAX as f64 {
-                all_int = false;
+                all_pos_int = false;
                 break;
             }
+            let id = v as u32;
+            unique_ids.insert(id);
+            if id > max_id {
+                max_id = id;
+            }
         }
-        if !has_pos {
-            return Ok(vec![0u32; dem.width() * dem.height()]);
-        }
-        if all_int {
+        // Only treat the raster as pre-labeled region IDs when its positive values form a
+        // dense 1..=N integer sequence (matching `region.tif`). Integer-valued elevation
+        // rasters (e.g., elevations 100..150) fall through to 4-connected `region_group`.
+        let is_dense_label_map =
+            all_pos_int && !unique_ids.is_empty() && max_id as usize == unique_ids.len();
+        if is_dense_label_map {
             let labels = sink_arr
                 .data()
                 .iter()
@@ -770,7 +777,8 @@ pub fn delineate_catchment_hierarchy(
         let out_cat_shp = out_shp_dir.join(&cat_name);
         let out_lvl_shp = out_level_dir.join(&lvl_name);
 
-        let (labels, src_layer) = if is_raster_extension(path) {
+        let is_raster_level = is_raster_extension(path);
+        let (labels, src_layer) = if is_raster_level {
             let r = load_raster::<f64>(path, None)?;
             validate_same_grid(&dem, &r, "level raster")?;
             let nd = r.no_data();
@@ -892,7 +900,15 @@ pub fn delineate_catchment_hierarchy(
         }
 
         for (idx, feat) in src_layer.features.iter().enumerate() {
-            let fid = (idx + 1) as u32;
+            let fid = if is_raster_level {
+                match feat.attributes.first() {
+                    Some(FieldValue::Integer(i)) if *i > 0 => *i as u32,
+                    Some(FieldValue::Float(f)) if *f > 0.0 && f.is_finite() => *f as u32,
+                    _ => continue,
+                }
+            } else {
+                (idx + 1) as u32
+            };
             let Some(rec) = rec_by_id.get(&fid) else {
                 continue;
             };
@@ -1115,8 +1131,17 @@ pub fn delineate_flow_paths(
 
     let mut raw_paths: Vec<(FlowPathRecord, Vec<Coord>)> = Vec::new();
     let max_steps = w * h;
+    // Reuse a single generation-stamped buffer across all sinks so tracing is O(total_path_len)
+    // rather than O(num_sinks * w * h).
+    let mut visited_stamp = vec![0u32; w * h];
+    let mut trace_gen = 0u32;
 
     for (sid, cells) in sink_cells {
+        trace_gen = trace_gen.wrapping_add(1);
+        if trace_gen == 0 {
+            visited_stamp.fill(0);
+            trace_gen = 1;
+        }
         let (sr, sc, cnt) = sum_rc[&sid];
         let cr = sr / cnt as f64;
         let cc = sc / cnt as f64;
@@ -1131,25 +1156,34 @@ pub fn delineate_flow_paths(
 
         let mut cur_r = start_r;
         let mut cur_c = start_c;
+        let mut last_origin_rc = (start_r, start_c);
         let mut steps = 0usize;
         let mut left_origin = false;
         let mut coords: Vec<Coord> = Vec::new();
         let mut elevs: Vec<f64> = Vec::new();
         let mut end_sink = 0u32;
-        let mut visited_guard = vec![false; w * h];
 
         while steps < max_steps {
             let idx = cur_r * w + cur_c;
-            if visited_guard[idx] {
+            if visited_stamp[idx] == trace_gen {
                 break;
             }
-            visited_guard[idx] = true;
+            visited_stamp[idx] = trace_gen;
             steps += 1;
 
             let lbl = sink_labels[idx];
             if !left_origin {
-                if lbl != sid {
+                if lbl == sid {
+                    last_origin_rc = (cur_r, cur_c);
+                } else {
                     left_origin = true;
+                    // Include the origin sink's spill-rim cell so direct sink-to-sink spills
+                    // (e.g., diagonally adjacent sinks) retain a valid 2-point segment.
+                    let (or_r, or_c) = last_origin_rc;
+                    let (ox, oy) = cell_center_xy(&dem_filled.geotransform, or_c, or_r);
+                    coords.push(Coord::xy(ox, oy));
+                    elevs.push(zdata[or_r * w + or_c]);
+
                     let (x, y) = cell_center_xy(&dem_filled.geotransform, cur_c, cur_r);
                     coords.push(Coord::xy(x, y));
                     elevs.push(zdata[idx]);
@@ -1189,17 +1223,17 @@ pub fn delineate_flow_paths(
         for pair in coords.windows(2) {
             length += (pair[1].x - pair[0].x).hypot(pair[1].y - pair[0].y);
         }
-        if length <= min_path_len {
+        // Keep direct sink-to-sink connections regardless of length; filter tiny boundary stubs.
+        if end_sink == 0 && length <= min_path_len {
             continue;
         }
 
         let start_elev = elevs.first().copied().unwrap_or(0.0);
         let end_elev = elevs.last().copied().unwrap_or(0.0);
         let volume = volumes.get(&sid).copied().unwrap_or(0.0);
-        let cat_area = cat_areas
-            .get(&sid)
-            .copied()
-            .unwrap_or(cnt as f64 * cell_area);
+        // Report 0.0 when refined_dem was not supplied rather than misrepresenting sink footprint
+        // area as contributing catchment area.
+        let cat_area = cat_areas.get(&sid).copied().unwrap_or(0.0);
         let simu_depth = if cat_area > 0.0 {
             volume / cat_area
         } else {
@@ -1231,16 +1265,19 @@ pub fn delineate_flow_paths(
         ));
     }
 
-    // Assign 1-based IDs and inundation rank sorted by time_inund ascending.
-    let mut order: Vec<usize> = (0..raw_paths.len()).collect();
-    order.sort_by(|&a, &b| {
-        raw_paths[a]
-            .0
-            .time_inund
-            .total_cmp(&raw_paths[b].0.time_inund)
-    });
-    for (rank_idx, &idx) in order.iter().enumerate() {
-        raw_paths[idx].0.rank = (rank_idx + 1) as u32;
+    // Assign inundation rank (1..=N) ordered by time_inund ascending only when refined_dem
+    // was supplied; otherwise leave rank = 0 (unranked) so callers aren't misled by arbitrary ranks.
+    if options.refined_dem.is_some() {
+        let mut order: Vec<usize> = (0..raw_paths.len()).collect();
+        order.sort_by(|&a, &b| {
+            raw_paths[a]
+                .0
+                .time_inund
+                .total_cmp(&raw_paths[b].0.time_inund)
+        });
+        for (rank_idx, &idx) in order.iter().enumerate() {
+            raw_paths[idx].0.rank = (rank_idx + 1) as u32;
+        }
     }
 
     let mut layer = Layer::new("flowpath".to_string()).with_geom_type(GeometryType::LineString);
@@ -1370,5 +1407,31 @@ mod tests {
         assert!((rec.sink_area - 36.0).abs() < 1e-9);
         assert!((rec.catchment_area - 100.0).abs() < 1e-9);
         assert!((rec.dep_to_cat_ratio - 0.36).abs() < 1e-9);
+    }
+
+    #[test]
+    fn integer_elevation_sink_raster_groups_as_single_region() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dem_path = tmp.path().join("dem.tif");
+        let sink_path = tmp.path().join("sink.tif");
+        let dem = Array2D::from_vec(5, 5, vec![110.0; 25]).unwrap();
+        // Integer-valued elevations (100, 101, 102) inside one connected 3x3 sink (0 = NoData).
+        let mut sink_data = vec![0.0; 25];
+        for r in 1..4 {
+            for c in 1..4 {
+                sink_data[r * 5 + c] = 100.0 + (r - 1) as f64;
+            }
+        }
+        let mut sink = Array2D::from_vec(5, 5, sink_data).unwrap();
+        sink.set_no_data(0.0);
+        save_raster(&dem, &dem_path, None, false).unwrap();
+        save_raster(&sink, &sink_path, None, false).unwrap();
+
+        let labels = load_or_rasterize_sink_labels(&sink_path, &dem).unwrap();
+        let max_label = labels.iter().copied().max().unwrap_or(0);
+        assert_eq!(
+            max_label, 1,
+            "connected integer-valued sink must produce 1 region"
+        );
     }
 }
