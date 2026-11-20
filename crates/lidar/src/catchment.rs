@@ -1002,6 +1002,154 @@ pub fn delineate_catchment_hierarchy(
     })
 }
 
+/// Delineates the nested catchment hierarchy completely in memory from a refined DEM
+/// and the `depression_level` raster produced by [`crate::delineate_depressions_in_memory`].
+///
+/// Returns `(catchment_hir_f64, records)` with zero filesystem I/O (suitable for
+/// WebAssembly / browser execution and high-throughput pipelines).
+pub fn delineate_catchment_hierarchy_in_memory(
+    dem: &Array2D<f64>,
+    depression_level: &Array2D<i32>,
+    min_size: usize,
+) -> Result<(Array2D<f64>, Vec<CatchmentHierarchyRecord>)> {
+    let w = dem.width();
+    let h = dem.height();
+    if depression_level.width() != w || depression_level.height() != h {
+        return Err(Error::DimensionMismatch(format!(
+            "depression_level ({}x{}) does not match DEM ({w}x{h})",
+            depression_level.width(),
+            depression_level.height()
+        )));
+    }
+    let ldata = depression_level.data();
+    let max_level = ldata.iter().copied().max().unwrap_or(0);
+    if max_level <= 0 {
+        let mut empty = Array2D::from_vec(w, h, vec![0.0; w * h])?;
+        empty.copy_metadata_from(dem);
+        empty.set_no_data(0.0);
+        return Ok((empty, Vec::new()));
+    }
+
+    let cell_area = affine_cell_area(&dem.geotransform);
+    let flowdirs = d8_flow_directions_resolved(dem)?;
+    let dem_data = dem.data();
+    let ldata_f64: Vec<f64> = ldata.iter().map(|&v| v as f64).collect();
+
+    let mut all_records = Vec::new();
+    let mut level_rasters: Vec<(u32, Vec<u32>, HashMap<u32, f64>)> = Vec::new();
+
+    for level_i32 in 1..=max_level {
+        let level = level_i32 as u32;
+        let level_f64 = level_i32 as f64;
+        // Mirror extract_levels: group cells with 0 < level_img <= level and retain
+        // components whose peak level reaches `level`.
+        let (raw_labels, nb_labels) =
+            region_group(&ldata_f64, w, h, min_size, |v| v > 0.0 && v <= level_f64);
+        if nb_labels == 0 {
+            continue;
+        }
+        let mut max_in_comp = vec![0i32; nb_labels as usize + 1];
+        for (&lbl, &lv) in raw_labels.iter().zip(ldata.iter()) {
+            if lbl > 0 && lv > max_in_comp[lbl as usize] {
+                max_in_comp[lbl as usize] = lv;
+            }
+        }
+        let mut remap = vec![0u32; nb_labels as usize + 1];
+        let mut next_id = 0u32;
+        for id in 1..=nb_labels as usize {
+            if max_in_comp[id] >= level_i32 {
+                next_id += 1;
+                remap[id] = next_id;
+            }
+        }
+        if next_id == 0 {
+            continue;
+        }
+        let labels: Vec<u32> = raw_labels.iter().map(|&l| remap[l as usize]).collect();
+        let watershed = d8_watersheds(&flowdirs, &labels)?;
+
+        let mut cat_counts: HashMap<u32, usize> = HashMap::new();
+        for &cid in watershed.data() {
+            if cid > 0 {
+                *cat_counts.entry(cid).or_insert(0) += 1;
+            }
+        }
+        let mut zonal: BTreeMap<u32, (usize, f64, f64, f64, f64)> = BTreeMap::new();
+        for (idx, &lbl) in labels.iter().enumerate() {
+            if lbl == 0 {
+                continue;
+            }
+            let z = dem_data[idx];
+            if is_missing(dem, z) {
+                continue;
+            }
+            let e = zonal
+                .entry(lbl)
+                .or_insert((0, f64::INFINITY, f64::NEG_INFINITY, 0.0, 0.0));
+            e.0 += 1;
+            if z < e.1 {
+                e.1 = z;
+            }
+            if z > e.2 {
+                e.2 = z;
+            }
+            e.3 += z;
+            e.4 += z * z;
+        }
+
+        let mut cat_area_by_id: HashMap<u32, f64> = HashMap::new();
+        for (fid, (count, zmin, zmax, zsum, zsum_sq)) in zonal {
+            if count == 0 {
+                continue;
+            }
+            let c_cells = cat_counts.get(&fid).copied().unwrap_or(count);
+            let area = count as f64 * cell_area;
+            let cat_area = c_cells as f64 * cell_area;
+            let dep_to_cat_ratio = if cat_area > 0.0 { area / cat_area } else { 0.0 };
+            let mean_elev = zsum / count as f64;
+            let variance = ((zsum_sq / count as f64) - mean_elev * mean_elev).max(0.0);
+            let std_elev = variance.sqrt();
+            let range = zmax - zmin;
+            let volume = ((count as f64) * zmax - zsum).max(0.0) * cell_area;
+            let mean_depth = if area > 0.0 { volume / area } else { 0.0 };
+            cat_area_by_id.insert(fid, cat_area);
+            all_records.push(CatchmentHierarchyRecord {
+                level,
+                level_fid: fid,
+                count,
+                area,
+                cat_area,
+                dep_to_cat_ratio,
+                min_elev: zmin,
+                max_elev: zmax,
+                range,
+                mean_elev,
+                std_elev,
+                sum_elev: zsum,
+                volume,
+                mean_depth,
+            });
+        }
+        level_rasters.push((level, labels, cat_area_by_id));
+    }
+
+    let mut hir_data = vec![0.0f64; w * h];
+    for (_, labels, cat_area_by_id) in level_rasters.iter().rev() {
+        for (idx, &lbl) in labels.iter().enumerate() {
+            if lbl > 0
+                && let Some(&area) = cat_area_by_id.get(&lbl)
+                && area > 0.0
+            {
+                hir_data[idx] = area;
+            }
+        }
+    }
+    let mut hir_arr = Array2D::from_vec(w, h, hir_data)?;
+    hir_arr.copy_metadata_from(dem);
+    hir_arr.set_no_data(0.0);
+    Ok((hir_arr, all_records))
+}
+
 /// Writes `catchment_hierarchy.csv`.
 pub fn write_catchment_hierarchy_csv(
     records: &[CatchmentHierarchyRecord],
@@ -1439,5 +1587,40 @@ mod tests {
             max_label, 1,
             "connected integer-valued sink must produce 1 region"
         );
+    }
+
+    #[test]
+    fn in_memory_catchment_hierarchy_populates_levels_and_areas() {
+        // 15x15 bowl with two nested depression levels (level 1 inner 3x3, level 2 outer 7x7).
+        let w = 15usize;
+        let h = 15usize;
+        let mut dem_data = vec![0.0; w * h];
+        let mut level_data = vec![0i32; w * h];
+        for r in 0..h {
+            for c in 0..w {
+                let d = ((r as i32 - 7).abs().max((c as i32 - 7).abs())) as f64;
+                dem_data[r * w + c] = 100.0 + d;
+                if (6..=8).contains(&r) && (6..=8).contains(&c) {
+                    level_data[r * w + c] = 1;
+                } else if (4..=10).contains(&r) && (4..=10).contains(&c) {
+                    level_data[r * w + c] = 2;
+                }
+            }
+        }
+        let mut dem = Array2D::from_vec(w, h, dem_data).unwrap();
+        dem.geotransform = [0.0, 2.0, 0.0, 30.0, 0.0, -2.0];
+        let mut dep_level = Array2D::from_vec(w, h, level_data).unwrap();
+        dep_level.copy_metadata_from(&dem);
+        dep_level.set_no_data(0);
+
+        let (hir, records) = delineate_catchment_hierarchy_in_memory(&dem, &dep_level, 1).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].level, 1);
+        assert_eq!(records[1].level, 2);
+        assert!(records[1].area > records[0].area);
+        assert!(records[0].cat_area >= records[0].area);
+        assert!(hir.get(7, 7) > 0.0);
+        assert!(hir.get(4, 4) > 0.0);
+        assert_eq!(hir.get(0, 0), 0.0);
     }
 }

@@ -8,7 +8,7 @@
 
 Pure-Rust port of [`opengeos/lidar`](https://github.com/opengeos/lidar) for delineating the nested hierarchy of surface depressions and elevated features (mounts) in digital elevation models (DEMs), powered by [`terrio`](https://github.com/opengeos/terrio) and [`richdem`](https://github.com/opengeos/richdem-rs) with **zero GDAL or C/C++ dependencies**.
 
-Try it interactively in your browser with no local setup via the [Google Colab notebook](https://colab.research.google.com/github/opengeos/lidar-rs/blob/main/examples/lidar_rs_demo.ipynb).
+Try it interactively in your browser with no local setup via the live [WebAssembly Playground](playground.md) or the [Google Colab notebook](https://colab.research.google.com/github/opengeos/lidar-rs/blob/main/examples/lidar_rs_demo.ipynb).
 
 ## Key Features
 
@@ -18,7 +18,7 @@ Try it interactively in your browser with no local setup via the [Google Colab n
 - **Nested mount hierarchy:** DEM inversion (`flip_dem`) and elevated feature hierarchy delineation (`delineate_mounts`).
 - **Catchment hierarchy, overland flow paths & inundation animation:** Pure-Rust ports of the ArcGIS Hydrology Analyst workflow (`delineate_catchments`, `delineate_flow_paths`, `delineate_catchment_hierarchy`, `simulate_inundation`, and shaded-relief GIF export via `animate_inundation`).
 - **Geospatial raster, vector & point-cloud utilities:** `polygonize`, `mosaic`, `reproject_image`, `resample`, `clip_image`, `image_to_cog`, `add_crs`, `join_csv_to_vector`, `csv_points_to_vector`, and pure-Rust LAS/LAZ/COPC/PLY/E57 I/O & DSM gridding (`lidar_to_dsm`).
-- **Rust library (`lidar`), standalone CLI (`lidar-cli`), and Python bindings (`lidar-rs`).**
+- **Rust library (`lidar`), standalone CLI (`lidar-cli`), Python bindings (`lidar-rs`), and WebAssembly (`lidar-js`).**
 
 ## Citations
 

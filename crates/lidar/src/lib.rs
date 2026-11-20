@@ -52,15 +52,15 @@ pub mod slicing;
 
 pub use animation::{
     AnimateInundationOptions, AnimateInundationResult, HillshadeOptions, animate_inundation,
-    compute_hillshade_rgb,
+    animate_inundation_to_bytes, compute_hillshade_rgb,
 };
 pub use catchment::{
     CatchmentHierarchyOptions, CatchmentHierarchyRecord, CatchmentHierarchyResult, CatchmentRecord,
     DelineateCatchmentsOptions, DelineateCatchmentsResult, DelineateFlowPathsOptions,
     DelineateFlowPathsResult, FlowPathRecord, InMemoryCatchments, d8_flow_directions_resolved,
-    d8_watersheds, delineate_catchment_hierarchy, delineate_catchments,
-    delineate_catchments_in_memory, delineate_flow_paths, write_catchment_hierarchy_csv,
-    write_catchments_csv, write_flowpaths_csv,
+    d8_watersheds, delineate_catchment_hierarchy, delineate_catchment_hierarchy_in_memory,
+    delineate_catchments, delineate_catchments_in_memory, delineate_flow_paths,
+    write_catchment_hierarchy_csv, write_catchments_csv, write_flowpaths_csv,
 };
 pub use error::{Error, Result};
 pub use filling::{

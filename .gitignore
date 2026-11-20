@@ -15,3 +15,7 @@ dist/
 build/
 *.so
 *.pyd
+js/pkg/
+js/pkg-node/
+js/Cargo.lock
+site/

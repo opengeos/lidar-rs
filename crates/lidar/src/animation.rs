@@ -536,6 +536,149 @@ pub fn animate_inundation(
     })
 }
 
+/// Renders an in-memory animated inundation GIF directly from a DEM and a
+/// `fill_time` raster (hours to inundation, as returned by
+/// [`crate::simulate_inundation_in_memory`]), with zero filesystem I/O.
+///
+/// Returns `(gif_bytes, frame_count, width, height)`.
+pub fn animate_inundation_to_bytes(
+    dem: &Array2D<f64>,
+    fill_time: &Array2D<f64>,
+    num_steps: usize,
+    time_step_h: f64,
+    options: &AnimateInundationOptions,
+) -> Result<(Vec<u8>, usize, usize, usize)> {
+    if num_steps == 0 || num_steps > 10_000 {
+        return Err(Error::InvalidArgument(format!(
+            "num_steps must be in 1..=10000, got {num_steps}"
+        )));
+    }
+    if !time_step_h.is_finite() || time_step_h <= 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "time_step_h must be finite and > 0, got {time_step_h}"
+        )));
+    }
+    if !options.water_alpha.is_finite() || !(0.0..=1.0).contains(&options.water_alpha) {
+        return Err(Error::InvalidArgument(format!(
+            "water_alpha must be in [0.0, 1.0], got {}",
+            options.water_alpha
+        )));
+    }
+    let sw = dem.width();
+    let sh = dem.height();
+    if sw == 0 || sh == 0 {
+        return Err(Error::InvalidArgument("input DEM is empty".into()));
+    }
+    if fill_time.width() != sw || fill_time.height() != sh {
+        return Err(Error::DimensionMismatch(format!(
+            "fill_time ({}x{}) does not match DEM ({sw}x{sh})",
+            fill_time.width(),
+            fill_time.height()
+        )));
+    }
+
+    let (dw, dh) = match options.max_dimension {
+        Some(max_dim) if max_dim > 0 && (sw > max_dim || sh > max_dim) => {
+            if sw >= sh {
+                let nh = ((sh as f64) * (max_dim as f64) / (sw as f64))
+                    .round()
+                    .max(1.0) as usize;
+                (max_dim, nh)
+            } else {
+                let nw = ((sw as f64) * (max_dim as f64) / (sh as f64))
+                    .round()
+                    .max(1.0) as usize;
+                (nw, max_dim)
+            }
+        }
+        _ => (sw, sh),
+    };
+
+    let banner_h = 22usize;
+    let total_h = dh + banner_h;
+    if dw > u16::MAX as usize || total_h > u16::MAX as usize {
+        return Err(Error::InvalidArgument(format!(
+            "animation frame dimensions ({dw}x{total_h}) exceed GIF u16 limit (65535); set max_dimension"
+        )));
+    }
+
+    let base_rgb_full = compute_hillshade_rgb(dem, &options.hillshade);
+    let base_rgb = downscale_rgb(&base_rgb_full, sw, sh, dw, dh);
+
+    let mut gif_bytes = Vec::new();
+    let frame_count = {
+        let mut encoder = Encoder::new(&mut gif_bytes, dw as u16, total_h as u16, &[])
+            .map_err(|e| Error::Algorithm(format!("GIF encoder init failed: {e}")))?;
+        let repeat = if options.loops == 0 {
+            Repeat::Infinite
+        } else {
+            Repeat::Finite(options.loops)
+        };
+        encoder
+            .set_repeat(repeat)
+            .map_err(|e| Error::Algorithm(format!("GIF repeat header failed: {e}")))?;
+
+        let delay_cs = (options.frame_delay_ms.max(20) / 10).max(2);
+        let alpha = options.water_alpha;
+        let inv_alpha = 1.0 - alpha;
+        let [wr, wg, wb] = options.water_rgb;
+
+        let mut sequence: Vec<(usize, bool)> = (0..num_steps).map(|i| (i, true)).collect();
+        if options.ping_pong && num_steps > 1 {
+            for i in (0..num_steps - 1).rev() {
+                sequence.push((i, false));
+            }
+        }
+
+        let ft_data = fill_time.data();
+        let mut frame_rgb = vec![0u8; dw * total_h * 3];
+        for &(src_idx, rising) in &sequence {
+            let t_hours = (src_idx + 1) as f64 * time_step_h;
+            let progress = (src_idx + 1) as f64 / num_steps as f64;
+            let phase = if rising { "RISING" } else { "FALLING" };
+            let banner_text = match options.rain_intensity_cm_h {
+                Some(r) => format!("{phase}  T = {t_hours:.1}H  ({r:.1} CM/H)"),
+                None => format!("{phase}  T = {t_hours:.1}H"),
+            };
+            draw_banner(
+                &mut frame_rgb[..dw * banner_h * 3],
+                dw,
+                banner_h,
+                &banner_text,
+                progress,
+                options.water_rgb,
+            );
+
+            let body = &mut frame_rgb[dw * banner_h * 3..];
+            body.copy_from_slice(&base_rgb);
+            for y in 0..dh {
+                let sy = (y * sh / dh).min(sh - 1);
+                for x in 0..dw {
+                    let sx = (x * sw / dw).min(sw - 1);
+                    let ft = ft_data[sy * sw + sx];
+                    if ft >= 0.0 && ft.is_finite() && ft <= t_hours {
+                        let p = (y * dw + x) * 3;
+                        body[p] = (body[p] as f32 * inv_alpha + wr as f32 * alpha).round() as u8;
+                        body[p + 1] =
+                            (body[p + 1] as f32 * inv_alpha + wg as f32 * alpha).round() as u8;
+                        body[p + 2] =
+                            (body[p + 2] as f32 * inv_alpha + wb as f32 * alpha).round() as u8;
+                    }
+                }
+            }
+
+            let mut gif_frame = Frame::from_rgb_speed(dw as u16, total_h as u16, &frame_rgb, 10);
+            gif_frame.delay = delay_cs;
+            encoder
+                .write_frame(&gif_frame)
+                .map_err(|e| Error::Algorithm(format!("GIF frame write failed: {e}")))?;
+        }
+        sequence.len()
+    };
+
+    Ok((gif_bytes, frame_count, dw, total_h))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,5 +767,41 @@ mod tests {
             !gif_path.exists(),
             "partial GIF should not be created on error"
         );
+    }
+
+    #[test]
+    fn animate_inundation_to_bytes_produces_valid_gif() {
+        let mut dem_data = vec![0.0; 20 * 20];
+        let mut ft_data = vec![-1.0; 20 * 20];
+        for r in 0..20 {
+            for c in 0..20 {
+                let d = ((r as f64 - 10.0).powi(2) + (c as f64 - 10.0).powi(2)).sqrt();
+                dem_data[r * 20 + c] = 100.0 + d;
+                if d <= 6.0 {
+                    ft_data[r * 20 + c] = d * 0.5;
+                }
+            }
+        }
+        let dem = Array2D::from_vec(20, 20, dem_data).unwrap();
+        let mut ft = Array2D::from_vec(20, 20, ft_data).unwrap();
+        ft.set_no_data(-1.0);
+
+        let (bytes, frames, w, h) = animate_inundation_to_bytes(
+            &dem,
+            &ft,
+            4,
+            1.0,
+            &AnimateInundationOptions {
+                ping_pong: true,
+                rain_intensity_cm_h: Some(5.0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(frames, 7); // 4 rising + 3 falling
+        assert_eq!(w, 20);
+        assert_eq!(h, 42);
+        assert!(bytes.starts_with(b"GIF89a"));
     }
 }
