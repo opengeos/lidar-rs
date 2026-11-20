@@ -13,7 +13,7 @@ authors = ["Qiusheng Wu <giswqs@gmail.com>"]
 
 [workspace.dependencies]
 lidar = { path = "crates/lidar", version = "0.2.0" }
-richdem = { version = "0.1", default-features = false, features = ["terrio"] }
+richdem = { version = "0.2", default-features = false, features = ["terrio"] }
 terrio = { version = "0.9", default-features = false, features = ["geotiff", "sqlite"] }
 rayon = "1.10"
 thiserror = "2"

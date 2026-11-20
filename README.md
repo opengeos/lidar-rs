@@ -59,7 +59,7 @@ fn main() -> lidar::Result<()> {
     )?;
 
     let deps = delineate_depressions(
-        &sinks.sink_path,
+        sinks.sink_path.as_ref().unwrap(),
         out_dir,
         &DelineateOptions {
             min_size: 1000,
@@ -120,6 +120,21 @@ dep_id, dep_level = lidar.DelineateDepressions(
     sink, min_size=1000, min_depth=0.3, interval=0.3, out_dir="out", bool_level_shp=True
 )
 ```
+
+## Performance
+
+Measured in release mode (`cargo run --release --example benchmark`) on the 400 × 400 sample datasets (`test_data/dem.tif`, `sink.tif`, `dsm.tif`, 160,000 cells):
+
+| Operation | Median Time |
+|---|---:|
+| `mean_filter` (3×3, in-memory) | 0.75 ms |
+| `median_filter` (3×3, in-memory) | 1.27 ms |
+| `gaussian_filter` (σ = 1.0, in-memory) | 1.51 ms |
+| `extract_sinks` (in-memory, `min_size = 1000`) | 8.25 ms |
+| `extract_sinks` (full file I/O: GeoTIFFs + CSV + Shapefile + GeoPackage) | 17.68 ms |
+| `delineate_depressions` (in-memory, `interval = 0.3`) | 46.77 ms |
+| `delineate_depressions` (full file I/O + per-level shapefiles) | 65.64 ms |
+| `delineate_mounts` (`dsm.tif`, full pipeline + file I/O) | 78.39 ms |
 
 ## Citations
 
