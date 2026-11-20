@@ -54,14 +54,14 @@ fn test_extract_sinks_on_sample_dem() {
     };
     let res = extract_sinks(&dem_path, tmp.path(), &opts).unwrap();
 
-    assert!(res.sink_path.exists());
-    assert!(res.refined_dem_path.exists());
-    assert!(res.filled_dem_path.exists());
-    assert!(res.dem_diff_path.exists());
-    assert!(res.depth_path.exists());
-    assert!(res.region_path.exists());
-    assert!(res.csv_path.exists());
-    assert!(res.shapefile_path.exists());
+    assert!(res.sink_path.as_ref().unwrap().exists());
+    assert!(res.refined_dem_path.as_ref().unwrap().exists());
+    assert!(res.filled_dem_path.as_ref().unwrap().exists());
+    assert!(res.dem_diff_path.as_ref().unwrap().exists());
+    assert!(res.depth_path.as_ref().unwrap().exists());
+    assert!(res.region_path.as_ref().unwrap().exists());
+    assert!(res.csv_path.as_ref().unwrap().exists());
+    assert!(res.shapefile_path.as_ref().unwrap().exists());
     assert!(res.gpkg_path.exists());
     assert!(
         !res.depressions.is_empty(),
@@ -96,8 +96,10 @@ fn test_extract_sinks_drop_intermediates() {
     };
     let res = extract_sinks(&dem_path, tmp.path(), &opts).unwrap();
     assert!(res.gpkg_path.exists());
-    assert!(!res.sink_path.exists());
-    assert!(!res.shapefile_path.exists());
+    assert!(res.sink_path.is_none());
+    assert!(res.shapefile_path.is_none());
+    assert!(!tmp.path().join("sink.tif").exists());
+    assert!(!tmp.path().join("regions.shp").exists());
 }
 
 #[test]
@@ -155,7 +157,7 @@ fn test_full_pipeline_median_extract_delineate() {
     .unwrap();
 
     let dep_res = delineate_depressions(
-        &sink_res.sink_path,
+        sink_res.sink_path.as_ref().unwrap(),
         tmp.path(),
         &DelineateOptions {
             min_size: 1000,
@@ -292,18 +294,47 @@ fn test_raster_and_vector_utilities() {
     )
     .unwrap();
     let poly_geojson = tmp.path().join("regions.geojson");
-    let n_poly = polygonize(&sink_res.region_path, &poly_geojson, "id").unwrap();
+    let n_poly = polygonize(sink_res.region_path.as_ref().unwrap(), &poly_geojson, "id").unwrap();
     assert_eq!(n_poly, sink_res.depressions.len());
     let joined_shp = tmp.path().join("joined.shp");
     let n_joined = join_csv_to_vector(
         &poly_geojson,
-        &sink_res.csv_path,
+        sink_res.csv_path.as_ref().unwrap(),
         &joined_shp,
         "id",
         "region_id",
     )
     .unwrap();
     assert_eq!(n_joined, n_poly);
+
+    // Safety guards: reject overwriting input DEM, mosaic input == output, invalid lat/lon.
+    assert!(extract_sinks(&dem_path, test_data_dir(), &ExtractSinksOptions::default()).is_err());
+    assert!(mosaic(&[&resampled], &resampled).is_err());
+
+    let bad_csv = tmp.path().join("bad_pts.csv");
+    std::fs::write(&bad_csv, "name,latitude,longitude\nBad,95.0,-83.0\n").unwrap();
+    assert!(
+        csv_points_to_vector(
+            &bad_csv,
+            tmp.path().join("bad.shp"),
+            "latitude",
+            "longitude"
+        )
+        .is_err()
+    );
+
+    // Quoted multiline CSV record should parse cleanly into 1 point.
+    let multi_csv = tmp.path().join("multi_pts.csv");
+    std::fs::write(
+        &multi_csv,
+        "name,note,latitude,longitude\nA,\"first\nsecond\",35.96,-83.92\n",
+    )
+    .unwrap();
+    let multi_gpkg = tmp.path().join("multi.gpkg");
+    assert_eq!(
+        csv_points_to_vector(&multi_csv, &multi_gpkg, "latitude", "longitude").unwrap(),
+        1
+    );
 }
 
 #[cfg(feature = "pointcloud")]

@@ -28,7 +28,11 @@ pub struct DelineateMountsResult {
 
 /// Flips a DEM upside-down: `flipped = -dem + max_elev + delta`, preserving NoData cells.
 ///
-/// Matches `lidar.FlipDEM` (with exact NoData preservation).
+/// If the input `no_data` sentinel collides with any valid flipped elevation, a
+/// collision-free output NoData value is chosen automatically and missing cells are
+/// remapped to it so valid inverted peaks are never masked out.
+///
+/// Matches `lidar.FlipDEM` (with collision-free NoData preservation).
 pub fn flip_dem(dem: &Array2D<f64>, delta: f64) -> Result<Array2D<f64>> {
     if !delta.is_finite() {
         return Err(Error::InvalidArgument(format!(
@@ -38,22 +42,41 @@ pub fn flip_dem(dem: &Array2D<f64>, delta: f64) -> Result<Array2D<f64>> {
     let nd = dem.no_data();
     let is_missing = |v: f64| !v.is_finite() || v.rd_eq(nd);
 
+    let mut min_elev = f64::INFINITY;
     let mut max_elev = f64::NEG_INFINITY;
     for &v in dem.data() {
-        if !is_missing(v) && v > max_elev {
-            max_elev = v;
+        if !is_missing(v) {
+            if v < min_elev {
+                min_elev = v;
+            }
+            if v > max_elev {
+                max_elev = v;
+            }
         }
     }
     if !max_elev.is_finite() {
         return Ok(dem.clone());
     }
 
+    // Valid flipped elevations lie in [delta, max_elev - min_elev + delta].
+    let flipped_min = delta;
+    let flipped_max = (max_elev - min_elev) + delta;
+    let out_nd = if nd.is_finite() && nd >= flipped_min && nd <= flipped_max {
+        if -9999.0 < flipped_min {
+            -9999.0
+        } else {
+            flipped_min - 9999.0
+        }
+    } else {
+        nd
+    };
+
     let flipped_data: Vec<f64> = dem
         .data()
         .iter()
         .map(|&v| {
             if is_missing(v) {
-                v
+                out_nd
             } else {
                 -v + max_elev + delta
             }
@@ -62,7 +85,7 @@ pub fn flip_dem(dem: &Array2D<f64>, delta: f64) -> Result<Array2D<f64>> {
 
     let mut out = Array2D::from_vec(dem.width(), dem.height(), flipped_data)?;
     out.copy_metadata_from(dem);
-    out.set_no_data(nd);
+    out.set_no_data(out_nd);
     Ok(out)
 }
 
@@ -100,10 +123,13 @@ pub fn delineate_mounts(
     out_dir: impl AsRef<Path>,
     options: &DelineateOptions,
 ) -> Result<DelineateMountsResult> {
+    let in_dem = in_dem.as_ref();
     let out_dir = out_dir.as_ref();
     std::fs::create_dir_all(out_dir)?;
 
     let flipped_dem_path = out_dir.join("dem_flip.tif");
+    let refined_dem_path = out_dir.join("dem.tif");
+    crate::raster_ops::ensure_no_path_collision(in_dem, &[&flipped_dem_path, &refined_dem_path])?;
     flip_dem_file(in_dem, 100.0, Some(&flipped_dem_path))?;
 
     let sink_opts = ExtractSinksOptions {
@@ -114,7 +140,11 @@ pub fn delineate_mounts(
         compress: options.compress,
     };
     let sinks = extract_sinks(&flipped_dem_path, out_dir, &sink_opts)?;
-    let mounts = delineate_depressions(&sinks.sink_path, out_dir, options)?;
+    let sink_path = sinks
+        .sink_path
+        .as_ref()
+        .ok_or_else(|| Error::Algorithm("extract_sinks did not produce sink.tif".into()))?;
+    let mounts = delineate_depressions(sink_path, out_dir, options)?;
 
     Ok(DelineateMountsResult {
         flipped_dem_path,
@@ -135,5 +165,17 @@ mod tests {
         assert!((flipped.get(0, 0) - 115.0).abs() < 1e-12);
         assert!((flipped.get(1, 0) - 100.0).abs() < 1e-12);
         assert_eq!(flipped.get(2, 0), -9999.0);
+    }
+
+    #[test]
+    fn flip_dem_avoids_nodata_collision_with_inverted_peak() {
+        let mut dem = Array2D::from_vec(3, 1, vec![100.0, 120.0, 80.0]).unwrap();
+        dem.set_no_data(100.0);
+        let flipped = flip_dem(&dem, 100.0).unwrap();
+        // Valid peak 120 maps to 100.0; NoData must be remapped away from 100.0.
+        assert_ne!(flipped.no_data(), 100.0);
+        assert_eq!(flipped.get(0, 0), flipped.no_data());
+        assert!((flipped.get(1, 0) - 100.0).abs() < 1e-12);
+        assert!((flipped.get(2, 0) - 140.0).abs() < 1e-12);
     }
 }

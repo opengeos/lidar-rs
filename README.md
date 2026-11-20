@@ -59,7 +59,7 @@ fn main() -> lidar::Result<()> {
     )?;
 
     let deps = delineate_depressions(
-        &sinks.sink_path,
+        sinks.sink_path.as_ref().unwrap(),
         out_dir,
         &DelineateOptions {
             min_size: 1000,

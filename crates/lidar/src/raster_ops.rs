@@ -12,10 +12,8 @@
 //! - [`join_csv_to_vector`]
 //! - [`csv_points_to_vector`]
 
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use richdem::{Array2D, DemNum, array2d_to_dataset};
 use terrio::crs::SpatialRef;
@@ -94,6 +92,40 @@ fn polygonize_dataset(ds: &RasterDataset, out_vector: &Path, field_name: &str) -
     Ok(count)
 }
 
+fn resolve_path_for_compare(path: &Path) -> Option<PathBuf> {
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return Some(canon);
+    }
+    let parent = path.parent()?;
+    let file_name = path.file_name()?;
+    let parent_dir = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let canon_parent = std::fs::canonicalize(parent_dir).ok()?;
+    Some(canon_parent.join(file_name))
+}
+
+/// Returns an error if `input` resolves to the same path as any entry in `outputs`.
+pub(crate) fn ensure_no_path_collision(input: &Path, outputs: &[&Path]) -> Result<()> {
+    let Some(in_canon) = resolve_path_for_compare(input) else {
+        return Ok(());
+    };
+    for out in outputs {
+        if let Some(out_canon) = resolve_path_for_compare(out)
+            && in_canon == out_canon
+        {
+            return Err(Error::InvalidArgument(format!(
+                "output path '{}' would overwrite input file '{}'",
+                out.display(),
+                input.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Mosaics multiple raster files into a single output GeoTIFF.
 ///
 /// Mirrors `lidar.mosaic`.
@@ -106,9 +138,8 @@ pub fn mosaic<P: AsRef<Path>>(inputs: &[P], output: impl AsRef<Path>) -> Result<
     let output = output.as_ref();
     ensure_parent_dir(output)?;
 
-    if inputs.len() == 1 {
-        std::fs::copy(inputs[0].as_ref(), output)?;
-        return Ok(());
+    for inp in inputs {
+        ensure_no_path_collision(inp.as_ref(), &[output])?;
     }
 
     let paths: Vec<String> = inputs
@@ -293,59 +324,80 @@ pub fn add_crs(input: impl AsRef<Path>, crs: &str, output: Option<&Path>) -> Res
     Ok(())
 }
 
-/// Parses a single CSV line respecting RFC-4180 double-quoted fields.
-fn parse_csv_line(line: &str) -> Vec<String> {
-    let mut fields = Vec::new();
-    let mut cur = String::new();
-    let mut chars = line.chars().peekable();
+/// Parses RFC-4180 CSV content into complete records, properly preserving
+/// embedded newlines and escaped quotes inside quoted fields.
+fn parse_csv_records(content: &str) -> Vec<Vec<String>> {
+    let mut records: Vec<Vec<String>> = Vec::new();
+    let mut row: Vec<String> = Vec::new();
+    let mut field = String::new();
+    let mut chars = content.chars().peekable();
     let mut in_quotes = false;
+    let mut had_field_content = false;
 
     while let Some(c) = chars.next() {
         if in_quotes {
             if c == '"' {
                 if chars.peek() == Some(&'"') {
                     chars.next();
-                    cur.push('"');
+                    field.push('"');
                 } else {
                     in_quotes = false;
                 }
             } else {
-                cur.push(c);
+                field.push(c);
             }
-        } else if c == '"' {
-            in_quotes = true;
-        } else if c == ',' {
-            fields.push(cur.trim().to_string());
-            cur.clear();
         } else {
-            cur.push(c);
+            match c {
+                '"' => {
+                    in_quotes = true;
+                    had_field_content = true;
+                }
+                ',' => {
+                    row.push(field.trim().to_string());
+                    field.clear();
+                    had_field_content = true;
+                }
+                '\r' => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    if had_field_content || !field.trim().is_empty() {
+                        row.push(field.trim().to_string());
+                        records.push(std::mem::take(&mut row));
+                    }
+                    field.clear();
+                    had_field_content = false;
+                }
+                '\n' => {
+                    if had_field_content || !field.trim().is_empty() {
+                        row.push(field.trim().to_string());
+                        records.push(std::mem::take(&mut row));
+                    }
+                    field.clear();
+                    had_field_content = false;
+                }
+                _ => {
+                    field.push(c);
+                }
+            }
         }
     }
-    fields.push(cur.trim().to_string());
-    fields
+
+    if had_field_content || !field.trim().is_empty() {
+        row.push(field.trim().to_string());
+        records.push(row);
+    }
+    records
 }
 
 fn read_csv_table(csv_path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>)> {
-    let file = File::open(csv_path)?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
-
-    let header_line = match lines.next() {
-        Some(Ok(l)) => l,
-        Some(Err(e)) => return Err(Error::Io(e)),
-        None => return Ok((Vec::new(), Vec::new())),
-    };
-    let headers = parse_csv_line(header_line.trim_end_matches(['\r', '\n']));
-    let mut rows = Vec::new();
-    for line in lines {
-        let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        rows.push(parse_csv_line(trimmed));
+    let content = std::fs::read_to_string(csv_path)?;
+    let mut records = parse_csv_records(&content);
+    if records.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
     }
-    Ok((headers, rows))
+    let headers = records.remove(0);
+    Ok((headers, records))
 }
 
 fn infer_field_type(rows: &[Vec<String>], col: usize) -> FieldType {
@@ -395,18 +447,67 @@ fn parse_field_value(raw: Option<&String>, ftype: FieldType) -> FieldValue {
     }
 }
 
+fn normalize_text_join_key(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Ok(i) = trimmed.parse::<i64>() {
+        return i.to_string();
+    }
+    if let Ok(f) = trimmed.parse::<f64>()
+        && f.is_finite()
+        && f.fract() == 0.0
+        && f >= (i64::MIN as f64)
+        && f < (i64::MAX as f64)
+        && f.abs() <= ((1u64 << 53) as f64)
+    {
+        return (f as i64).to_string();
+    }
+    trimmed.to_string()
+}
+
 fn field_value_join_key(val: &FieldValue) -> Option<String> {
     match val {
         FieldValue::Integer(i) => Some(i.to_string()),
         FieldValue::Float(f) => {
-            if f.fract() == 0.0 {
+            if f.is_finite() && f.fract() == 0.0 && f.abs() <= ((1u64 << 53) as f64) {
                 Some((*f as i64).to_string())
             } else {
                 Some(f.to_string())
             }
         }
-        FieldValue::Text(s) => Some(s.trim().to_string()),
+        FieldValue::Text(s) => Some(normalize_text_join_key(s)),
         _ => None,
+    }
+}
+
+/// Allocates a field name unique within `used_names` (case-insensitive),
+/// truncating safely to 10 UTF-8 bytes when writing ESRI Shapefiles.
+fn allocate_unique_field_name(
+    raw_name: &str,
+    is_shp: bool,
+    used_names: &mut HashSet<String>,
+) -> String {
+    let base_raw = raw_name.replace('-', "_");
+    let base = if is_shp && base_raw.len() > 10 {
+        truncate_utf8_bytes(&base_raw, 10)
+    } else {
+        base_raw
+    };
+    if used_names.insert(base.to_ascii_lowercase()) {
+        return base;
+    }
+    let mut counter = 1usize;
+    loop {
+        let suffix = format!("_{counter}");
+        let mut candidate = if is_shp && base.len() + suffix.len() > 10 {
+            truncate_utf8_bytes(&base, 10usize.saturating_sub(suffix.len()))
+        } else {
+            base.clone()
+        };
+        candidate.push_str(&suffix);
+        if used_names.insert(candidate.to_ascii_lowercase()) {
+            return candidate;
+        }
+        counter += 1;
     }
 }
 
@@ -480,13 +581,13 @@ pub fn join_csv_to_vector(
         out_layer.schema.add_field(field.clone());
     }
 
-    // Add CSV fields (truncating to 10 UTF-8 bytes for ESRI Shapefile DBF compatibility).
+    // Add CSV fields with guaranteed unique names (truncated to 10 UTF-8 bytes for Shapefile DBF).
     let mut csv_col_types = Vec::with_capacity(headers.len());
-    let mut used_names: HashMap<String, usize> = out_layer
+    let mut used_names: HashSet<String> = out_layer
         .schema
         .fields()
         .iter()
-        .map(|f| (f.name.to_ascii_lowercase(), 1))
+        .map(|f| f.name.to_ascii_lowercase())
         .collect();
     let mut csv_keep_cols = Vec::new();
 
@@ -495,31 +596,17 @@ pub fn join_csv_to_vector(
             continue;
         }
         let ftype = infer_field_type(&rows, ci);
-        let mut name = raw_name.replace('-', "_");
-        if is_shp && name.len() > 10 {
-            name = truncate_utf8_bytes(&name, 10);
-        }
-        let lower = name.to_ascii_lowercase();
-        if let Some(cnt) = used_names.get_mut(&lower) {
-            let suffix = format!("_{cnt}");
-            *cnt += 1;
-            if is_shp && name.len() + suffix.len() > 10 {
-                name = truncate_utf8_bytes(&name, 10usize.saturating_sub(suffix.len()));
-            }
-            name.push_str(&suffix);
-        } else {
-            used_names.insert(lower, 1);
-        }
+        let name = allocate_unique_field_name(raw_name, is_shp, &mut used_names);
         out_layer.schema.add_field(FieldDef::new(name, ftype));
         csv_col_types.push(ftype);
         csv_keep_cols.push(ci);
     }
 
-    // Build lookup map from CSV join key to row.
+    // Build lookup map from normalized CSV join key to row.
     let mut lookup: HashMap<String, &Vec<String>> = HashMap::with_capacity(rows.len());
     for row in &rows {
         if let Some(k) = row.get(csv_key_idx) {
-            lookup.insert(k.trim().to_string(), row);
+            lookup.insert(normalize_text_join_key(k), row);
         }
     }
 
@@ -594,13 +681,11 @@ pub fn csv_points_to_vector(
     let mut layer = Layer::new("points".to_string()).with_geom_type(GeometryType::Point);
     SpatialRef::parse("EPSG:4326")?.apply_to_layer(&mut layer);
 
+    let mut used_names = HashSet::new();
     let mut col_types = Vec::with_capacity(headers.len());
     for (ci, h) in headers.iter().enumerate() {
         let ftype = infer_field_type(&rows, ci);
-        let mut name = h.replace('-', "_");
-        if is_shp && name.len() > 10 {
-            name = truncate_utf8_bytes(&name, 10);
-        }
+        let name = allocate_unique_field_name(h, is_shp, &mut used_names);
         layer.schema.add_field(FieldDef::new(name, ftype));
         col_types.push(ftype);
     }
@@ -611,11 +696,23 @@ pub fn csv_points_to_vector(
             .ok_or_else(|| Error::Parse(format!("missing latitude at row {}", fid + 1)))?
             .parse()
             .map_err(|e| Error::Parse(format!("invalid latitude at row {}: {e}", fid + 1)))?;
+        if !lat.is_finite() || !(-90.0..=90.0).contains(&lat) {
+            return Err(Error::Parse(format!(
+                "latitude out of WGS 84 range [-90, 90] at row {}: {lat}",
+                fid + 1
+            )));
+        }
         let lon: f64 = row
             .get(lon_idx)
             .ok_or_else(|| Error::Parse(format!("missing longitude at row {}", fid + 1)))?
             .parse()
             .map_err(|e| Error::Parse(format!("invalid longitude at row {}: {e}", fid + 1)))?;
+        if !lon.is_finite() || !(-180.0..=180.0).contains(&lon) {
+            return Err(Error::Parse(format!(
+                "longitude out of WGS 84 range [-180, 180] at row {}: {lon}",
+                fid + 1
+            )));
+        }
 
         let attrs: Vec<FieldValue> = (0..headers.len())
             .map(|ci| parse_field_value(row.get(ci), col_types[ci]))

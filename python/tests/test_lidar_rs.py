@@ -28,12 +28,18 @@ def test_array_filters():
     assert flipped[0, 0] == pytest.approx(115.0)
     assert flipped[0, 1] == pytest.approx(100.0)
 
+    with pytest.raises(ValueError, match="out_file"):
+        lidar_rs.MeanFilter(arr, out_file="should_fail.tif")
+
 
 def test_file_filters_and_pipeline(tmp_path: Path):
     dem = TEST_DATA / "dem.tif"
     med_path = tmp_path / "median.tif"
     out = lidar_rs.MedianFilter(dem, kernel_size=3, out_file=med_path)
     assert Path(out).exists()
+
+    with pytest.raises(ValueError, match="keep_files"):
+        lidar_rs.ExtractSinks(med_path, min_size=1000, out_dir=tmp_path, keep_files=False)
 
     sink_path = lidar_rs.ExtractSinks(med_path, min_size=1000, out_dir=tmp_path)
     assert Path(sink_path).exists()
@@ -45,6 +51,8 @@ def test_file_filters_and_pipeline(tmp_path: Path):
     assert Path(dep_id).exists()
     assert Path(dep_level).exists()
     assert (tmp_path / "depressions_info.csv").exists()
+    level_shps = list((tmp_path / "shp-level").glob("Single_level_*.shp"))
+    assert len(level_shps) >= 1
 
 
 def test_delineate_mounts(tmp_path: Path):

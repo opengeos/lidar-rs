@@ -13,8 +13,8 @@ use richdem::{Array2D, DemNum, Topology, fill_depressions, load_raster, save_ras
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::raster_ops::{join_csv_to_vector, polygonize};
-use crate::region::{RegionProps, region_group, region_props};
+use crate::raster_ops::{ensure_no_path_collision, join_csv_to_vector, polygonize};
+use crate::region::{RegionProps, region_group, region_props_xy};
 
 /// Geometric and topographic attributes of an extracted sink (depression region).
 ///
@@ -28,7 +28,7 @@ pub struct SinkDepression {
     pub count: usize,
     /// Surface area in map units squared.
     pub area: f64,
-    /// Depression storage volume in cubic map units.
+    /// Depression relief volume below `max_elev` (`avg_depth * area`, matching `lidar/filling.py`).
     pub volume: f64,
     /// Mean depth in vertical elevation units.
     pub avg_depth: f64,
@@ -105,25 +105,28 @@ impl Default for ExtractSinksOptions {
 }
 
 /// Output paths and metadata produced by [`extract_sinks`].
+///
+/// Intermediate paths are `Some(...)` when retained on disk and `None` when
+/// removed by `keep_files = false`. `gpkg_path` is always retained.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ExtractSinksResult {
-    /// Path to `sink.tif` (elevation inside sinks, 0 outside).
-    pub sink_path: PathBuf,
-    /// Path to refined `dem.tif` (small artifact depressions filled, real depressions preserved).
-    pub refined_dem_path: PathBuf,
-    /// Path to `dem_filled.tif` (or the caller-supplied filled DEM).
-    pub filled_dem_path: PathBuf,
-    /// Path to `dem_diff.tif` (raw filled minus original DEM).
-    pub dem_diff_path: PathBuf,
-    /// Path to `depth.tif` (depth of retained depressions, 0 outside).
-    pub depth_path: PathBuf,
-    /// Path to `region.tif` (`i32` region IDs, 0 outside).
-    pub region_path: PathBuf,
-    /// Path to `regions_info.csv`.
-    pub csv_path: PathBuf,
-    /// Path to `regions.shp`.
-    pub shapefile_path: PathBuf,
+    /// Path to `sink.tif` (elevation inside sinks, 0 outside), or `None` if removed.
+    pub sink_path: Option<PathBuf>,
+    /// Path to refined `dem.tif`, or `None` if removed.
+    pub refined_dem_path: Option<PathBuf>,
+    /// Path to `dem_filled.tif` (or caller-supplied filled DEM), or `None` if removed.
+    pub filled_dem_path: Option<PathBuf>,
+    /// Path to `dem_diff.tif`, or `None` if removed.
+    pub dem_diff_path: Option<PathBuf>,
+    /// Path to `depth.tif`, or `None` if removed.
+    pub depth_path: Option<PathBuf>,
+    /// Path to `region.tif`, or `None` if removed.
+    pub region_path: Option<PathBuf>,
+    /// Path to `regions_info.csv`, or `None` if removed.
+    pub csv_path: Option<PathBuf>,
+    /// Path to `regions.shp`, or `None` if removed.
+    pub shapefile_path: Option<PathBuf>,
     /// Path to `<stem>.gpkg` with region geometries joined to CSV attributes.
     pub gpkg_path: PathBuf,
     /// Extracted sink attributes.
@@ -204,7 +207,7 @@ pub fn extract_sinks_with_filled_in_memory(
         .checked_mul(h)
         .ok_or_else(|| Error::DimensionMismatch(format!("raster dimensions overflow ({w}x{h})")))?;
 
-    let mut dem_filled = match pre_filled {
+    let (mut dem_filled, filled_nd_opt) = match pre_filled {
         Some(f) => {
             if f.width() != w || f.height() != h {
                 return Err(Error::DimensionMismatch(format!(
@@ -213,21 +216,51 @@ pub fn extract_sinks_with_filled_in_memory(
                     f.height()
                 )));
             }
-            f.clone()
+            for (k, (a, b)) in dem
+                .geotransform
+                .iter()
+                .zip(f.geotransform.iter())
+                .enumerate()
+            {
+                let tol = 1e-9 * a.abs().max(b.abs()).max(1.0);
+                if (a - b).abs() > tol {
+                    return Err(Error::DimensionMismatch(format!(
+                        "filled DEM geotransform[{k}] ({b}) does not match input DEM ({a})"
+                    )));
+                }
+            }
+            if !dem.projection.is_empty()
+                && !f.projection.is_empty()
+                && dem.projection != f.projection
+            {
+                return Err(Error::InvalidArgument(
+                    "filled DEM CRS/projection does not match input DEM".into(),
+                ));
+            }
+            (f.clone(), Some(f.no_data()))
         }
         None => {
             let mut f = dem.clone();
             fill_depressions(&mut f, topology);
-            f
+            (f, None)
         }
     };
 
     let no_data = dem.no_data();
-    let resolution = dem.geotransform[1].abs();
-    let resolution = if resolution > 0.0 && resolution.is_finite() {
-        resolution
+    let gt = dem.geotransform;
+    let res_x = gt[1].hypot(gt[4]);
+    let res_y = gt[2].hypot(gt[5]);
+    let det = (gt[1] * gt[5] - gt[2] * gt[4]).abs();
+    let (res_x, res_y, cell_area) = if res_x > 0.0
+        && res_x.is_finite()
+        && res_y > 0.0
+        && res_y.is_finite()
+        && det > 0.0
+        && det.is_finite()
+    {
+        (res_x, res_y, det)
     } else {
-        1.0
+        (1.0, 1.0, 1.0)
     };
 
     let is_missing = |v: f64| !v.is_finite() || v.rd_eq(no_data);
@@ -241,6 +274,11 @@ pub fn extract_sinks_with_filled_in_memory(
             *diff_cell = 0.0;
         } else {
             let filled = dem_filled.get_i(i);
+            if !filled.is_finite() || filled_nd_opt.is_some_and(|fnd| filled.rd_eq(fnd)) {
+                return Err(Error::InvalidArgument(format!(
+                    "pre-filled DEM contains NoData/non-finite value at cell index {i} where input DEM is valid"
+                )));
+            }
             let d = filled - orig;
             *diff_cell = if d.is_finite() && d > 0.0 { d } else { 0.0 };
         }
@@ -265,7 +303,16 @@ pub fn extract_sinks_with_filled_in_memory(
     depth.set_no_data(0.0);
 
     // Depression properties on original DEM elevations.
-    let props = region_props(&labels, nb_labels, dem.data(), w, h, resolution);
+    let props = region_props_xy(
+        &labels,
+        nb_labels,
+        dem.data(),
+        w,
+        h,
+        res_x,
+        res_y,
+        cell_area,
+    );
     let depressions: Vec<SinkDepression> = props.iter().map(SinkDepression::from).collect();
 
     // Region ID raster (i32, 0 outside).
@@ -340,6 +387,24 @@ pub fn extract_sinks(
         .clone()
         .unwrap_or_else(|| out_dir.join("dem_filled.tif"));
 
+    let mut output_paths: Vec<&Path> = vec![
+        &out_dem,
+        &out_dem_diff,
+        &out_sink,
+        &out_region,
+        &out_depth,
+        &out_csv_file,
+        &out_vec_file,
+        &out_gpkg,
+    ];
+    if options.filled_dem.is_none() {
+        output_paths.push(&out_dem_filled);
+    }
+    ensure_no_path_collision(in_dem, &output_paths)?;
+    if let Some(ref fpath) = options.filled_dem {
+        ensure_no_path_collision(fpath, &output_paths)?;
+    }
+
     let dem = load_raster::<f64>(in_dem, None)?;
     let pre_filled = match &options.filled_dem {
         Some(path) => Some(load_raster::<f64>(path, None)?),
@@ -398,7 +463,20 @@ pub fn extract_sinks(
     polygonize(&out_region, &out_vec_file, "id")?;
     join_csv_to_vector(&out_vec_file, &out_csv_file, &out_gpkg, "id", "region_id")?;
 
-    if !options.keep_files {
+    let result = if options.keep_files {
+        ExtractSinksResult {
+            sink_path: Some(out_sink),
+            refined_dem_path: Some(out_dem),
+            filled_dem_path: Some(out_dem_filled),
+            dem_diff_path: Some(out_dem_diff),
+            depth_path: Some(out_depth),
+            region_path: Some(out_region),
+            csv_path: Some(out_csv_file),
+            shapefile_path: Some(out_vec_file),
+            gpkg_path: out_gpkg,
+            depressions: mem.depressions,
+        }
+    } else {
         for f in [
             &out_dem,
             &out_dem_diff,
@@ -416,18 +494,19 @@ pub fn extract_sinks(
             let sidecar = out_vec_file.with_extension(ext);
             let _ = std::fs::remove_file(sidecar);
         }
-    }
+        ExtractSinksResult {
+            sink_path: None,
+            refined_dem_path: None,
+            filled_dem_path: options.filled_dem.clone(),
+            dem_diff_path: None,
+            depth_path: None,
+            region_path: None,
+            csv_path: None,
+            shapefile_path: None,
+            gpkg_path: out_gpkg,
+            depressions: mem.depressions,
+        }
+    };
 
-    Ok(ExtractSinksResult {
-        sink_path: out_sink,
-        refined_dem_path: out_dem,
-        filled_dem_path: out_dem_filled,
-        dem_diff_path: out_dem_diff,
-        depth_path: out_depth,
-        region_path: out_region,
-        csv_path: out_csv_file,
-        shapefile_path: out_vec_file,
-        gpkg_path: out_gpkg,
-        depressions: mem.depressions,
-    })
+    Ok(result)
 }

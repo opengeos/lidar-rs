@@ -6,9 +6,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use lidar::pointcloud::{
-    GridMethod, GridStat, LidarToDsmOptions, convert_lidar, lidar_to_dsm, read_lidar,
-};
+use lidar::pointcloud::{GridMethod, GridStat, LidarToDsmOptions, convert_lidar, lidar_to_dsm};
 use lidar::{
     DelineateOptions, ExtractSinksOptions, Topology, add_crs, clip_image, csv_points_to_vector,
     delineate_depressions, delineate_mounts, extract_sinks, flip_dem_file, gaussian_filter_file,
@@ -160,7 +158,7 @@ enum Commands {
         /// Output inverted DEM raster
         output: PathBuf,
         /// Base elevation offset added to the flipped DEM
-        #[arg(long, default_value_t = 100.0)]
+        #[arg(long, default_value_t = 100.0, allow_hyphen_values = true)]
         delta: f64,
     },
     /// Polygonize a raster band into a vector file (Shapefile, GeoPackage, GeoJSON, etc.)
@@ -294,10 +292,10 @@ enum Commands {
         #[arg(long)]
         radius: Option<f64>,
         /// Optional minimum Z filter
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         min_z: Option<f64>,
         /// Optional maximum Z filter
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         max_z: Option<f64>,
         /// Grid statistic (max, min, mean, idw, count, stdev)
         #[arg(long, default_value = "max")]
@@ -370,7 +368,9 @@ fn run() -> lidar::Result<()> {
                 );
             } else {
                 println!("Extracted {} sink region(s)", res.depressions.len());
-                println!("  sink: {}", res.sink_path.display());
+                if let Some(ref sink_path) = res.sink_path {
+                    println!("  sink: {}", sink_path.display());
+                }
                 println!("  gpkg: {}", res.gpkg_path.display());
             }
         }
@@ -584,25 +584,11 @@ fn run() -> lidar::Result<()> {
             let p_str = input.to_str().ok_or_else(|| {
                 lidar::Error::InvalidArgument(format!("non-UTF-8 path: {}", input.display()))
             })?;
-            if terrio::pointcloud::PointFormat::for_path(p_str).is_some() {
-                let cloud = read_lidar(&input)?;
-                println!("File       = {}", input.display());
-                println!("Type       = PointCloud");
-                println!("Points     = {}", cloud.len());
-                println!("Dimensions = {:?}", cloud.dimension_names());
-                if let Some(b) = cloud.bounds() {
-                    println!(
-                        "Bounds     = [{:.3}, {:.3}, {:.3}] .. [{:.3}, {:.3}, {:.3}]",
-                        b[0], b[1], b[2], b[3], b[4], b[5]
-                    );
-                }
-                if !cloud.crs.is_unknown() {
-                    println!("CRS        = {}", cloud.crs);
-                }
-            } else {
-                let ds = terrio::open(p_str)?;
-                println!("{}", terrio::info::info(&ds, &Default::default()).to_text());
-            }
+            let opts = terrio::info::InfoOptions {
+                statistics: false,
+                ..Default::default()
+            };
+            println!("{}", terrio::info::info_path(p_str, &opts)?.to_text());
         }
     }
 

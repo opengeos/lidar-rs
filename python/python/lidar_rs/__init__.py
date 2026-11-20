@@ -25,10 +25,14 @@ def MeanFilter(
 ) -> str | np.ndarray:
     """Apply a moving-window mean filter to a DEM file or 2D NumPy array."""
     if isinstance(in_dem, np.ndarray):
+        if out_file is not None:
+            raise ValueError(
+                "out_file is not supported for NumPy array input; pass a raster file path or omit out_file"
+            )
         arr = np.ascontiguousarray(in_dem, dtype=np.float64)
         return _lidar_rs.mean_filter_array(arr, kernel_size, no_data)
     out_str = _as_path_str(out_file) if out_file is not None else None
-    res = _lidar_rs.mean_filter_file(_as_path_str(in_dem), kernel_size, out_str)
+    res = _lidar_rs.mean_filter_file(_as_path_str(in_dem), kernel_size, out_str, no_data)
     return out_str if out_str is not None else res
 
 
@@ -40,10 +44,14 @@ def MedianFilter(
 ) -> str | np.ndarray:
     """Apply a moving-window median filter to a DEM file or 2D NumPy array."""
     if isinstance(in_dem, np.ndarray):
+        if out_file is not None:
+            raise ValueError(
+                "out_file is not supported for NumPy array input; pass a raster file path or omit out_file"
+            )
         arr = np.ascontiguousarray(in_dem, dtype=np.float64)
         return _lidar_rs.median_filter_array(arr, kernel_size, no_data)
     out_str = _as_path_str(out_file) if out_file is not None else None
-    res = _lidar_rs.median_filter_file(_as_path_str(in_dem), kernel_size, out_str)
+    res = _lidar_rs.median_filter_file(_as_path_str(in_dem), kernel_size, out_str, no_data)
     return out_str if out_str is not None else res
 
 
@@ -55,10 +63,14 @@ def GaussianFilter(
 ) -> str | np.ndarray:
     """Apply a 2D Gaussian filter to a DEM file or 2D NumPy array."""
     if isinstance(in_dem, np.ndarray):
+        if out_file is not None:
+            raise ValueError(
+                "out_file is not supported for NumPy array input; pass a raster file path or omit out_file"
+            )
         arr = np.ascontiguousarray(in_dem, dtype=np.float64)
         return _lidar_rs.gaussian_filter_array(arr, float(sigma), no_data)
     out_str = _as_path_str(out_file) if out_file is not None else None
-    res = _lidar_rs.gaussian_filter_file(_as_path_str(in_dem), float(sigma), out_str)
+    res = _lidar_rs.gaussian_filter_file(_as_path_str(in_dem), float(sigma), out_str, no_data)
     return out_str if out_str is not None else res
 
 
@@ -70,10 +82,14 @@ def FlipDEM(
 ) -> str | np.ndarray:
     """Flip a DEM upside-down so elevated features become depressions."""
     if isinstance(dem, np.ndarray):
+        if out_file is not None:
+            raise ValueError(
+                "out_file is not supported for NumPy array input; pass a raster file path or omit out_file"
+            )
         arr = np.ascontiguousarray(dem, dtype=np.float64)
         return _lidar_rs.flip_dem_array(arr, float(delta), no_data)
     out_str = _as_path_str(out_file) if out_file is not None else None
-    res = _lidar_rs.flip_dem_file(_as_path_str(dem), float(delta), out_str)
+    res = _lidar_rs.flip_dem_file(_as_path_str(dem), float(delta), out_str, no_data)
     return out_str if out_str is not None else res
 
 
@@ -106,6 +122,11 @@ def ExtractSinks(
     keep_files: bool = True,
 ) -> str:
     """Drop-in replacement for `lidar.ExtractSinks`; returns the path to `sink.tif`."""
+    if not keep_files:
+        raise ValueError(
+            "ExtractSinks returns sink_path which is deleted when keep_files=False; "
+            "call extract_sinks(..., keep_files=False) for GeoPackage-only output"
+        )
     res = extract_sinks(
         in_dem, min_size, out_dir, filled_dem=filled_dem, keep_files=keep_files
     )
@@ -200,10 +221,18 @@ def mosaic(
     output: str | os.PathLike[str],
     ext: str = ".tif",
 ) -> None:
-    """Mosaic a list of rasters (or all rasters in a directory) into a single GeoTIFF."""
+    """Mosaic a list of rasters (or all raster files in a directory) into a single GeoTIFF."""
+    out_resolved = Path(output).resolve()
     if isinstance(images, (str, os.PathLike)):
         directory = Path(images)
-        inputs = sorted(str(p) for p in directory.iterdir() if p.suffix == ext)
+        ext_lower = ext.lower()
+        inputs = sorted(
+            str(p)
+            for p in directory.iterdir()
+            if p.is_file()
+            and p.suffix.lower() == ext_lower
+            and p.resolve() != out_resolved
+        )
     else:
         inputs = [_as_path_str(p) for p in images]
     _lidar_rs.mosaic(inputs, _as_path_str(output))

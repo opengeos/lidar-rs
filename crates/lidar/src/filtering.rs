@@ -189,11 +189,24 @@ pub fn median_filter(dem: &Array2D<f64>, kernel_size: usize) -> Result<Array2D<f
 }
 
 /// Builds a normalized 1D Gaussian kernel matching `scipy.ndimage.gaussian_filter`
-/// (`truncate = 4.0`).
-fn gaussian_kernel_1d(sigma: f64, truncate: f64) -> Vec<f64> {
-    let radius = (truncate * sigma + 0.5).floor() as isize;
+/// (`truncate = 4.0`). Returns an error if the resulting kernel width exceeds
+/// `MAX_KERNEL_SIZE`.
+fn gaussian_kernel_1d(sigma: f64, truncate: f64) -> Result<Vec<f64>> {
+    let max_radius = (MAX_KERNEL_SIZE - 1) / 2;
+    let raw_radius = (truncate * sigma + 0.5).floor();
+    if !raw_radius.is_finite() || raw_radius > max_radius as f64 {
+        return Err(Error::InvalidArgument(format!(
+            "sigma={sigma} produces a Gaussian kernel wider than MAX_KERNEL_SIZE ({MAX_KERNEL_SIZE})"
+        )));
+    }
+    let radius = raw_radius as isize;
     let size = (2 * radius + 1) as usize;
-    let mut kernel = Vec::with_capacity(size);
+    let mut kernel = Vec::new();
+    kernel.try_reserve_exact(size).map_err(|e| {
+        Error::Algorithm(format!(
+            "failed to allocate Gaussian kernel of size {size}: {e}"
+        ))
+    })?;
     let denom = 2.0 * sigma * sigma;
     let mut sum = 0.0f64;
     for i in -radius..=radius {
@@ -204,13 +217,14 @@ fn gaussian_kernel_1d(sigma: f64, truncate: f64) -> Vec<f64> {
     for w in &mut kernel {
         *w /= sum;
     }
-    kernel
+    Ok(kernel)
 }
 
 /// Applies a separable 2D Gaussian filter with standard deviation `sigma` to a DEM.
 ///
 /// Matches `scipy.ndimage.gaussian_filter` (`truncate = 4.0`, `mode = 'reflect'`)
-/// while preserving NoData / non-finite cells via normalized convolution.
+/// while preserving NoData / non-finite cells via exact 2D normalized convolution
+/// (carrying weighted values and validity weights across both passes before dividing).
 pub fn gaussian_filter(dem: &Array2D<f64>, sigma: f64) -> Result<Array2D<f64>> {
     if !sigma.is_finite() || sigma < 0.0 {
         return Err(Error::InvalidArgument(format!(
@@ -223,20 +237,17 @@ pub fn gaussian_filter(dem: &Array2D<f64>, sigma: f64) -> Result<Array2D<f64>> {
         return Ok(dem.clone());
     }
 
-    let kernel = gaussian_kernel_1d(sigma, 4.0);
+    let kernel = gaussian_kernel_1d(sigma, 4.0)?;
     let radius = (kernel.len() / 2) as isize;
     let src = dem.data();
 
-    // Horizontal pass
-    let h_pass_row = |y: usize| -> Vec<f64> {
-        let mut row = Vec::with_capacity(w);
+    // Horizontal pass: accumulate weighted value and validity weight for EVERY cell
+    // (including missing cells, so diagonal valid neighbors propagate into the vertical pass).
+    let h_pass_row = |y: usize| -> (Vec<f64>, Vec<f64>) {
+        let mut val_row = Vec::with_capacity(w);
+        let mut wt_row = Vec::with_capacity(w);
         let row_off = y * w;
         for x in 0..w {
-            let center = src[row_off + x];
-            if is_missing(dem, center) {
-                row.push(center);
-                continue;
-            }
             let mut sum = 0.0f64;
             let mut wsum = 0.0f64;
             for (ki, &kw) in kernel.iter().enumerate() {
@@ -248,28 +259,32 @@ pub fn gaussian_filter(dem: &Array2D<f64>, sigma: f64) -> Result<Array2D<f64>> {
                     wsum += kw;
                 }
             }
-            row.push(if wsum > 0.0 { sum / wsum } else { center });
+            val_row.push(sum);
+            wt_row.push(wsum);
         }
-        row
+        (val_row, wt_row)
     };
 
     #[cfg(feature = "parallel")]
-    let h_rows: Vec<Vec<f64>> = (0..h).into_par_iter().map(h_pass_row).collect();
+    let h_rows: Vec<(Vec<f64>, Vec<f64>)> = (0..h).into_par_iter().map(h_pass_row).collect();
     #[cfg(not(feature = "parallel"))]
-    let h_rows: Vec<Vec<f64>> = (0..h).map(h_pass_row).collect();
+    let h_rows: Vec<(Vec<f64>, Vec<f64>)> = (0..h).map(h_pass_row).collect();
 
-    let mut horiz = Vec::with_capacity(w * h);
-    for r in h_rows {
-        horiz.extend_from_slice(&r);
+    let mut horiz_val = Vec::with_capacity(w * h);
+    let mut horiz_wt = Vec::with_capacity(w * h);
+    for (vr, wr) in h_rows {
+        horiz_val.extend_from_slice(&vr);
+        horiz_wt.extend_from_slice(&wr);
     }
 
-    // Vertical pass
+    // Vertical pass: convolve both weighted values and weights, then divide once for valid cells.
     let v_pass_row = |y: usize| -> Vec<f64> {
         let mut row = Vec::with_capacity(w);
+        let row_off = y * w;
         for x in 0..w {
-            let center = horiz[y * w + x];
-            if is_missing(dem, center) {
-                row.push(center);
+            let orig = src[row_off + x];
+            if is_missing(dem, orig) {
+                row.push(orig);
                 continue;
             }
             let mut sum = 0.0f64;
@@ -277,13 +292,11 @@ pub fn gaussian_filter(dem: &Array2D<f64>, sigma: f64) -> Result<Array2D<f64>> {
             for (ki, &kw) in kernel.iter().enumerate() {
                 let dy = ki as isize - radius;
                 let ny = reflect_index(y as isize + dy, h);
-                let v = horiz[ny * w + x];
-                if !is_missing(dem, v) {
-                    sum += v * kw;
-                    wsum += kw;
-                }
+                let idx = ny * w + x;
+                sum += horiz_val[idx] * kw;
+                wsum += horiz_wt[idx] * kw;
             }
-            row.push(if wsum > 0.0 { sum / wsum } else { center });
+            row.push(if wsum > 0.0 { sum / wsum } else { orig });
         }
         row
     };
@@ -426,5 +439,17 @@ mod tests {
         assert!(median_filter(&dem, 0).is_err());
         assert!(mean_filter(&dem, 10_000).is_err());
         assert!(median_filter(&dem, 10_000).is_err());
+        assert!(gaussian_filter(&dem, 1e12).is_err());
+        assert!(gaussian_filter(&dem, 1e20).is_err());
+    }
+
+    #[test]
+    fn gaussian_carries_validity_weights_across_both_passes() {
+        let mut dem = Array2D::from_vec(2, 2, vec![0.0, -9999.0, 10.0, 10.0]).unwrap();
+        dem.set_no_data(-9999.0);
+        let g = gaussian_filter(&dem, 1.0).unwrap();
+        assert_eq!(g.get(1, 0), -9999.0);
+        // Bottom-right (1,1) receives positive diagonal weight from valid top-left 0.0.
+        assert!(g.get(1, 1) < 10.0, "expected < 10.0, got {}", g.get(1, 1));
     }
 }

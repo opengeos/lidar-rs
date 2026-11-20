@@ -63,6 +63,10 @@ fn uf_find(parent: &mut [u32], mut x: u32) -> u32 {
 ///
 /// Matches `lidar`'s `regionGroup` (`scipy.ndimage.label` 4-connectivity with
 /// `sizes > min_size`).
+///
+/// # Panics
+///
+/// Panics if `data.len() != width * height` (or if `width * height` overflows `usize`).
 pub fn region_group<F>(
     data: &[f64],
     width: usize,
@@ -73,8 +77,15 @@ pub fn region_group<F>(
 where
     F: Fn(f64) -> bool,
 {
-    let n = width * height;
-    debug_assert_eq!(data.len(), n);
+    let n = width
+        .checked_mul(height)
+        .expect("region_group dimensions overflow usize");
+    assert_eq!(
+        data.len(),
+        n,
+        "region_group data length ({}) must equal width * height ({n})",
+        data.len()
+    );
     let mut labels = vec![0u32; n];
     if n == 0 {
         return (labels, 0);
@@ -213,8 +224,13 @@ pub(crate) fn benkrid_crookes_perimeter(mask: &[bool], bw: usize, bh: usize) -> 
     perim
 }
 
-/// Computes region properties for every label `1..=nb_labels`, matching
-/// `skimage.measure.regionprops` and `lidar`'s `get_dep_props`.
+/// Computes region properties for every label `1..=nb_labels` assuming square pixels
+/// of side `resolution`, matching `skimage.measure.regionprops` and `lidar`'s `get_dep_props`.
+///
+/// # Panics
+///
+/// Panics if `labels.len() != width * height`, `elev.len() != width * height`, or any
+/// non-zero label exceeds `nb_labels`.
 pub fn region_props(
     labels: &[u32],
     nb_labels: u32,
@@ -223,6 +239,52 @@ pub fn region_props(
     height: usize,
     resolution: f64,
 ) -> Vec<RegionProps> {
+    region_props_xy(
+        labels,
+        nb_labels,
+        elev,
+        width,
+        height,
+        resolution,
+        resolution,
+        resolution * resolution,
+    )
+}
+
+/// Computes region properties for every label `1..=nb_labels` using separate column/row
+/// pixel spacings (`res_x`, `res_y`) and `cell_area` (the absolute affine determinant
+/// `|gt[1]*gt[5] - gt[2]*gt[4]|`).
+///
+/// # Panics
+///
+/// Panics if `labels.len() != width * height`, `elev.len() != width * height`, or any
+/// non-zero label exceeds `nb_labels`.
+#[allow(clippy::too_many_arguments)]
+pub fn region_props_xy(
+    labels: &[u32],
+    nb_labels: u32,
+    elev: &[f64],
+    width: usize,
+    height: usize,
+    res_x: f64,
+    res_y: f64,
+    cell_area: f64,
+) -> Vec<RegionProps> {
+    let n = width
+        .checked_mul(height)
+        .expect("region_props dimensions overflow usize");
+    assert_eq!(
+        labels.len(),
+        n,
+        "region_props labels length ({}) must equal width * height ({n})",
+        labels.len()
+    );
+    assert_eq!(
+        elev.len(),
+        n,
+        "region_props elev length ({}) must equal width * height ({n})",
+        elev.len()
+    );
     let k = nb_labels as usize;
     if k == 0 {
         return Vec::new();
@@ -245,14 +307,18 @@ pub fn region_props(
 
     for r in 0..height {
         let off = r * width;
-        let rf = r as f64;
+        let rf = r as f64 * res_y;
         for c in 0..width {
             let lbl = labels[off + c];
             if lbl == 0 {
                 continue;
             }
+            assert!(
+                lbl <= nb_labels,
+                "label {lbl} exceeds nb_labels ({nb_labels})"
+            );
             let idx = (lbl - 1) as usize;
-            let cf = c as f64;
+            let cf = c as f64 * res_x;
             let z = elev[off + c];
 
             if count[idx] == 0 {
@@ -286,7 +352,8 @@ pub fn region_props(
         }
     }
 
-    let cell_area = resolution * resolution;
+    let mean_res = 0.5 * (res_x + res_y);
+    let min_res = res_x.min(res_y);
     let mut props = Vec::with_capacity(k);
 
     for idx in 0..k {
@@ -314,9 +381,9 @@ pub fn region_props(
                 }
             }
         }
-        let perimeter = benkrid_crookes_perimeter(&mask, bw, bh) * resolution;
+        let perimeter = benkrid_crookes_perimeter(&mask, bw, bh) * mean_res;
 
-        // Second central spatial moments (matching skimage.measure.regionprops).
+        // Second central spatial moments in map units (matches skimage when res_x == res_y).
         let r_bar = sum_r[idx] / nf;
         let c_bar = sum_c[idx] / nf;
         let mu20 = (sum_rr[idx] / nf - r_bar * r_bar).max(0.0);
@@ -327,10 +394,10 @@ pub fn region_props(
         let l1 = (0.5 * (mu20 + mu02 + common)).max(0.0);
         let l2 = (0.5 * (mu20 + mu02 - common)).max(0.0);
 
-        let major_axis = 4.0 * l1.sqrt() * resolution;
-        let mut minor_axis = 4.0 * l2.sqrt() * resolution;
+        let major_axis = 4.0 * l1.sqrt();
+        let mut minor_axis = 4.0 * l2.sqrt();
         if minor_axis == 0.0 {
-            minor_axis = resolution;
+            minor_axis = min_res;
         }
         let elongatedness = if minor_axis > 0.0 {
             major_axis / minor_axis
