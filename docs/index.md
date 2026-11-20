@@ -1,0 +1,17 @@
+# lidar-rs
+
+Pure-Rust port of [`opengeos/lidar`](https://github.com/opengeos/lidar) for delineating the nested hierarchy of surface depressions and elevated features (mounts) in digital elevation models (DEMs), powered by [`terrio`](https://github.com/opengeos/terrio) and [`richdem`](https://github.com/opengeos/richdem-rs) with **zero GDAL or C/C++ dependencies**.
+
+## Key Features
+
+- **DEM smoothing filters:** Mean, median, and Gaussian filters with symmetric boundary reflection and NoData safety.
+- **Sink extraction & DEM refinement:** Priority-Flood depression filling via `richdem`, 4-connected region grouping, small artifact removal, refined DEM generation, and GeoTIFF / CSV / Shapefile / GeoPackage export via `terrio`.
+- **Nested depression hierarchy (Wu et al. 2019):** Top-down level-set slicing, 18 geometric & topological attributes per depression, CSV export, and per-level shapefile extraction.
+- **Nested mount hierarchy:** DEM inversion (`flip_dem`) and elevated feature hierarchy delineation (`delineate_mounts`).
+- **Geospatial raster, vector & point-cloud utilities:** `polygonize`, `mosaic`, `reproject_image`, `resample`, `clip_image`, `image_to_cog`, `add_crs`, `join_csv_to_vector`, `csv_points_to_vector`, and pure-Rust LAS/LAZ/COPC/PLY/E57 I/O & DSM gridding (`lidar_to_dsm`).
+- **Rust library (`lidar`), standalone CLI (`lidar-cli`), and Python bindings (`lidar-rs`).**
+
+## Citations
+
+- **Wu, Q.** (2021). lidar: A Python package for delineating nested surface depressions from digital elevation data. *Journal of Open Source Software*, 6(59), 2965. <https://doi.org/10.21105/joss.02965>
+- **Wu, Q.**, Lane, C.R., Wang, L., Vanderhoof, M.K., Christensen, J.R., & Liu, H. (2019). Efficient Delineation of Nested Depression Hierarchy in Digital Elevation Models for Hydrological Analysis Using Level-Set Method. *Journal of the American Water Resources Association*, 55(2), 354–368. <https://doi.org/10.1111/1752-1688.12689>

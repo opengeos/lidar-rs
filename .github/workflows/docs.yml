@@ -1,0 +1,95 @@
+name: docs
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths: ["docs/**", "zensical.toml", "requirements_docs.txt", ".github/workflows/docs.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # PR checks must not replace a queued main deployment. Only a newer check on
+  # the same PR may cancel an active build; main publishing remains serialized.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: false
+      - name: Build docs with Zensical
+        run: |
+          uv venv --python 3.12
+          uv pip install -r requirements_docs.txt
+          .venv/bin/zensical build
+          test -f site/CNAME
+          test -f site/install.sh
+          test -f site/install.ps1
+      - name: Lint and smoke-test installer scripts
+        run: |
+          sh -n docs/install.sh
+          shellcheck docs/install.sh
+          pwsh -NoProfile -Command '
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile("docs/install.ps1", [ref]$null, [ref]$errors)
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error $_.ToString() }
+              exit 1
+            }
+          '
+          # Smoke-test install.sh against a local file:// mirror (happy path + broken-binary preservation)
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          arch=$(uname -m)
+          target="${arch}-unknown-linux-musl"
+          name="lidar-cli-v0.0.1-${target}"
+          mkdir -p "$tmp/mirror/$name" "$tmp/bin"
+          printf '#!/bin/sh\necho "lidar 0.0.1"\n' > "$tmp/mirror/$name/lidar"
+          chmod 755 "$tmp/mirror/$name/lidar"
+          tar -czf "$tmp/mirror/$name.tar.gz" -C "$tmp/mirror" "$name"
+          sha256sum "$tmp/mirror/$name.tar.gz" > "$tmp/mirror/$name.tar.gz.sha256"
+          LIDAR_VERSION="0.0.1" LIDAR_INSTALL_DIR="$tmp/bin" LIDAR_DOWNLOAD_URL="file://$tmp/mirror" sh docs/install.sh
+          test "$("$tmp/bin/lidar" --version)" = "lidar 0.0.1"
+          # Broken binary must fail without overwriting the existing working binary
+          name_bad="lidar-cli-v0.0.2-${target}"
+          mkdir -p "$tmp/mirror/$name_bad"
+          printf '#!/bin/sh\nexit 1\n' > "$tmp/mirror/$name_bad/lidar"
+          chmod 755 "$tmp/mirror/$name_bad/lidar"
+          tar -czf "$tmp/mirror/$name_bad.tar.gz" -C "$tmp/mirror" "$name_bad"
+          sha256sum "$tmp/mirror/$name_bad.tar.gz" > "$tmp/mirror/$name_bad.tar.gz.sha256"
+          if LIDAR_VERSION="0.0.2" LIDAR_INSTALL_DIR="$tmp/bin" LIDAR_DOWNLOAD_URL="file://$tmp/mirror" sh docs/install.sh; then
+            echo "expected broken binary install to fail" >&2
+            exit 1
+          fi
+          test "$("$tmp/bin/lidar" --version)" = "lidar 0.0.1"
+          test ! -e "$tmp/bin/lidar.tmp"
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        with:
+          path: ./site
+
+  deploy:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    concurrency:
+      group: docs-pages-deploy
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

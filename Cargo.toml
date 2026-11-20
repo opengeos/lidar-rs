@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = ["crates/lidar", "crates/lidar-cli"]
+exclude = ["python"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.90"
+repository = "https://github.com/opengeos/lidar-rs"
+authors = ["Qiusheng Wu <giswqs@gmail.com>"]
+
+[workspace.dependencies]
+lidar = { path = "crates/lidar", version = "0.2.0" }
+richdem = { version = "0.1", default-features = false, features = ["terrio"] }
+terrio = { version = "0.9", default-features = false, features = ["geotiff", "sqlite"] }
+rayon = "1.10"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+tempfile = "3"

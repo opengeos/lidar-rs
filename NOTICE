@@ -1,0 +1,23 @@
+lidar-rs
+Copyright (c) 2018-2026 Qiusheng Wu
+
+This software is a pure-Rust port of the `lidar` Python package
+(https://github.com/opengeos/lidar), implementing the level-set algorithm
+for delineating nested surface depressions and mounts in digital elevation
+models (DEMs):
+
+- Wu, Q. (2021). lidar: A Python package for delineating nested surface
+  depressions from digital elevation data. Journal of Open Source Software,
+  6(59), 2965. https://doi.org/10.21105/joss.02965
+- Wu, Q., Lane, C.R., Wang, L., Vanderhoof, M.K., Christensen, J.R., &
+  Liu, H. (2019). Efficient Delineation of Nested Depression Hierarchy in
+  Digital Elevation Models for Hydrological Analysis Using Level-Set Method.
+  Journal of the American Water Resources Association, 55(2), 354-368.
+  https://doi.org/10.1111/1752-1688.12689
+
+Third-party crates used directly:
+- `terrio` (https://github.com/opengeos/terrio): MIT AND MPL-2.0 AND Apache-2.0
+- `richdem` (https://github.com/opengeos/richdem-rs): GPL-3.0-only
+  Note: `lidar-rs` source code is licensed under the MIT License. Compiled
+  binaries or wheels linking `richdem` (GPL-3.0-only) are subject to the
+  terms of the GNU General Public License v3.0 when distributed.

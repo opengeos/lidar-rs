@@ -1,0 +1,45 @@
+cff-version: 1.2.0
+message: "If you use lidar-rs in your work, please cite the JOSS paper and the level-set method paper below."
+title: "lidar-rs: Pure-Rust Nested Surface Depression and Mount Delineation from DEMs"
+type: software
+license: MIT
+repository-code: "https://github.com/opengeos/lidar-rs"
+authors:
+  - family-names: Wu
+    given-names: Qiusheng
+    orcid: "https://orcid.org/0000-0001-5437-4073"
+    affiliation: "University of Tennessee, Knoxville"
+references:
+  - type: article
+    title: "lidar: A Python package for delineating nested surface depressions from digital elevation data"
+    authors:
+      - family-names: Wu
+        given-names: Qiusheng
+    journal: "Journal of Open Source Software"
+    volume: 6
+    issue: 59
+    start: 2965
+    year: 2021
+    doi: "10.21105/joss.02965"
+  - type: article
+    title: "Efficient Delineation of Nested Depression Hierarchy in Digital Elevation Models for Hydrological Analysis Using Level-Set Method"
+    authors:
+      - family-names: Wu
+        given-names: Qiusheng
+      - family-names: Lane
+        given-names: Charles R.
+      - family-names: Wang
+        given-names: Lei
+      - family-names: Vanderhoof
+        given-names: Melanie K.
+      - family-names: Christensen
+        given-names: Jay R.
+      - family-names: Liu
+        given-names: Hongxing
+    journal: "Journal of the American Water Resources Association"
+    volume: 55
+    issue: 2
+    start: 354
+    end: 368
+    year: 2019
+    doi: "10.1111/1752-1688.12689"

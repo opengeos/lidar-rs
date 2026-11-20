@@ -1,0 +1,32 @@
+[package]
+name = "lidar"
+description = "Pure-Rust port of opengeos/lidar for delineating nested surface depressions and mounts in DEMs using the level-set method, powered by terrio and richdem"
+readme = "../../README.md"
+keywords = ["gis", "lidar", "dem", "hydrology", "depressions"]
+categories = ["science::geo", "algorithms"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = ["parallel", "pointcloud", "serde"]
+## Multi-threaded parallelism via `rayon`
+parallel = ["dep:rayon", "richdem/parallel"]
+## LiDAR point cloud I/O, conversion, and DSM gridding via `terrio/pointcloud` (LAS, LAZ, COPC, PLY, E57)
+pointcloud = ["terrio/pointcloud"]
+## Serialization of depression and result structs via `serde`
+serde = ["dep:serde", "richdem/serde"]
+
+[dependencies]
+richdem.workspace = true
+terrio.workspace = true
+thiserror.workspace = true
+rayon = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "lidar-cli"
+description = "Command-line interface for lidar-rs: DEM filtering, sink extraction, nested depression/mount delineation, and LiDAR point cloud tools in pure Rust"
+readme = "../../README.md"
+keywords = ["gis", "lidar", "dem", "hydrology", "cli"]
+categories = ["science::geo", "command-line-utilities"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "lidar"
+path = "src/main.rs"
+
+[dependencies]
+lidar = { workspace = true, features = ["parallel", "pointcloud", "serde"] }
+richdem = { workspace = true, features = ["parallel"] }
+terrio = { workspace = true, features = ["pointcloud"] }
+clap.workspace = true
+serde_json.workspace = true

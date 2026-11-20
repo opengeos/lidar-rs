@@ -1,0 +1,17 @@
+/target
+**/target
+**/*.rs.bk
+*.pdb
+.DS_Store
+.venv/
+**/.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.so
+*.pyd

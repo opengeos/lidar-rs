@@ -1,0 +1,49 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "lidar-rs"
+dynamic = ["version"]
+description = "Pure-Rust port of opengeos/lidar for delineating nested surface depressions and mounts in DEMs (powered by terrio and richdem)"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.11"
+authors = [
+    { name = "Qiusheng Wu", email = "giswqs@gmail.com" },
+]
+keywords = ["GIS", "lidar", "dem", "hydrology", "depressions", "terrain", "rust"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: GIS",
+]
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/opengeos/lidar-rs"
+Repository = "https://github.com/opengeos/lidar-rs"
+Issues = "https://github.com/opengeos/lidar-rs/issues"
+
+[tool.maturin]
+module-name = "lidar_rs._lidar_rs"
+python-source = "python"
+manifest-path = "Cargo.toml"
+include = [
+    { path = "LICENSE", format = "sdist" },
+    { path = "NOTICE", format = "sdist" },
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
