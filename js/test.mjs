@@ -43,7 +43,12 @@ const sinkGeo = JSON.parse(sinks.geojson());
 assert.equal(sinkGeo.type, "FeatureCollection");
 assert.ok(sinkGeo.features.length >= 1);
 
-const cats = lidar.delineateCatchments(sinks.refinedDemTif(), sinks.regionTif(), "dem.tif");
+const cats = lidar.delineateCatchments(
+  sinks.refinedDemTif(),
+  sinks.regionTif(),
+  "dem.tif",
+  "region.tif",
+);
 const catRecords = JSON.parse(cats.recordsJson());
 assert.equal(catRecords.length, sinkDeps.length);
 cats.free();

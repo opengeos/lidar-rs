@@ -121,7 +121,7 @@ try {
 | `extractSinks` | `(bytes, filename, minSize)` | `SinksOutput` (`width`, `height`, `depressionsJson()`, `sinkTif()`, `refinedDemTif()`, `depthTif()`, `regionTif()`, `geojson()`, `depthRgba()`) |
 | `delineateDepressions` | `(sinkBytes, filename, minSize, minDepth, interval)` | `DepressionsOutput` (`width`, `height`, `maxLevel`, `numRegions`, `depressionsJson()`, `idTif()`, `levelTif()`, `geojson()`, `levelRgba()`) |
 | `delineateMounts` | `(dsmBytes, filename, minSize, minHeight, interval)` | `DepressionsOutput` (same fields as `delineateDepressions`) |
-| `delineateCatchments` | `(demBytes, sinkOrRegionBytes, filename)` | `CatchmentsOutput` (`recordsJson()`, `watershedTif()`, `geojson()`) |
+| `delineateCatchments` | `(demBytes, sinkOrRegionBytes, demFilename, sinkFilename)` | `CatchmentsOutput` (`recordsJson()`, `watershedTif()`, `geojson()`) |
 | `simulateInundation` | `(demBytes, filename, kernelSize, minSize, minDepth, interval, rainIntensityCmH, rainDurationH, timeStepH)` | `InundationOutput` (`width`, `height`, `projection`, `maxLevel`, `numRegions`, `numSteps`, `depressionsJson()`, `catchmentHierarchyJson()`, `stepsJson()`, `encodeGif(frameDelayMs, pingPong, maxDim)`, `fillTimeTif()`, `catchmentHirTif()`, `sinkTif()`, `levelTif()`, `depressionsGeojson()`, `hillshadeRgba()`, `depthRgba()`, `levelRgba()`, `fillTimeRgba()`, `fillTimeValues()`) |
 
 !!! tip "Memory Management"

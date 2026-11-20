@@ -1111,8 +1111,8 @@ pub fn delineate_catchment_hierarchy_in_memory(
         }
         let mut remap = vec![0u32; nb_labels as usize + 1];
         let mut next_id = 0u32;
-        for id in 1..=nb_labels as usize {
-            if max_in_comp[id] >= level_i32 {
+        for (id, &max_lv) in max_in_comp.iter().enumerate().skip(1) {
+            if max_lv >= level_i32 {
                 next_id += 1;
                 remap[id] = next_id;
             }

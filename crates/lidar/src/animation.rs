@@ -601,9 +601,7 @@ pub fn animate_inundation_to_bytes(
     }
 
     let mut effective_opts = options.clone();
-    if effective_opts.time_step_h.is_none() {
-        effective_opts.time_step_h = Some(time_step_h);
-    }
+    effective_opts.time_step_h = Some(time_step_h);
 
     let ft_data = fill_time.data();
     let ft_nd = fill_time.no_data();
@@ -613,7 +611,7 @@ pub fn animate_inundation_to_bytes(
             let t_hours = (src_idx + 1) as f64 * time_step_h;
             Ok(ft_data
                 .iter()
-                .map(|&ft| ft.is_finite() && !ft.rd_eq(ft_nd) && ft >= 0.0 && ft <= t_hours)
+                .map(|&ft| ft.is_finite() && !ft.rd_eq(ft_nd) && (0.0..=t_hours).contains(&ft))
                 .collect())
         })?;
 

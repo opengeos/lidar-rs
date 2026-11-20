@@ -350,12 +350,19 @@
 
   async function ensureGifUrl() {
     if (cachedGifUrl) return cachedGifUrl;
-    if (!currentSim) throw new Error("No active inundation simulation");
+    const simRef = currentSim;
+    if (!simRef) throw new Error("No active inundation simulation");
     const pingPong = $("lp-pingpong") ? $("lp-pingpong").checked : true;
     setStatus("Encoding animated inundation GIF in WebAssembly…");
     await nextTick();
+    if (currentSim !== simRef) {
+      return null;
+    }
     const t0 = performance.now();
-    const gifBytes = currentSim.encodeGif(150, pingPong, 400);
+    const gifBytes = simRef.encodeGif(150, pingPong, 400);
+    if (currentSim !== simRef) {
+      return null;
+    }
     const elapsed = performance.now() - t0;
     const url = URL.createObjectURL(new Blob([gifBytes], { type: "image/gif" }));
     activeObjectUrls.push(url);
@@ -395,6 +402,7 @@
         btn.disabled = true;
         try {
           const url = await ensureGifUrl();
+          if (!url) return;
           const a = document.createElement("a");
           a.href = url;
           a.download = `${currentSimStem}_inundation.gif`;

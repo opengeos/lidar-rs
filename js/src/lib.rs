@@ -526,10 +526,11 @@ impl CatchmentsOutput {
 pub fn delineate_catchments(
     dem_bytes: &[u8],
     sink_or_region_bytes: &[u8],
-    filename: &str,
+    dem_filename: &str,
+    sink_filename: &str,
 ) -> Result<CatchmentsOutput, JsValue> {
-    let dem = read_array2d_f64(dem_bytes, filename)?;
-    let sink_arr = read_array2d_f64(sink_or_region_bytes, "region.tif")?;
+    let dem = read_array2d_f64(dem_bytes, dem_filename)?;
+    let sink_arr = read_array2d_f64(sink_or_region_bytes, sink_filename)?;
     let labels = extract_sink_labels_from_raster(&dem, &sink_arr).map_err(to_js_err)?;
     let mem = delineate_catchments_in_memory(&dem, &labels).map_err(to_js_err)?;
     let records_json = serde_json::to_string(&mem.records).map_err(to_js_err)?;
