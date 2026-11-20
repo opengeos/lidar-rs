@@ -117,7 +117,7 @@ enum Commands {
         #[arg(long)]
         level_shp: bool,
         /// Also export combined level GeoTIFFs when --level-shp is set
-        #[arg(long)]
+        #[arg(long, requires = "level_shp")]
         comb_tif: bool,
         /// Compress output GeoTIFFs with DEFLATE
         #[arg(short = 'c', long)]

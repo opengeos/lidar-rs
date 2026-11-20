@@ -128,8 +128,19 @@ pub fn delineate_mounts(
     std::fs::create_dir_all(out_dir)?;
 
     let flipped_dem_path = out_dir.join("dem_flip.tif");
-    let refined_dem_path = out_dir.join("dem.tif");
-    crate::raster_ops::ensure_no_path_collision(in_dem, &[&flipped_dem_path, &refined_dem_path])?;
+    let protected_outputs = [
+        flipped_dem_path.clone(),
+        out_dir.join("dem.tif"),
+        out_dir.join("dem_filled.tif"),
+        out_dir.join("dem_diff.tif"),
+        out_dir.join("depth.tif"),
+        out_dir.join("sink.tif"),
+        out_dir.join("region.tif"),
+        out_dir.join("depression_id.tif"),
+        out_dir.join("depression_level.tif"),
+    ];
+    let protected_refs: Vec<&Path> = protected_outputs.iter().map(PathBuf::as_path).collect();
+    crate::raster_ops::ensure_no_path_collision(in_dem, &protected_refs)?;
     flip_dem_file(in_dem, 100.0, Some(&flipped_dem_path))?;
 
     let sink_opts = ExtractSinksOptions {

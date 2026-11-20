@@ -224,15 +224,22 @@ def mosaic(
     """Mosaic a list of rasters (or all raster files in a directory) into a single GeoTIFF."""
     out_resolved = Path(output).resolve()
     if isinstance(images, (str, os.PathLike)):
-        directory = Path(images)
-        ext_lower = ext.lower()
-        inputs = sorted(
-            str(p)
-            for p in directory.iterdir()
-            if p.is_file()
-            and p.suffix.lower() == ext_lower
-            and p.resolve() != out_resolved
-        )
+        path = Path(images)
+        if path.is_file():
+            inputs = [str(path)]
+        elif path.is_dir():
+            ext_lower = ext.lower()
+            inputs = sorted(
+                str(p)
+                for p in path.iterdir()
+                if p.is_file()
+                and p.suffix.lower() == ext_lower
+                and p.resolve() != out_resolved
+            )
+        else:
+            raise ValueError(
+                f"mosaic expected an existing file, directory, or list of raster paths; got {path}"
+            )
     else:
         inputs = [_as_path_str(p) for p in images]
     _lidar_rs.mosaic(inputs, _as_path_str(output))

@@ -166,8 +166,10 @@ pub fn reproject_image(
     resampling: Resampling,
     resolution: Option<(f64, f64)>,
 ) -> Result<()> {
-    let in_str = path_to_str(input.as_ref())?;
+    let in_path = input.as_ref();
     let out_path = output.as_ref();
+    ensure_no_path_collision(in_path, &[out_path])?;
+    let in_str = path_to_str(in_path)?;
     ensure_parent_dir(out_path)?;
     let out_str = path_to_str(out_path)?;
 
@@ -198,8 +200,10 @@ pub fn resample(
             "resolution must be finite and > 0, got {resolution}"
         )));
     }
-    let in_str = path_to_str(input.as_ref())?;
+    let in_path = input.as_ref();
     let out_path = output.as_ref();
+    ensure_no_path_collision(in_path, &[out_path])?;
+    let in_str = path_to_str(in_path)?;
     ensure_parent_dir(out_path)?;
     let out_str = path_to_str(out_path)?;
 
@@ -223,9 +227,11 @@ pub fn clip_image(
     mask: impl AsRef<Path>,
     output: impl AsRef<Path>,
 ) -> Result<()> {
-    let in_str = path_to_str(input.as_ref())?;
-    let mask_str = path_to_str(mask.as_ref())?;
+    let in_path = input.as_ref();
     let out_path = output.as_ref();
+    ensure_no_path_collision(in_path, &[out_path])?;
+    let in_str = path_to_str(in_path)?;
+    let mask_str = path_to_str(mask.as_ref())?;
     ensure_parent_dir(out_path)?;
     let out_str = path_to_str(out_path)?;
 
@@ -249,8 +255,10 @@ pub fn image_to_cog(
     output: impl AsRef<Path>,
     compression: Option<&str>,
 ) -> Result<()> {
-    let in_str = path_to_str(input.as_ref())?;
+    let in_path = input.as_ref();
     let out_path = output.as_ref();
+    ensure_no_path_collision(in_path, &[out_path])?;
+    let in_str = path_to_str(in_path)?;
     ensure_parent_dir(out_path)?;
     let out_str = path_to_str(out_path)?;
 
@@ -391,8 +399,9 @@ fn parse_csv_records(content: &str) -> Vec<Vec<String>> {
 }
 
 fn read_csv_table(csv_path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>)> {
-    let content = std::fs::read_to_string(csv_path)?;
-    let mut records = parse_csv_records(&content);
+    let raw = std::fs::read_to_string(csv_path)?;
+    let content = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+    let mut records = parse_csv_records(content);
     if records.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }

@@ -307,9 +307,10 @@ fn test_raster_and_vector_utilities() {
     .unwrap();
     assert_eq!(n_joined, n_poly);
 
-    // Safety guards: reject overwriting input DEM, mosaic input == output, invalid lat/lon.
+    // Safety guards: reject overwriting input DEM, mosaic/cog input == output, invalid lat/lon.
     assert!(extract_sinks(&dem_path, test_data_dir(), &ExtractSinksOptions::default()).is_err());
     assert!(mosaic(&[&resampled], &resampled).is_err());
+    assert!(image_to_cog(&resampled, &resampled, None).is_err());
 
     let bad_csv = tmp.path().join("bad_pts.csv");
     std::fs::write(&bad_csv, "name,latitude,longitude\nBad,95.0,-83.0\n").unwrap();
@@ -323,11 +324,11 @@ fn test_raster_and_vector_utilities() {
         .is_err()
     );
 
-    // Quoted multiline CSV record should parse cleanly into 1 point.
+    // UTF-8 BOM + quoted multiline CSV record should parse cleanly into 1 point.
     let multi_csv = tmp.path().join("multi_pts.csv");
     std::fs::write(
         &multi_csv,
-        "name,note,latitude,longitude\nA,\"first\nsecond\",35.96,-83.92\n",
+        "\u{feff}latitude,longitude,name,note\n35.96,-83.92,A,\"first\nsecond\"\n",
     )
     .unwrap();
     let multi_gpkg = tmp.path().join("multi.gpkg");
