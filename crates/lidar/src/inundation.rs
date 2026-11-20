@@ -446,6 +446,24 @@ pub fn simulate_inundation(
     let catchment = load_raster::<f64>(in_catchment, None)?;
     let (fill_time, num_regions) = simulate_inundation_in_memory(&sink, &catchment, options)?;
 
+    // Remove stale flood_*.tif(f) frames from any prior run in out_dir so rerun outputs
+    // with a different step count cannot interleave with old frames.
+    if let Ok(entries) = std::fs::read_dir(out_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file()
+                && let Some(name) = p.file_name().and_then(|n| n.to_str())
+            {
+                let lower = name.to_ascii_lowercase();
+                if lower.starts_with("flood_")
+                    && (lower.ends_with(".tif") || lower.ends_with(".tiff"))
+                {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+        }
+    }
+
     save_raster(
         &fill_time,
         &fill_time_path,

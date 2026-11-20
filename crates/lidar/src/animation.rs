@@ -334,6 +334,13 @@ fn downscale_rgb(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<
     dst
 }
 
+fn parse_flood_frame_index(path: &Path) -> Option<usize> {
+    let stem = path.file_stem()?.to_str()?;
+    let lower = stem.to_ascii_lowercase();
+    let suffix = lower.strip_prefix("flood_")?;
+    suffix.parse::<usize>().ok()
+}
+
 fn discover_flood_frames(in_flood_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut frames: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(in_flood_dir)? {
@@ -350,7 +357,11 @@ fn discover_flood_frames(in_flood_dir: &Path) -> Result<Vec<PathBuf>> {
             frames.push(p);
         }
     }
-    frames.sort();
+    frames.sort_by(|a, b| {
+        let ka = parse_flood_frame_index(a);
+        let kb = parse_flood_frame_index(b);
+        ka.cmp(&kb).then_with(|| a.file_name().cmp(&b.file_name()))
+    });
     if frames.is_empty() {
         return Err(Error::InvalidArgument(format!(
             "no flood_*.tif frames found in {}",
@@ -414,31 +425,22 @@ pub fn animate_inundation(
         )));
     }
 
-    // Preload and validate all binary flood masks BEFORE creating the output GIF so a
-    // dimension mismatch or read error never leaves a truncated file on disk.
-    let mut masks: Vec<Vec<bool>> = Vec::with_capacity(frames.len());
+    // Validate dimensions of every flood frame upfront (dropping each raster immediately)
+    // so errors never leave a truncated GIF and peak memory stays O(pixels) rather than
+    // O(frames * pixels).
     for fpath in &frames {
-        let flood = load_raster::<f64>(fpath, None)?;
-        if flood.width() != sw || flood.height() != sh {
+        let p_str = fpath.to_str().ok_or_else(|| {
+            Error::InvalidArgument(format!("non-UTF-8 path: {}", fpath.display()))
+        })?;
+        let ds = terrio::open_raster(p_str)?;
+        if ds.raster.cols != sw || ds.raster.rows != sh {
             return Err(Error::DimensionMismatch(format!(
                 "flood frame {} ({}x{}) does not match DEM ({sw}x{sh})",
                 fpath.display(),
-                flood.width(),
-                flood.height()
+                ds.raster.cols,
+                ds.raster.rows
             )));
         }
-        let fnd = flood.no_data();
-        let fdata = flood.data();
-        let mut mask = vec![false; dw * dh];
-        for y in 0..dh {
-            let sy = (y * sh / dh).min(sh - 1);
-            for x in 0..dw {
-                let sx = (x * sw / dw).min(sw - 1);
-                let v = fdata[sy * sw + sx];
-                mask[y * dw + x] = v.is_finite() && !v.rd_eq(fnd) && v > 0.0;
-            }
-        }
-        masks.push(mask);
     }
 
     let base_rgb_full = compute_hillshade_rgb(&dem, &options.hillshade);
@@ -468,16 +470,20 @@ pub fn animate_inundation(
     let [wr, wg, wb] = options.water_rgb;
 
     // Build playback sequence: rising (0..N), and if ping_pong, decreasing (N-2..=0).
-    let mut sequence: Vec<(usize, bool)> = (0..masks.len()).map(|i| (i, true)).collect();
-    if options.ping_pong && masks.len() > 1 {
-        for i in (0..masks.len() - 1).rev() {
+    let mut sequence: Vec<(usize, bool)> = (0..frames.len()).map(|i| (i, true)).collect();
+    if options.ping_pong && frames.len() > 1 {
+        for i in (0..frames.len() - 1).rev() {
             sequence.push((i, false));
         }
     }
 
-    let n_src = masks.len().max(1);
+    let n_src = frames.len().max(1);
     let mut frame_rgb = vec![0u8; dw * total_h * 3];
     for &(src_idx, rising) in &sequence {
+        let flood = load_raster::<f64>(&frames[src_idx], None)?;
+        let fnd = flood.no_data();
+        let fdata = flood.data();
+
         let progress = (src_idx + 1) as f64 / n_src as f64;
         let time_label = match options.time_step_h {
             Some(dt) => format!("T = {:.1}H", (src_idx + 1) as f64 * dt),
@@ -499,13 +505,19 @@ pub fn animate_inundation(
 
         let body = &mut frame_rgb[dw * banner_h * 3..];
         body.copy_from_slice(&base_rgb);
-        let mask = &masks[src_idx];
-        for (i, &wet) in mask.iter().enumerate() {
-            if wet {
-                let p = i * 3;
-                body[p] = (body[p] as f32 * inv_alpha + wr as f32 * alpha).round() as u8;
-                body[p + 1] = (body[p + 1] as f32 * inv_alpha + wg as f32 * alpha).round() as u8;
-                body[p + 2] = (body[p + 2] as f32 * inv_alpha + wb as f32 * alpha).round() as u8;
+        for y in 0..dh {
+            let sy = (y * sh / dh).min(sh - 1);
+            for x in 0..dw {
+                let sx = (x * sw / dw).min(sw - 1);
+                let v = fdata[sy * sw + sx];
+                if v.is_finite() && !v.rd_eq(fnd) && v > 0.0 {
+                    let p = (y * dw + x) * 3;
+                    body[p] = (body[p] as f32 * inv_alpha + wr as f32 * alpha).round() as u8;
+                    body[p + 1] =
+                        (body[p + 1] as f32 * inv_alpha + wg as f32 * alpha).round() as u8;
+                    body[p + 2] =
+                        (body[p + 2] as f32 * inv_alpha + wb as f32 * alpha).round() as u8;
+                }
             }
         }
 

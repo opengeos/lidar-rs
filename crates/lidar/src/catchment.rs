@@ -401,9 +401,10 @@ fn load_or_rasterize_sink_labels(in_sink: &Path, dem: &Array2D<f64>) -> Result<V
                 .collect();
             Ok(labels)
         } else {
-            // Elevation sink raster (e.g. sink.tif): group valid foreground cells into regions.
+            // Elevation sink raster (e.g. sink.tif) or non-dense 0-background mask: group
+            // valid nonzero foreground cells into 4-connected regions.
             let (labels, _) = region_group(sink_arr.data(), dem.width(), dem.height(), 1, |v| {
-                v.is_finite() && !v.rd_eq(nd)
+                v.is_finite() && !v.rd_eq(nd) && v != 0.0
             });
             Ok(labels)
         }
@@ -493,6 +494,11 @@ fn polygonize_u32_with_records(
         mask: None,
     };
     let mut layer = terrio_polygonize(&ds, &opts)?;
+    layer.features.retain(|f| match f.attributes.first() {
+        Some(FieldValue::Integer(i)) => *i > 0,
+        Some(FieldValue::Float(v)) => v.is_finite() && *v > 0.0,
+        _ => false,
+    });
     layer
         .schema
         .add_field(FieldDef::new("cat_area", FieldType::Float));
