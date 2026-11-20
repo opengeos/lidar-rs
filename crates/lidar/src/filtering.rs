@@ -41,17 +41,26 @@ fn make_output_template(dem: &Array2D<f64>, data: Vec<f64>) -> Result<Array2D<f6
     Ok(out)
 }
 
+/// Maximum supported square filter kernel size (1025 × 1025) to prevent
+/// excessive memory allocation or O(N·k²) denial-of-service on untrusted input.
+const MAX_KERNEL_SIZE: usize = 1025;
+
+fn validate_kernel_size(kernel_size: usize) -> Result<()> {
+    if kernel_size == 0 || kernel_size > MAX_KERNEL_SIZE {
+        return Err(Error::InvalidArgument(format!(
+            "kernel_size must be in 1..={MAX_KERNEL_SIZE}, got {kernel_size}"
+        )));
+    }
+    Ok(())
+}
+
 /// Applies a `kernel_size × kernel_size` box mean filter to a DEM.
 ///
 /// Boundary pixels use symmetric reflection (`scipy.ndimage` `mode='reflect'`).
 /// NoData and non-finite cells are preserved untouched and excluded from
 /// neighbor averages.
 pub fn mean_filter(dem: &Array2D<f64>, kernel_size: usize) -> Result<Array2D<f64>> {
-    if kernel_size == 0 {
-        return Err(Error::InvalidArgument(
-            "kernel_size must be at least 1".into(),
-        ));
-    }
+    validate_kernel_size(kernel_size)?;
     let w = dem.width();
     let h = dem.height();
     if w == 0 || h == 0 || kernel_size == 1 {
@@ -111,11 +120,7 @@ pub fn mean_filter(dem: &Array2D<f64>, kernel_size: usize) -> Result<Array2D<f64
 /// NoData and non-finite cells are preserved untouched and excluded from the
 /// median window.
 pub fn median_filter(dem: &Array2D<f64>, kernel_size: usize) -> Result<Array2D<f64>> {
-    if kernel_size == 0 {
-        return Err(Error::InvalidArgument(
-            "kernel_size must be at least 1".into(),
-        ));
-    }
+    validate_kernel_size(kernel_size)?;
     let w = dem.width();
     let h = dem.height();
     if w == 0 || h == 0 || kernel_size == 1 {
@@ -124,7 +129,9 @@ pub fn median_filter(dem: &Array2D<f64>, kernel_size: usize) -> Result<Array2D<f
 
     let r_neg = (kernel_size / 2) as isize;
     let r_pos = (kernel_size as isize) - 1 - r_neg;
-    let win_cap = kernel_size.saturating_mul(kernel_size);
+    let win_cap = kernel_size.checked_mul(kernel_size).ok_or_else(|| {
+        Error::InvalidArgument(format!("kernel_size² overflows usize: {kernel_size}"))
+    })?;
     let src = dem.data();
 
     let compute_row = |y: usize| -> Vec<f64> {
@@ -410,5 +417,14 @@ mod tests {
         dem.set(2, 2, 1000.0);
         let med = median_filter(&dem, 3).unwrap();
         assert_eq!(med.get(2, 2), 5.0);
+    }
+
+    #[test]
+    fn rejects_invalid_and_oversized_kernel() {
+        let dem = Array2D::from_vec(3, 3, vec![1.0; 9]).unwrap();
+        assert!(mean_filter(&dem, 0).is_err());
+        assert!(median_filter(&dem, 0).is_err());
+        assert!(mean_filter(&dem, 10_000).is_err());
+        assert!(median_filter(&dem, 10_000).is_err());
     }
 }

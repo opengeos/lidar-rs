@@ -263,7 +263,10 @@ fn level_set_region(
 
         let objects = region_props(&label_objects, nb_labels, &img, bw, bh, resolution);
         for (i, obj) in objects.iter().enumerate() {
-            if parent_counts.is_empty() {
+            let (fr, fc) = obj.first_pixel;
+            let parent_id = level_img[fr * bw + fc];
+
+            if parent_counts.is_empty() || parent_id == 0 {
                 unique_id += 1;
                 dep_list.push(depression_from_props(unique_id, region_id, obj));
                 parent_counts.insert(unique_id, 0);
@@ -280,8 +283,6 @@ fn level_set_region(
                     }
                 }
             } else {
-                let (fr, fc) = obj.first_pixel;
-                let parent_id = level_img[fr * bw + fc];
                 if let Some(cnt) = parent_counts.get_mut(&parent_id) {
                     *cnt += 1;
                 }
@@ -404,12 +405,26 @@ pub fn write_depressions_csv(
 ///
 /// The `sink` raster should have valid elevation values inside sink regions and
 /// `0` / NoData outside (such as `sink.tif` produced by [`crate::filling::extract_sinks`]).
+///
+/// Note on NoData and `min_depth`:
+/// - When `sink.no_data() == 0.0`, cells with elevation `<= 0.0` are treated as background,
+///   matching upstream `opengeos/lidar`'s `get_min_max_nodata`. To delineate depressions with
+///   negative (below-sea-level) elevations, set an explicit non-zero NoData sentinel (such as
+///   `-9999.0`).
+/// - `min_depth` is validated (`>= 0.0` and finite) and retained for signature compatibility
+///   with upstream `opengeos/lidar`'s `DelineateDepressions` (whose `levelSet` does not
+///   filter nodes by depth).
 pub fn delineate_depressions_in_memory(
     sink: &Array2D<f64>,
     min_size: usize,
-    _min_depth: f64,
+    min_depth: f64,
     interval: f64,
 ) -> Result<InMemoryDepressions> {
+    if !min_depth.is_finite() || min_depth < 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "min_depth must be finite and >= 0, got {min_depth}"
+        )));
+    }
     if !interval.is_finite() || interval == 0.0 {
         return Err(Error::InvalidArgument(format!(
             "interval must be finite and non-zero, got {interval}"
@@ -758,5 +773,21 @@ mod tests {
         );
         assert_eq!(res.depressions[0].level, res.max_level);
         assert_eq!(res.depressions[0].children_ids.len(), 2);
+    }
+
+    #[test]
+    fn top_slice_multiple_roots_are_preserved() {
+        // Two disconnected 4x4 sub-components passed directly to level_set_region.
+        let (bw, bh) = (10, 4);
+        let mut sub = vec![f64::NAN; bw * bh];
+        for r in 0..4 {
+            for c in 0..4 {
+                sub[r * bw + c] = 10.0 + (r + c) as f64 * 0.1;
+                sub[r * bw + (c + 6)] = 10.0 + (r + c) as f64 * 0.1;
+            }
+        }
+        let (obj, deps) = level_set_region(&sub, bw, bh, 1, 2, 0.2, 1.0);
+        assert_eq!(deps.len(), 2);
+        assert!(obj[0] > 0 && obj[6] > 0 && obj[0] != obj[6]);
     }
 }

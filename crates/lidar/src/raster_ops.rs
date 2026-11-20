@@ -233,8 +233,21 @@ pub fn image_to_cog(
     Ok(())
 }
 
+/// Truncates a string to at most `max_bytes` UTF-8 bytes without splitting
+/// a multibyte character (required for ESRI Shapefile DBF 10-byte field names).
+fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> String {
+    s.char_indices()
+        .take_while(|(i, c)| i + c.len_utf8() <= max_bytes)
+        .map(|(_, c)| c)
+        .collect()
+}
+
 /// Assigns a CRS (EPSG code such as `"4326"` / `"EPSG:4326"`, WKT, or PROJ string)
 /// to a raster dataset without reprojecting pixels.
+///
+/// When `output` is `None` (in-place update), writes atomically via a temporary
+/// sibling file and renames it over `input` so a write failure cannot corrupt the
+/// original raster.
 ///
 /// Mirrors `lidar.add_crs`.
 pub fn add_crs(input: impl AsRef<Path>, crs: &str, output: Option<&Path>) -> Result<()> {
@@ -242,7 +255,6 @@ pub fn add_crs(input: impl AsRef<Path>, crs: &str, output: Option<&Path>) -> Res
     let in_str = path_to_str(in_path)?;
     let out_path = output.unwrap_or(in_path);
     ensure_parent_dir(out_path)?;
-    let out_str = path_to_str(out_path)?;
 
     let crs_norm = if crs.trim().chars().all(|c| c.is_ascii_digit()) {
         format!("EPSG:{}", crs.trim())
@@ -252,7 +264,32 @@ pub fn add_crs(input: impl AsRef<Path>, crs: &str, output: Option<&Path>) -> Res
     let sref = SpatialRef::parse(&crs_norm)?;
     let mut ds = terrio::open_raster(in_str)?;
     ds.raster.crs = sref.to_crs_info();
-    terrio::write_raster_dataset(&ds, out_str, &RasterWriteOptions::default())?;
+
+    let in_place = output.is_none() || out_path == in_path;
+    if in_place {
+        let ext = out_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("tif");
+        let stem = out_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("raster");
+        let tmp_path =
+            out_path.with_file_name(format!(".{stem}.lidar_tmp_{}.{ext}", std::process::id()));
+        let tmp_str = path_to_str(&tmp_path)?;
+        if let Err(e) = terrio::write_raster_dataset(&ds, tmp_str, &RasterWriteOptions::default()) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, out_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
+    } else {
+        let out_str = path_to_str(out_path)?;
+        terrio::write_raster_dataset(&ds, out_str, &RasterWriteOptions::default())?;
+    }
     Ok(())
 }
 
@@ -431,7 +468,9 @@ pub fn join_csv_to_vector(
             Error::InvalidArgument(format!("join column '{csv_join_col}' not found in CSV"))
         })?;
 
-    // Copy original fields except duplicate join column if csv has its own.
+    // Drop the vector join column when `csv_join_col` uses a different name
+    // (matching `ExtractSinks` dropping `id` in favor of `region_id`). When both
+    // join columns share the same name, keep the vector key and skip the duplicate CSV key.
     let mut keep_vec_indices = Vec::new();
     for (idx, field) in src_layer.schema.fields().iter().enumerate() {
         if idx == vec_key_idx && !vec_join_col.eq_ignore_ascii_case(csv_join_col) {
@@ -441,7 +480,7 @@ pub fn join_csv_to_vector(
         out_layer.schema.add_field(field.clone());
     }
 
-    // Add CSV fields (truncating to 10 chars for ESRI Shapefile DBF compatibility).
+    // Add CSV fields (truncating to 10 UTF-8 bytes for ESRI Shapefile DBF compatibility).
     let mut csv_col_types = Vec::with_capacity(headers.len());
     let mut used_names: HashMap<String, usize> = out_layer
         .schema
@@ -458,14 +497,14 @@ pub fn join_csv_to_vector(
         let ftype = infer_field_type(&rows, ci);
         let mut name = raw_name.replace('-', "_");
         if is_shp && name.len() > 10 {
-            name.truncate(10);
+            name = truncate_utf8_bytes(&name, 10);
         }
         let lower = name.to_ascii_lowercase();
         if let Some(cnt) = used_names.get_mut(&lower) {
             let suffix = format!("_{cnt}");
             *cnt += 1;
             if is_shp && name.len() + suffix.len() > 10 {
-                name.truncate(10 - suffix.len());
+                name = truncate_utf8_bytes(&name, 10usize.saturating_sub(suffix.len()));
             }
             name.push_str(&suffix);
         } else {
@@ -560,7 +599,7 @@ pub fn csv_points_to_vector(
         let ftype = infer_field_type(&rows, ci);
         let mut name = h.replace('-', "_");
         if is_shp && name.len() > 10 {
-            name.truncate(10);
+            name = truncate_utf8_bytes(&name, 10);
         }
         layer.schema.add_field(FieldDef::new(name, ftype));
         col_types.push(ftype);
@@ -592,4 +631,20 @@ pub fn csv_points_to_vector(
     let count = layer.features.len();
     terrio::write_vector(&[layer], out_str, &VectorWriteOptions::default())?;
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_utf8_bytes_never_splits_multibyte_chars() {
+        let a = truncate_utf8_bytes("elevación_m", 10);
+        assert!(a.len() <= 10);
+        assert_eq!(a, "elevación"); // 10 UTF-8 bytes ('ó' is 2 bytes)
+
+        let b = truncate_utf8_bytes("aaaaaaaaa°C", 10);
+        assert!(b.len() <= 10);
+        assert_eq!(b, "aaaaaaaaa"); // 9 bytes; '°' would cross byte 10
+    }
 }

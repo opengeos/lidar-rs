@@ -1106,9 +1106,9 @@ dependencies = [
 
 [[package]]
 name = "richdem"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c278d69af7853cc110e10d0a71cf2cccfb6e1984970d6e62e10c31f7aaeff793"
+checksum = "7ba6b9df53384cca884bf1fe0d055c5ca7ace91357b59a7cfeb4fa61fd44aa74"
 dependencies = [
  "rand 0.8.8",
  "rayon",
