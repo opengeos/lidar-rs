@@ -1,6 +1,14 @@
 # lidar-rs
 
+[![CI](https://github.com/opengeos/lidar-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/opengeos/lidar-rs/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/lidar.svg)](https://crates.io/crates/lidar)
+[![PyPI](https://img.shields.io/pypi/v/lidar-rs.svg)](https://pypi.org/project/lidar-rs/)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/opengeos/lidar-rs/blob/main/examples/lidar_rs_demo.ipynb)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/opengeos/lidar-rs/blob/main/LICENSE)
+
 Pure-Rust port of [`opengeos/lidar`](https://github.com/opengeos/lidar) for delineating the nested hierarchy of surface depressions and elevated features (mounts) in digital elevation models (DEMs), powered by [`terrio`](https://github.com/opengeos/terrio) and [`richdem`](https://github.com/opengeos/richdem-rs) with **zero GDAL or C/C++ dependencies**.
+
+Try it interactively in your browser with no local setup via the [Google Colab notebook](https://colab.research.google.com/github/opengeos/lidar-rs/blob/main/examples/lidar_rs_demo.ipynb).
 
 ## Key Features
 

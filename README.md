@@ -4,6 +4,7 @@
 [![Docs](https://img.shields.io/badge/docs-lidar--rs.opengeos.org-teal.svg)](https://lidar-rs.opengeos.org)
 [![crates.io](https://img.shields.io/crates/v/lidar.svg)](https://crates.io/crates/lidar)
 [![PyPI](https://img.shields.io/pypi/v/lidar-rs.svg)](https://pypi.org/project/lidar-rs/)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/opengeos/lidar-rs/blob/main/examples/lidar_rs_demo.ipynb)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 High-performance nested surface depression and mount delineation from Digital Elevation Models (DEMs) in **pure Rust**, ported from [`opengeos/lidar`](https://github.com/opengeos/lidar) and powered by [`terrio`](https://github.com/opengeos/terrio) and [`richdem`](https://github.com/opengeos/richdem-rs) with **zero GDAL or C/C++ dependencies**.
@@ -25,6 +26,7 @@ High-performance nested surface depression and mount delineation from Digital El
 | `crates/lidar-cli` | Standalone `lidar` command-line tool (`lidar-cli`) |
 | `python` | Python bindings (`lidar-rs`, PyO3 + NumPy) with drop-in `opengeos/lidar` API |
 | `test_data` | Sample DEM/DSM/sink GeoTIFF datasets from `opengeos/lidar` |
+| `examples` | Interactive Google Colab demo notebook (`lidar_rs_demo.ipynb`) |
 | `docs` | Zensical documentation site and CLI installer scripts (`install.sh`, `install.ps1`) |
 
 ## Rust Usage
@@ -110,6 +112,8 @@ lidar lidar-to-dsm cloud.laz dsm.tif --resolution 1.0
 ```sh
 pip install lidar-rs
 ```
+
+Or try it interactively in [Google Colab](https://colab.research.google.com/github/opengeos/lidar-rs/blob/main/examples/lidar_rs_demo.ipynb).
 
 ```python
 import lidar_rs as lidar
