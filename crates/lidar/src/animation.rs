@@ -371,35 +371,23 @@ fn discover_flood_frames(in_flood_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(frames)
 }
 
-/// Renders a DEM shaded relief and time-series `flood_*.tif` inundation overlays
-/// into an animated GIF (`out_gif`).
-///
-/// Pure-Rust port of `7_Play_Animation.py`.
-pub fn animate_inundation(
-    in_dem: impl AsRef<Path>,
-    in_flood_dir: impl AsRef<Path>,
-    out_gif: impl AsRef<Path>,
+/// Pixel height of the status banner prepended to animated inundation GIF frames.
+pub const ANIMATION_BANNER_HEIGHT: usize = 22;
+
+fn compute_gif_dimensions(
+    sw: usize,
+    sh: usize,
     options: &AnimateInundationOptions,
-) -> Result<AnimateInundationResult> {
-    let in_dem = in_dem.as_ref();
-    let in_flood_dir = in_flood_dir.as_ref();
-    let out_gif = out_gif.as_ref();
+) -> Result<(usize, usize, usize)> {
     if !options.water_alpha.is_finite() || !(0.0..=1.0).contains(&options.water_alpha) {
         return Err(Error::InvalidArgument(format!(
             "water_alpha must be in [0.0, 1.0], got {}",
             options.water_alpha
         )));
     }
-    ensure_no_path_collision(in_dem, &[out_gif])?;
-
-    let frames = discover_flood_frames(in_flood_dir)?;
-    let dem = load_raster::<f64>(in_dem, None)?;
-    let sw = dem.width();
-    let sh = dem.height();
     if sw == 0 || sh == 0 {
         return Err(Error::InvalidArgument("input DEM is empty".into()));
     }
-
     let (dw, dh) = match options.max_dimension {
         Some(max_dim) if max_dim > 0 && (sw > max_dim || sh > max_dim) => {
             if sw >= sh {
@@ -416,44 +404,42 @@ pub fn animate_inundation(
         }
         _ => (sw, sh),
     };
-
-    let banner_h = 22usize;
-    let total_h = dh + banner_h;
+    let total_h = dh + ANIMATION_BANNER_HEIGHT;
     if dw > u16::MAX as usize || total_h > u16::MAX as usize {
         return Err(Error::InvalidArgument(format!(
             "animation frame dimensions ({dw}x{total_h}) exceed GIF u16 limit (65535); set max_dimension"
         )));
     }
+    Ok((dw, dh, total_h))
+}
 
-    // Validate dimensions of every flood frame upfront (dropping each raster immediately)
-    // so errors never leave a truncated GIF and peak memory stays O(pixels) rather than
-    // O(frames * pixels).
-    for fpath in &frames {
-        let p_str = fpath.to_str().ok_or_else(|| {
-            Error::InvalidArgument(format!("non-UTF-8 path: {}", fpath.display()))
-        })?;
-        let ds = terrio::open_raster(p_str)?;
-        if ds.raster.cols != sw || ds.raster.rows != sh {
-            return Err(Error::DimensionMismatch(format!(
-                "flood frame {} ({}x{}) does not match DEM ({sw}x{sh})",
-                fpath.display(),
-                ds.raster.cols,
-                ds.raster.rows
-            )));
-        }
+/// Shared internal GIF renderer used by both [`animate_inundation`] (disk frames -> file)
+/// and [`animate_inundation_to_bytes`] (in-memory `fill_time` -> byte buffer).
+fn render_inundation_gif<W, F>(
+    dem: &Array2D<f64>,
+    num_steps: usize,
+    options: &AnimateInundationOptions,
+    writer: W,
+    mut load_wet_mask: F,
+) -> Result<(usize, usize, usize)>
+where
+    W: std::io::Write,
+    F: FnMut(usize) -> Result<Vec<bool>>,
+{
+    if num_steps == 0 || num_steps > 10_000 {
+        return Err(Error::InvalidArgument(format!(
+            "num_steps must be in 1..=10000, got {num_steps}"
+        )));
     }
+    let sw = dem.width();
+    let sh = dem.height();
+    let (dw, dh, total_h) = compute_gif_dimensions(sw, sh, options)?;
+    let banner_h = ANIMATION_BANNER_HEIGHT;
 
-    let base_rgb_full = compute_hillshade_rgb(&dem, &options.hillshade);
+    let base_rgb_full = compute_hillshade_rgb(dem, &options.hillshade);
     let base_rgb = downscale_rgb(&base_rgb_full, sw, sh, dw, dh);
 
-    if let Some(parent) = out_gif.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let file = BufWriter::new(File::create(out_gif)?);
-    let mut encoder = Encoder::new(file, dw as u16, total_h as u16, &[])
+    let mut encoder = Encoder::new(writer, dw as u16, total_h as u16, &[])
         .map_err(|e| Error::Algorithm(format!("GIF encoder init failed: {e}")))?;
     let repeat = if options.loops == 0 {
         Repeat::Infinite
@@ -470,24 +456,27 @@ pub fn animate_inundation(
     let [wr, wg, wb] = options.water_rgb;
 
     // Build playback sequence: rising (0..N), and if ping_pong, decreasing (N-2..=0).
-    let mut sequence: Vec<(usize, bool)> = (0..frames.len()).map(|i| (i, true)).collect();
-    if options.ping_pong && frames.len() > 1 {
-        for i in (0..frames.len() - 1).rev() {
+    let mut sequence: Vec<(usize, bool)> = (0..num_steps).map(|i| (i, true)).collect();
+    if options.ping_pong && num_steps > 1 {
+        for i in (0..num_steps - 1).rev() {
             sequence.push((i, false));
         }
     }
 
-    let n_src = frames.len().max(1);
     let mut frame_rgb = vec![0u8; dw * total_h * 3];
     for &(src_idx, rising) in &sequence {
-        let flood = load_raster::<f64>(&frames[src_idx], None)?;
-        let fnd = flood.no_data();
-        let fdata = flood.data();
+        let wet = load_wet_mask(src_idx)?;
+        if wet.len() != sw * sh {
+            return Err(Error::DimensionMismatch(format!(
+                "wet mask length ({}) does not match DEM ({sw}x{sh})",
+                wet.len()
+            )));
+        }
 
-        let progress = (src_idx + 1) as f64 / n_src as f64;
+        let progress = (src_idx + 1) as f64 / num_steps as f64;
         let time_label = match options.time_step_h {
             Some(dt) => format!("T = {:.1}H", (src_idx + 1) as f64 * dt),
-            None => format!("STEP {}/{n_src}", src_idx + 1),
+            None => format!("STEP {}/{num_steps}", src_idx + 1),
         };
         let phase = if rising { "RISING" } else { "FALLING" };
         let banner_text = match options.rain_intensity_cm_h {
@@ -509,8 +498,7 @@ pub fn animate_inundation(
             let sy = (y * sh / dh).min(sh - 1);
             for x in 0..dw {
                 let sx = (x * sw / dw).min(sw - 1);
-                let v = fdata[sy * sw + sx];
-                if v.is_finite() && !v.rd_eq(fnd) && v > 0.0 {
+                if wet[sy * sw + sx] {
                     let p = (y * dw + x) * 3;
                     body[p] = (body[p] as f32 * inv_alpha + wr as f32 * alpha).round() as u8;
                     body[p + 1] =
@@ -528,12 +516,126 @@ pub fn animate_inundation(
             .map_err(|e| Error::Algorithm(format!("GIF frame write failed: {e}")))?;
     }
 
+    Ok((sequence.len(), dw, total_h))
+}
+
+/// Renders a DEM shaded relief and time-series `flood_*.tif` inundation overlays
+/// into an animated GIF (`out_gif`).
+///
+/// Pure-Rust port of `7_Play_Animation.py`.
+pub fn animate_inundation(
+    in_dem: impl AsRef<Path>,
+    in_flood_dir: impl AsRef<Path>,
+    out_gif: impl AsRef<Path>,
+    options: &AnimateInundationOptions,
+) -> Result<AnimateInundationResult> {
+    let in_dem = in_dem.as_ref();
+    let in_flood_dir = in_flood_dir.as_ref();
+    let out_gif = out_gif.as_ref();
+    ensure_no_path_collision(in_dem, &[out_gif])?;
+
+    let frames = discover_flood_frames(in_flood_dir)?;
+    let dem = load_raster::<f64>(in_dem, None)?;
+    let sw = dem.width();
+    let sh = dem.height();
+
+    // Validate options, frame count, and output dimensions before touching the filesystem
+    // so invalid inputs never create an empty/partial output GIF.
+    if frames.is_empty() || frames.len() > 10_000 {
+        return Err(Error::InvalidArgument(format!(
+            "num_steps must be in 1..=10000, got {}",
+            frames.len()
+        )));
+    }
+    let _ = compute_gif_dimensions(sw, sh, options)?;
+
+    // Validate dimensions of every flood frame upfront (dropping each raster immediately)
+    // so errors never leave a truncated GIF and peak memory stays O(pixels) rather than
+    // O(frames * pixels).
+    for fpath in &frames {
+        let p_str = fpath.to_str().ok_or_else(|| {
+            Error::InvalidArgument(format!("non-UTF-8 path: {}", fpath.display()))
+        })?;
+        let ds = terrio::open_raster(p_str)?;
+        if ds.raster.cols != sw || ds.raster.rows != sh {
+            return Err(Error::DimensionMismatch(format!(
+                "flood frame {} ({}x{}) does not match DEM ({sw}x{sh})",
+                fpath.display(),
+                ds.raster.cols,
+                ds.raster.rows
+            )));
+        }
+    }
+
+    if let Some(parent) = out_gif.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let file = BufWriter::new(File::create(out_gif)?);
+    let (frame_count, width, height) =
+        render_inundation_gif(&dem, frames.len(), options, file, |src_idx| {
+            let flood = load_raster::<f64>(&frames[src_idx], None)?;
+            let fnd = flood.no_data();
+            Ok(flood
+                .data()
+                .iter()
+                .map(|&v| v.is_finite() && !v.rd_eq(fnd) && v > 0.0)
+                .collect())
+        })?;
+
     Ok(AnimateInundationResult {
         gif_path: out_gif.to_path_buf(),
-        frame_count: sequence.len(),
-        width: dw,
-        height: total_h,
+        frame_count,
+        width,
+        height,
     })
+}
+
+/// Renders an in-memory animated inundation GIF directly from a DEM and a
+/// `fill_time` raster (hours to inundation, as returned by
+/// [`crate::simulate_inundation_in_memory`]), with zero filesystem I/O.
+///
+/// Returns `(gif_bytes, frame_count, width, height)`.
+pub fn animate_inundation_to_bytes(
+    dem: &Array2D<f64>,
+    fill_time: &Array2D<f64>,
+    num_steps: usize,
+    time_step_h: f64,
+    options: &AnimateInundationOptions,
+) -> Result<(Vec<u8>, usize, usize, usize)> {
+    if !time_step_h.is_finite() || time_step_h <= 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "time_step_h must be finite and > 0, got {time_step_h}"
+        )));
+    }
+    if fill_time.width() != dem.width() || fill_time.height() != dem.height() {
+        return Err(Error::DimensionMismatch(format!(
+            "fill_time ({}x{}) does not match DEM ({}x{})",
+            fill_time.width(),
+            fill_time.height(),
+            dem.width(),
+            dem.height()
+        )));
+    }
+
+    let mut effective_opts = options.clone();
+    effective_opts.time_step_h = Some(time_step_h);
+
+    let ft_data = fill_time.data();
+    let ft_nd = fill_time.no_data();
+    let mut gif_bytes = Vec::new();
+    let (frame_count, width, height) =
+        render_inundation_gif(dem, num_steps, &effective_opts, &mut gif_bytes, |src_idx| {
+            let t_hours = (src_idx + 1) as f64 * time_step_h;
+            Ok(ft_data
+                .iter()
+                .map(|&ft| ft.is_finite() && !ft.rd_eq(ft_nd) && (0.0..=t_hours).contains(&ft))
+                .collect())
+        })?;
+
+    Ok((gif_bytes, frame_count, width, height))
 }
 
 #[cfg(test)]
@@ -624,5 +726,55 @@ mod tests {
             !gif_path.exists(),
             "partial GIF should not be created on error"
         );
+    }
+
+    #[test]
+    fn animate_inundation_to_bytes_produces_valid_gif() {
+        let mut dem_data = vec![0.0; 20 * 20];
+        let mut ft_data = vec![-1.0; 20 * 20];
+        for r in 0..20 {
+            for c in 0..20 {
+                let d = ((r as f64 - 10.0).powi(2) + (c as f64 - 10.0).powi(2)).sqrt();
+                dem_data[r * 20 + c] = 100.0 + d;
+                if d <= 6.0 {
+                    ft_data[r * 20 + c] = d * 0.5;
+                }
+            }
+        }
+        let dem = Array2D::from_vec(20, 20, dem_data).unwrap();
+        let mut ft = Array2D::from_vec(20, 20, ft_data).unwrap();
+        ft.set_no_data(-1.0);
+
+        let (bytes, frames, w, h) = animate_inundation_to_bytes(
+            &dem,
+            &ft,
+            4,
+            1.0,
+            &AnimateInundationOptions {
+                ping_pong: true,
+                rain_intensity_cm_h: Some(5.0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(frames, 7); // 4 rising + 3 falling
+        assert_eq!(w, 20);
+        assert_eq!(h, 42);
+        assert!(bytes.starts_with(b"GIF89a"));
+
+        // Decode the generated GIF bytes and verify every frame and dimension.
+        let mut decoder = gif::DecodeOptions::new()
+            .read_info(std::io::Cursor::new(&bytes))
+            .unwrap();
+        assert_eq!(decoder.width(), w as u16);
+        assert_eq!(decoder.height(), h as u16);
+        let mut decoded_frames = 0usize;
+        while let Some(frame) = decoder.read_next_frame().unwrap() {
+            assert_eq!(frame.width, w as u16);
+            assert_eq!(frame.height, h as u16);
+            decoded_frames += 1;
+        }
+        assert_eq!(decoded_frames, frames);
     }
 }

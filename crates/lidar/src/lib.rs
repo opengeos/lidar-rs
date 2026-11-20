@@ -51,16 +51,17 @@ pub mod region;
 pub mod slicing;
 
 pub use animation::{
-    AnimateInundationOptions, AnimateInundationResult, HillshadeOptions, animate_inundation,
-    compute_hillshade_rgb,
+    ANIMATION_BANNER_HEIGHT, AnimateInundationOptions, AnimateInundationResult, HillshadeOptions,
+    animate_inundation, animate_inundation_to_bytes, compute_hillshade_rgb,
 };
 pub use catchment::{
     CatchmentHierarchyOptions, CatchmentHierarchyRecord, CatchmentHierarchyResult, CatchmentRecord,
     DelineateCatchmentsOptions, DelineateCatchmentsResult, DelineateFlowPathsOptions,
     DelineateFlowPathsResult, FlowPathRecord, InMemoryCatchments, d8_flow_directions_resolved,
-    d8_watersheds, delineate_catchment_hierarchy, delineate_catchments,
-    delineate_catchments_in_memory, delineate_flow_paths, write_catchment_hierarchy_csv,
-    write_catchments_csv, write_flowpaths_csv,
+    d8_watersheds, delineate_catchment_hierarchy, delineate_catchment_hierarchy_in_memory,
+    delineate_catchments, delineate_catchments_in_memory, delineate_flow_paths,
+    extract_sink_labels_from_raster, write_catchment_hierarchy_csv, write_catchments_csv,
+    write_flowpaths_csv,
 };
 pub use error::{Error, Result};
 pub use filling::{
@@ -72,10 +73,14 @@ pub use filtering::{
     median_filter_file,
 };
 pub use inundation::{
-    InundationStep, SimulateInundationOptions, SimulateInundationResult, simulate_inundation,
-    simulate_inundation_in_memory, write_inundation_summary_csv,
+    InMemoryInundationPipeline, InundationPipelineOptions, InundationStep, InundationStepSummary,
+    SimulateInundationOptions, SimulateInundationResult, compute_inundation_step_summaries,
+    simulate_inundation, simulate_inundation_in_memory, simulate_inundation_pipeline_in_memory,
+    write_inundation_summary_csv,
 };
-pub use mounts::{DelineateMountsResult, delineate_mounts, flip_dem, flip_dem_file};
+pub use mounts::{
+    DelineateMountsResult, delineate_mounts, delineate_mounts_in_memory, flip_dem, flip_dem_file,
+};
 #[cfg(feature = "pointcloud")]
 pub use pointcloud::{LidarToDsmOptions, convert_lidar, lidar_to_dsm, read_lidar, write_lidar};
 pub use raster_ops::{

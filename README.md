@@ -3,7 +3,7 @@
 [![CI](https://github.com/opengeos/lidar-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/opengeos/lidar-rs/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-lidar--rs.opengeos.org-teal.svg)](https://lidar-rs.opengeos.org)
 [![crates.io](https://img.shields.io/crates/v/lidar.svg)](https://crates.io/crates/lidar)
-[![PyPI](https://img.shields.io/pypi/v/lidar-rs.svg)](https://pypi.org/project/lidar-rs/)
+[![PyPI](https://img.shields.io/pypi/v/lidar-rs)](https://pypi.org/project/lidar-rs/)
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/opengeos/lidar-rs/blob/main/examples/lidar_rs_demo.ipynb)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -17,7 +17,7 @@ High-performance nested surface depression and mount delineation from Digital El
 - **Nested mount hierarchy (`delineate_mounts` & `flip_dem`):** DEM/DSM inversion and elevated feature hierarchy delineation.
 - **Catchment hierarchy, flow paths & inundation simulation (`catchment`, `inundation`, `animation`):** Pure-Rust ports of `opengeos/lidar`'s ArcGIS Hydrology Analyst toolbox (`delineate_catchments`, `delineate_flow_paths`, `delineate_catchment_hierarchy`, single-pass parallel `simulate_inundation`, and shaded-relief animated GIF export via `animate_inundation`).
 - **Pure-Rust geospatial utilities:** `polygonize`, `mosaic`, `reproject_image`, `resample`, `clip_image`, `image_to_cog`, `add_crs`, `join_csv_to_vector`, `csv_points_to_vector`, and LiDAR point cloud I/O, conversion, and DSM gridding (`read_lidar`, `write_lidar`, `convert_lidar`, `lidar_to_dsm`) via `terrio`.
-- **Rust crate (`lidar`), standalone CLI (`lidar-cli`), and Python bindings (`lidar-rs` via PyO3 + maturin).**
+- **Rust crate (`lidar`), standalone CLI (`lidar-cli`), Python bindings (`lidar-rs` via PyO3 + maturin), and WebAssembly (`lidar-js` via `wasm-bindgen`) with a live browser [Playground](https://lidar-rs.opengeos.org/playground/).**
 
 ## Workspace Layout
 
@@ -26,9 +26,10 @@ High-performance nested surface depression and mount delineation from Digital El
 | `crates/lidar` | Pure-Rust core library (published to crates.io as `lidar`) |
 | `crates/lidar-cli` | Standalone `lidar` command-line tool (`lidar-cli`) |
 | `python` | Python bindings (`lidar-rs`, PyO3 + NumPy) with drop-in `opengeos/lidar` API |
+| `js` | WebAssembly (`wasm-bindgen`) bindings (`lidar-js`) for browsers and Node.js |
 | `test_data` | Sample DEM/DSM/sink GeoTIFF datasets from `opengeos/lidar` |
-| `examples` | Interactive Google Colab demo notebook (`lidar_rs_demo.ipynb`) |
-| `docs` | Zensical documentation site and CLI installer scripts (`install.sh`, `install.ps1`) |
+| `examples` | Interactive Google Colab demo notebooks (`lidar_rs_demo.ipynb`, `inundation_demo.ipynb`) |
+| `docs` | Zensical documentation site, interactive WASM Playground, and CLI installer scripts (`install.sh`, `install.ps1`) |
 
 ## Rust Usage
 

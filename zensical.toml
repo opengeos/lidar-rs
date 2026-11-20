@@ -5,14 +5,18 @@ site_author = "opengeos"
 site_url = "https://lidar-rs.opengeos.org"
 repo_url = "https://github.com/opengeos/lidar-rs"
 repo_name = "opengeos/lidar-rs"
+extra_css = ["stylesheets/playground.css"]
+extra_javascript = ["javascripts/playground.js"]
 copyright = "lidar-rs is released under the MIT License. Ported from <a href=\"https://github.com/opengeos/lidar\">opengeos/lidar</a>; see <a href=\"https://github.com/opengeos/lidar-rs/blob/main/NOTICE\">NOTICE</a>."
 
 nav = [
   { "Home" = "index.md" },
+  { "Playground" = "playground.md" },
   { "Installation" = "installation.md" },
   { "CLI Reference" = "cli.md" },
   { "Rust Library" = "rust.md" },
   { "Python API" = "python.md" },
+  { "JavaScript / WASM" = "javascript.md" },
   { "Report Issues" = "https://github.com/opengeos/lidar-rs/issues" },
 ]
 

@@ -17,13 +17,17 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
-use richdem::{Array2D, DemNum, load_raster, save_raster};
+use richdem::{Array2D, DemNum, Topology, load_raster, save_raster};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+use crate::catchment::{CatchmentHierarchyRecord, delineate_catchment_hierarchy_in_memory};
 use crate::error::{Error, Result};
+use crate::filling::{InMemorySinks, extract_sinks_in_memory};
+use crate::filtering::median_filter;
 use crate::raster_ops::ensure_no_path_collision;
 use crate::region::{region_group, region_props_xy};
+use crate::slicing::{InMemoryDepressions, delineate_depressions_in_memory};
 
 /// Maximum vertical slices permitted per region to guard against tiny intervals.
 const MAX_SLICES_PER_REGION: usize = 100_000;
@@ -407,6 +411,171 @@ pub fn simulate_inundation_in_memory(
     out.copy_metadata_from(sink);
     out.set_no_data(-1.0);
     Ok((out, nb_regions))
+}
+
+/// Per-step inundation metrics without a filesystem path (used by in-memory pipelines).
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct InundationStepSummary {
+    /// 1-based iteration index.
+    pub step: usize,
+    /// Elapsed rainfall duration in hours.
+    pub time_hours: f64,
+    /// Number of inundated pixels at this time step.
+    pub inundated_cells: usize,
+    /// Inundated surface area in map units squared.
+    pub inundated_area: f64,
+    /// Fraction of total valid sink area inundated (`0.0..=1.0`).
+    pub inundated_fraction: f64,
+}
+
+/// Options for the end-to-end in-memory hydrology & inundation pipeline
+/// ([`simulate_inundation_pipeline_in_memory`]).
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct InundationPipelineOptions {
+    /// Median smoothing filter kernel size (`<= 1` skips smoothing; default `3`).
+    pub kernel_size: usize,
+    /// Simulation and level-set parameters.
+    pub simulation: SimulateInundationOptions,
+}
+
+impl Default for InundationPipelineOptions {
+    fn default() -> Self {
+        Self {
+            kernel_size: 3,
+            simulation: SimulateInundationOptions::default(),
+        }
+    }
+}
+
+/// Full in-memory outputs of [`simulate_inundation_pipeline_in_memory`].
+#[derive(Debug, Clone)]
+pub struct InMemoryInundationPipeline {
+    /// Intermediate sink extraction outputs (`dem_refined`, `sink`, `depth`, `region`, ...).
+    pub sinks: InMemorySinks,
+    /// Nested depression hierarchy outputs (`depression_id`, `depression_level`, `depressions`, ...).
+    pub depressions: InMemoryDepressions,
+    /// Nested catchment hierarchy raster (contributing area in map units squared).
+    pub catchment_hierarchy: Array2D<f64>,
+    /// Per-level catchment hierarchy statistics.
+    pub catchment_records: Vec<CatchmentHierarchyRecord>,
+    /// Per-cell minimum time to inundation in hours (`-1.0` = dry / NoData).
+    pub fill_time: Array2D<f64>,
+    /// Number of top-level sink regions simulated.
+    pub num_regions: usize,
+    /// Per-timestep cumulative inundation metrics computed in a single O(N + steps) pass.
+    pub steps: Vec<InundationStepSummary>,
+}
+
+/// Computes cumulative per-step inundation metrics in O(W*H + num_steps) time without
+/// rescanning the raster for each time step.
+pub fn compute_inundation_step_summaries(
+    sink: &Array2D<f64>,
+    fill_time: &Array2D<f64>,
+    num_steps: usize,
+    time_step_h: f64,
+) -> Vec<InundationStepSummary> {
+    let (_, _, cell_area) = affine_metrics(&sink.geotransform);
+    let sink_nd = sink.no_data();
+    let total_sink_cells = sink
+        .data()
+        .iter()
+        .filter(|&&v| v.is_finite() && !v.rd_eq(sink_nd))
+        .count();
+
+    let ft_nd = fill_time.no_data();
+    let mut newly_wet = vec![0usize; num_steps];
+    for &ft in fill_time.data() {
+        if !ft.is_finite() || ft.rd_eq(ft_nd) || ft < 0.0 {
+            continue;
+        }
+        let mut step_1based = if ft <= 0.0 {
+            1usize
+        } else {
+            let est = (ft / time_step_h).ceil();
+            if !est.is_finite() || est > num_steps as f64 + 1.0 {
+                continue;
+            }
+            (est as usize).max(1)
+        };
+        // Guard against floating-point boundary rounding so the bucket matches `ft <= k * dt` exactly.
+        while step_1based > 1 && ((step_1based - 1) as f64) * time_step_h >= ft {
+            step_1based -= 1;
+        }
+        while step_1based <= num_steps && (step_1based as f64) * time_step_h < ft {
+            step_1based += 1;
+        }
+        if step_1based <= num_steps {
+            newly_wet[step_1based - 1] += 1;
+        }
+    }
+
+    let mut steps = Vec::with_capacity(num_steps);
+    let mut cumulative = 0usize;
+    for (idx, count) in newly_wet.into_iter().enumerate() {
+        cumulative += count;
+        let k = idx + 1;
+        let t_hours = k as f64 * time_step_h;
+        steps.push(InundationStepSummary {
+            step: k,
+            time_hours: t_hours,
+            inundated_cells: cumulative,
+            inundated_area: cumulative as f64 * cell_area,
+            inundated_fraction: if total_sink_cells > 0 {
+                cumulative as f64 / total_sink_cells as f64
+            } else {
+                0.0
+            },
+        });
+    }
+    steps
+}
+
+/// Runs the end-to-end in-memory hydrology & inundation pipeline:
+/// optional median filter → sink extraction → nested depression hierarchy →
+/// nested catchment hierarchy → inundation simulation → O(N + steps) step summaries.
+pub fn simulate_inundation_pipeline_in_memory(
+    raw_dem: &Array2D<f64>,
+    options: &InundationPipelineOptions,
+) -> Result<InMemoryInundationPipeline> {
+    let num_steps = validate_options(&options.simulation)?;
+    let sim_opts = &options.simulation;
+
+    let smoothed;
+    let dem = if options.kernel_size > 1 {
+        smoothed = median_filter(raw_dem, options.kernel_size)?;
+        &smoothed
+    } else {
+        raw_dem
+    };
+
+    let sinks = extract_sinks_in_memory(dem, sim_opts.min_size, Topology::D8)?;
+    let depressions = delineate_depressions_in_memory(
+        &sinks.sink,
+        sim_opts.min_size,
+        sim_opts.min_depth,
+        sim_opts.interval,
+    )?;
+    let (catchment_hierarchy, catchment_records) = delineate_catchment_hierarchy_in_memory(
+        &sinks.dem_refined,
+        &depressions.depression_level,
+        sim_opts.min_size,
+    )?;
+    let (fill_time, num_regions) =
+        simulate_inundation_in_memory(&sinks.sink, &catchment_hierarchy, sim_opts)?;
+    let steps =
+        compute_inundation_step_summaries(&sinks.sink, &fill_time, num_steps, sim_opts.time_step_h);
+
+    Ok(InMemoryInundationPipeline {
+        sinks,
+        depressions,
+        catchment_hierarchy,
+        catchment_records,
+        fill_time,
+        num_regions,
+        steps,
+    })
 }
 
 /// Simulates surface inundation dynamics over time and writes `flood_*.tif`,
