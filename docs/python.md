@@ -1,6 +1,8 @@
 # Python API
 
-`lidar-rs` provides drop-in Python functions matching [`opengeos/lidar`](https://github.com/opengeos/lidar) without requiring GDAL, SciPy, scikit-image, or GeoPandas.
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/opengeos/lidar-rs/blob/main/examples/lidar_rs_demo.ipynb)
+
+`lidar-rs` provides drop-in Python functions matching [`opengeos/lidar`](https://github.com/opengeos/lidar) without requiring GDAL, SciPy, scikit-image, or GeoPandas. Try the [interactive Google Colab notebook](https://colab.research.google.com/github/opengeos/lidar-rs/blob/main/examples/lidar_rs_demo.ipynb) to run the full DEM/DSM pipeline in your browser.
 
 ```python
 import lidar_rs as lidar
