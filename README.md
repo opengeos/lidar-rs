@@ -15,6 +15,7 @@ High-performance nested surface depression and mount delineation from Digital El
 - **Sink extraction & DEM refinement (`extract_sinks`):** Priority-Flood depression filling via `richdem`, 4-connected region grouping, small artifact removal, refined DEM generation, geometric/topographic depression attributes (`regions_info.csv`), and polygonized Shapefile + attribute-joined GeoPackage export via `terrio`.
 - **Nested depression hierarchy (`delineate_depressions`):** Wu et al. (2019) level-set algorithm delineating nested depressions across sink regions in parallel, computing all 18 geometric and topological attributes (`id`, `level`, `count`, `area`, `volume`, `avg_depth`, `max_depth`, `min_elev`, `max_elev`, `children_id`, `region_id`, `perimeter`, `major_axis`, `minor_axis`, `elongatedness`, `eccentricity`, `orientation`, `area_bbox_ratio`), and exporting per-level shapefiles (`shp-level/Single_level_*.shp`).
 - **Nested mount hierarchy (`delineate_mounts` & `flip_dem`):** DEM/DSM inversion and elevated feature hierarchy delineation.
+- **Catchment hierarchy, flow paths & inundation simulation (`catchment`, `inundation`, `animation`):** Pure-Rust ports of `opengeos/lidar`'s ArcGIS Hydrology Analyst toolbox (`delineate_catchments`, `delineate_flow_paths`, `delineate_catchment_hierarchy`, single-pass parallel `simulate_inundation`, and shaded-relief animated GIF export via `animate_inundation`).
 - **Pure-Rust geospatial utilities:** `polygonize`, `mosaic`, `reproject_image`, `resample`, `clip_image`, `image_to_cog`, `add_crs`, `join_csv_to_vector`, `csv_points_to_vector`, and LiDAR point cloud I/O, conversion, and DSM gridding (`read_lidar`, `write_lidar`, `convert_lidar`, `lidar_to_dsm`) via `terrio`.
 - **Rust crate (`lidar`), standalone CLI (`lidar-cli`), and Python bindings (`lidar-rs` via PyO3 + maturin).**
 
@@ -103,6 +104,9 @@ Example commands:
 lidar median-filter dem.tif out/median.tif -k 3
 lidar extract-sinks out/median.tif out --min-size 1000
 lidar delineate-depressions out/sink.tif out --min-size 1000 --min-depth 0.3 --interval 0.3 --level-shp
+lidar catchment-hierarchy out/dem.tif out/shp-level out/catchment_hir.tif
+lidar simulate-inundation out/sink.tif out/catchment_hir.tif out/simulation --rain-intensity 5 --duration 50 --time-step 1
+lidar animate-inundation out/dem.tif out/simulation out/inundation.gif --rain-intensity 5
 lidar delineate-mounts dsm.tif out_mounts --min-size 1000 --min-height 0.3 --interval 0.3
 lidar lidar-to-dsm cloud.laz dsm.tif --resolution 1.0
 ```

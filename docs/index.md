@@ -16,6 +16,7 @@ Try it interactively in your browser with no local setup via the [Google Colab n
 - **Sink extraction & DEM refinement:** Priority-Flood depression filling via `richdem`, 4-connected region grouping, small artifact removal, refined DEM generation, and GeoTIFF / CSV / Shapefile / GeoPackage export via `terrio`.
 - **Nested depression hierarchy (Wu et al. 2019):** Top-down level-set slicing, 18 geometric & topological attributes per depression, CSV export, and per-level shapefile extraction.
 - **Nested mount hierarchy:** DEM inversion (`flip_dem`) and elevated feature hierarchy delineation (`delineate_mounts`).
+- **Catchment hierarchy, overland flow paths & inundation animation:** Pure-Rust ports of the ArcGIS Hydrology Analyst workflow (`delineate_catchments`, `delineate_flow_paths`, `delineate_catchment_hierarchy`, `simulate_inundation`, and shaded-relief GIF export via `animate_inundation`).
 - **Geospatial raster, vector & point-cloud utilities:** `polygonize`, `mosaic`, `reproject_image`, `resample`, `clip_image`, `image_to_cog`, `add_crs`, `join_csv_to_vector`, `csv_points_to_vector`, and pure-Rust LAS/LAZ/COPC/PLY/E57 I/O & DSM gridding (`lidar_to_dsm`).
 - **Rust library (`lidar`), standalone CLI (`lidar-cli`), and Python bindings (`lidar-rs`).**
 

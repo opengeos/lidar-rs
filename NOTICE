@@ -17,6 +17,7 @@ models (DEMs):
 
 Third-party crates used directly:
 - `terrio` (https://github.com/opengeos/terrio): MIT AND MPL-2.0 AND Apache-2.0
+- `gif` (https://github.com/image-rs/image-gif): MIT OR Apache-2.0
 - `richdem` (https://github.com/opengeos/richdem-rs): GPL-3.0-only
   Note: `lidar-rs` source code is licensed under the MIT License. Compiled
   binaries or wheels linking `richdem` (GPL-3.0-only) are subject to the

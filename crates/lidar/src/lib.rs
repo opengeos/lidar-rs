@@ -37,9 +37,12 @@
 //!   *Journal of the American Water Resources Association*, 55(2), 354–368.
 //!   <https://doi.org/10.1111/1752-1688.12689>
 
+pub mod animation;
+pub mod catchment;
 pub mod error;
 pub mod filling;
 pub mod filtering;
+pub mod inundation;
 pub mod mounts;
 #[cfg(feature = "pointcloud")]
 pub mod pointcloud;
@@ -47,6 +50,18 @@ pub mod raster_ops;
 pub mod region;
 pub mod slicing;
 
+pub use animation::{
+    AnimateInundationOptions, AnimateInundationResult, HillshadeOptions, animate_inundation,
+    compute_hillshade_rgb,
+};
+pub use catchment::{
+    CatchmentHierarchyOptions, CatchmentHierarchyRecord, CatchmentHierarchyResult, CatchmentRecord,
+    DelineateCatchmentsOptions, DelineateCatchmentsResult, DelineateFlowPathsOptions,
+    DelineateFlowPathsResult, FlowPathRecord, InMemoryCatchments, d8_flow_directions_resolved,
+    d8_watersheds, delineate_catchment_hierarchy, delineate_catchments,
+    delineate_catchments_in_memory, delineate_flow_paths, write_catchment_hierarchy_csv,
+    write_catchments_csv, write_flowpaths_csv,
+};
 pub use error::{Error, Result};
 pub use filling::{
     ExtractSinksOptions, ExtractSinksResult, InMemorySinks, SinkDepression, extract_sinks,
@@ -55,6 +70,10 @@ pub use filling::{
 pub use filtering::{
     gaussian_filter, gaussian_filter_file, mean_filter, mean_filter_file, median_filter,
     median_filter_file,
+};
+pub use inundation::{
+    InundationStep, SimulateInundationOptions, SimulateInundationResult, simulate_inundation,
+    simulate_inundation_in_memory, write_inundation_summary_csv,
 };
 pub use mounts::{DelineateMountsResult, delineate_mounts, flip_dem, flip_dem_file};
 #[cfg(feature = "pointcloud")]
