@@ -79,3 +79,64 @@ def test_raster_vector_helpers(tmp_path: Path):
     n = lidar_rs.csv_to_shp(pts_csv, pts_shp)
     assert n == 2
     assert pts_shp.exists()
+
+
+def test_inundation_hydrology_pipeline(tmp_path: Path):
+    dem = TEST_DATA / "dem.tif"
+    med_path = tmp_path / "median.tif"
+    lidar_rs.MedianFilter(dem, kernel_size=3, out_file=med_path)
+
+    sinks = lidar_rs.extract_sinks(med_path, min_size=1000, out_dir=tmp_path)
+    refined_dem = sinks["refined_dem_path"]
+    filled_dem = sinks["filled_dem_path"]
+    region_tif = sinks["region_path"]
+    sink_tif = sinks["sink_path"]
+
+    cats = lidar_rs.delineate_catchments(refined_dem, region_tif, tmp_path / "catchments")
+    assert len(cats["records"]) >= 1
+    assert Path(cats["watershed_path"]).exists()
+    assert Path(cats["vector_path"]).exists()
+
+    fp = lidar_rs.delineate_flow_paths(
+        filled_dem, region_tif, tmp_path / "flowpath.shp", rain_intensity_cm_h=5.0, refined_dem=refined_dem
+    )
+    assert Path(fp["flowpath_vector_path"]).exists()
+
+    deps = lidar_rs.delineate_depressions(
+        sink_tif, min_size=1000, min_depth=0.3, interval=0.3, out_dir=tmp_path, bool_level_shp=True
+    )
+    assert deps["max_level"] >= 2
+
+    hir_tif = tmp_path / "hir" / "catchment_hir.tif"
+    hir = lidar_rs.delineate_catchment_hierarchy(refined_dem, tmp_path / "shp-level", hir_tif)
+    assert Path(hir["catchment_raster_path"]).exists()
+    assert len(hir["records"]) >= 1
+
+    sim_dir = tmp_path / "simulation"
+    sim = lidar_rs.simulate_inundation(
+        sink_tif,
+        hir_tif,
+        sim_dir,
+        min_size=1000,
+        min_depth=0.2,
+        interval=0.3,
+        rain_intensity_cm_h=5.0,
+        rain_duration_h=10.0,
+        time_step_h=2.0,
+    )
+    assert len(sim["steps"]) == 5
+    assert sim["steps"][-1]["inundated_cells"] > 0
+
+    gif_path = tmp_path / "inundation.gif"
+    anim = lidar_rs.animate_inundation(
+        refined_dem,
+        sim_dir,
+        gif_path,
+        frame_delay_ms=150,
+        ping_pong=True,
+        max_dimension=200,
+        time_step_h=2.0,
+        rain_intensity_cm_h=5.0,
+    )
+    assert anim["frame_count"] == 9
+    assert Path(anim["gif_path"]).read_bytes()[:6] == b"GIF89a"

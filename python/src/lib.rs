@@ -10,7 +10,9 @@ use pyo3::types::{PyDict, PyList};
 
 use lidar::pointcloud::{GridMethod, GridStat, LidarToDsmOptions};
 use lidar::{
-    Array2D, DelineateOptions, ExtractSinksOptions, NestedDepression, SinkDepression, Topology,
+    AnimateInundationOptions, Array2D, CatchmentHierarchyOptions, DelineateCatchmentsOptions,
+    DelineateFlowPathsOptions, DelineateOptions, ExtractSinksOptions, HillshadeOptions,
+    NestedDepression, SimulateInundationOptions, SinkDepression, Topology,
 };
 
 fn to_py_err(e: lidar::Error) -> PyErr {
@@ -619,6 +621,269 @@ fn lidar_to_dsm(
         .map_err(to_py_err)
 }
 
+#[pyfunction]
+#[pyo3(signature = (in_dem, in_sink, out_dir, compress=false))]
+fn delineate_catchments<'py>(
+    py: Python<'py>,
+    in_dem: &str,
+    in_sink: &str,
+    out_dir: &str,
+    compress: bool,
+) -> PyResult<Bound<'py, PyDict>> {
+    let in_dem = in_dem.to_string();
+    let in_sink = in_sink.to_string();
+    let out_dir = out_dir.to_string();
+    let opts = DelineateCatchmentsOptions { compress };
+    let res = py
+        .detach(move || lidar::delineate_catchments(&in_dem, &in_sink, &out_dir, &opts))
+        .map_err(to_py_err)?;
+
+    let dict = PyDict::new(py);
+    dict.set_item(
+        "watershed_path",
+        res.watershed_path.to_string_lossy().as_ref(),
+    )?;
+    dict.set_item("vector_path", res.vector_path.to_string_lossy().as_ref())?;
+    dict.set_item("csv_path", res.csv_path.to_string_lossy().as_ref())?;
+    let recs = PyList::empty(py);
+    for r in &res.records {
+        let d = PyDict::new(py);
+        d.set_item("id", r.id)?;
+        d.set_item("sink_cells", r.sink_cells)?;
+        d.set_item("sink_area", r.sink_area)?;
+        d.set_item("catchment_cells", r.catchment_cells)?;
+        d.set_item("catchment_area", r.catchment_area)?;
+        d.set_item("dep_to_cat_ratio", r.dep_to_cat_ratio)?;
+        recs.append(d)?;
+    }
+    dict.set_item("records", recs)?;
+    Ok(dict)
+}
+
+#[pyfunction]
+#[pyo3(signature = (in_dem_filled, in_sink, out_flowpath, rain_intensity_cm_h=5.0, refined_dem=None))]
+fn delineate_flow_paths<'py>(
+    py: Python<'py>,
+    in_dem_filled: &str,
+    in_sink: &str,
+    out_flowpath: &str,
+    rain_intensity_cm_h: f64,
+    refined_dem: Option<&str>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let in_dem_filled = in_dem_filled.to_string();
+    let in_sink = in_sink.to_string();
+    let out_flowpath = out_flowpath.to_string();
+    let opts = DelineateFlowPathsOptions {
+        rain_intensity_cm_h,
+        refined_dem: refined_dem.map(PathBuf::from),
+    };
+    let res = py
+        .detach(move || lidar::delineate_flow_paths(&in_dem_filled, &in_sink, &out_flowpath, &opts))
+        .map_err(to_py_err)?;
+
+    let dict = PyDict::new(py);
+    dict.set_item(
+        "flowpath_vector_path",
+        res.flowpath_vector_path.to_string_lossy().as_ref(),
+    )?;
+    dict.set_item("csv_path", res.csv_path.to_string_lossy().as_ref())?;
+    let recs = PyList::empty(py);
+    for r in &res.records {
+        let d = PyDict::new(py);
+        d.set_item("id", r.id)?;
+        d.set_item("start_sink", r.start_sink)?;
+        d.set_item("end_sink", r.end_sink)?;
+        d.set_item("start_elev", r.start_elev)?;
+        d.set_item("end_elev", r.end_elev)?;
+        d.set_item("diff_elev", r.diff_elev)?;
+        d.set_item("length", r.length)?;
+        d.set_item("volume", r.volume)?;
+        d.set_item("cat_area", r.cat_area)?;
+        d.set_item("simu_depth", r.simu_depth)?;
+        d.set_item("rain_intensity_m_h", r.rain_intensity_m_h)?;
+        d.set_item("time_inund", r.time_inund)?;
+        d.set_item("rank", r.rank)?;
+        recs.append(d)?;
+    }
+    dict.set_item("records", recs)?;
+    Ok(dict)
+}
+
+#[pyfunction]
+#[pyo3(signature = (in_dem, in_level_dir, out_catchment_img, compress=false))]
+fn delineate_catchment_hierarchy<'py>(
+    py: Python<'py>,
+    in_dem: &str,
+    in_level_dir: &str,
+    out_catchment_img: &str,
+    compress: bool,
+) -> PyResult<Bound<'py, PyDict>> {
+    let in_dem = in_dem.to_string();
+    let in_level_dir = in_level_dir.to_string();
+    let out_catchment_img = out_catchment_img.to_string();
+    let opts = CatchmentHierarchyOptions { compress };
+    let res = py
+        .detach(move || {
+            lidar::delineate_catchment_hierarchy(&in_dem, &in_level_dir, &out_catchment_img, &opts)
+        })
+        .map_err(to_py_err)?;
+
+    let dict = PyDict::new(py);
+    dict.set_item(
+        "catchment_raster_path",
+        res.catchment_raster_path.to_string_lossy().as_ref(),
+    )?;
+    dict.set_item(
+        "merged_shapefile_path",
+        res.merged_shapefile_path.to_string_lossy().as_ref(),
+    )?;
+    dict.set_item("csv_path", res.csv_path.to_string_lossy().as_ref())?;
+    let cat_shps: Vec<String> = res
+        .catchment_shapefiles
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let lvl_shps: Vec<String> = res
+        .level_shapefiles
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    dict.set_item("catchment_shapefiles", cat_shps)?;
+    dict.set_item("level_shapefiles", lvl_shps)?;
+    let recs = PyList::empty(py);
+    for r in &res.records {
+        let d = PyDict::new(py);
+        d.set_item("level", r.level)?;
+        d.set_item("level_fid", r.level_fid)?;
+        d.set_item("count", r.count)?;
+        d.set_item("area", r.area)?;
+        d.set_item("cat_area", r.cat_area)?;
+        d.set_item("dep_to_cat_ratio", r.dep_to_cat_ratio)?;
+        d.set_item("min_elev", r.min_elev)?;
+        d.set_item("max_elev", r.max_elev)?;
+        d.set_item("range", r.range)?;
+        d.set_item("mean_elev", r.mean_elev)?;
+        d.set_item("std_elev", r.std_elev)?;
+        d.set_item("sum_elev", r.sum_elev)?;
+        d.set_item("volume", r.volume)?;
+        d.set_item("mean_depth", r.mean_depth)?;
+        recs.append(d)?;
+    }
+    dict.set_item("records", recs)?;
+    Ok(dict)
+}
+
+#[pyfunction]
+#[pyo3(signature = (in_sink, in_catchment, out_dir, min_size=1000, min_depth=0.2, interval=0.2, rain_intensity_cm_h=5.0, rain_duration_h=50.0, time_step_h=1.0, compress=false))]
+#[allow(clippy::too_many_arguments)]
+fn simulate_inundation<'py>(
+    py: Python<'py>,
+    in_sink: &str,
+    in_catchment: &str,
+    out_dir: &str,
+    min_size: usize,
+    min_depth: f64,
+    interval: f64,
+    rain_intensity_cm_h: f64,
+    rain_duration_h: f64,
+    time_step_h: f64,
+    compress: bool,
+) -> PyResult<Bound<'py, PyDict>> {
+    let in_sink = in_sink.to_string();
+    let in_catchment = in_catchment.to_string();
+    let out_dir = out_dir.to_string();
+    let opts = SimulateInundationOptions {
+        min_size,
+        min_depth,
+        interval,
+        rain_intensity_cm_h,
+        rain_duration_h,
+        time_step_h,
+        compress,
+    };
+    let res = py
+        .detach(move || lidar::simulate_inundation(&in_sink, &in_catchment, &out_dir, &opts))
+        .map_err(to_py_err)?;
+
+    let dict = PyDict::new(py);
+    let frames: Vec<String> = res
+        .frame_paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    dict.set_item("frame_paths", frames)?;
+    dict.set_item(
+        "fill_time_path",
+        res.fill_time_path.to_string_lossy().as_ref(),
+    )?;
+    dict.set_item(
+        "summary_csv_path",
+        res.summary_csv_path.to_string_lossy().as_ref(),
+    )?;
+    dict.set_item("num_regions", res.num_regions)?;
+    let steps = PyList::empty(py);
+    for s in &res.steps {
+        let d = PyDict::new(py);
+        d.set_item("step", s.step)?;
+        d.set_item("time_hours", s.time_hours)?;
+        d.set_item("inundated_cells", s.inundated_cells)?;
+        d.set_item("inundated_area", s.inundated_area)?;
+        d.set_item("inundated_fraction", s.inundated_fraction)?;
+        d.set_item("raster_path", s.raster_path.to_string_lossy().as_ref())?;
+        steps.append(d)?;
+    }
+    dict.set_item("steps", steps)?;
+    Ok(dict)
+}
+
+#[pyfunction]
+#[pyo3(signature = (in_dem, in_flood_dir, out_gif, frame_delay_ms=200, ping_pong=true, loops=0, water_alpha=0.55, max_dimension=None, time_step_h=Some(1.0), rain_intensity_cm_h=None, azimuth_deg=135.0, elevation_deg=45.0))]
+#[allow(clippy::too_many_arguments)]
+fn animate_inundation<'py>(
+    py: Python<'py>,
+    in_dem: &str,
+    in_flood_dir: &str,
+    out_gif: &str,
+    frame_delay_ms: u16,
+    ping_pong: bool,
+    loops: u16,
+    water_alpha: f32,
+    max_dimension: Option<usize>,
+    time_step_h: Option<f64>,
+    rain_intensity_cm_h: Option<f64>,
+    azimuth_deg: f64,
+    elevation_deg: f64,
+) -> PyResult<Bound<'py, PyDict>> {
+    let in_dem = in_dem.to_string();
+    let in_flood_dir = in_flood_dir.to_string();
+    let out_gif = out_gif.to_string();
+    let opts = AnimateInundationOptions {
+        frame_delay_ms,
+        ping_pong,
+        loops,
+        water_alpha,
+        max_dimension,
+        time_step_h,
+        rain_intensity_cm_h,
+        hillshade: HillshadeOptions {
+            azimuth_deg,
+            elevation_deg,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let res = py
+        .detach(move || lidar::animate_inundation(&in_dem, &in_flood_dir, &out_gif, &opts))
+        .map_err(to_py_err)?;
+
+    let dict = PyDict::new(py);
+    dict.set_item("gif_path", res.gif_path.to_string_lossy().as_ref())?;
+    dict.set_item("frame_count", res.frame_count)?;
+    dict.set_item("width", res.width)?;
+    dict.set_item("height", res.height)?;
+    Ok(dict)
+}
+
 #[pymodule]
 fn _lidar_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", lidar::VERSION)?;
@@ -633,6 +898,11 @@ fn _lidar_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_sinks, m)?)?;
     m.add_function(wrap_pyfunction!(delineate_depressions, m)?)?;
     m.add_function(wrap_pyfunction!(delineate_mounts, m)?)?;
+    m.add_function(wrap_pyfunction!(delineate_catchments, m)?)?;
+    m.add_function(wrap_pyfunction!(delineate_flow_paths, m)?)?;
+    m.add_function(wrap_pyfunction!(delineate_catchment_hierarchy, m)?)?;
+    m.add_function(wrap_pyfunction!(simulate_inundation, m)?)?;
+    m.add_function(wrap_pyfunction!(animate_inundation, m)?)?;
     m.add_function(wrap_pyfunction!(polygonize, m)?)?;
     m.add_function(wrap_pyfunction!(mosaic, m)?)?;
     m.add_function(wrap_pyfunction!(reproject_image, m)?)?;

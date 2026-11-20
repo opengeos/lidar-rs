@@ -394,3 +394,144 @@ fn test_pointcloud_convert_and_lidar_to_dsm() {
     assert!(cols >= 19 && rows >= 19);
     assert!(dsm_path.exists());
 }
+
+#[test]
+fn test_full_inundation_hydrology_pipeline_on_sample_dem() {
+    use lidar::{
+        AnimateInundationOptions, CatchmentHierarchyOptions, DelineateCatchmentsOptions,
+        DelineateFlowPathsOptions, SimulateInundationOptions, animate_inundation,
+        delineate_catchment_hierarchy, delineate_catchments, delineate_flow_paths,
+        simulate_inundation,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dem_path = test_data_dir().join("dem.tif");
+
+    // Step 1: Median filter + Extract sinks
+    let med_path = tmp.path().join("median.tif");
+    median_filter_file(&dem_path, 3, Some(&med_path)).unwrap();
+    let sinks = extract_sinks(
+        &med_path,
+        tmp.path(),
+        &ExtractSinksOptions {
+            min_size: 1000,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let refined_dem = sinks.refined_dem_path.as_ref().unwrap();
+    let filled_dem = sinks.filled_dem_path.as_ref().unwrap();
+    let region_tif = sinks.region_path.as_ref().unwrap();
+    let sink_tif = sinks.sink_path.as_ref().unwrap();
+
+    // Step 2: Delineate catchments (2_Delineate_Catchment.py)
+    let cat_dir = tmp.path().join("catchments");
+    let cats = delineate_catchments(
+        refined_dem,
+        region_tif,
+        &cat_dir,
+        &DelineateCatchmentsOptions::default(),
+    )
+    .unwrap();
+    assert!(!cats.records.is_empty());
+    assert!(cats.watershed_path.exists());
+    assert!(cats.vector_path.exists());
+    assert!(cats.csv_path.exists());
+    for rec in &cats.records {
+        assert!(rec.catchment_area >= rec.sink_area);
+        assert!(rec.dep_to_cat_ratio > 0.0 && rec.dep_to_cat_ratio <= 1.0);
+    }
+
+    // Step 3: Delineate overland flow paths (3_Flow_Path.py)
+    let flowpath_shp = tmp.path().join("flowpath.shp");
+    let fp = delineate_flow_paths(
+        filled_dem,
+        region_tif,
+        &flowpath_shp,
+        &DelineateFlowPathsOptions {
+            rain_intensity_cm_h: 5.0,
+            refined_dem: Some(refined_dem.clone()),
+        },
+    )
+    .unwrap();
+    assert!(fp.flowpath_vector_path.exists());
+    assert!(fp.csv_path.exists());
+
+    // Step 4: Delineate depression hierarchy with per-level shapefiles
+    let deps = delineate_depressions(
+        sink_tif,
+        tmp.path(),
+        &DelineateOptions {
+            min_size: 1000,
+            min_depth: 0.3,
+            interval: 0.3,
+            bool_level_shp: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(deps.max_level >= 2);
+    let level_dir = tmp.path().join("shp-level");
+
+    // Step 5: Delineate catchment hierarchy (5_Catchment_Hierarchy.py)
+    let hir_dir = tmp.path().join("catchment_hir");
+    let hir_tif = hir_dir.join("catchment_hir.tif");
+    let hir = delineate_catchment_hierarchy(
+        refined_dem,
+        &level_dir,
+        &hir_tif,
+        &CatchmentHierarchyOptions::default(),
+    )
+    .unwrap();
+    assert!(hir.catchment_raster_path.exists());
+    assert!(hir.merged_shapefile_path.exists());
+    assert!(hir.csv_path.exists());
+    assert_eq!(hir.level_shapefiles.len(), deps.max_level as usize);
+    assert!(!hir.records.is_empty());
+
+    // Step 6: Simulate inundation dynamics (6_Simulate Inundation.py)
+    let sim_dir = tmp.path().join("simulation");
+    let sim = simulate_inundation(
+        sink_tif,
+        &hir_tif,
+        &sim_dir,
+        &SimulateInundationOptions {
+            min_size: 1000,
+            min_depth: 0.2,
+            interval: 0.3,
+            rain_intensity_cm_h: 5.0,
+            rain_duration_h: 10.0,
+            time_step_h: 2.0,
+            compress: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(sim.steps.len(), 5);
+    assert!(sim.fill_time_path.exists());
+    assert!(sim.summary_csv_path.exists());
+    for pair in sim.steps.windows(2) {
+        assert!(pair[1].inundated_cells >= pair[0].inundated_cells);
+    }
+    assert!(sim.steps.last().unwrap().inundated_cells > 0);
+
+    // Step 7: Animate inundation to GIF (7_Play_Animation.py)
+    let gif_path = tmp.path().join("inundation.gif");
+    let anim = animate_inundation(
+        refined_dem,
+        &sim_dir,
+        &gif_path,
+        &AnimateInundationOptions {
+            frame_delay_ms: 150,
+            ping_pong: true,
+            max_dimension: Some(200),
+            time_step_h: Some(2.0),
+            rain_intensity_cm_h: Some(5.0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(anim.frame_count, 9); // 5 rising + 4 falling
+    assert!(anim.gif_path.exists());
+    let bytes = std::fs::read(&gif_path).unwrap();
+    assert!(bytes.starts_with(b"GIF89a"));
+}

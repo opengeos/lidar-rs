@@ -8,10 +8,13 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use lidar::pointcloud::{GridMethod, GridStat, LidarToDsmOptions, convert_lidar, lidar_to_dsm};
 use lidar::{
-    DelineateOptions, ExtractSinksOptions, Topology, add_crs, clip_image, csv_points_to_vector,
-    delineate_depressions, delineate_mounts, extract_sinks, flip_dem_file, gaussian_filter_file,
-    image_to_cog, join_csv_to_vector, mean_filter_file, median_filter_file, mosaic,
-    parse_resampling, polygonize, reproject_image, resample,
+    AnimateInundationOptions, CatchmentHierarchyOptions, DelineateCatchmentsOptions,
+    DelineateFlowPathsOptions, DelineateOptions, ExtractSinksOptions, HillshadeOptions,
+    SimulateInundationOptions, Topology, add_crs, animate_inundation, clip_image,
+    csv_points_to_vector, delineate_catchment_hierarchy, delineate_catchments,
+    delineate_depressions, delineate_flow_paths, delineate_mounts, extract_sinks, flip_dem_file,
+    gaussian_filter_file, image_to_cog, join_csv_to_vector, mean_filter_file, median_filter_file,
+    mosaic, parse_resampling, polygonize, reproject_image, resample, simulate_inundation,
 };
 
 #[derive(Parser)]
@@ -307,6 +310,123 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         window_size: usize,
     },
+    /// Delineate contributing catchments for extracted sinks (ports 2_Delineate_Catchment.py)
+    DelineateCatchments {
+        /// Partially-filled / refined DEM raster (e.g. dem.tif from extract-sinks)
+        dem: PathBuf,
+        /// Sink region raster (region.tif / sink.tif) or sink polygon vector (.shp / .gpkg)
+        sink: PathBuf,
+        /// Output directory
+        out_dir: PathBuf,
+        /// Compress output GeoTIFFs with DEFLATE
+        #[arg(short = 'c', long)]
+        compress: bool,
+        /// Print summary as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delineate overland spill flow paths between sinks (ports 3_Flow_Path.py)
+    DelineateFlowPaths {
+        /// Fully filled DEM raster (e.g. dem_filled.tif from extract-sinks)
+        dem_filled: PathBuf,
+        /// Sink region raster (region.tif / sink.tif) or sink polygon vector (.shp / .gpkg)
+        sink: PathBuf,
+        /// Output polyline vector file (.shp, .gpkg, .geojson)
+        output: PathBuf,
+        /// Rainfall intensity in cm/h
+        #[arg(long, default_value_t = 5.0)]
+        rain_intensity: f64,
+        /// Optional refined/partially-filled DEM (dem.tif); required to compute sink volume, cat_area, time_inund, and rank (otherwise left 0 / unranked)
+        #[arg(long)]
+        refined_dem: Option<PathBuf>,
+        /// Print summary as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delineate nested catchment hierarchy across depression levels (ports 5_Catchment_Hierarchy.py)
+    CatchmentHierarchy {
+        /// Partially-filled / refined DEM raster (e.g. dem.tif from extract-sinks)
+        dem: PathBuf,
+        /// Directory containing Single_level_*.shp (or .tif) from delineate-depressions --level-shp
+        level_dir: PathBuf,
+        /// Output catchment hierarchy GeoTIFF (e.g. catchment_hir.tif)
+        output: PathBuf,
+        /// Compress output GeoTIFF with DEFLATE
+        #[arg(short = 'c', long)]
+        compress: bool,
+        /// Print summary as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Simulate surface inundation dynamics over time (ports 6_Simulate Inundation.py)
+    SimulateInundation {
+        /// Input sink elevation raster (sink.tif)
+        sink: PathBuf,
+        /// Input catchment hierarchy raster (catchment_hir.tif)
+        catchment: PathBuf,
+        /// Output directory for flood_*.tif frames, fill_time.tif, and summary CSV
+        out_dir: PathBuf,
+        /// Minimum depression size in pixels
+        #[arg(short = 'm', long, default_value_t = 1000)]
+        min_size: usize,
+        /// Minimum depression depth
+        #[arg(short = 'd', long, default_value_t = 0.2)]
+        min_depth: f64,
+        /// Vertical level-set slicing interval (positive; sliced top-down)
+        #[arg(short = 'i', long, default_value_t = 0.2)]
+        interval: f64,
+        /// Rainfall intensity in cm/h
+        #[arg(long, default_value_t = 5.0)]
+        rain_intensity: f64,
+        /// Total rainfall duration in hours
+        #[arg(long, default_value_t = 50.0)]
+        duration: f64,
+        /// Simulation time step in hours
+        #[arg(long, default_value_t = 1.0)]
+        time_step: f64,
+        /// Compress output GeoTIFFs with DEFLATE
+        #[arg(short = 'c', long)]
+        compress: bool,
+        /// Print summary as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Render shaded-relief inundation animation as an animated GIF (ports 7_Play_Animation.py)
+    AnimateInundation {
+        /// Background DEM raster (e.g. dem.tif)
+        dem: PathBuf,
+        /// Directory containing flood_*.tif rasters from simulate-inundation
+        flood_dir: PathBuf,
+        /// Output animated GIF path (e.g. inundation.gif)
+        output: PathBuf,
+        /// Delay between frames in milliseconds
+        #[arg(long, default_value_t = 200)]
+        delay_ms: u16,
+        /// Play only rising water (disable rising-then-falling ping-pong playback)
+        #[arg(long)]
+        no_ping_pong: bool,
+        /// Number of GIF loops (0 = infinite)
+        #[arg(long, default_value_t = 0)]
+        loops: u16,
+        /// Water overlay opacity (0.0..=1.0)
+        #[arg(long, default_value_t = 0.55)]
+        water_alpha: f32,
+        /// Optional maximum width/height in pixels for downscaling large DEMs
+        #[arg(long)]
+        max_dim: Option<usize>,
+        /// Optional time step in hours for frame labels
+        #[arg(long, default_value_t = 1.0)]
+        time_step: f64,
+        /// Optional rainfall intensity in cm/h for the banner title
+        #[arg(long)]
+        rain_intensity: Option<f64>,
+        /// Hillshade azimuth in degrees
+        #[arg(long, default_value_t = 135.0)]
+        azimuth: f64,
+        /// Hillshade elevation angle in degrees
+        #[arg(long, default_value_t = 45.0)]
+        elevation: f64,
+    },
     /// Print metadata summary for a raster or LiDAR point cloud
     Info {
         /// Input raster or point cloud file
@@ -579,6 +699,174 @@ fn run() -> lidar::Result<()> {
             };
             let (cols, rows) = lidar_to_dsm(&input, &output, &opts)?;
             println!("Generated {cols}x{rows} DSM at {}", output.display());
+        }
+        Commands::DelineateCatchments {
+            dem,
+            sink,
+            out_dir,
+            compress,
+            json,
+        } => {
+            let res = delineate_catchments(
+                &dem,
+                &sink,
+                &out_dir,
+                &DelineateCatchmentsOptions { compress },
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&res)
+                        .map_err(|e| lidar::Error::Algorithm(e.to_string()))?
+                );
+            } else {
+                println!(
+                    "Delineated {} catchment(s):\n  watershed: {}\n  vector:    {}\n  csv:       {}",
+                    res.records.len(),
+                    res.watershed_path.display(),
+                    res.vector_path.display(),
+                    res.csv_path.display(),
+                );
+            }
+        }
+        Commands::DelineateFlowPaths {
+            dem_filled,
+            sink,
+            output,
+            rain_intensity,
+            refined_dem,
+            json,
+        } => {
+            let res = delineate_flow_paths(
+                &dem_filled,
+                &sink,
+                &output,
+                &DelineateFlowPathsOptions {
+                    rain_intensity_cm_h: rain_intensity,
+                    refined_dem,
+                },
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&res)
+                        .map_err(|e| lidar::Error::Algorithm(e.to_string()))?
+                );
+            } else {
+                println!(
+                    "Delineated {} flow path(s):\n  vector: {}\n  csv:    {}",
+                    res.records.len(),
+                    res.flowpath_vector_path.display(),
+                    res.csv_path.display(),
+                );
+            }
+        }
+        Commands::CatchmentHierarchy {
+            dem,
+            level_dir,
+            output,
+            compress,
+            json,
+        } => {
+            let res = delineate_catchment_hierarchy(
+                &dem,
+                &level_dir,
+                &output,
+                &CatchmentHierarchyOptions { compress },
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&res)
+                        .map_err(|e| lidar::Error::Algorithm(e.to_string()))?
+                );
+            } else {
+                println!(
+                    "Delineated catchment hierarchy ({} feature(s) across {} level(s)):\n  raster: {}\n  merged: {}\n  csv:    {}",
+                    res.records.len(),
+                    res.level_shapefiles.len(),
+                    res.catchment_raster_path.display(),
+                    res.merged_shapefile_path.display(),
+                    res.csv_path.display(),
+                );
+            }
+        }
+        Commands::SimulateInundation {
+            sink,
+            catchment,
+            out_dir,
+            min_size,
+            min_depth,
+            interval,
+            rain_intensity,
+            duration,
+            time_step,
+            compress,
+            json,
+        } => {
+            let opts = SimulateInundationOptions {
+                min_size,
+                min_depth,
+                interval,
+                rain_intensity_cm_h: rain_intensity,
+                rain_duration_h: duration,
+                time_step_h: time_step,
+                compress,
+            };
+            let res = simulate_inundation(&sink, &catchment, &out_dir, &opts)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&res)
+                        .map_err(|e| lidar::Error::Algorithm(e.to_string()))?
+                );
+            } else {
+                println!(
+                    "Simulated {} timestep(s) across {} region(s):\n  fill_time: {}\n  summary:   {}",
+                    res.steps.len(),
+                    res.num_regions,
+                    res.fill_time_path.display(),
+                    res.summary_csv_path.display(),
+                );
+            }
+        }
+        Commands::AnimateInundation {
+            dem,
+            flood_dir,
+            output,
+            delay_ms,
+            no_ping_pong,
+            loops,
+            water_alpha,
+            max_dim,
+            time_step,
+            rain_intensity,
+            azimuth,
+            elevation,
+        } => {
+            let opts = AnimateInundationOptions {
+                frame_delay_ms: delay_ms,
+                ping_pong: !no_ping_pong,
+                loops,
+                water_alpha,
+                max_dimension: max_dim,
+                time_step_h: Some(time_step),
+                rain_intensity_cm_h: rain_intensity,
+                hillshade: HillshadeOptions {
+                    azimuth_deg: azimuth,
+                    elevation_deg: elevation,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let res = animate_inundation(&dem, &flood_dir, &output, &opts)?;
+            println!(
+                "Rendered {} frame(s) ({}x{}) to {}",
+                res.frame_count,
+                res.width,
+                res.height,
+                res.gif_path.display(),
+            );
         }
         Commands::Info { input } => {
             let p_str = input.to_str().ok_or_else(|| {

@@ -21,6 +21,7 @@ pointcloud = ["terrio/pointcloud"]
 serde = ["dep:serde", "richdem/serde"]
 
 [dependencies]
+gif.workspace = true
 richdem.workspace = true
 terrio.workspace = true
 thiserror.workspace = true

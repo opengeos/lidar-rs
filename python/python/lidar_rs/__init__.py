@@ -370,6 +370,206 @@ def lidar_to_dsm(
     return int(cols), int(rows)
 
 
+def delineate_catchments(
+    in_dem: str | os.PathLike[str],
+    in_sink: str | os.PathLike[str],
+    out_dir: str | os.PathLike[str],
+    compress: bool = False,
+) -> dict[str, Any]:
+    """Delineate contributing catchments for extracted sinks (ports 2_Delineate_Catchment.py)."""
+    return _lidar_rs.delineate_catchments(
+        _as_path_str(in_dem),
+        _as_path_str(in_sink),
+        _as_path_str(out_dir),
+        compress,
+    )
+
+
+def DelineateCatchments(
+    in_dem: str | os.PathLike[str],
+    in_sink: str | os.PathLike[str],
+    out_dir: str | os.PathLike[str],
+) -> str:
+    """ArcGIS-style wrapper for `delineate_catchments`; returns the catchment vector path."""
+    return str(delineate_catchments(in_dem, in_sink, out_dir)["vector_path"])
+
+
+def delineate_flow_paths(
+    in_dem_filled: str | os.PathLike[str],
+    in_sink: str | os.PathLike[str],
+    out_flowpath: str | os.PathLike[str],
+    rain_intensity_cm_h: float = 5.0,
+    refined_dem: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
+    """Delineate overland spill flow paths between sinks (ports 3_Flow_Path.py)."""
+    return _lidar_rs.delineate_flow_paths(
+        _as_path_str(in_dem_filled),
+        _as_path_str(in_sink),
+        _as_path_str(out_flowpath),
+        float(rain_intensity_cm_h),
+        _as_path_str(refined_dem) if refined_dem is not None else None,
+    )
+
+
+def DelineateFlowPaths(
+    in_dem_filled: str | os.PathLike[str],
+    in_sink: str | os.PathLike[str],
+    out_flowpath: str | os.PathLike[str],
+    rain_intensity_cm_h: float = 5.0,
+    refined_dem: str | os.PathLike[str] | None = None,
+) -> str:
+    """ArcGIS-style wrapper for `delineate_flow_paths`; returns the output flow-path vector path."""
+    return str(
+        delineate_flow_paths(
+            in_dem_filled,
+            in_sink,
+            out_flowpath,
+            rain_intensity_cm_h=rain_intensity_cm_h,
+            refined_dem=refined_dem,
+        )["flowpath_vector_path"]
+    )
+
+
+def delineate_catchment_hierarchy(
+    in_dem: str | os.PathLike[str],
+    in_level_dir: str | os.PathLike[str],
+    out_catchment_img: str | os.PathLike[str],
+    compress: bool = False,
+) -> dict[str, Any]:
+    """Delineate nested catchment hierarchy across depression levels (ports 5_Catchment_Hierarchy.py)."""
+    return _lidar_rs.delineate_catchment_hierarchy(
+        _as_path_str(in_dem),
+        _as_path_str(in_level_dir),
+        _as_path_str(out_catchment_img),
+        compress,
+    )
+
+
+def CatchmentHierarchy(
+    in_dem: str | os.PathLike[str],
+    in_level_dir: str | os.PathLike[str],
+    out_catchment_img: str | os.PathLike[str],
+) -> str:
+    """ArcGIS-style wrapper for `delineate_catchment_hierarchy`; returns `catchment_hir.tif` path."""
+    return str(
+        delineate_catchment_hierarchy(in_dem, in_level_dir, out_catchment_img)[
+            "catchment_raster_path"
+        ]
+    )
+
+
+def simulate_inundation(
+    in_sink: str | os.PathLike[str],
+    in_catchment: str | os.PathLike[str],
+    out_dir: str | os.PathLike[str],
+    min_size: int = 1000,
+    min_depth: float = 0.2,
+    interval: float = 0.2,
+    rain_intensity_cm_h: float = 5.0,
+    rain_duration_h: float = 50.0,
+    time_step_h: float = 1.0,
+    compress: bool = False,
+) -> dict[str, Any]:
+    """Simulate surface inundation dynamics over time (ports 6_Simulate Inundation.py)."""
+    return _lidar_rs.simulate_inundation(
+        _as_path_str(in_sink),
+        _as_path_str(in_catchment),
+        _as_path_str(out_dir),
+        int(min_size),
+        float(min_depth),
+        float(interval),
+        float(rain_intensity_cm_h),
+        float(rain_duration_h),
+        float(time_step_h),
+        compress,
+    )
+
+
+def SimulateInundation(
+    in_sink: str | os.PathLike[str],
+    in_catchment: str | os.PathLike[str],
+    out_dir: str | os.PathLike[str],
+    min_size: int = 1000,
+    min_depth: float = 0.2,
+    interval: float = 0.2,
+    rain_intensity_cm_h: float = 5.0,
+    rain_duration_h: float = 50.0,
+    time_step_h: float = 1.0,
+) -> list[str]:
+    """ArcGIS-style wrapper for `simulate_inundation`; returns the list of `flood_*.tif` paths."""
+    return list(
+        simulate_inundation(
+            in_sink,
+            in_catchment,
+            out_dir,
+            min_size=min_size,
+            min_depth=min_depth,
+            interval=interval,
+            rain_intensity_cm_h=rain_intensity_cm_h,
+            rain_duration_h=rain_duration_h,
+            time_step_h=time_step_h,
+        )["frame_paths"]
+    )
+
+
+def animate_inundation(
+    in_dem: str | os.PathLike[str],
+    in_flood_dir: str | os.PathLike[str],
+    out_gif: str | os.PathLike[str],
+    frame_delay_ms: int = 200,
+    ping_pong: bool = True,
+    loops: int = 0,
+    water_alpha: float = 0.55,
+    max_dimension: int | None = None,
+    time_step_h: float | None = 1.0,
+    rain_intensity_cm_h: float | None = None,
+    azimuth_deg: float = 135.0,
+    elevation_deg: float = 45.0,
+) -> dict[str, Any]:
+    """Render a shaded-relief inundation animated GIF (ports 7_Play_Animation.py)."""
+    return _lidar_rs.animate_inundation(
+        _as_path_str(in_dem),
+        _as_path_str(in_flood_dir),
+        _as_path_str(out_gif),
+        int(frame_delay_ms),
+        bool(ping_pong),
+        int(loops),
+        float(water_alpha),
+        int(max_dimension) if max_dimension is not None else None,
+        float(time_step_h) if time_step_h is not None else None,
+        float(rain_intensity_cm_h) if rain_intensity_cm_h is not None else None,
+        float(azimuth_deg),
+        float(elevation_deg),
+    )
+
+
+def PlayAnimation(
+    in_dem: str | os.PathLike[str],
+    in_flood_dir: str | os.PathLike[str],
+    out_gif: str | os.PathLike[str] = "inundation.gif",
+    frame_delay_ms: int = 200,
+    ping_pong: bool = True,
+    loops: int = 0,
+    display: bool = False,
+    **kwargs: Any,
+) -> Any:
+    """Render an inundation animation GIF; when `display=True` in Jupyter/Colab, returns `IPython.display.Image`."""
+    res = animate_inundation(
+        in_dem,
+        in_flood_dir,
+        out_gif,
+        frame_delay_ms=frame_delay_ms,
+        ping_pong=ping_pong,
+        loops=loops,
+        **kwargs,
+    )
+    if display:
+        from IPython.display import Image
+
+        return Image(filename=res["gif_path"])
+    return str(res["gif_path"])
+
+
 # Snake-case aliases
 mean_filter = MeanFilter
 median_filter = MedianFilter
@@ -385,6 +585,11 @@ __all__ = [
     "ExtractSinks",
     "DelineateDepressions",
     "DelineateMounts",
+    "DelineateCatchments",
+    "DelineateFlowPaths",
+    "CatchmentHierarchy",
+    "SimulateInundation",
+    "PlayAnimation",
     "mean_filter",
     "median_filter",
     "gaussian_filter",
@@ -392,6 +597,11 @@ __all__ = [
     "extract_sinks",
     "delineate_depressions",
     "delineate_mounts",
+    "delineate_catchments",
+    "delineate_flow_paths",
+    "delineate_catchment_hierarchy",
+    "simulate_inundation",
+    "animate_inundation",
     "polygonize",
     "mosaic",
     "reproject_image",
