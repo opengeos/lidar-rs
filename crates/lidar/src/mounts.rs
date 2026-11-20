@@ -11,8 +11,13 @@ use richdem::{Array2D, DemNum, Topology, load_raster, save_raster};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::filling::{ExtractSinksOptions, ExtractSinksResult, extract_sinks};
-use crate::slicing::{DelineateOptions, DelineateResult, delineate_depressions};
+use crate::filling::{
+    ExtractSinksOptions, ExtractSinksResult, extract_sinks, extract_sinks_in_memory,
+};
+use crate::slicing::{
+    DelineateOptions, DelineateResult, InMemoryDepressions, delineate_depressions,
+    delineate_depressions_in_memory,
+};
 
 /// Output paths and metadata produced by [`delineate_mounts`].
 #[derive(Debug, Clone)]
@@ -111,6 +116,22 @@ pub fn flip_dem_file(
         )?;
     }
     Ok(flipped)
+}
+
+/// Delineates the nested hierarchy of elevated features (mounts, buildings, tree crowns)
+/// completely in memory with zero filesystem I/O.
+///
+/// Flips the input DSM (`delta = 100.0`), extracts sinks with D8 topology, and runs
+/// [`delineate_depressions_in_memory`] on the inverted surface.
+pub fn delineate_mounts_in_memory(
+    dsm: &Array2D<f64>,
+    min_size: usize,
+    min_height: f64,
+    interval: f64,
+) -> Result<InMemoryDepressions> {
+    let flipped = flip_dem(dsm, 100.0)?;
+    let sinks = extract_sinks_in_memory(&flipped, min_size, Topology::D8)?;
+    delineate_depressions_in_memory(&sinks.sink, min_size, min_height, interval)
 }
 
 /// Delineates the nested hierarchy of elevated features (mounts, buildings, tree crowns)

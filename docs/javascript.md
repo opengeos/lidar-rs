@@ -23,7 +23,7 @@ const demBytes = new Uint8Array(await (await fetch("dem.tif")).arrayBuffer());
 const info = JSON.parse(rasterInfo(demBytes, "dem.tif"));
 console.log(`${info.width}×${info.height}`, info.min, "→", info.max);
 
-// Run the full 7-step hydrology & inundation pipeline in memory
+// Run the full hydrology & inundation pipeline in memory
 const sim = simulateInundation(
   demBytes,
   "dem.tif",
@@ -34,14 +34,12 @@ const sim = simulateInundation(
   5.0,   // rain intensity (cm/h)
   20.0,  // rain duration (hours)
   1.0,   // time step (hours)
-  150,   // GIF frame delay (ms)
-  true,  // ping-pong (rising + falling water)
-  400,   // max GIF dimension (px, 0 = original)
 );
 
 try {
-  // Display the animated shaded-relief inundation GIF
-  const gifUrl = URL.createObjectURL(new Blob([sim.gifBytes()], { type: "image/gif" }));
+  // Encode the animated shaded-relief inundation GIF on demand
+  const gifBytes = sim.encodeGif(150, true, 400); // delay ms, ping-pong, max dim px
+  const gifUrl = URL.createObjectURL(new Blob([gifBytes], { type: "image/gif" }));
   document.querySelector("#inundation-gif").src = gifUrl;
 
   // Render the shaded-relief preview onto an HTML5 <canvas>
@@ -124,7 +122,7 @@ try {
 | `delineateDepressions` | `(sinkBytes, filename, minSize, minDepth, interval)` | `DepressionsOutput` (`width`, `height`, `maxLevel`, `numRegions`, `depressionsJson()`, `idTif()`, `levelTif()`, `geojson()`, `levelRgba()`) |
 | `delineateMounts` | `(dsmBytes, filename, minSize, minHeight, interval)` | `DepressionsOutput` (same fields as `delineateDepressions`) |
 | `delineateCatchments` | `(demBytes, sinkOrRegionBytes, filename)` | `CatchmentsOutput` (`recordsJson()`, `watershedTif()`, `geojson()`) |
-| `simulateInundation` | `(demBytes, filename, kernelSize, minSize, minDepth, interval, rainIntensityCmH, rainDurationH, timeStepH, frameDelayMs, pingPong, maxDim)` | `InundationOutput` (`width`, `height`, `maxLevel`, `numRegions`, `frameCount`, `gifWidth`, `gifHeight`, `depressionsJson()`, `catchmentHierarchyJson()`, `stepsJson()`, `gifBytes()`, `fillTimeTif()`, `catchmentHirTif()`, `sinkTif()`, `levelTif()`, `depressionsGeojson()`, `hillshadeRgba()`, `depthRgba()`, `levelRgba()`, `fillTimeRgba()`, `fillTimeValues()`) |
+| `simulateInundation` | `(demBytes, filename, kernelSize, minSize, minDepth, interval, rainIntensityCmH, rainDurationH, timeStepH)` | `InundationOutput` (`width`, `height`, `projection`, `maxLevel`, `numRegions`, `numSteps`, `depressionsJson()`, `catchmentHierarchyJson()`, `stepsJson()`, `encodeGif(frameDelayMs, pingPong, maxDim)`, `fillTimeTif()`, `catchmentHirTif()`, `sinkTif()`, `levelTif()`, `depressionsGeojson()`, `hillshadeRgba()`, `depthRgba()`, `levelRgba()`, `fillTimeRgba()`, `fillTimeValues()`) |
 
 !!! tip "Memory Management"
     `SinksOutput`, `DepressionsOutput`, `CatchmentsOutput`, and `InundationOutput` hold WebAssembly heap allocations. Call `.free()` (ideally in a `finally` block) once you have copied the buffers or strings you need.

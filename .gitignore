@@ -17,5 +17,4 @@ build/
 *.pyd
 js/pkg/
 js/pkg-node/
-js/Cargo.lock
 site/

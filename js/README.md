@@ -30,12 +30,10 @@ const sim = simulateInundation(
   5.0,   // rain intensity (cm/h)
   20.0,  // rain duration (h)
   1.0,   // time step (h)
-  150,   // GIF frame delay (ms)
-  true,  // ping-pong (rising then falling)
-  400,   // max GIF dimension (px)
 );
 
-const gifUrl = URL.createObjectURL(new Blob([sim.gifBytes()], { type: "image/gif" }));
+const gifBytes = sim.encodeGif(150, true, 400); // delay ms, ping-pong, max dim px
+const gifUrl = URL.createObjectURL(new Blob([gifBytes], { type: "image/gif" }));
 document.querySelector("#anim").src = gifUrl;
 console.log(JSON.parse(sim.depressionsJson()));
 sim.free();

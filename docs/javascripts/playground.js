@@ -14,6 +14,10 @@
   let modulePromise = null;
   let loadedFile = null; // { bytes: Uint8Array, name: string }
   let activeObjectUrls = [];
+  let currentSim = null; // retained for lazy on-demand GIF encoding; freed on replace/unload
+  let currentSimStem = "";
+  let cachedGifUrl = null;
+  let loadGeneration = 0;
   let runToken = 0;
 
   // Interactive inundation player state
@@ -48,6 +52,16 @@
       URL.revokeObjectURL(url);
     }
     activeObjectUrls = [];
+    cachedGifUrl = null;
+  }
+
+  function releaseSim() {
+    if (currentSim) {
+      currentSim.free();
+      currentSim = null;
+    }
+    currentSimStem = "";
+    cachedGifUrl = null;
   }
 
   function stopPlayer() {
@@ -62,8 +76,36 @@
     if (btn) btn.textContent = "Play";
   }
 
-  function nextFrame() {
-    return new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve, 0)));
+  // Yields to the browser event loop without depending on requestAnimationFrame
+  // (which pauses in background tabs).
+  function nextTick() {
+    return new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  /** Infers linear-squared area unit label from a WKT/PROJ projection string. */
+  function detectAreaUnit(projection) {
+    const p = (projection || "").toLowerCase();
+    if (!p) return "units²";
+    const isProjected =
+      p.includes("projcs[") || p.includes("projcrs[") || p.includes("+proj=utm") || p.includes("+proj=aea") || p.includes("+proj=lcc") || p.includes("+proj=merc");
+    if (!isProjected && (p.includes("geogcs[") || p.includes("geogcrs[") || p.includes("epsg:4326") || p.includes("+proj=longlat"))) {
+      return "deg²";
+    }
+    if (p.includes("foot") || p.includes("feet") || p.includes("us_survey_foot")) {
+      return "ft²";
+    }
+    if (p.includes("metre") || p.includes("meter") || p.includes("unit[\"m\"") || isProjected) {
+      return "m²";
+    }
+    return "units²";
+  }
+
+  function formatArea(area, unit) {
+    if (!Number.isFinite(area)) return `— ${unit}`;
+    if (unit === "deg²" || (area > 0 && area < 1)) {
+      return `${area.toPrecision(4)} ${unit}`;
+    }
+    return `${area.toLocaleString(undefined, { maximumFractionDigits: 0 })} ${unit}`;
   }
 
   function drawRgba(canvas, width, height, rgba, baseRgba) {
@@ -96,12 +138,22 @@
 
   function renderPlayerFrame() {
     if (!player) return;
-    const { width, height, hillshade, fillTimes, steps, rainIntensity, frameBuf, stepIdx, direction } =
-      player;
+    const {
+      width,
+      height,
+      hillshade,
+      fillTimes,
+      steps,
+      rainIntensity,
+      areaUnit,
+      frameBuf,
+      stepIdx,
+      direction,
+    } = player;
     const step = steps[stepIdx];
     const tHours = step ? step.time_hours : 0;
 
-    // Composite live water inundation over shaded-relief DEM
+    // Composite live water inundation over shaded-relief DEM using full-precision f64 fill times
     const alpha = 0.72;
     const inv = 1 - alpha;
     const wr = 20;
@@ -112,8 +164,8 @@
       const p = i * 4;
       const ft = fillTimes[i];
       if (ft >= 0 && ft <= tHours) {
-        // Slightly deeper blue for cells inundated earlier
-        const freshness = tHours > 0 ? Math.min(1, Math.max(0, (tHours - ft) / Math.max(tHours, 1))) : 0;
+        const freshness =
+          tHours > 0 ? Math.min(1, Math.max(0, (tHours - ft) / Math.max(tHours, 1))) : 0;
         const r = Math.round(wr * (1 - 0.35 * freshness));
         const g = Math.round(wg * (1 - 0.3 * freshness));
         const b = Math.round(wb * (1 - 0.12 * freshness));
@@ -145,9 +197,9 @@
       const totalHours = steps[steps.length - 1].time_hours;
       const cumRain = (tHours * rainIntensity).toFixed(1);
       const pct = (step.inundated_fraction * 100).toFixed(1);
-      const areaStr = step.inundated_area.toLocaleString(undefined, { maximumFractionDigits: 0 });
+      const areaStr = formatArea(step.inundated_area, areaUnit);
       telemetry.textContent =
-        `${phase} · T = ${tHours.toFixed(1)} / ${totalHours.toFixed(1)} h · Rain: ${cumRain} cm · Inundated: ${step.inundated_cells.toLocaleString()} cells (${areaStr} m², ${pct}% of sinks)`;
+        `${phase} · T = ${tHours.toFixed(1)} / ${totalHours.toFixed(1)} h · Rain: ${cumRain} cm · Inundated: ${step.inundated_cells.toLocaleString()} cells (${areaStr}, ${pct}% of sinks)`;
     }
 
     renderInundationChart();
@@ -169,7 +221,6 @@
 
     ctx.clearRect(0, 0, w, h);
 
-    // Detect dark vs light theme color from computed body color
     const fg = getComputedStyle(document.body).color || "#333";
     const gridColor = "rgba(128,128,128,0.22)";
     const maxT = Math.max(steps[steps.length - 1].time_hours, 1e-6);
@@ -177,7 +228,6 @@
     const xOf = (t) => pad.left + (t / maxT) * pw;
     const yOf = (frac) => pad.top + ph * (1 - Math.min(1, Math.max(0, frac)));
 
-    // Grid lines (0%, 25%, 50%, 75%, 100%)
     ctx.strokeStyle = gridColor;
     ctx.lineWidth = 1;
     ctx.font = "11px sans-serif";
@@ -193,17 +243,14 @@
       ctx.fillText(`${Math.round(frac * 100)}%`, pad.left - 6, y);
     }
 
-    // X-axis ticks
     ctx.textAlign = "center";
     ctx.textBaseline = "top";
     const ticks = 4;
     for (let i = 0; i <= ticks; i++) {
       const t = (maxT * i) / ticks;
-      const x = xOf(t);
-      ctx.fillText(`${t.toFixed(0)}h`, x, pad.top + ph + 6);
+      ctx.fillText(`${t.toFixed(0)}h`, xOf(t), pad.top + ph + 6);
     }
 
-    // Filled area under curve
     ctx.beginPath();
     ctx.moveTo(xOf(0), yOf(0));
     for (const s of steps) {
@@ -214,7 +261,6 @@
     ctx.fillStyle = "rgba(20, 115, 225, 0.18)";
     ctx.fill();
 
-    // Curve stroke
     ctx.beginPath();
     ctx.moveTo(xOf(0), yOf(0));
     for (const s of steps) {
@@ -224,7 +270,6 @@
     ctx.lineWidth = 2.2;
     ctx.stroke();
 
-    // Current time marker
     const cur = steps[stepIdx];
     if (cur) {
       const cx = xOf(cur.time_hours);
@@ -276,7 +321,7 @@
     playTimer = setInterval(stepPlayer, delayMs);
   }
 
-  function initPlayer(width, height, hillshade, fillTimes, steps, rainIntensity) {
+  function initPlayer(width, height, hillshade, fillTimes, steps, rainIntensity, areaUnit) {
     stopPlayer();
     player = {
       width,
@@ -285,6 +330,7 @@
       fillTimes,
       steps,
       rainIntensity,
+      areaUnit,
       frameBuf: new Uint8ClampedArray(width * height * 4),
       stepIdx: 0,
       direction: 1,
@@ -302,6 +348,26 @@
     }
   }
 
+  async function ensureGifUrl() {
+    if (cachedGifUrl) return cachedGifUrl;
+    if (!currentSim) throw new Error("No active inundation simulation");
+    const pingPong = $("lp-pingpong") ? $("lp-pingpong").checked : true;
+    setStatus("Encoding animated inundation GIF in WebAssembly…");
+    await nextTick();
+    const t0 = performance.now();
+    const gifBytes = currentSim.encodeGif(150, pingPong, 400);
+    const elapsed = performance.now() - t0;
+    const url = URL.createObjectURL(new Blob([gifBytes], { type: "image/gif" }));
+    activeObjectUrls.push(url);
+    cachedGifUrl = url;
+    const gifImg = $("lp-gif");
+    if (gifImg) gifImg.src = url;
+    setStatus(
+      `Encoded animated inundation GIF (${(gifBytes.length / 1024).toFixed(0)} KB) in ${elapsed.toFixed(0)} ms.`,
+    );
+    return url;
+  }
+
   function renderSummary(items) {
     const el = $("lp-summary");
     el.innerHTML = "";
@@ -317,9 +383,30 @@
     }
   }
 
-  function renderDownloads(files) {
+  function renderDownloads(files, includeLazyGif) {
     const el = $("lp-downloads");
     el.innerHTML = "";
+    if (includeLazyGif) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "md-button";
+      btn.textContent = "Export Inundation GIF";
+      btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        try {
+          const url = await ensureGifUrl();
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `${currentSimStem}_inundation.gif`;
+          a.click();
+        } catch (e) {
+          setStatus(`GIF export failed: ${errMsg(e)}`, true);
+        } finally {
+          btn.disabled = false;
+        }
+      });
+      el.appendChild(btn);
+    }
     for (const { label, filename, data, mime } of files) {
       const blob = new Blob([data], { type: mime });
       const url = URL.createObjectURL(blob);
@@ -386,17 +473,15 @@
 
     const runBtn = $("lp-run");
     runBtn.disabled = true;
-    stopPlayer();
     setStatus(
       `Running ${mode === "inundation" ? "inundation simulation" : "mount delineation"} on ${loadedFile.name} in WebAssembly…`,
     );
-    await nextFrame();
+    await nextTick();
 
     try {
       const wasm = await loadWasm();
       if (token !== runToken) return;
 
-      clearObjectUrls();
       const t0 = performance.now();
       const stem = loadedFile.name.replace(/\.[^.]+$/, "");
 
@@ -411,69 +496,74 @@
           rain,
           duration,
           step,
-          150,
-          true,
-          400,
         );
-        try {
-          const elapsed = performance.now() - t0;
-          const w = sim.width;
-          const h = sim.height;
-          const hill = sim.hillshadeRgba();
-          const depth = sim.depthRgba();
-          const level = sim.levelRgba();
-          const fill = sim.fillTimeRgba();
-          const fillTimes = sim.fillTimeValues();
-          const gifBytes = sim.gifBytes();
-          const depressions = JSON.parse(sim.depressionsJson());
-          const steps = JSON.parse(sim.stepsJson());
-          const lastStep = steps.length > 0 ? steps[steps.length - 1] : null;
+        if (token !== runToken) {
+          sim.free();
+          return;
+        }
+        // Only discard previous results and object URLs once the new run succeeds.
+        stopPlayer();
+        releaseSim();
+        clearObjectUrls();
+        currentSim = sim;
+        currentSimStem = stem;
 
-          $("lp-results").hidden = false;
-          $("lp-player-section").hidden = false;
-          $("lp-fig-depth").hidden = false;
-          $("lp-fig-fill").hidden = false;
-          $("lp-cap-level").textContent = "Nested Depression Levels (over hillshade)";
+        const elapsed = performance.now() - t0;
+        const w = sim.width;
+        const h = sim.height;
+        const areaUnit = detectAreaUnit(sim.projection);
+        const hill = sim.hillshadeRgba();
+        const depth = sim.depthRgba();
+        const level = sim.levelRgba();
+        const fill = sim.fillTimeRgba();
+        const fillTimes = sim.fillTimeValues();
+        const depressions = JSON.parse(sim.depressionsJson());
+        const steps = JSON.parse(sim.stepsJson());
+        const lastStep = steps.length > 0 ? steps[steps.length - 1] : null;
 
-          const gifUrl = URL.createObjectURL(new Blob([gifBytes], { type: "image/gif" }));
-          activeObjectUrls.push(gifUrl);
-          $("lp-gif").src = gifUrl;
+        $("lp-results").hidden = false;
+        $("lp-player-section").hidden = false;
+        $("lp-fig-depth").hidden = false;
+        $("lp-fig-fill").hidden = false;
+        $("lp-cap-level").textContent = "Nested Depression Levels (over hillshade)";
+        const gifDetails = $("lp-gif-details");
+        if (gifDetails) gifDetails.open = false;
+        const gifImg = $("lp-gif");
+        if (gifImg) gifImg.removeAttribute("src");
 
-          initPlayer(w, h, hill, fillTimes, steps, rain);
+        initPlayer(w, h, hill, fillTimes, steps, rain, areaUnit);
 
-          drawRgba($("lp-c-hillshade"), w, h, hill, null);
-          drawRgba($("lp-c-depth"), w, h, depth, hill);
-          drawRgba($("lp-c-level"), w, h, level, hill);
-          drawRgba($("lp-c-fill"), w, h, fill, hill);
+        drawRgba($("lp-c-hillshade"), w, h, hill, null);
+        drawRgba($("lp-c-depth"), w, h, depth, hill);
+        drawRgba($("lp-c-level"), w, h, level, hill);
+        drawRgba($("lp-c-fill"), w, h, fill, hill);
 
-          renderSummary([
-            ["Raster Size", `${w} × ${h}`],
-            ["Sink Regions", String(sim.numRegions)],
-            ["Nested Depressions", String(depressions.length)],
-            ["Max Level", String(sim.maxLevel)],
-            ["Final Inundated", lastStep ? `${(lastStep.inundated_fraction * 100).toFixed(1)}%` : "0%"],
-            ["Time Steps", String(steps.length)],
-            ["WASM Runtime", `${elapsed.toFixed(0)} ms`],
-          ]);
+        renderSummary([
+          ["Raster Size", `${w} × ${h}`],
+          ["Sink Regions", String(sim.numRegions)],
+          ["Nested Depressions", String(depressions.length)],
+          ["Max Level", String(sim.maxLevel)],
+          ["Final Inundated", lastStep ? `${(lastStep.inundated_fraction * 100).toFixed(1)}%` : "0%"],
+          ["Time Steps", String(steps.length)],
+          ["WASM Runtime", `${elapsed.toFixed(0)} ms`],
+        ]);
 
-          renderDownloads([
-            { label: "Inundation GIF", filename: `${stem}_inundation.gif`, data: gifBytes, mime: "image/gif" },
+        renderDownloads(
+          [
             { label: "Depressions GeoJSON", filename: `${stem}_depressions.geojson`, data: sim.depressionsGeojson(), mime: "application/geo+json" },
             { label: "Depression Level GeoTIFF", filename: `${stem}_level.tif`, data: sim.levelTif(), mime: "image/tiff" },
             { label: "Fill Time GeoTIFF", filename: `${stem}_fill_time.tif`, data: sim.fillTimeTif(), mime: "image/tiff" },
             { label: "Catchment Hierarchy GeoTIFF", filename: `${stem}_catchment_hir.tif`, data: sim.catchmentHirTif(), mime: "image/tiff" },
             { label: "Sink GeoTIFF", filename: `${stem}_sink.tif`, data: sim.sinkTif(), mime: "image/tiff" },
-          ]);
+          ],
+          true,
+        );
 
-          renderTable(depressions);
-          setStatus(
-            `lidar-rs ${wasm.version()}: simulated ${steps.length} inundation steps across ${depressions.length} nested depressions (${sim.maxLevel} levels) in ${elapsed.toFixed(0)} ms.`,
-          );
-        } finally {
-          sim.free();
-        }
+        renderTable(depressions);
+        setStatus(
+          `lidar-rs ${wasm.version()}: simulated ${steps.length} inundation steps across ${depressions.length} nested depressions (${sim.maxLevel} levels) in ${elapsed.toFixed(0)} ms.`,
+        );
       } else {
-        player = null;
         const hill = wasm.hillshadeRgba(loadedFile.bytes, loadedFile.name, 315.0, 45.0, 1.5);
         const mounts = wasm.delineateMounts(
           loadedFile.bytes,
@@ -483,6 +573,12 @@
           interval,
         );
         try {
+          if (token !== runToken) return;
+          stopPlayer();
+          releaseSim();
+          clearObjectUrls();
+          player = null;
+
           const elapsed = performance.now() - t0;
           const w = mounts.width;
           const h = mounts.height;
@@ -506,11 +602,14 @@
             ["WASM Runtime", `${elapsed.toFixed(0)} ms`],
           ]);
 
-          renderDownloads([
-            { label: "Mounts GeoJSON", filename: `${stem}_mounts.geojson`, data: mounts.geojson(), mime: "application/geo+json" },
-            { label: "Mount Level GeoTIFF", filename: `${stem}_mount_level.tif`, data: mounts.levelTif(), mime: "image/tiff" },
-            { label: "Mount ID GeoTIFF", filename: `${stem}_mount_id.tif`, data: mounts.idTif(), mime: "image/tiff" },
-          ]);
+          renderDownloads(
+            [
+              { label: "Mounts GeoJSON", filename: `${stem}_mounts.geojson`, data: mounts.geojson(), mime: "application/geo+json" },
+              { label: "Mount Level GeoTIFF", filename: `${stem}_mount_level.tif`, data: mounts.levelTif(), mime: "image/tiff" },
+              { label: "Mount ID GeoTIFF", filename: `${stem}_mount_id.tif`, data: mounts.idTif(), mime: "image/tiff" },
+            ],
+            false,
+          );
 
           renderTable(features);
           setStatus(
@@ -532,17 +631,22 @@
   }
 
   async function loadFile(file) {
+    const gen = ++loadGeneration;
     try {
       const bytes = new Uint8Array(await file.arrayBuffer());
+      if (gen !== loadGeneration) return;
       loadedFile = { bytes, name: file.name };
       $("lp-run").disabled = false;
       await runAnalysis();
     } catch (e) {
-      setStatus(`Could not read ${file.name}: ${errMsg(e)}`, true);
+      if (gen === loadGeneration) {
+        setStatus(`Could not read ${file.name}: ${errMsg(e)}`, true);
+      }
     }
   }
 
   async function loadSample(kind) {
+    const gen = ++loadGeneration;
     const url = SAMPLE_URLS[kind];
     const name = `${kind}.tif`;
     try {
@@ -550,21 +654,26 @@
       const resp = await fetch(url);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const bytes = new Uint8Array(await resp.arrayBuffer());
+      if (gen !== loadGeneration) return;
       loadedFile = { bytes, name };
       $("lp-mode").value = kind === "dsm" ? "mounts" : "inundation";
       syncModeFields();
       $("lp-run").disabled = false;
       await runAnalysis();
     } catch (e) {
-      setStatus(`Could not load sample ${name}: ${errMsg(e)}`, true);
+      if (gen === loadGeneration) {
+        setStatus(`Could not load sample ${name}: ${errMsg(e)}`, true);
+      }
     }
   }
 
   function init() {
     const root = $("lidar-playground");
     if (!root) {
+      loadGeneration++;
       runToken++;
       stopPlayer();
+      releaseSim();
       player = null;
       clearObjectUrls();
       loadedFile = null;
@@ -588,6 +697,21 @@
     $("lp-sample-dsm").addEventListener("click", () => loadSample("dsm"));
     $("lp-file").addEventListener("change", (e) => {
       if (e.target.files[0]) loadFile(e.target.files[0]);
+    });
+
+    // Lazy GIF preview when user opens the collapsible preview
+    const gifDetails = $("lp-gif-details");
+    if (gifDetails) {
+      gifDetails.addEventListener("toggle", () => {
+        if (gifDetails.open && currentSim && !cachedGifUrl) {
+          ensureGifUrl().catch((e) => setStatus(`GIF preview failed: ${errMsg(e)}`, true));
+        }
+      });
+    }
+
+    // Invalidate cached GIF when ping-pong option changes
+    $("lp-pingpong").addEventListener("change", () => {
+      cachedGifUrl = null;
     });
 
     // Interactive inundation player controls
@@ -634,7 +758,10 @@
       const padRight = 16;
       const scaleX = e.currentTarget.width / rect.width;
       const x = (e.clientX - rect.left) * scaleX;
-      const frac = Math.min(1, Math.max(0, (x - padLeft) / (e.currentTarget.width - padLeft - padRight)));
+      const frac = Math.min(
+        1,
+        Math.max(0, (x - padLeft) / (e.currentTarget.width - padLeft - padRight)),
+      );
       stopPlayer();
       player.stepIdx = Math.round(frac * (player.steps.length - 1));
       renderPlayerFrame();

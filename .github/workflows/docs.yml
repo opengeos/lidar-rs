@@ -46,7 +46,7 @@ jobs:
           test -f site/install.ps1
       - name: Build browser WASM bundle and copy sample rasters for Playground
         run: |
-          (cd js && wasm-pack build --target web --release --out-dir ../site/wasm)
+          (cd js && wasm-pack build --target web --release --out-dir ../site/wasm -- --locked)
           rm -f site/wasm/.gitignore
           mkdir -p site/samples
           cp test_data/dem.tif test_data/dsm.tif site/samples/

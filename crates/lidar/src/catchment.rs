@@ -358,56 +358,69 @@ fn is_raster_extension(path: &Path) -> bool {
     )
 }
 
+/// Extracts 1-based sink labels (`0` = background) from an in-memory sink/region raster
+/// validated against `dem`'s grid.
+///
+/// Preserves dense `1..=N` integer region IDs (matching `region.tif`) while falling back
+/// to 4-connected [`region_group`] for elevation sink rasters (e.g. `sink.tif`) or sparse
+/// binary masks.
+pub fn extract_sink_labels_from_raster(
+    dem: &Array2D<f64>,
+    sink_arr: &Array2D<f64>,
+) -> Result<Vec<u32>> {
+    validate_same_grid(dem, sink_arr, "sink raster")?;
+    let nd = sink_arr.no_data();
+    let mut all_pos_int = true;
+    let mut unique_ids: HashSet<u32> = HashSet::new();
+    let mut max_id = 0u32;
+    for &v in sink_arr.data() {
+        if !v.is_finite() || v.rd_eq(nd) || v == 0.0 {
+            continue;
+        }
+        if v < 0.0 || v.fract() != 0.0 || v > u32::MAX as f64 {
+            all_pos_int = false;
+            break;
+        }
+        let id = v as u32;
+        unique_ids.insert(id);
+        if id > max_id {
+            max_id = id;
+        }
+    }
+    // Only treat the raster as pre-labeled region IDs when its positive values form a
+    // dense 1..=N integer sequence (matching `region.tif`). Integer-valued elevation
+    // rasters (e.g., elevations 100..150) fall through to 4-connected `region_group`.
+    let is_dense_label_map =
+        all_pos_int && !unique_ids.is_empty() && max_id as usize == unique_ids.len();
+    if is_dense_label_map {
+        let labels = sink_arr
+            .data()
+            .iter()
+            .map(|&v| {
+                if !v.is_finite() || v.rd_eq(nd) || v <= 0.0 {
+                    0
+                } else {
+                    v as u32
+                }
+            })
+            .collect();
+        Ok(labels)
+    } else {
+        // Elevation sink raster (e.g. sink.tif) or non-dense 0-background mask: group
+        // valid nonzero foreground cells into 4-connected regions.
+        let (labels, _) = region_group(sink_arr.data(), dem.width(), dem.height(), 1, |v| {
+            v.is_finite() && !v.rd_eq(nd) && v != 0.0
+        });
+        Ok(labels)
+    }
+}
+
 /// Loads a sink raster (dense 1..=N integer region IDs or elevation mask) or rasterizes
 /// a sink polygon vector onto `dem`'s exact grid, returning 1-based sink labels (`0` = background).
 fn load_or_rasterize_sink_labels(in_sink: &Path, dem: &Array2D<f64>) -> Result<Vec<u32>> {
     if is_raster_extension(in_sink) {
         let sink_arr = load_raster::<f64>(in_sink, None)?;
-        validate_same_grid(dem, &sink_arr, "sink raster")?;
-        let nd = sink_arr.no_data();
-        let mut all_pos_int = true;
-        let mut unique_ids: HashSet<u32> = HashSet::new();
-        let mut max_id = 0u32;
-        for &v in sink_arr.data() {
-            if !v.is_finite() || v.rd_eq(nd) || v == 0.0 {
-                continue;
-            }
-            if v < 0.0 || v.fract() != 0.0 || v > u32::MAX as f64 {
-                all_pos_int = false;
-                break;
-            }
-            let id = v as u32;
-            unique_ids.insert(id);
-            if id > max_id {
-                max_id = id;
-            }
-        }
-        // Only treat the raster as pre-labeled region IDs when its positive values form a
-        // dense 1..=N integer sequence (matching `region.tif`). Integer-valued elevation
-        // rasters (e.g., elevations 100..150) fall through to 4-connected `region_group`.
-        let is_dense_label_map =
-            all_pos_int && !unique_ids.is_empty() && max_id as usize == unique_ids.len();
-        if is_dense_label_map {
-            let labels = sink_arr
-                .data()
-                .iter()
-                .map(|&v| {
-                    if !v.is_finite() || v.rd_eq(nd) || v <= 0.0 {
-                        0
-                    } else {
-                        v as u32
-                    }
-                })
-                .collect();
-            Ok(labels)
-        } else {
-            // Elevation sink raster (e.g. sink.tif) or non-dense 0-background mask: group
-            // valid nonzero foreground cells into 4-connected regions.
-            let (labels, _) = region_group(sink_arr.data(), dem.width(), dem.height(), 1, |v| {
-                v.is_finite() && !v.rd_eq(nd) && v != 0.0
-            });
-            Ok(labels)
-        }
+        extract_sink_labels_from_raster(dem, &sink_arr)
     } else {
         let (labels, _) = rasterize_vector_to_labels(in_sink, dem)?;
         Ok(labels)
@@ -651,6 +664,118 @@ pub fn write_catchments_csv(records: &[CatchmentRecord], path: impl AsRef<Path>)
     Ok(())
 }
 
+struct LevelCatchmentStats {
+    watershed: Array2D<u32>,
+    records: Vec<CatchmentHierarchyRecord>,
+    cat_area_by_id: HashMap<u32, f64>,
+}
+
+/// Shared per-level catchment watershed & zonal DEM statistics helper used by both
+/// [`delineate_catchment_hierarchy`] and [`delineate_catchment_hierarchy_in_memory`].
+fn compute_level_catchment_stats(
+    dem: &Array2D<f64>,
+    flowdirs: &Array2D<u8>,
+    cell_area: f64,
+    level: u32,
+    labels: &[u32],
+) -> Result<LevelCatchmentStats> {
+    let watershed = d8_watersheds(flowdirs, labels)?;
+
+    let mut cat_counts: HashMap<u32, usize> = HashMap::new();
+    for &cid in watershed.data() {
+        if cid > 0 {
+            *cat_counts.entry(cid).or_insert(0) += 1;
+        }
+    }
+
+    // Accumulators per depression label: (count, min, max, sum, sum_sq).
+    let mut zonal: BTreeMap<u32, (usize, f64, f64, f64, f64)> = BTreeMap::new();
+    let dem_data = dem.data();
+    for (idx, &lbl) in labels.iter().enumerate() {
+        if lbl == 0 {
+            continue;
+        }
+        let z = dem_data[idx];
+        if is_missing(dem, z) {
+            continue;
+        }
+        let e = zonal
+            .entry(lbl)
+            .or_insert((0, f64::INFINITY, f64::NEG_INFINITY, 0.0, 0.0));
+        e.0 += 1;
+        if z < e.1 {
+            e.1 = z;
+        }
+        if z > e.2 {
+            e.2 = z;
+        }
+        e.3 += z;
+        e.4 += z * z;
+    }
+
+    let mut cat_area_by_id: HashMap<u32, f64> = HashMap::new();
+    let mut records = Vec::with_capacity(zonal.len());
+    for (fid, (count, zmin, zmax, zsum, zsum_sq)) in zonal {
+        if count == 0 {
+            continue;
+        }
+        let c_cells = cat_counts.get(&fid).copied().unwrap_or(count);
+        let area = count as f64 * cell_area;
+        let cat_area = c_cells as f64 * cell_area;
+        let dep_to_cat_ratio = if cat_area > 0.0 { area / cat_area } else { 0.0 };
+        let mean_elev = zsum / count as f64;
+        let variance = ((zsum_sq / count as f64) - mean_elev * mean_elev).max(0.0);
+        let std_elev = variance.sqrt();
+        let range = zmax - zmin;
+        let volume = ((count as f64) * zmax - zsum).max(0.0) * cell_area;
+        let mean_depth = if area > 0.0 { volume / area } else { 0.0 };
+
+        cat_area_by_id.insert(fid, cat_area);
+        records.push(CatchmentHierarchyRecord {
+            level,
+            level_fid: fid,
+            count,
+            area,
+            cat_area,
+            dep_to_cat_ratio,
+            min_elev: zmin,
+            max_elev: zmax,
+            range,
+            mean_elev,
+            std_elev,
+            sum_elev: zsum,
+            volume,
+            mean_depth,
+        });
+    }
+
+    Ok(LevelCatchmentStats {
+        watershed,
+        records,
+        cat_area_by_id,
+    })
+}
+
+/// Paints a level's catchment areas into `hir_data` for cells that have not yet been
+/// claimed by a lower level (`hir_data[idx] == 0.0`). Processing levels in ascending order
+/// (`1..=max_level`) gives the same precedence as painting in descending order with overwrite,
+/// while releasing each level's label grid immediately (O(1) peak label memory).
+fn paint_unclaimed_catchment_area(
+    hir_data: &mut [f64],
+    labels: &[u32],
+    cat_area_by_id: &HashMap<u32, f64>,
+) {
+    for (dst, &lbl) in hir_data.iter_mut().zip(labels.iter()) {
+        if *dst == 0.0
+            && lbl > 0
+            && let Some(&area) = cat_area_by_id.get(&lbl)
+            && area > 0.0
+        {
+            *dst = area;
+        }
+    }
+}
+
 /// Parses the integer level number from filenames like `Single_level_1.shp` or `Single_level_02.tif`.
 fn parse_single_level_number(path: &Path) -> Option<u32> {
     let stem = path.file_stem()?.to_str()?;
@@ -740,12 +865,10 @@ pub fn delineate_catchment_hierarchy(
     let mut catchment_shapefiles = Vec::with_capacity(level_files.len());
     let mut level_shapefiles = Vec::with_capacity(level_files.len());
     let mut all_records: Vec<CatchmentHierarchyRecord> = Vec::new();
-
-    // Store per-level `(level, labels, cat_area_by_id)` so we can paint catchment_hir.tif
-    // from highest level down to level 1 (innermost levels overwrite inner footprints while
-    // outer rims retain their enclosing level's catchment area).
-    let mut level_rasters: Vec<(u32, Vec<u32>, HashMap<u32, f64>)> =
-        Vec::with_capacity(level_files.len());
+    // Paint ascending levels (1..=max_level) only into unclaimed cells (`0.0`), releasing
+    // each level's label grid immediately (O(1) peak label memory) while preserving lowest-level
+    // precedence for inner footprints and outer-rim catchment areas.
+    let mut hir_data_f64 = vec![0.0f64; w * h];
 
     let mut merged_layer =
         Layer::new("Merge_levels".to_string()).with_geom_type(GeometryType::Polygon);
@@ -811,84 +934,24 @@ pub fn delineate_catchment_hierarchy(
             rasterize_vector_to_labels(path, &dem)?
         };
 
-        let watershed = d8_watersheds(&flowdirs, &labels)?;
+        let stats = compute_level_catchment_stats(&dem, &flowdirs, cell_area, *level, &labels)?;
+        paint_unclaimed_catchment_area(&mut hir_data_f64, &labels, &stats.cat_area_by_id);
 
-        // Compute per-feature catchment pixel counts and zonal DEM statistics.
-        let mut cat_counts: HashMap<u32, usize> = HashMap::new();
-        for &cid in watershed.data() {
-            if cid > 0 {
-                *cat_counts.entry(cid).or_insert(0) += 1;
-            }
-        }
-
-        // Accumulators per depression label: (count, min, max, sum, sum_sq).
-        let mut zonal: BTreeMap<u32, (usize, f64, f64, f64, f64)> = BTreeMap::new();
-        let dem_data = dem.data();
-        for (idx, &lbl) in labels.iter().enumerate() {
-            if lbl == 0 {
-                continue;
-            }
-            let z = dem_data[idx];
-            if is_missing(&dem, z) {
-                continue;
-            }
-            let entry = zonal
-                .entry(lbl)
-                .or_insert((0, f64::INFINITY, f64::NEG_INFINITY, 0.0, 0.0));
-            entry.0 += 1;
-            if z < entry.1 {
-                entry.1 = z;
-            }
-            if z > entry.2 {
-                entry.2 = z;
-            }
-            entry.3 += z;
-            entry.4 += z * z;
-        }
-
-        let mut cat_area_by_id: HashMap<u32, f64> = HashMap::new();
         let mut area_ratio_by_id: HashMap<u32, (f64, f64)> = HashMap::new();
         let mut rec_by_id: HashMap<u32, CatchmentHierarchyRecord> = HashMap::new();
-
-        for (fid, (count, zmin, zmax, zsum, zsum_sq)) in zonal {
-            if count == 0 {
-                continue;
-            }
-            let c_cells = cat_counts.get(&fid).copied().unwrap_or(count);
-            let area = count as f64 * cell_area;
-            let cat_area = c_cells as f64 * cell_area;
-            let dep_to_cat_ratio = if cat_area > 0.0 { area / cat_area } else { 0.0 };
-            let mean_elev = zsum / count as f64;
-            let variance = ((zsum_sq / count as f64) - mean_elev * mean_elev).max(0.0);
-            let std_elev = variance.sqrt();
-            let range = zmax - zmin;
-            let volume = ((count as f64) * zmax - zsum).max(0.0) * cell_area;
-            let mean_depth = if area > 0.0 { volume / area } else { 0.0 };
-
-            cat_area_by_id.insert(fid, cat_area);
-            area_ratio_by_id.insert(fid, (cat_area, dep_to_cat_ratio));
-            let rec = CatchmentHierarchyRecord {
-                level: *level,
-                level_fid: fid,
-                count,
-                area,
-                cat_area,
-                dep_to_cat_ratio,
-                min_elev: zmin,
-                max_elev: zmax,
-                range,
-                mean_elev,
-                std_elev,
-                sum_elev: zsum,
-                volume,
-                mean_depth,
-            };
+        for rec in stats.records {
+            area_ratio_by_id.insert(rec.level_fid, (rec.cat_area, rec.dep_to_cat_ratio));
             all_records.push(rec.clone());
-            rec_by_id.insert(fid, rec);
+            rec_by_id.insert(rec.level_fid, rec);
         }
 
         // Write Catchment_level_*.shp
-        polygonize_u32_with_records(&watershed, &out_cat_shp, "catchment", &area_ratio_by_id)?;
+        polygonize_u32_with_records(
+            &stats.watershed,
+            &out_cat_shp,
+            "catchment",
+            &area_ratio_by_id,
+        )?;
         catchment_shapefiles.push(out_cat_shp);
 
         // Write enriched Single_level_*.shp and append to Merge_levels.shp
@@ -952,8 +1015,6 @@ pub fn delineate_catchment_hierarchy(
         })?;
         terrio::write_vector(&[out_lvl_layer], lvl_str, &VectorWriteOptions::default())?;
         level_shapefiles.push(out_lvl_shp);
-
-        level_rasters.push((*level, labels, cat_area_by_id));
     }
 
     // Write Merge_levels.shp
@@ -965,21 +1026,16 @@ pub fn delineate_catchment_hierarchy(
     })?;
     terrio::write_vector(&[merged_layer], merge_str, &VectorWriteOptions::default())?;
 
-    // Burn catchment_hir.tif from highest level down to level 1 so each depression level's
-    // rim carries that level's contributing catchment area (u32, NoData = 0).
-    let mut hir_data = vec![0u32; w * h];
-    for (_, labels, cat_area_by_id) in level_rasters.iter().rev() {
-        for (idx, &lbl) in labels.iter().enumerate() {
-            if lbl > 0
-                && let Some(&area) = cat_area_by_id.get(&lbl)
-            {
-                let v = area.round().clamp(0.0, u32::MAX as f64) as u32;
-                if v > 0 {
-                    hir_data[idx] = v;
-                }
+    let hir_data: Vec<u32> = hir_data_f64
+        .into_iter()
+        .map(|area| {
+            if area > 0.0 {
+                area.round().clamp(0.0, u32::MAX as f64) as u32
+            } else {
+                0
             }
-        }
-    }
+        })
+        .collect();
     let mut hir_arr = Array2D::from_vec(w, h, hir_data)?;
     hir_arr.copy_metadata_from(&dem);
     hir_arr.set_no_data(0);
@@ -1032,11 +1088,10 @@ pub fn delineate_catchment_hierarchy_in_memory(
 
     let cell_area = affine_cell_area(&dem.geotransform);
     let flowdirs = d8_flow_directions_resolved(dem)?;
-    let dem_data = dem.data();
     let ldata_f64: Vec<f64> = ldata.iter().map(|&v| v as f64).collect();
 
     let mut all_records = Vec::new();
-    let mut level_rasters: Vec<(u32, Vec<u32>, HashMap<u32, f64>)> = Vec::new();
+    let mut hir_data = vec![0.0f64; w * h];
 
     for level_i32 in 1..=max_level {
         let level = level_i32 as u32;
@@ -1066,84 +1121,11 @@ pub fn delineate_catchment_hierarchy_in_memory(
             continue;
         }
         let labels: Vec<u32> = raw_labels.iter().map(|&l| remap[l as usize]).collect();
-        let watershed = d8_watersheds(&flowdirs, &labels)?;
-
-        let mut cat_counts: HashMap<u32, usize> = HashMap::new();
-        for &cid in watershed.data() {
-            if cid > 0 {
-                *cat_counts.entry(cid).or_insert(0) += 1;
-            }
-        }
-        let mut zonal: BTreeMap<u32, (usize, f64, f64, f64, f64)> = BTreeMap::new();
-        for (idx, &lbl) in labels.iter().enumerate() {
-            if lbl == 0 {
-                continue;
-            }
-            let z = dem_data[idx];
-            if is_missing(dem, z) {
-                continue;
-            }
-            let e = zonal
-                .entry(lbl)
-                .or_insert((0, f64::INFINITY, f64::NEG_INFINITY, 0.0, 0.0));
-            e.0 += 1;
-            if z < e.1 {
-                e.1 = z;
-            }
-            if z > e.2 {
-                e.2 = z;
-            }
-            e.3 += z;
-            e.4 += z * z;
-        }
-
-        let mut cat_area_by_id: HashMap<u32, f64> = HashMap::new();
-        for (fid, (count, zmin, zmax, zsum, zsum_sq)) in zonal {
-            if count == 0 {
-                continue;
-            }
-            let c_cells = cat_counts.get(&fid).copied().unwrap_or(count);
-            let area = count as f64 * cell_area;
-            let cat_area = c_cells as f64 * cell_area;
-            let dep_to_cat_ratio = if cat_area > 0.0 { area / cat_area } else { 0.0 };
-            let mean_elev = zsum / count as f64;
-            let variance = ((zsum_sq / count as f64) - mean_elev * mean_elev).max(0.0);
-            let std_elev = variance.sqrt();
-            let range = zmax - zmin;
-            let volume = ((count as f64) * zmax - zsum).max(0.0) * cell_area;
-            let mean_depth = if area > 0.0 { volume / area } else { 0.0 };
-            cat_area_by_id.insert(fid, cat_area);
-            all_records.push(CatchmentHierarchyRecord {
-                level,
-                level_fid: fid,
-                count,
-                area,
-                cat_area,
-                dep_to_cat_ratio,
-                min_elev: zmin,
-                max_elev: zmax,
-                range,
-                mean_elev,
-                std_elev,
-                sum_elev: zsum,
-                volume,
-                mean_depth,
-            });
-        }
-        level_rasters.push((level, labels, cat_area_by_id));
+        let stats = compute_level_catchment_stats(dem, &flowdirs, cell_area, level, &labels)?;
+        paint_unclaimed_catchment_area(&mut hir_data, &labels, &stats.cat_area_by_id);
+        all_records.extend(stats.records);
     }
 
-    let mut hir_data = vec![0.0f64; w * h];
-    for (_, labels, cat_area_by_id) in level_rasters.iter().rev() {
-        for (idx, &lbl) in labels.iter().enumerate() {
-            if lbl > 0
-                && let Some(&area) = cat_area_by_id.get(&lbl)
-                && area > 0.0
-            {
-                hir_data[idx] = area;
-            }
-        }
-    }
     let mut hir_arr = Array2D::from_vec(w, h, hir_data)?;
     hir_arr.copy_metadata_from(dem);
     hir_arr.set_no_data(0.0);

@@ -84,12 +84,12 @@ jobs:
       - name: Format check (js)
         run: cargo fmt --manifest-path js/Cargo.toml -- --check
       - name: Clippy (wasm32)
-        run: cargo clippy --manifest-path js/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+        run: cargo clippy --manifest-path js/Cargo.toml --locked --target wasm32-unknown-unknown -- -D warnings
       - name: Build and test Node.js WASM bundle
         working-directory: js
         run: |
-          wasm-pack build --target nodejs --release --out-dir pkg-node
+          wasm-pack build --target nodejs --release --out-dir pkg-node -- --locked
           node test.mjs
       - name: Build browser WASM bundle
         working-directory: js
-        run: wasm-pack build --target web --release --out-dir pkg
+        run: wasm-pack build --target web --release --out-dir pkg -- --locked

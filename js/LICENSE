@@ -1,6 +1,20 @@
+# Licensing for `lidar-js` (WebAssembly Package)
+
+The distributed `lidar-js` WebAssembly package and compiled `.wasm` binaries are
+licensed under the **GNU General Public License v3.0 only (`GPL-3.0-only`)**
+because the compiled WebAssembly module statically links `richdem`
+(`GPL-3.0-only`). See `NOTICE` for full third-party attribution details and
+<https://www.gnu.org/licenses/gpl-3.0.txt> for the complete text of the GNU
+General Public License v3.0.
+
+The `lidar-rs` Rust source code itself (excluding third-party GPL-3.0-only
+dependencies) is licensed under the MIT License below:
+
+---
+
 MIT License
 
-Copyright (c) 2018-2026 Qiusheng Wu
+Copyright (c) 2026 Qiusheng Wu
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

@@ -82,7 +82,7 @@ Run **`lidar-rs`** directly in your browser via WebAssembly — DEM smoothing, P
           <h4>Inundation Curve</h4>
           <p class="lp-hint">Click the chart or drag the slider to inspect any time step.</p>
           <canvas id="lp-chart" width="420" height="240"></canvas>
-          <details class="lp-gif-details">
+          <details class="lp-gif-details" id="lp-gif-details">
             <summary>Preview exported animated GIF</summary>
             <div class="lp-gif-wrap">
               <img id="lp-gif" alt="Simulated surface inundation animated GIF">
