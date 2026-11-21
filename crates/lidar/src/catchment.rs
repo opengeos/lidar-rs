@@ -1065,10 +1065,10 @@ pub fn delineate_catchment_hierarchy(
 /// Delineates the nested catchment hierarchy completely in memory from a refined DEM
 /// and the `depression_level` raster produced by [`crate::delineate_depressions_in_memory`].
 ///
-/// Uses a single-pass compressed D8 forest over depression cells combined with an
-/// incremental Union-Find (DSU) across ascending hierarchy levels (`1..=max_level`),
-/// avoiding $O(L \cdot W \cdot H)$ repeated full-grid connected-component and watershed
-/// passes while producing bit-exact results for every level.
+/// Compresses all non-depression upland cells in a single $O(N)$ pass onto their
+/// receiving depression cells, then evaluates levels `1..=max_level` in $O(L \cdot D)$
+/// over only the $D \ll N$ depression cells using an incremental Union-Find (DSU)
+/// instead of $O(L \cdot W \cdot H)$ repeated full-grid watershed passes.
 ///
 /// Returns `(catchment_hir_f64, records)` with zero filesystem I/O (suitable for
 /// WebAssembly / browser execution and high-throughput pipelines).

@@ -30,7 +30,7 @@ lidar delineate-flow-paths out/dem_filled.tif out/region.tif out/flowpath.shp --
 lidar catchment-hierarchy out/dem.tif out/shp-level out/catchment_hir.tif
 lidar simulate-inundation out/sink.tif out/catchment_hir.tif out/simulation --min-size 1000 --min-depth 0.2 --interval 0.2 --rain-intensity 5 --duration 50 --time-step 1
 lidar animate-inundation out/dem.tif out/simulation out/inundation.gif --delay-ms 150 --rain-intensity 5 --scale-bar --legend
-lidar export-frames out/dem.tif out_pipe/fill_time.tif out_pipe/frames --num-steps 10 --time-step 5 --rain-intensity 5 --scale-bar --legend
+lidar export-frames out/dem.tif out/simulation/fill_time.tif out/frames --num-steps 10 --time-step 5 --rain-intensity 5 --scale-bar --legend
 
 # Delineate elevated features (mounts / canopies)
 lidar delineate-mounts dsm.tif out_mounts --min-size 1000 --min-height 0.3 --interval 0.3

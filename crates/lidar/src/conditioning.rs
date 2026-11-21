@@ -4,11 +4,10 @@
 //! Powered by [`richdem::lindsay2016`] and [`terrio`] with zero C/C++ or GDAL
 //! dependencies.
 
-use std::collections::VecDeque;
 use std::path::Path;
 
 use richdem::{
-    Array2D, D8X, D8Y, DemNum, LindsayMode, Topology, complete_breaching_lindsay2016, lindsay2016,
+    Array2D, DemNum, LindsayMode, Topology, complete_breaching_lindsay2016, lindsay2016,
     load_raster, save_raster,
 };
 #[cfg(feature = "serde")]
@@ -178,32 +177,81 @@ fn bresenham_segment(
     w: usize,
     h: usize,
 ) -> Vec<(usize, usize)> {
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    let max_x = w as isize - 1;
+    let max_y = h as isize - 1;
+    // Reject segments whose bounding box is completely disjoint from the raster.
+    if c0.max(c1) < 0 || c0.min(c1) > max_x || r0.max(r1) < 0 || r0.min(r1) > max_y {
+        return Vec::new();
+    }
+    // Liang-Barsky parametric clip to [-0.5, max_x + 0.5] x [-0.5, max_y + 0.5] so huge
+    // off-grid segments never iterate millions of off-grid cells.
+    let dx_f = (c1 - c0) as f64;
+    let dy_f = (r1 - r0) as f64;
+    let mut t0 = 0.0f64;
+    let mut t1 = 1.0f64;
+    let clip = |p: f64, q: f64, t0: &mut f64, t1: &mut f64| -> bool {
+        if p.abs() < 1e-12 {
+            return q >= 0.0;
+        }
+        let r = q / p;
+        if p < 0.0 {
+            if r > *t1 {
+                return false;
+            }
+            if r > *t0 {
+                *t0 = r;
+            }
+        } else {
+            if r < *t0 {
+                return false;
+            }
+            if r < *t1 {
+                *t1 = r;
+            }
+        }
+        true
+    };
+    let ok = clip(-dx_f, c0 as f64 + 0.5, &mut t0, &mut t1)
+        && clip(dx_f, max_x as f64 + 0.5 - c0 as f64, &mut t0, &mut t1)
+        && clip(-dy_f, r0 as f64 + 0.5, &mut t0, &mut t1)
+        && clip(dy_f, max_y as f64 + 0.5 - r0 as f64, &mut t0, &mut t1);
+    if !ok {
+        return Vec::new();
+    }
+    let sc0 = (c0 as f64 + t0 * dx_f).round() as isize;
+    let sr0 = (r0 as f64 + t0 * dy_f).round() as isize;
+    let sc1 = (c0 as f64 + t1 * dx_f).round() as isize;
+    let sr1 = (r0 as f64 + t1 * dy_f).round() as isize;
+
     let mut out = Vec::new();
-    let mut x = c0;
-    let mut y = r0;
-    let dx = (c1 - c0).abs();
-    let dy = -(r1 - r0).abs();
-    let sx = if c0 < c1 { 1 } else { -1 };
-    let sy = if r0 < r1 { 1 } else { -1 };
+    let mut x = sc0;
+    let mut y = sr0;
+    let dx = (sc1 - sc0).abs();
+    let dy = -(sr1 - sr0).abs();
+    let sx = if sc0 < sc1 { 1 } else { -1 };
+    let sy = if sr0 < sr1 { 1 } else { -1 };
     let mut err = dx + dy;
 
     loop {
         if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h {
             out.push((x as usize, y as usize));
         }
-        if x == c1 && y == r1 {
+        if x == sc1 && y == sr1 {
             break;
         }
         let e2 = 2 * err;
         if e2 >= dy {
-            if x == c1 {
+            if x == sc1 {
                 break;
             }
             err += dy;
             x += sx;
         }
         if e2 <= dx {
-            if y == r1 {
+            if y == sr1 {
                 break;
             }
             err += dx;
@@ -269,7 +317,7 @@ fn carve_polyline(
     };
 
     let n = path_cells.len();
-    let hw = options.half_width_cells as isize;
+    let hw = options.half_width_cells;
     let mut carved = 0usize;
     for (i, &(c, r)) in path_cells.iter().enumerate() {
         let t = if n > 1 {
@@ -277,15 +325,19 @@ fn carve_polyline(
         } else {
             0.0
         };
-        let target_z = za + t * (zb - za) - options.depth_offset;
-        for dr in -hw..=hw {
-            for dc in -hw..=hw {
-                let nr = r as isize + dr;
-                let nc = c as isize + dc;
-                if nr < 0 || nc < 0 || (nr as usize) >= h || (nc as usize) >= w {
-                    continue;
-                }
-                let (ncu, nru) = (nc as usize, nr as usize);
+        // Keep the two endpoints tied to the receiving bed so carving never creates an outlet pit.
+        let offset = if i == 0 || i + 1 == n {
+            0.0
+        } else {
+            options.depth_offset
+        };
+        let target_z = za + t * (zb - za) - offset;
+        let r_lo = r.saturating_sub(hw);
+        let r_hi = r.saturating_add(hw).min(h - 1);
+        let c_lo = c.saturating_sub(hw);
+        let c_hi = c.saturating_add(hw).min(w - 1);
+        for nru in r_lo..=r_hi {
+            for ncu in c_lo..=c_hi {
                 let cur = dem.get(ncu, nru);
                 if cur.is_finite() && !cur.rd_eq(nd) && cur > target_z {
                     dem.set(ncu, nru, target_z);
@@ -337,13 +389,16 @@ fn carve_point(dem: &mut Array2D<f64>, x: f64, y: f64, options: &BurnCulvertsOpt
     let (p1c, p1r, z1) = perim[0];
     let v1x = p1c as f64 - cc as f64;
     let v1y = p1r as f64 - cr as f64;
-    let p2 = perim
+    // Strictly require the opposite hemisphere (`dot < 0.0`) so a point culvert cuts across the
+    // embankment rather than grazing a perpendicular perimeter cell on the same ridge.
+    let Some((p2c, p2r, z2)) = perim
         .iter()
         .skip(1)
-        .find(|&&(c, r, _)| (c as f64 - cc as f64) * v1x + (r as f64 - cr as f64) * v1y <= 0.0)
+        .find(|&&(c, r, _)| (c as f64 - cc as f64) * v1x + (r as f64 - cr as f64) * v1y < 0.0)
         .copied()
-        .unwrap_or(perim[1]);
-    let (p2c, p2r, z2) = p2;
+    else {
+        return 0;
+    };
 
     let mut path = bresenham_segment(p1c as isize, p1r as isize, cc, cr, w, h);
     for cell in bresenham_segment(cc, cr, p2c as isize, p2r as isize, w, h) {
@@ -351,9 +406,7 @@ fn carve_point(dem: &mut Array2D<f64>, x: f64, y: f64, options: &BurnCulvertsOpt
             path.push(cell);
         }
     }
-    // Also ensure connectivity via BFS-free linear elevation profile from z2 down to z1.
-    let target_lo = z1.min(z2) - options.depth_offset;
-    let hw = options.half_width_cells as isize;
+    let hw = options.half_width_cells;
     let mut carved = 0usize;
     let n = path.len();
     for (i, &(c, r)) in path.iter().enumerate() {
@@ -362,15 +415,18 @@ fn carve_point(dem: &mut Array2D<f64>, x: f64, y: f64, options: &BurnCulvertsOpt
         } else {
             0.0
         };
-        let z_interp = (z1 + t * (z2 - z1) - options.depth_offset).max(target_lo);
-        for dr in -hw..=hw {
-            for dc in -hw..=hw {
-                let nr = r as isize + dr;
-                let nc = c as isize + dc;
-                if nr < 0 || nc < 0 || (nr as usize) >= h || (nc as usize) >= w {
-                    continue;
-                }
-                let (ncu, nru) = (nc as usize, nr as usize);
+        let offset = if i == 0 || i + 1 == n {
+            0.0
+        } else {
+            options.depth_offset
+        };
+        let z_interp = z1 + t * (z2 - z1) - offset;
+        let r_lo = r.saturating_sub(hw);
+        let r_hi = r.saturating_add(hw).min(h - 1);
+        let c_lo = c.saturating_sub(hw);
+        let c_hi = c.saturating_add(hw).min(w - 1);
+        for nru in r_lo..=r_hi {
+            for ncu in c_lo..=c_hi {
                 let cur = dem.get(ncu, nru);
                 if cur.is_finite() && !cur.rd_eq(nd) && cur > z_interp {
                     dem.set(ncu, nru, z_interp);
@@ -379,8 +435,6 @@ fn carve_point(dem: &mut Array2D<f64>, x: f64, y: f64, options: &BurnCulvertsOpt
             }
         }
     }
-    // Suppress unused import warning on VecDeque/D8X/D8Y if not needed elsewhere.
-    let _ = (VecDeque::<usize>::new(), D8X[0], D8Y[0]);
     carved
 }
 

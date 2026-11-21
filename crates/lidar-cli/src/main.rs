@@ -447,10 +447,10 @@ enum Commands {
         /// Breaching mode (complete, selective, constrained)
         #[arg(long, value_enum, default_value_t = CliBreachMode::Selective)]
         mode: CliBreachMode,
-        /// Maximum breach depth in elevation units
+        /// Maximum breach depth in elevation units (defaults to 1.5 for selective/constrained; pass 0 for unlimited)
         #[arg(long)]
         max_depth: Option<f64>,
-        /// Maximum breach path length in cells
+        /// Maximum breach path length in cells (defaults to 50 for selective/constrained; pass 0 for unlimited)
         #[arg(long)]
         max_length: Option<u32>,
         /// Fill remaining unbreached depressions after selective/constrained breaching
@@ -561,7 +561,7 @@ enum Commands {
         #[arg(long, default_value_t = 2048)]
         tile_size: usize,
         /// Overlap halo around each tile in pixels
-        #[arg(long, default_value_t = 256)]
+        #[arg(long, default_value_t = 128)]
         overlap: usize,
         /// Median filter kernel size (1 = skip)
         #[arg(short = 'k', long, default_value_t = 3)]
@@ -1079,13 +1079,27 @@ fn run() -> lidar::Result<()> {
             fill_remaining,
             compress,
         } => {
+            let defaults = BreachOptions::default();
+            let breach_mode: BreachMode = mode.into();
+            let resolved_depth = match max_depth {
+                Some(0.0) => None,
+                Some(v) => Some(v),
+                None if breach_mode == BreachMode::Complete => None,
+                None => defaults.max_depth,
+            };
+            let resolved_length = match max_length {
+                Some(0) => None,
+                Some(v) => Some(v),
+                None if breach_mode == BreachMode::Complete => None,
+                None => defaults.max_length,
+            };
             let opts = BreachOptions {
-                mode: mode.into(),
-                max_depth,
-                max_length,
+                mode: breach_mode,
+                max_depth: resolved_depth,
+                max_length: resolved_length,
                 fill_remaining,
                 compress,
-                ..Default::default()
+                ..defaults
             };
             breach_depressions_file(&input, &output, &opts)?;
             println!("Saved breached DEM to {}", output.display());

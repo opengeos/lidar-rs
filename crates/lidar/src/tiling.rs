@@ -82,12 +82,15 @@ struct TileWindow {
     pad_c1: usize,
 }
 
-/// Extracts a tile sub-grid as `Array2D<f64>` from either an `f32` or `f64` source raster.
+/// Extracts a tile sub-grid as `Array2D<f64>` from either an `f32` or `f64` source raster,
+/// preserving the source NoData sentinel so valid elevations are never misclassified as NoData.
 fn extract_tile_f64<T: DemNum>(src: &Array2D<T>, win: TileWindow) -> Result<Array2D<f64>> {
     let w = src.width();
     let tw = win.pad_c1 - win.pad_c0;
     let th = win.pad_r1 - win.pad_r0;
     let nd = src.no_data();
+    let nd_f64 = nd.to_f64();
+    let out_nd = if nd_f64.is_finite() { nd_f64 } else { f64::NAN };
     let sdata = src.data();
     let mut data = Vec::with_capacity(tw * th);
     for r in win.pad_r0..win.pad_r1 {
@@ -95,15 +98,15 @@ fn extract_tile_f64<T: DemNum>(src: &Array2D<T>, win: TileWindow) -> Result<Arra
         for c in win.pad_c0..win.pad_c1 {
             let v = sdata[off + c];
             if v.rd_eq(nd) {
-                data.push(-9999.0f64);
+                data.push(out_nd);
             } else {
                 let f = v.to_f64();
-                data.push(if f.is_finite() { f } else { -9999.0 });
+                data.push(if f.is_finite() { f } else { out_nd });
             }
         }
     }
     let mut tile = Array2D::from_vec(tw, th, data)?;
-    tile.set_no_data(-9999.0);
+    tile.set_no_data(out_nd);
     let gt = src.geotransform;
     let c0f = win.pad_c0 as f64;
     let r0f = win.pad_r0 as f64;
@@ -119,11 +122,20 @@ fn extract_tile_f64<T: DemNum>(src: &Array2D<T>, win: TileWindow) -> Result<Arra
     Ok(tile)
 }
 
+struct TileRegionOutput {
+    /// Global `(row, col)` of the lowest-elevation cell in this sink region (used for global deduplication across seams).
+    min_cell: (usize, usize),
+    /// Total pixel count of this sink region inside the tile (larger = less truncated).
+    total_cells: usize,
+    /// Complete nested depression hierarchy for this sink region.
+    depressions: Vec<NestedDepression>,
+}
+
 fn process_one_tile(
     tile: Array2D<f64>,
     win: TileWindow,
     options: &TiledDelineationOptions,
-) -> Result<Vec<NestedDepression>> {
+) -> Result<Vec<TileRegionOutput>> {
     let smoothed = if options.kernel_size > 1 {
         median_filter(&tile, options.kernel_size)?
     } else {
@@ -140,54 +152,93 @@ fn process_one_tile(
         return Ok(Vec::new());
     }
 
-    // Compute pixel centroid (in global DEM coordinates) for each top-level sink region.
+    // Compute pixel centroid and global minimum-elevation cell for each top-level sink region.
     // Keeping complete regions whose centroid falls inside this tile's non-overlapping core
-    // preserves parent-child hierarchy integrity without cutting multi-level complexes in half.
+    // preserves parent-child hierarchy integrity, and global deduplication by `min_cell` prevents
+    // any region wider than `overlap` from being emitted twice across neighbouring tiles.
     let tw = deps.depression_id.width();
     let th = deps.depression_id.height();
     let id_data = deps.depression_id.data();
+    let sink_data = sinks.sink.data();
+    let sink_nd = sinks.sink.no_data();
     let dep_region: HashMap<u32, u32> = deps
         .depressions
         .iter()
         .map(|d| (d.id, d.region_id))
         .collect();
-    let mut reg_acc: HashMap<u32, (f64, f64, usize)> = HashMap::new();
+    struct RegAcc {
+        sum_r: f64,
+        sum_c: f64,
+        count: usize,
+        min_elev: f64,
+        min_cell: (usize, usize),
+    }
+    let mut reg_acc: HashMap<u32, RegAcc> = HashMap::new();
     for r in 0..th {
         let off = r * tw;
+        let gr = win.pad_r0 + r;
         for c in 0..tw {
             let did = id_data[off + c];
             if did > 0
                 && let Some(&rid) = dep_region.get(&(did as u32))
             {
-                let e = reg_acc.entry(rid).or_insert((0.0, 0.0, 0));
-                e.0 += (win.pad_r0 + r) as f64;
-                e.1 += (win.pad_c0 + c) as f64;
-                e.2 += 1;
+                let gc = win.pad_c0 + c;
+                let z = sink_data[off + c];
+                let e = reg_acc.entry(rid).or_insert(RegAcc {
+                    sum_r: 0.0,
+                    sum_c: 0.0,
+                    count: 0,
+                    min_elev: f64::INFINITY,
+                    min_cell: (gr, gc),
+                });
+                e.sum_r += gr as f64;
+                e.sum_c += gc as f64;
+                e.count += 1;
+                if z.is_finite()
+                    && !z.rd_eq(sink_nd)
+                    && (z < e.min_elev
+                        || ((z - e.min_elev).abs() <= 1e-12 && (gr, gc) < e.min_cell))
+                {
+                    e.min_elev = z;
+                    e.min_cell = (gr, gc);
+                }
             }
         }
     }
 
-    let mut kept_regions = std::collections::HashSet::new();
-    for (rid, (sr, sc, cnt)) in reg_acc {
-        if cnt == 0 {
+    let mut kept_meta: HashMap<u32, ((usize, usize), usize)> = HashMap::new();
+    for (rid, acc) in reg_acc {
+        if acc.count == 0 {
             continue;
         }
-        let gr = sr / cnt as f64;
-        let gc = sc / cnt as f64;
+        let gr = acc.sum_r / acc.count as f64;
+        let gc = acc.sum_c / acc.count as f64;
         if gr >= win.core_r0 as f64
             && gr < win.core_r1 as f64
             && gc >= win.core_c0 as f64
             && gc < win.core_c1 as f64
         {
-            kept_regions.insert(rid);
+            kept_meta.insert(rid, (acc.min_cell, acc.count));
         }
     }
 
-    Ok(deps
-        .depressions
-        .into_iter()
-        .filter(|d| kept_regions.contains(&d.region_id))
-        .collect())
+    let mut by_reg: HashMap<u32, Vec<NestedDepression>> = HashMap::new();
+    for d in deps.depressions {
+        if kept_meta.contains_key(&d.region_id) {
+            by_reg.entry(d.region_id).or_default().push(d);
+        }
+    }
+
+    let mut out = Vec::with_capacity(by_reg.len());
+    for (rid, reg_deps) in by_reg {
+        let (min_cell, total_cells) = kept_meta[&rid];
+        out.push(TileRegionOutput {
+            min_cell,
+            total_cells,
+            depressions: reg_deps,
+        });
+    }
+    Ok(out)
 }
 
 fn run_tiled_generic<T: DemNum>(
@@ -214,8 +265,8 @@ fn run_tiled_generic<T: DemNum>(
                 core_c1: c1,
                 pad_r0: r0.saturating_sub(ov),
                 pad_c0: c0.saturating_sub(ov),
-                pad_r1: (r1 + ov).min(h),
-                pad_c1: (c1 + ov).min(w),
+                pad_r1: r1.saturating_add(ov).min(h),
+                pad_c1: c1.saturating_add(ov).min(w),
             });
             c0 = c1;
         }
@@ -223,22 +274,43 @@ fn run_tiled_generic<T: DemNum>(
     }
 
     let num_tiles = windows.len();
-    let run_one = |win: TileWindow| -> Result<Vec<NestedDepression>> {
+    let run_one = |win: TileWindow| -> Result<Vec<TileRegionOutput>> {
         let tile = extract_tile_f64(dem, win)?;
         process_one_tile(tile, win, options)
     };
 
     #[cfg(feature = "parallel")]
-    let per_tile: Vec<Vec<NestedDepression>> = windows
+    let per_tile: Vec<Vec<TileRegionOutput>> = windows
         .into_par_iter()
         .map(run_one)
         .collect::<Result<Vec<_>>>()?;
 
     #[cfg(not(feature = "parallel"))]
-    let per_tile: Vec<Vec<NestedDepression>> = windows
+    let per_tile: Vec<Vec<TileRegionOutput>> = windows
         .into_iter()
         .map(run_one)
         .collect::<Result<Vec<_>>>()?;
+
+    // Global deduplication across tile seams keyed by each sink region's global lowest pixel:
+    // if a depression wider than `overlap` landed in two neighbouring tiles, keep the tile copy
+    // with the largest pixel count (least clipped).
+    let mut best_by_min_cell: HashMap<(usize, usize), TileRegionOutput> = HashMap::new();
+    for tile_regions in per_tile {
+        for reg in tile_regions {
+            match best_by_min_cell.entry(reg.min_cell) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(reg);
+                }
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    if reg.total_cells > e.get().total_cells {
+                        e.insert(reg);
+                    }
+                }
+            }
+        }
+    }
+    let mut dedup_regions: Vec<TileRegionOutput> = best_by_min_cell.into_values().collect();
+    dedup_regions.sort_by_key(|r| r.min_cell);
 
     // Reassign globally unique sequential IDs, parent_ids, children_ids, and region_ids.
     let mut merged = Vec::new();
@@ -246,7 +318,8 @@ fn run_tiled_generic<T: DemNum>(
     let mut next_reg_id = 1u32;
     let mut max_level = 0u32;
 
-    for tile_deps in per_tile {
+    for reg in dedup_regions {
+        let tile_deps = reg.depressions;
         if tile_deps.is_empty() {
             continue;
         }
@@ -306,7 +379,11 @@ pub fn delineate_depressions_tiled(
             options.tile_size
         )));
     }
+    let in_dem = in_dem.as_ref();
     let out_dir = out_dir.as_ref();
+    std::fs::create_dir_all(out_dir)?;
+    let csv_path = out_dir.join("depressions_info.csv");
+    crate::raster_ops::ensure_no_path_collision(in_dem, &[&csv_path])?;
     if options.use_f32 {
         let dem = load_raster::<f32>(in_dem, None)?;
         run_tiled_generic(&dem, out_dir, options)

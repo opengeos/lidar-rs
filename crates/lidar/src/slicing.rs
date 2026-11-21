@@ -303,11 +303,13 @@ fn level_set_region(
         let (perimeter, major_axis, minor_axis, elongatedness, orientation) = if bh == 1 {
             let maj = bw as f64 * res_x;
             let min = res_y;
-            (maj, maj, min, maj / min, 0.0)
+            let perim = 2.0 * (maj + min);
+            (perim, maj, min, maj / min, 0.0)
         } else {
             let maj = bh as f64 * res_y;
             let min = res_x;
-            (maj, maj, min, maj / min, 90.0)
+            let perim = 2.0 * (maj + min);
+            (perim, maj, min, maj / min, 90.0)
         };
         let (circularity, depth_diam_ratio, hypsometric_integral, rim_slope_deg, artifact_flag) =
             extended_morphometrics(area, perimeter, mean_depth, max_depth, elongatedness, 1.0);
@@ -932,12 +934,19 @@ pub fn delineate_depressions(
     let out_level_file = out_dir.join("depression_level.tif");
     let out_vec_file = out_dir.join("depressions.shp");
     let out_csv_file = out_dir.join("depressions_info.csv");
+    let out_gpkg_file = out_dir.join("depressions.gpkg");
     let out_shp_dir = out_dir.join("shp-level");
 
-    ensure_no_path_collision(
-        in_sink,
-        &[&out_obj_file, &out_level_file, &out_vec_file, &out_csv_file],
-    )?;
+    let mut out_paths: Vec<&Path> = vec![
+        out_obj_file.as_path(),
+        out_level_file.as_path(),
+        out_vec_file.as_path(),
+        out_csv_file.as_path(),
+    ];
+    if options.export_gpkg {
+        out_paths.push(out_gpkg_file.as_path());
+    }
+    ensure_no_path_collision(in_sink, &out_paths)?;
 
     let sink = load_raster::<f64>(in_sink, None)?;
     let mem = delineate_depressions_in_memory(

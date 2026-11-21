@@ -141,8 +141,8 @@ def delineate_depressions(
     out_dir: str | os.PathLike[str],
     bool_level_shp: bool = False,
     bool_comb_tif: bool = False,
-    export_gpkg: bool = False,
     compress: bool = False,
+    export_gpkg: bool = False,
 ) -> dict[str, Any]:
     """Delineate nested depressions using Wu et al. (2019) level-set method."""
     return _lidar_rs.delineate_depressions(
@@ -153,8 +153,8 @@ def delineate_depressions(
         _as_path_str(out_dir),
         bool_level_shp,
         bool_comb_tif,
-        export_gpkg,
         compress,
+        export_gpkg,
     )
 
 

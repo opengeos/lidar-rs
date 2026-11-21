@@ -254,6 +254,7 @@ fn glyph_5x7(ch: char) -> [u8; 7] {
         '8' => [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E],
         '9' => [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C],
         'A' => [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
+        'B' => [0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E],
         'C' => [0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E],
         'D' => [0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E],
         'E' => [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F],
@@ -261,17 +262,23 @@ fn glyph_5x7(ch: char) -> [u8; 7] {
         'G' => [0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F],
         'H' => [0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
         'I' => [0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E],
+        'J' => [0x07, 0x02, 0x02, 0x02, 0x12, 0x12, 0x0C],
+        'K' => [0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11],
         'L' => [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F],
         'M' => [0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11],
         'N' => [0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11],
         'O' => [0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
         'P' => [0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10],
+        'Q' => [0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D],
         'R' => [0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11],
         'S' => [0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E],
         'T' => [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
         'U' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
         'V' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04],
         'W' => [0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11],
+        'X' => [0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11],
+        'Y' => [0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04],
+        'Z' => [0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F],
         ':' => [0x00, 0x04, 0x04, 0x00, 0x04, 0x04, 0x00],
         '.' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C],
         '/' => [0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10],
@@ -691,9 +698,9 @@ where
             draw_active_spill_paths(body, dw, dh, sw, sh, &wet, t_hours, spill_paths);
         }
 
-        if options.show_scale_bar {
+        if options.show_scale_bar && !is_geographic_crs(&dem.projection, dem.geotransform) {
             let cell_m = dem.geotransform[1].hypot(dem.geotransform[4]).max(1e-6);
-            draw_scale_bar(body, dw, dh, sw, cell_m);
+            draw_scale_bar(body, dw, dh, sw, cell_m, &dem.projection);
         }
         if options.show_legend {
             draw_legend_box(body, dw, dh, options.water_rgb, !spill_paths.is_empty());
@@ -897,14 +904,23 @@ fn draw_overlay_polylines(
     polylines: &[Vec<(usize, usize)>],
     rgb: [u8; 3],
 ) {
-    let sx = dw as f64 / sw.max(1) as f64;
-    let sy = dh as f64 / sh.max(1) as f64;
+    if dw == 0 || dh == 0 || sw == 0 || sh == 0 {
+        return;
+    }
+    let sx = dw as f64 / sw as f64;
+    let sy = dh as f64 / sh as f64;
+    let max_x = (dw - 1) as f64;
+    let max_y = (dh - 1) as f64;
+    let map_x =
+        |c: usize| -> isize { ((c as f64 + 0.5) * sx - 0.5).clamp(0.0, max_x).round() as isize };
+    let map_y =
+        |r: usize| -> isize { ((r as f64 + 0.5) * sy - 0.5).clamp(0.0, max_y).round() as isize };
     for line in polylines {
         for seg in line.windows(2) {
-            let x0 = (seg[0].0 as f64 * sx).round() as isize;
-            let y0 = (seg[0].1 as f64 * sy).round() as isize;
-            let x1 = (seg[1].0 as f64 * sx).round() as isize;
-            let y1 = (seg[1].1 as f64 * sy).round() as isize;
+            let x0 = map_x(seg[0].0);
+            let y0 = map_y(seg[0].1);
+            let x1 = map_x(seg[1].0);
+            let y1 = map_y(seg[1].1);
             let steps = (x1 - x0).abs().max((y1 - y0).abs()).max(1);
             for s in 0..=steps {
                 let px = x0 + (x1 - x0) * s / steps;
@@ -920,27 +936,57 @@ fn draw_overlay_polylines(
     }
 }
 
-fn draw_scale_bar(body: &mut [u8], dw: usize, dh: usize, sw: usize, cell_m: f64) {
-    if dw < 90 || dh < 36 {
+fn draw_scale_bar(
+    body: &mut [u8],
+    dw: usize,
+    dh: usize,
+    sw: usize,
+    cell_units: f64,
+    projection: &str,
+) {
+    if dw < 90 || dh < 36 || !cell_units.is_finite() || cell_units <= 0.0 {
         return;
     }
+    let p_lower = projection.to_ascii_lowercase();
+    let unit_is_feet =
+        p_lower.contains("foot") || p_lower.contains("feet") || p_lower.contains("us_survey_foot");
+    let cell_m = if unit_is_feet {
+        cell_units * 0.3048
+    } else {
+        cell_units
+    };
     let total_m = sw as f64 * cell_m;
+    let max_bar_px = (dw as f64 * 0.35).max(24.0);
+    let max_bar_m = (max_bar_px / dw as f64) * total_m;
     let target_m = total_m * 0.22;
     let nice_vals = [
-        10.0, 25.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0,
+        0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0,
+        10_000.0, 25_000.0, 50_000.0,
     ];
-    let bar_m = nice_vals
+    let Some(bar_m) = nice_vals
         .iter()
         .copied()
+        .filter(|&v| v <= max_bar_m && ((v / total_m) * dw as f64) >= 16.0)
         .min_by(|a, b| (a - target_m).abs().total_cmp(&(b - target_m).abs()))
-        .unwrap_or(100.0);
-    let bar_px = ((bar_m / total_m.max(1e-6)) * dw as f64)
-        .round()
-        .clamp(24.0, (dw as f64 * 0.35).max(24.0)) as usize;
+    else {
+        return;
+    };
+    let bar_px = ((bar_m / total_m) * dw as f64).round() as usize;
+    if bar_px < 16 {
+        return;
+    }
+    let label = if bar_m >= 1000.0 {
+        format!("{} KM", (bar_m / 1000.0).round() as u32)
+    } else if bar_m >= 1.0 {
+        format!("{} M", bar_m.round() as u32)
+    } else {
+        format!("{bar_m:.1} M")
+    };
     let bx0 = 10usize;
     let by0 = dh.saturating_sub(24);
     let pad = 4usize;
-    let box_w = (bar_px + 2 * pad).min(dw.saturating_sub(bx0));
+    let label_px = label.len() * 6;
+    let box_w = (bar_px.max(label_px) + 2 * pad).min(dw.saturating_sub(bx0));
     let box_h = 20usize.min(dh.saturating_sub(by0));
     for y in by0..(by0 + box_h) {
         for x in bx0..(bx0 + box_w) {
@@ -950,11 +996,6 @@ fn draw_scale_bar(body: &mut [u8], dw: usize, dh: usize, sw: usize, cell_m: f64)
             body[p + 2] = ((body[p + 2] as u16 + 36) / 3) as u8;
         }
     }
-    let label = if bar_m >= 1000.0 {
-        format!("{} KM", (bar_m / 1000.0) as u32)
-    } else {
-        format!("{} M", bar_m as u32)
-    };
     draw_text_5x7(body, dw, dh, bx0 + pad, by0 + 2, &label, [245, 248, 255]);
     let bar_y = by0 + 12;
     let half = bar_px / 2;
@@ -1034,6 +1075,28 @@ pub fn encode_rgb_to_png_bytes(rgb: &[u8], width: usize, height: usize) -> Resul
     Ok(out)
 }
 
+/// Returns `true` when the DEM projection metadata indicates geographic (angular degree)
+/// coordinates where a linear metric scale bar would be misleading.
+fn is_geographic_crs(projection: &str, geotransform: [f64; 6]) -> bool {
+    let p = projection.to_ascii_lowercase();
+    let is_projected = p.contains("projcs[")
+        || p.contains("projcrs[")
+        || p.contains("+proj=utm")
+        || p.contains("+proj=aea")
+        || p.contains("+proj=lcc")
+        || p.contains("+proj=merc");
+    if !is_projected
+        && (p.contains("geogcs[")
+            || p.contains("geogcrs[")
+            || p.contains("epsg:4326")
+            || p.contains("+proj=longlat"))
+    {
+        return true;
+    }
+    let cell = geotransform[1].hypot(geotransform[4]);
+    projection.trim().is_empty() && cell > 0.0 && cell < 1e-2
+}
+
 /// Renders a single shaded-relief inundation frame at `t_hours` into PNG bytes
 /// with banner, optional active spill paths, optional scale bar, and optional legend.
 pub fn render_inundation_frame_png_bytes(
@@ -1046,6 +1109,13 @@ pub fn render_inundation_frame_png_bytes(
 ) -> Result<Vec<u8>> {
     let sw = dem.width();
     let sh = dem.height();
+    if fill_time.width() != sw || fill_time.height() != sh {
+        return Err(Error::DimensionMismatch(format!(
+            "fill_time ({}x{}) does not match DEM ({sw}x{sh})",
+            fill_time.width(),
+            fill_time.height()
+        )));
+    }
     let (dw, dh, total_h) = compute_gif_dimensions(sw, sh, options)?;
     let full_bg = compute_hillshade_rgb(dem, &options.hillshade);
     let bg = downscale_rgb(&full_bg, sw, sh, dw, dh);
@@ -1105,8 +1175,8 @@ pub fn render_inundation_frame_png_bytes(
     if !spill_paths.is_empty() && t_hours > 0.0 {
         draw_active_spill_paths(body, dw, dh, sw, sh, &wet, t_hours, spill_paths);
     }
-    if options.show_scale_bar {
-        draw_scale_bar(body, dw, dh, sw, cell_m);
+    if options.show_scale_bar && !is_geographic_crs(&dem.projection, dem.geotransform) {
+        draw_scale_bar(body, dw, dh, sw, cell_m, &dem.projection);
     }
     if options.show_legend {
         draw_legend_box(body, dw, dh, options.water_rgb, !spill_paths.is_empty());
@@ -1135,11 +1205,18 @@ pub fn export_inundation_frames_png(
             "num_steps must be in 1..=10000, got {num_steps}"
         )));
     }
+    let sw = dem.width();
+    let sh = dem.height();
+    if fill_time.width() != sw || fill_time.height() != sh {
+        return Err(Error::DimensionMismatch(format!(
+            "fill_time ({}x{}) does not match DEM ({sw}x{sh})",
+            fill_time.width(),
+            fill_time.height()
+        )));
+    }
     let out_dir = out_dir.as_ref();
     std::fs::create_dir_all(out_dir)?;
 
-    let sw = dem.width();
-    let sh = dem.height();
     let (dw, dh, total_h) = compute_gif_dimensions(sw, sh, options)?;
     let full_bg = compute_hillshade_rgb(dem, &options.hillshade);
     let bg = downscale_rgb(&full_bg, sw, sh, dw, dh);
@@ -1150,6 +1227,8 @@ pub fn export_inundation_frames_png(
     let ft_nd = fill_time.no_data();
     let digits = (num_steps as f64).log10().floor() as usize + 1;
     let cell_m = dem.geotransform[1].hypot(dem.geotransform[4]).max(1e-6);
+    let draw_scale =
+        options.show_scale_bar && !is_geographic_crs(&dem.projection, dem.geotransform);
 
     let mut frame_rgb = vec![0u8; dw * total_h * 3];
     let mut paths = Vec::with_capacity(num_steps);
@@ -1205,8 +1284,8 @@ pub fn export_inundation_frames_png(
         if !spill_paths.is_empty() {
             draw_active_spill_paths(body, dw, dh, sw, sh, &wet, t_hours, spill_paths);
         }
-        if options.show_scale_bar {
-            draw_scale_bar(body, dw, dh, sw, cell_m);
+        if draw_scale {
+            draw_scale_bar(body, dw, dh, sw, cell_m, &dem.projection);
         }
         if options.show_legend {
             draw_legend_box(body, dw, dh, options.water_rgb, !spill_paths.is_empty());

@@ -259,7 +259,8 @@
     }
     ctx.textAlign = "left";
     ctx.textBaseline = "top";
-    ctx.fillText("Stage-Volume Rating Curve (m³ vs depth)", pad.left, 3);
+    const volUnit = player && player.areaUnit === "m²" ? "m³" : `${(player && player.areaUnit) || "units²"}·z`;
+    ctx.fillText(`Stage-Volume Rating Curve (${volUnit} vs depth)`, pad.left, 3);
 
     ctx.beginPath();
     ctx.moveTo(xOf(0), yOf(0));
@@ -318,9 +319,10 @@
 
     if (statsEl) {
       statsEl.innerHTML = "";
+      const volUnit = player.areaUnit === "m²" ? "m³" : `${player.areaUnit}·z`;
       const items = [
         ["Area", formatArea(d.area, player.areaUnit)],
-        ["Volume", `${d.volume.toLocaleString(undefined, { maximumFractionDigits: 1 })} m³`],
+        ["Volume", `${d.volume.toLocaleString(undefined, { maximumFractionDigits: 1 })} ${volUnit}`],
         ["Max / Mean Depth", `${d.max_depth.toFixed(2)} / ${d.avg_depth.toFixed(2)} m`],
         ["Parent / Children", `${parentStr} / ${childrenStr}`],
         ["Circularity / HI", `${d.circularity.toFixed(2)} / ${d.hypsometric_integral.toFixed(2)}`],
@@ -915,10 +917,19 @@
         td.textContent = String(val);
         tr.appendChild(td);
       }
-      tr.addEventListener("click", () => {
+      tr.tabIndex = 0;
+      tr.setAttribute("role", "button");
+      const activateRow = () => {
         if (player) {
           stopPlayer();
           selectDepression(d.id);
+        }
+      };
+      tr.addEventListener("click", activateRow);
+      tr.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          activateRow();
         }
       });
       tbody.appendChild(tr);

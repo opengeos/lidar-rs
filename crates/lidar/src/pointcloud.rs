@@ -194,23 +194,50 @@ pub fn classify_ground(cloud: &PointCloud, method: GroundFilterMethod) -> Result
 }
 
 /// Filters a [`PointCloud`] in memory to keep only points matching `classes`.
-pub fn filter_by_classification(cloud: &PointCloud, classes: &[u8]) -> PointCloud {
+///
+/// Returns an error if `classes` is non-empty and the point cloud lacks a supported
+/// integer `classification` dimension.
+pub fn filter_by_classification(cloud: &PointCloud, classes: &[u8]) -> Result<PointCloud> {
     if classes.is_empty() {
-        return cloud.clone();
+        return Ok(cloud.clone());
     }
     let Some(dim) = cloud
         .dim("classification")
         .or_else(|| cloud.dim("Classification"))
     else {
-        return cloud.clone();
+        return Err(Error::InvalidArgument(
+            "point cloud has no classification dimension for classification filtering".into(),
+        ));
     };
     let keep: Vec<bool> = match &dim.values {
         Values::U8(v) => v.iter().map(|c| classes.contains(c)).collect(),
-        Values::U16(v) => v.iter().map(|c| classes.contains(&(*c as u8))).collect(),
-        Values::I32(v) => v.iter().map(|c| classes.contains(&(*c as u8))).collect(),
-        _ => vec![true; cloud.len()],
+        Values::U16(v) => v
+            .iter()
+            .map(|&c| u8::try_from(c).is_ok_and(|b| classes.contains(&b)))
+            .collect(),
+        Values::I32(v) => v
+            .iter()
+            .map(|&c| u8::try_from(c).is_ok_and(|b| classes.contains(&b)))
+            .collect(),
+        Values::U32(v) => v
+            .iter()
+            .map(|&c| u8::try_from(c).is_ok_and(|b| classes.contains(&b)))
+            .collect(),
+        Values::I16(v) => v
+            .iter()
+            .map(|&c| u8::try_from(c).is_ok_and(|b| classes.contains(&b)))
+            .collect(),
+        Values::I8(v) => v
+            .iter()
+            .map(|&c| u8::try_from(c).is_ok_and(|b| classes.contains(&b)))
+            .collect(),
+        other => {
+            return Err(Error::InvalidArgument(format!(
+                "unsupported classification dimension type: {other:?}"
+            )));
+        }
     };
-    cloud.select(&keep)
+    Ok(cloud.select(&keep))
 }
 
 /// Generates a Digital Surface Model (DSM) GeoTIFF from a LiDAR point cloud.
@@ -301,9 +328,15 @@ pub fn lidar_to_dtm(
             read_lidar_filtered(in_lidar, filter)?
         }
         method => {
+            if options.ground_class != 2 {
+                return Err(Error::InvalidArgument(format!(
+                    "{method:?} always assigns ASPRS ground class 2; set ground_class=2 or use GroundFilterMethod::Preclassified (got ground_class={})",
+                    options.ground_class
+                )));
+            }
             let raw = read_lidar(in_lidar)?;
             let classified = classify_ground(&raw, method)?;
-            filter_by_classification(&classified, &[options.ground_class])
+            filter_by_classification(&classified, &[2])?
         }
     };
 
@@ -350,17 +383,30 @@ pub fn lidar_to_chm(
     if raw.is_empty() {
         return Err(Error::Algorithm("input point cloud is empty".into()));
     }
-    let classified = match options.ground_method {
-        GroundFilterMethod::Preclassified => raw.clone(),
-        method => classify_ground(&raw, method)?,
+    let ground = match options.ground_method {
+        GroundFilterMethod::Preclassified => {
+            filter_by_classification(&raw, &[options.ground_class])?
+        }
+        method => {
+            if options.ground_class != 2 {
+                return Err(Error::InvalidArgument(format!(
+                    "{method:?} always assigns ASPRS ground class 2; set ground_class=2 or use GroundFilterMethod::Preclassified (got ground_class={})",
+                    options.ground_class
+                )));
+            }
+            let classified = classify_ground(&raw, method)?;
+            filter_by_classification(&classified, &[2])?
+        }
     };
-    let ground = filter_by_classification(&classified, &[options.ground_class]);
     if ground.is_empty() {
         return Err(Error::Algorithm(format!(
             "no ground points found (class={})",
             options.ground_class
         )));
     }
+
+    // Use the raw cloud's XY extent for both DSM and DTM so both grids share one exact lattice.
+    let shared_bounds = raw.bounds().map(|b| [b[0], b[1], b[3], b[4]]);
 
     let dsm_opts = GridOptions {
         resolution: options.resolution,
@@ -369,6 +415,7 @@ pub fn lidar_to_chm(
         dimension: "z".to_string(),
         radius: options.radius,
         window_size: options.window_size,
+        bounds: shared_bounds,
         nodata: options.nodata,
         ..Default::default()
     };
@@ -379,6 +426,7 @@ pub fn lidar_to_chm(
         dimension: "z".to_string(),
         radius: options.radius,
         window_size: options.window_size,
+        bounds: shared_bounds,
         nodata: options.nodata,
         ..Default::default()
     };

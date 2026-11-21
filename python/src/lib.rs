@@ -67,6 +67,11 @@ fn from_py_array2_with_cell(
     no_data: Option<f64>,
     cell_size: f64,
 ) -> PyResult<Array2D<f64>> {
+    if !cell_size.is_finite() || cell_size <= 0.0 {
+        return Err(PyValueError::new_err(format!(
+            "cell_size must be finite and > 0, got {cell_size}"
+        )));
+    }
     let mut a = from_py_array2(arr, no_data)?;
     a.geotransform = [
         0.0,
@@ -420,7 +425,7 @@ fn extract_sinks<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (in_sink, min_size, min_depth, interval, out_dir, bool_level_shp=false, bool_comb_tif=false, export_gpkg=false, compress=false))]
+#[pyo3(signature = (in_sink, min_size, min_depth, interval, out_dir, bool_level_shp=false, bool_comb_tif=false, compress=false, export_gpkg=false))]
 #[allow(clippy::too_many_arguments)]
 fn delineate_depressions<'py>(
     py: Python<'py>,
@@ -431,8 +436,8 @@ fn delineate_depressions<'py>(
     out_dir: &str,
     bool_level_shp: bool,
     bool_comb_tif: bool,
-    export_gpkg: bool,
     compress: bool,
+    export_gpkg: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let opts = DelineateOptions {
         min_size,
@@ -1305,88 +1310,53 @@ fn simulate_inundation_array<'py>(
         compress: false,
     };
 
-    let (dep_id, dep_level, hir, fill_time, depressions, steps, spill_paths, rating_curves, graph) =
-        py.detach(move || -> lidar::Result<_> {
-            let mut dem = raw_dem;
-            if let Some(md) = breach_max_depth {
-                dem = lidar::breach_depressions(
-                    &dem,
-                    &BreachOptions {
-                        mode: BreachMode::Selective,
-                        max_depth: Some(md),
-                        ..Default::default()
-                    },
-                )?;
-            }
-            if kernel_size > 1 {
-                dem = lidar::median_filter(&dem, kernel_size)?;
-            }
-            let sinks = lidar::extract_sinks_in_memory(&dem, min_size, Topology::D8)?;
-            let deps =
-                lidar::delineate_depressions_in_memory(&sinks.sink, min_size, min_depth, interval)?;
-            let (hir, cat_recs) = lidar::delineate_catchment_hierarchy_in_memory(
-                &sinks.dem_refined,
-                &deps.depression_level,
-                min_size,
-            )?;
-            let forcing = InundationForcing {
-                runoff_coeff: rc.as_ref(),
-                infiltration_cm_h: inf.as_ref(),
-                antecedent_depth: ant.as_ref(),
-                hyetograph: hyetograph.as_deref(),
+    let pipe = py
+        .detach(move || {
+            let breach = breach_max_depth.map(|md| BreachOptions {
+                mode: BreachMode::Selective,
+                max_depth: Some(md),
+                ..Default::default()
+            });
+            let opts = lidar::InMemoryFullPipelineOptions {
+                kernel_size,
+                breach,
+                simulation: sim_opts,
+                forcing: InundationForcing {
+                    runoff_coeff: rc.as_ref(),
+                    infiltration_cm_h: inf.as_ref(),
+                    antecedent_depth: ant.as_ref(),
+                    hyetograph: hyetograph.as_deref(),
+                },
+                scalar_runoff_coeff: 1.0,
+                stream_vector: None,
             };
-            let (fill_time, _) = lidar::simulate_inundation_with_forcing_in_memory(
-                &sinks.sink,
-                &hir,
-                &sim_opts,
-                &forcing,
-            )?;
-            let num_steps = ((rain_duration_h / time_step_h).ceil() as usize).max(1);
-            let steps = lidar::compute_inundation_step_summaries(
-                &sinks.sink,
-                &fill_time,
-                num_steps,
-                time_step_h,
-            );
-            let spill_paths =
-                lidar::delineate_spill_flow_paths_in_memory(&sinks.dem_refined, &deps, &fill_time)?;
-            let rating_curves = lidar::compute_rating_curves(&sinks.sink, &deps, interval.abs())?;
-            let graph = lidar::build_connectivity_graph(
-                &deps,
-                &cat_recs,
-                &fill_time,
-                &spill_paths,
-                rain_intensity_cm_h,
-                None,
-            )?;
-            Ok((
-                deps.depression_id,
-                deps.depression_level,
-                hir,
-                fill_time,
-                deps.depressions,
-                steps,
-                spill_paths,
-                rating_curves,
-                graph,
-            ))
+            lidar::run_full_pipeline_in_memory(&raw_dem, &opts)
         })
         .map_err(to_py_err)?;
 
     let dict = PyDict::new(py);
-    dict.set_item("depression_id", to_py_array2_i32(py, dep_id)?)?;
-    dict.set_item("depression_level", to_py_array2_i32(py, dep_level)?)?;
-    dict.set_item("catchment_hierarchy", to_py_array2(py, hir)?)?;
-    dict.set_item("fill_time", to_py_array2(py, fill_time)?)?;
+    dict.set_item(
+        "depression_id",
+        to_py_array2_i32(py, pipe.depressions.depression_id)?,
+    )?;
+    dict.set_item(
+        "depression_level",
+        to_py_array2_i32(py, pipe.depressions.depression_level)?,
+    )?;
+    dict.set_item(
+        "catchment_hierarchy",
+        to_py_array2(py, pipe.catchment_hierarchy)?,
+    )?;
+    dict.set_item("fill_time", to_py_array2(py, pipe.fill_time)?)?;
 
     let py_deps = PyList::empty(py);
-    for d in &depressions {
+    for d in &pipe.depressions.depressions {
         py_deps.append(nested_dep_to_dict(py, d)?)?;
     }
     dict.set_item("depressions", py_deps)?;
 
     let py_steps = PyList::empty(py);
-    for s in &steps {
+    for s in &pipe.steps {
         let d = PyDict::new(py);
         d.set_item("step", s.step)?;
         d.set_item("time_hours", s.time_hours)?;
@@ -1398,7 +1368,7 @@ fn simulate_inundation_array<'py>(
     dict.set_item("steps", py_steps)?;
 
     let py_spills = PyList::empty(py);
-    for sp in &spill_paths {
+    for sp in &pipe.spill_paths {
         let d = PyDict::new(py);
         d.set_item("from_dep_id", sp.from_dep_id)?;
         d.set_item("from_level", sp.from_level)?;
@@ -1412,7 +1382,7 @@ fn simulate_inundation_array<'py>(
     dict.set_item("spill_paths", py_spills)?;
 
     let py_rc = PyList::empty(py);
-    for pt in &rating_curves {
+    for pt in &pipe.rating_curves {
         let d = PyDict::new(py);
         d.set_item("dep_id", pt.dep_id)?;
         d.set_item("level", pt.level)?;
@@ -1424,8 +1394,8 @@ fn simulate_inundation_array<'py>(
         py_rc.append(d)?;
     }
     dict.set_item("rating_curves", py_rc)?;
-    dict.set_item("graph_node_count", graph.nodes.len())?;
-    dict.set_item("graph_edge_count", graph.edges.len())?;
+    dict.set_item("graph_node_count", pipe.connectivity_graph.nodes.len())?;
+    dict.set_item("graph_edge_count", pipe.connectivity_graph.edges.len())?;
     Ok(dict)
 }
 

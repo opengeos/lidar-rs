@@ -5,8 +5,6 @@
 //! georeferenced spill-path vector layers (`.gpkg`, `.geojson`, `.shp`).
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use richdem::{Array2D, DemNum};
@@ -134,11 +132,16 @@ pub fn compute_rating_curves(
         }
 
         let n_steps = ((span / interval).ceil() as usize).clamp(1, 500);
+        let eff_interval = if n_steps == 500 && span > 500.0 * interval {
+            span / n_steps as f64
+        } else {
+            interval
+        };
         for s in 0..=n_steps {
             let stage = if s == n_steps {
                 z_max
             } else {
-                (z_min + s as f64 * interval).min(z_max)
+                (z_min + s as f64 * eff_interval).min(z_max)
             };
             // Number of cells with z <= stage
             let k = buf.partition_point(|&z| z <= stage);
@@ -167,16 +170,7 @@ pub fn write_rating_curves_csv(points: &[RatingCurvePoint], path: impl AsRef<Pat
     {
         std::fs::create_dir_all(parent)?;
     }
-    let mut w = BufWriter::new(File::create(path)?);
-    writeln!(w, "dep_id,level,region_id,stage,depth,area,volume")?;
-    for p in points {
-        writeln!(
-            w,
-            "{},{},{},{:.4},{:.4},{:.4},{:.4}",
-            p.dep_id, p.level, p.region_id, p.stage, p.depth, p.area, p.volume
-        )?;
-    }
-    w.flush()?;
+    std::fs::write(path, rating_curves_to_csv_string(points))?;
     Ok(())
 }
 
@@ -294,22 +288,37 @@ fn load_stream_segments(path: &Path) -> Result<Vec<([f64; 2], [f64; 2])>> {
 /// Builds a directed connectivity graph combining nested depression nodes, hierarchical
 /// child-to-parent merge edges, and simulated overland spill-path edges.
 ///
+/// When `hyetograph` is provided (`[(dt_h, intensity_cm_h)]`), `fill_runoff_mm` and
+/// `spill_runoff_mm` integrate cumulative depth along the hyetograph instead of assuming
+/// constant `rain_intensity_cm_h`.
+///
 /// When `stream_vector` is provided (e.g., USGS NHD flowlines in the same CRS as the DEM),
 /// each spill edge is annotated with the exact Euclidean distance from its endpoint to the
 /// nearest stream segment.
+#[allow(clippy::too_many_arguments)]
 pub fn build_connectivity_graph(
     deps: &InMemoryDepressions,
     catchments: &[CatchmentHierarchyRecord],
     fill_time: &Array2D<f64>,
     spill_paths: &[SpillFlowPath],
     rain_intensity_cm_h: f64,
+    hyetograph: Option<&[(f64, f64)]>,
     stream_vector: Option<&Path>,
 ) -> Result<ConnectivityGraph> {
     let gt = deps.depression_id.geotransform;
-    let rain_mm_h = rain_intensity_cm_h * 10.0;
+    if fill_time.width() != deps.depression_id.width()
+        || fill_time.height() != deps.depression_id.height()
+    {
+        return Err(Error::DimensionMismatch(format!(
+            "fill_time ({}x{}) does not match depression_id ({}x{})",
+            fill_time.width(),
+            fill_time.height(),
+            deps.depression_id.width(),
+            deps.depression_id.height()
+        )));
+    }
 
-    // Approximate per-depression fill time (max finite fill time across its owned cells)
-    // and map catchment area from records when sizes match, falling back to depression area.
+    // Approximate per-depression fill time (max finite fill time across its owned cells).
     let max_id = deps.depressions.iter().map(|d| d.id).max().unwrap_or(0) as usize;
     let mut dep_max_ft = vec![f64::NEG_INFINITY; max_id + 1];
     let nd = fill_time.no_data();
@@ -330,7 +339,8 @@ pub fn build_connectivity_graph(
         }
     }
 
-    // Match catchment records by (level, count) or level-order fallback.
+    // Match catchment area by `(level, cell_count)` heuristic (falling back to depression area
+    // when no matching catchment record exists; ties at identical `(level, count)` share `cat_area`).
     let mut cat_by_lvl_area: HashMap<(u32, usize), f64> = HashMap::new();
     for r in catchments {
         cat_by_lvl_area.insert((r.level, r.count), r.cat_area);
@@ -363,7 +373,9 @@ pub fn build_connectivity_graph(
                 hypsometric_integral: d.hypsometric_integral,
                 cat_area,
                 fill_time_h: ft,
-                fill_runoff_mm: ft.map(|t| t * rain_mm_h),
+                fill_runoff_mm: ft.map(|t| {
+                    crate::inundation::cumulative_runoff_mm(t, rain_intensity_cm_h, hyetograph)
+                }),
             }
         })
         .collect();
@@ -402,7 +414,11 @@ pub fn build_connectivity_graph(
             to_id: sp.to_dep_id,
             edge_type: "spill".to_string(),
             spill_time_h: Some(sp.spill_time_h),
-            spill_runoff_mm: Some(sp.spill_time_h * rain_mm_h),
+            spill_runoff_mm: Some(crate::inundation::cumulative_runoff_mm(
+                sp.spill_time_h,
+                rain_intensity_cm_h,
+                hyetograph,
+            )),
             merge_time_h: sp.merge_time_h,
             spill_elev: Some(sp.spill_elev),
             length_m,
@@ -530,13 +546,31 @@ pub fn connectivity_graph_to_graphml_string(graph: &ConnectivityGraph) -> String
         }
         let _ = writeln!(out, r#"    </node>"#);
     }
+    fn xml_escape(s: &str) -> String {
+        let mut escaped = String::with_capacity(s.len());
+        for ch in s.chars() {
+            match ch {
+                '&' => escaped.push_str("&amp;"),
+                '<' => escaped.push_str("&lt;"),
+                '>' => escaped.push_str("&gt;"),
+                '"' => escaped.push_str("&quot;"),
+                '\'' => escaped.push_str("&apos;"),
+                other => escaped.push(other),
+            }
+        }
+        escaped
+    }
     for (ei, e) in graph.edges.iter().enumerate() {
         let _ = writeln!(
             out,
             r#"    <edge id="e{ei}" source="n{}" target="n{}">"#,
             e.from_id, e.to_id
         );
-        let _ = writeln!(out, r#"      <data key="e_type">{}</data>"#, e.edge_type);
+        let _ = writeln!(
+            out,
+            r#"      <data key="e_type">{}</data>"#,
+            xml_escape(&e.edge_type)
+        );
         if let Some(sm) = e.spill_runoff_mm {
             let _ = writeln!(out, r#"      <data key="e_spill_mm">{sm:.4}</data>"#);
         }
@@ -570,6 +604,7 @@ pub fn write_spill_paths_vector(
     geotransform: &[f64; 6],
     projection: &str,
     rain_intensity_cm_h: f64,
+    hyetograph: Option<&[(f64, f64)]>,
     path: impl AsRef<Path>,
 ) -> Result<()> {
     let path = path.as_ref();
@@ -601,7 +636,6 @@ pub fn write_spill_paths_vector(
         layer.schema.add_field(FieldDef::new(name, ftype));
     }
 
-    let rain_mm_h = rain_intensity_cm_h * 10.0;
     for (idx, sp) in spill_paths.iter().enumerate() {
         if sp.cells.len() < 2 {
             continue;
@@ -626,7 +660,11 @@ pub fn write_spill_paths_vector(
                 FieldValue::Integer(sp.from_level as i64),
                 FieldValue::Integer(sp.to_dep_id as i64),
                 FieldValue::Float(sp.spill_time_h),
-                FieldValue::Float(sp.spill_time_h * rain_mm_h),
+                FieldValue::Float(crate::inundation::cumulative_runoff_mm(
+                    sp.spill_time_h,
+                    rain_intensity_cm_h,
+                    hyetograph,
+                )),
                 sp.merge_time_h
                     .map(FieldValue::Float)
                     .unwrap_or(FieldValue::Null),

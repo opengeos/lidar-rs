@@ -491,6 +491,21 @@ fn test_full_inundation_hydrology_pipeline_on_sample_dem() {
     assert_eq!(hir.level_shapefiles.len(), deps.max_level as usize);
     assert!(!hir.records.is_empty());
 
+    // Verify in-memory compressed-forest catchment hierarchy matches per-level reference
+    let dem = load_raster::<f64>(refined_dem, None).unwrap();
+    let dep_lvl = load_raster::<i32>(&deps.depression_level_path, None).unwrap();
+    let (mem_hir, mem_recs) =
+        lidar::delineate_catchment_hierarchy_in_memory(&dem, &dep_lvl, 1000).unwrap();
+    let file_hir = load_raster::<f64>(&hir.catchment_raster_path, None).unwrap();
+    assert_eq!(mem_hir.data().len(), file_hir.data().len());
+    assert_eq!(mem_recs.len(), hir.records.len());
+    for (a, b) in mem_hir.data().iter().zip(file_hir.data().iter()) {
+        assert!(
+            (a - b).abs() < 1e-6,
+            "catchment hierarchy raster mismatch: in-memory={a} vs file={b}"
+        );
+    }
+
     // Step 6: Simulate inundation dynamics (6_Simulate Inundation.py)
     let sim_dir = tmp.path().join("simulation");
     let sim = simulate_inundation(
@@ -760,11 +775,32 @@ fn test_inundation_forcing_scs_and_run_pipeline() {
     assert!(res.depressions_gpkg.as_ref().unwrap().exists());
     assert!(res.spill_paths_gpkg.as_ref().unwrap().exists());
     assert!(res.rating_curves_csv.as_ref().unwrap().exists());
+    #[cfg(feature = "serde")]
     assert!(res.connectivity_graph_json.as_ref().unwrap().exists());
     assert!(res.connectivity_graphml.as_ref().unwrap().exists());
     assert!(res.inundation_csv.exists());
     assert!(tmp.path().join("fill_time.tif").exists());
     assert!(res.summary_json.exists());
+
+    // Verify hyetograph step-limit error & cumulative_runoff_mm integration
+    assert!(scs_type2_hyetograph(100.0, 24.0, 0.001).is_err());
+    let cum_24 = lidar::cumulative_runoff_mm(24.0, 999.0, Some(&hyeto));
+    assert!((cum_24 - 100.0).abs() < 1e-3);
+
+    // Verify export_inundation_frames_png rejects mismatched fill_time dimensions
+    let bad_ft = lidar::Array2D::from_vec(10, 10, vec![0.0; 100]).unwrap();
+    assert!(
+        lidar::export_inundation_frames_png(
+            &dem,
+            &bad_ft,
+            2,
+            1.0,
+            &[],
+            tmp.path().join("bad_frames"),
+            &lidar::AnimateInundationOptions::default(),
+        )
+        .is_err()
+    );
 
     // Verify GraphML has valid XML graph tags and morphometry fields exist in GeoPackage
     let graphml = std::fs::read_to_string(res.connectivity_graphml.as_ref().unwrap()).unwrap();
@@ -934,8 +970,8 @@ fn test_pointcloud_filtering_dtm_and_chm() {
         .filter(|v| v.is_finite() && *v > 0.0)
         .fold(f64::NEG_INFINITY, f64::max);
     assert!(
-        max_g < 103.0,
-        "ground-filtered DSM max should be < 103, got {max_g}"
+        max_g.is_finite() && max_g > 99.0 && max_g < 103.0,
+        "ground-filtered DSM max should be in (99, 103), got {max_g}"
     );
 
     // DTM using preclassified and CSF

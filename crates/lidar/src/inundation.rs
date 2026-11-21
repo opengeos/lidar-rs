@@ -1176,7 +1176,7 @@ pub fn scs_curve_number_runoff(cn: &Array2D<f64>, precip_mm: f64) -> Result<Arra
             if !v.is_finite() || v.rd_eq(nd) {
                 return 1.0;
             }
-            let c = v.clamp(1.0, 100.0);
+            let c = v.clamp(1e-6, 100.0);
             let s = 25_400.0 / c - 254.0;
             let ia = 0.2 * s;
             if precip_mm <= ia {
@@ -1249,7 +1249,13 @@ pub fn scs_type2_hyetograph(
         }
         1.0
     };
-    let n_steps = ((duration_h / time_step_h).ceil() as usize).clamp(1, MAX_SIMULATION_STEPS);
+    let raw_steps = (duration_h / time_step_h).ceil();
+    if !raw_steps.is_finite() || raw_steps < 1.0 || raw_steps > MAX_SIMULATION_STEPS as f64 {
+        return Err(Error::InvalidArgument(format!(
+            "hyetograph requires {raw_steps} steps (duration_h={duration_h}, time_step_h={time_step_h}), exceeding MAX_SIMULATION_STEPS ({MAX_SIMULATION_STEPS})"
+        )));
+    }
+    let n_steps = raw_steps as usize;
     let mut out = Vec::with_capacity(n_steps);
     let mut prev_t = 0.0f64;
     let mut prev_frac = 0.0f64;
@@ -1264,6 +1270,63 @@ pub fn scs_type2_hyetograph(
         prev_frac = frac;
     }
     Ok(out)
+}
+
+/// Integrates cumulative storm rainfall / effective runoff depth (mm) up to `t_hours`.
+///
+/// When `hyetograph` is `Some`, integrates piecewise-constant `(dt_h, intensity_cm_h)` steps
+/// up to `t_hours`. Otherwise uses constant `t_hours * rain_intensity_cm_h * 10.0`.
+pub fn cumulative_runoff_mm(
+    t_hours: f64,
+    rain_intensity_cm_h: f64,
+    hyetograph: Option<&[(f64, f64)]>,
+) -> f64 {
+    if !t_hours.is_finite() || t_hours <= 0.0 {
+        return 0.0;
+    }
+    let Some(steps) = hyetograph else {
+        return t_hours * rain_intensity_cm_h * 10.0;
+    };
+    let mut rem_t = t_hours;
+    let mut total_mm = 0.0f64;
+    for &(dt, intensity_cm_h) in steps {
+        if rem_t <= 0.0 {
+            break;
+        }
+        if dt <= 0.0 {
+            continue;
+        }
+        let used = rem_t.min(dt);
+        total_mm += used * intensity_cm_h * 10.0;
+        rem_t -= used;
+    }
+    total_mm
+}
+
+/// Formats time-series inundation step summaries as CSV with integrated cumulative runoff (mm).
+pub fn format_inundation_curve_csv(
+    steps: &[InundationStepSummary],
+    rain_intensity_cm_h: f64,
+    hyetograph: Option<&[(f64, f64)]>,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from(
+        "step,time_hours,runoff_mm,inundated_cells,inundated_area,inundated_fraction\n",
+    );
+    for s in steps {
+        let runoff_mm = cumulative_runoff_mm(s.time_hours, rain_intensity_cm_h, hyetograph);
+        let _ = writeln!(
+            out,
+            "{},{:.4},{:.4},{},{:.4},{:.6}",
+            s.step,
+            s.time_hours,
+            runoff_mm,
+            s.inundated_cells,
+            s.inundated_area,
+            s.inundated_fraction
+        );
+    }
+    out
 }
 
 /// Maps a required cumulative effective runoff depth (meters) onto elapsed time (hours)
@@ -1292,6 +1355,10 @@ fn invert_hyetograph_time(
                 return elapsed_h + rem_vol / inflow_m3_h;
             }
             rem_vol -= step_vol;
+        } else if inflow_m3_h < 0.0 {
+            // Vertical infiltration exceeds rainfall: previously accumulated water drains
+            // (capped at empty basin `req_volume_m3`).
+            rem_vol = (rem_vol - inflow_m3_h * dt).min(req_volume_m3);
         }
         elapsed_h += dt;
     }
@@ -1492,9 +1559,24 @@ pub fn simulate_inundation_with_forcing_in_memory(
         return simulate_inundation_in_memory(sink, catchment_area, options);
     }
     let _ = validate_options(options)?;
+    if let Some(hyeto) = forcing.hyetograph {
+        if hyeto.is_empty() {
+            return Err(Error::InvalidArgument(
+                "hyetograph must not be empty when provided".into(),
+            ));
+        }
+        for (idx, &(dt, intensity)) in hyeto.iter().enumerate() {
+            if !dt.is_finite() || dt <= 0.0 || !intensity.is_finite() || intensity < 0.0 {
+                return Err(Error::InvalidArgument(format!(
+                    "invalid hyetograph step {idx}: dt={dt}, intensity_cm_h={intensity}"
+                )));
+            }
+        }
+    }
     let w = sink.width();
     let h = sink.height();
-    let check_dim = |arr: &Array2D<f64>, name: &str| -> Result<()> {
+    let sink_gt = sink.geotransform;
+    let check_grid = |arr: &Array2D<f64>, name: &str| -> Result<()> {
         if arr.width() != w || arr.height() != h {
             return Err(Error::DimensionMismatch(format!(
                 "{name} ({}x{}) does not match sink ({w}x{h})",
@@ -1502,17 +1584,25 @@ pub fn simulate_inundation_with_forcing_in_memory(
                 arr.height()
             )));
         }
+        for (k, (&a, &b)) in arr.geotransform.iter().zip(sink_gt.iter()).enumerate() {
+            let tol = 1e-6 * a.abs().max(b.abs()).max(1.0);
+            if (a - b).abs() > tol {
+                return Err(Error::DimensionMismatch(format!(
+                    "{name} geotransform[{k}] ({a}) does not match sink ({b})"
+                )));
+            }
+        }
         Ok(())
     };
-    check_dim(catchment_area, "catchment raster")?;
+    check_grid(catchment_area, "catchment raster")?;
     if let Some(rc) = forcing.runoff_coeff {
-        check_dim(rc, "runoff_coeff")?;
+        check_grid(rc, "runoff_coeff")?;
     }
     if let Some(inf) = forcing.infiltration_cm_h {
-        check_dim(inf, "infiltration_cm_h")?;
+        check_grid(inf, "infiltration_cm_h")?;
     }
     if let Some(ant) = forcing.antecedent_depth {
-        check_dim(ant, "antecedent_depth")?;
+        check_grid(ant, "antecedent_depth")?;
     }
 
     let metrics = affine_metrics(&sink.geotransform);
@@ -1640,6 +1730,115 @@ pub fn simulate_inundation_with_forcing_in_memory(
     Ok((out, nb_regions))
 }
 
+/// Options for [`run_full_pipeline_in_memory`] (shared core orchestration for Rust, Python, and WASM).
+pub struct InMemoryFullPipelineOptions<'a> {
+    /// Median filter kernel size (`<= 1` skips smoothing).
+    pub kernel_size: usize,
+    /// Optional selective/constrained depression breaching applied prior to smoothing and sink extraction.
+    pub breach: Option<BreachOptions>,
+    /// Level-set and inundation simulation parameters.
+    pub simulation: SimulateInundationOptions,
+    /// Hydrologic forcing (runoff coefficient raster, infiltration raster, antecedent depth, hyetograph).
+    pub forcing: InundationForcing<'a>,
+    /// Effective scalar runoff multiplier used for reporting cumulative runoff (mm) when no spatially
+    /// variable raster is used (default `1.0`).
+    pub scalar_runoff_coeff: f64,
+    /// Optional stream polyline vector for computing spill-to-stream distances on the connectivity graph.
+    pub stream_vector: Option<&'a Path>,
+}
+
+/// Complete in-memory outputs from [`run_full_pipeline_in_memory`].
+pub struct InMemoryFullPipeline {
+    pub sinks: InMemorySinks,
+    pub depressions: InMemoryDepressions,
+    pub catchment_hierarchy: Array2D<f64>,
+    pub catchment_records: Vec<CatchmentHierarchyRecord>,
+    pub fill_time: Array2D<f64>,
+    pub num_regions: usize,
+    pub steps: Vec<InundationStepSummary>,
+    pub spill_paths: Vec<SpillFlowPath>,
+    pub rating_curves: Vec<crate::graph::RatingCurvePoint>,
+    pub connectivity_graph: crate::graph::ConnectivityGraph,
+    pub inundation_curve_csv: String,
+}
+
+/// Runs the complete in-memory hydrology pipeline (optional breaching -> optional median filter ->
+/// sink extraction -> nested depression hierarchy -> catchment hierarchy -> forced inundation ->
+/// spill flow paths -> rating curves -> connectivity graph) without touching the filesystem.
+pub fn run_full_pipeline_in_memory(
+    raw_dem: &Array2D<f64>,
+    options: &InMemoryFullPipelineOptions<'_>,
+) -> Result<InMemoryFullPipeline> {
+    let num_steps = validate_options(&options.simulation)?;
+    let sim_opts = &options.simulation;
+
+    let mut dem = raw_dem.clone();
+    if options.kernel_size > 1 {
+        dem = median_filter(&dem, options.kernel_size)?;
+    }
+    if let Some(ref breach_opts) = options.breach {
+        dem = breach_depressions(&dem, breach_opts)?;
+    }
+
+    let sinks = extract_sinks_in_memory(&dem, sim_opts.min_size, Topology::D8)?;
+    let depressions = delineate_depressions_in_memory(
+        &sinks.sink,
+        sim_opts.min_size,
+        sim_opts.min_depth,
+        sim_opts.interval,
+    )?;
+    let (catchment_hierarchy, catchment_records) = delineate_catchment_hierarchy_in_memory(
+        &sinks.dem_refined,
+        &depressions.depression_level,
+        sim_opts.min_size,
+    )?;
+
+    let (fill_time, num_regions) = simulate_inundation_with_forcing_in_memory(
+        &sinks.sink,
+        &catchment_hierarchy,
+        sim_opts,
+        &options.forcing,
+    )?;
+    let steps =
+        compute_inundation_step_summaries(&sinks.sink, &fill_time, num_steps, sim_opts.time_step_h);
+    let spill_paths =
+        delineate_spill_flow_paths_in_memory(&sinks.dem_refined, &depressions, &fill_time)?;
+    let rating_curves = compute_rating_curves(&sinks.sink, &depressions, sim_opts.interval.abs())?;
+
+    // Scale hyetograph / constant rainfall intensity by scalar_runoff_coeff for reported runoff depth.
+    let eff_rain = sim_opts.rain_intensity_cm_h * options.scalar_runoff_coeff;
+    let scaled_hyeto: Option<Vec<(f64, f64)>> = options.forcing.hyetograph.map(|h| {
+        h.iter()
+            .map(|&(dt, cm_h)| (dt, cm_h * options.scalar_runoff_coeff))
+            .collect()
+    });
+    let connectivity_graph = build_connectivity_graph(
+        &depressions,
+        &catchment_records,
+        &fill_time,
+        &spill_paths,
+        eff_rain,
+        scaled_hyeto.as_deref(),
+        options.stream_vector,
+    )?;
+    let inundation_curve_csv =
+        format_inundation_curve_csv(&steps, eff_rain, scaled_hyeto.as_deref());
+
+    Ok(InMemoryFullPipeline {
+        sinks,
+        depressions,
+        catchment_hierarchy,
+        catchment_records,
+        fill_time,
+        num_regions,
+        steps,
+        spill_paths,
+        rating_curves,
+        connectivity_graph,
+        inundation_curve_csv,
+    })
+}
+
 /// Options for the all-in-one end-to-end [`run_pipeline`] workflow.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -1670,7 +1869,10 @@ pub struct RunPipelineOptions {
     pub save_rasters: bool,
     /// Export unified `depressions.gpkg` and `spill_paths.gpkg` vector layers (default `true`).
     pub export_vectors: bool,
-    /// Export `rating_curves.csv`, `connectivity_graph.json`, and `connectivity_graph.graphml` (default `true`).
+    /// Export `rating_curves.csv`, `connectivity_graph.graphml`, and (when compiled with
+    /// the `serde` feature) `connectivity_graph.json` (default `true`). Note: `summary.json`
+    /// also serializes the full [`RunPipelineResult`] under `serde`, and a minimal numeric
+    /// JSON object when built without `serde`.
     pub export_graph: bool,
 }
 
@@ -1733,15 +1935,54 @@ pub fn run_pipeline(
     let num_steps = validate_options(&options.simulation)?;
     let sim_opts = &options.simulation;
 
+    // Guard against output paths resolving to the input DEM before writing anything.
+    let depressions_csv = out_dir.join("depressions.csv");
+    let catchments_csv = out_dir.join("catchments.csv");
+    let inundation_csv = out_dir.join("inundation_curve.csv");
+    let summary_json = out_dir.join("summary.json");
+    let mut candidate_outputs = vec![
+        depressions_csv.clone(),
+        catchments_csv.clone(),
+        inundation_csv.clone(),
+        summary_json.clone(),
+    ];
+    if options.save_rasters {
+        for name in [
+            "depth.tif",
+            "depression_id.tif",
+            "depression_level.tif",
+            "catchment_hir.tif",
+            "fill_time.tif",
+        ] {
+            candidate_outputs.push(out_dir.join(name));
+        }
+    }
+    if options.export_vectors {
+        candidate_outputs.push(out_dir.join("depressions.gpkg"));
+        candidate_outputs.push(out_dir.join("spill_paths.gpkg"));
+    }
+    if options.export_graph {
+        candidate_outputs.push(out_dir.join("rating_curves.csv"));
+        candidate_outputs.push(out_dir.join("connectivity_graph.graphml"));
+        candidate_outputs.push(out_dir.join("connectivity_graph.json"));
+    }
+    let candidate_refs: Vec<&Path> = candidate_outputs.iter().map(PathBuf::as_path).collect();
+    crate::raster_ops::ensure_no_path_collision(in_dem, &candidate_refs)?;
+
     let mut dem = if options.use_f32 {
         let d32 = load_raster::<f32>(in_dem, None)?;
         let nd32 = d32.no_data();
+        let out_nd = if nd32.is_finite() {
+            nd32 as f64
+        } else {
+            f64::NAN
+        };
         let data: Vec<f64> = d32
             .data()
             .iter()
             .map(|&v| {
                 if v.rd_eq(nd32) || !v.is_finite() {
-                    -9999.0
+                    out_nd
                 } else {
                     v as f64
                 }
@@ -1749,22 +1990,23 @@ pub fn run_pipeline(
             .collect();
         let mut out = Array2D::from_vec(d32.width(), d32.height(), data)?;
         out.copy_metadata_from(&d32);
-        out.set_no_data(-9999.0);
+        out.set_no_data(out_nd);
         out
     } else {
         load_raster::<f64>(in_dem, None)?
     };
 
-    // Optional hydro-conditioning (culvert burning -> selective breaching -> median smoothing)
+    // Smooth raw DEM noise FIRST, then apply culvert burning and selective breaching so a
+    // median filter never smooths away a 1-cell culvert cut or breach channel.
+    if options.kernel_size > 1 {
+        dem = median_filter(&dem, options.kernel_size)?;
+    }
     if let Some(ref culv) = options.culverts_vector {
         let (burned, _) = burn_culverts(&dem, culv, &options.burn_culverts)?;
         dem = burned;
     }
     if let Some(ref breach_opts) = options.breach {
         dem = breach_depressions(&dem, breach_opts)?;
-    }
-    if options.kernel_size > 1 {
-        dem = median_filter(&dem, options.kernel_size)?;
     }
 
     let sinks = extract_sinks_in_memory(&dem, sim_opts.min_size, Topology::D8)?;
@@ -1819,34 +2061,16 @@ pub fn run_pipeline(
         .map(|&v| v * cell_area)
         .sum();
 
-    let depressions_csv = out_dir.join("depressions.csv");
-    let catchments_csv = out_dir.join("catchments.csv");
-    let inundation_csv = out_dir.join("inundation_curve.csv");
-    let summary_json = out_dir.join("summary.json");
-
     write_depressions_csv(&depressions.depressions, &depressions_csv)?;
     write_catchment_hierarchy_csv(&catchment_records, &catchments_csv)?;
-    {
-        let mut w = BufWriter::new(File::create(&inundation_csv)?);
-        writeln!(
-            w,
-            "step,time_hours,runoff_mm,inundated_cells,inundated_area,inundated_fraction"
-        )?;
-        let rain_mm_h = sim_opts.rain_intensity_cm_h * 10.0;
-        for s in &steps {
-            writeln!(
-                w,
-                "{},{:.4},{:.4},{},{:.4},{:.6}",
-                s.step,
-                s.time_hours,
-                s.time_hours * rain_mm_h,
-                s.inundated_cells,
-                s.inundated_area,
-                s.inundated_fraction
-            )?;
-        }
-        w.flush()?;
-    }
+    std::fs::write(
+        &inundation_csv,
+        format_inundation_curve_csv(
+            &steps,
+            sim_opts.rain_intensity_cm_h,
+            options.hyetograph.as_deref(),
+        ),
+    )?;
 
     if options.save_rasters {
         let comp = sim_opts.compress;
@@ -1881,6 +2105,7 @@ pub fn run_pipeline(
             &dem.geotransform,
             &dem.projection,
             sim_opts.rain_intensity_cm_h,
+            options.hyetograph.as_deref(),
             &sg,
         )?;
         (Some(dg), Some(sg))
@@ -1900,6 +2125,7 @@ pub fn run_pipeline(
             &fill_time,
             &spill_paths,
             sim_opts.rain_intensity_cm_h,
+            options.hyetograph.as_deref(),
             options.stream_vector.as_deref(),
         )?;
         let gml_path = out_dir.join("connectivity_graph.graphml");

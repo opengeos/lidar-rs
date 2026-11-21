@@ -14,17 +14,14 @@ use wasm_bindgen::prelude::*;
 
 use lidar::{
     ANIMATION_BANNER_HEIGHT, AnimateInundationOptions, BreachMode, BreachOptions, HillshadeOptions,
-    InundationForcing, SimulateInundationOptions, SpillFlowPath,
+    InMemoryFullPipelineOptions, InundationForcing, SimulateInundationOptions, SpillFlowPath,
     animate_inundation_to_bytes_with_spill_paths, breach_depressions as core_breach_depressions,
-    build_connectivity_graph, compute_hillshade_rgb, compute_inundation_step_summaries,
-    compute_rating_curves, connectivity_graph_to_graphml_string,
-    delineate_catchment_hierarchy_in_memory, delineate_catchments_in_memory,
-    delineate_depressions_in_memory, delineate_mounts_in_memory,
-    delineate_spill_flow_paths_in_memory, extract_sink_labels_from_raster, extract_sinks_in_memory,
-    flip_dem as core_flip_dem, gaussian_filter as core_gaussian_filter,
+    compute_hillshade_rgb, connectivity_graph_to_graphml_string, delineate_catchments_in_memory,
+    delineate_depressions_in_memory, delineate_mounts_in_memory, extract_sink_labels_from_raster,
+    extract_sinks_in_memory, flip_dem as core_flip_dem, gaussian_filter as core_gaussian_filter,
     mean_filter as core_mean_filter, median_filter as core_median_filter,
-    rating_curves_to_csv_string, render_inundation_frame_png_bytes, scs_type2_hyetograph,
-    simulate_inundation_with_forcing_in_memory,
+    rating_curves_to_csv_string, render_inundation_frame_png_bytes, run_full_pipeline_in_memory,
+    scs_type2_hyetograph,
 };
 
 /// Upper bound on total pixels (`frames * width * height`) encoded in a single synchronous
@@ -669,6 +666,7 @@ pub struct InundationOutput {
     time_step_h: f64,
     rain_intensity_cm_h: f64,
     runoff_coeff: f64,
+    scaled_hyetograph: Option<Vec<(f64, f64)>>,
     dem_refined: Array2D<f64>,
     fill_time: Array2D<f64>,
     spill_paths: Vec<SpillFlowPath>,
@@ -839,9 +837,19 @@ impl InundationOutput {
         } else {
             0.0
         };
+        let eff_intensity_cm_h = if t_hours > 0.0 {
+            let cum_mm = lidar::cumulative_runoff_mm(
+                t_hours,
+                self.rain_intensity_cm_h * self.runoff_coeff,
+                self.scaled_hyetograph.as_deref(),
+            );
+            cum_mm / (t_hours * 10.0)
+        } else {
+            self.rain_intensity_cm_h * self.runoff_coeff
+        };
         let opts = AnimateInundationOptions {
             time_step_h: Some(self.time_step_h),
-            rain_intensity_cm_h: Some(self.rain_intensity_cm_h * self.runoff_coeff),
+            rain_intensity_cm_h: Some(eff_intensity_cm_h),
             show_scale_bar,
             show_legend,
             ..Default::default()
@@ -990,53 +998,22 @@ pub fn simulate_inundation_advanced(
         )));
     }
     let raw_dem = read_array2d_f64(dem_bytes, filename)?;
-    let mut dem = raw_dem.clone();
-    if let Some(md) = breach_max_depth
-        && md > 0.0
-    {
-        dem = core_breach_depressions(
-            &dem,
-            &BreachOptions {
-                mode: BreachMode::Selective,
-                max_depth: Some(md),
-                max_length: Some(40),
-                ..Default::default()
-            },
-        )
-        .map_err(to_js_err)?;
-    }
-    if kernel_size > 1 {
-        dem = core_median_filter(&dem, kernel_size).map_err(to_js_err)?;
-    }
-
-    let sim_opts = SimulateInundationOptions {
-        min_size,
-        min_depth,
-        interval,
-        rain_intensity_cm_h,
-        rain_duration_h,
-        time_step_h,
-        compress: false,
-    };
-
-    let sinks = extract_sinks_in_memory(&dem, min_size, Topology::D8).map_err(to_js_err)?;
-    let depressions = delineate_depressions_in_memory(&sinks.sink, min_size, min_depth, interval)
-        .map_err(to_js_err)?;
-    let (catchment_hierarchy, catchment_records) = delineate_catchment_hierarchy_in_memory(
-        &sinks.dem_refined,
-        &depressions.depression_level,
-        min_size,
-    )
-    .map_err(to_js_err)?;
-
+    let breach = breach_max_depth
+        .filter(|&md| md > 0.0)
+        .map(|md| BreachOptions {
+            mode: BreachMode::Selective,
+            max_depth: Some(md),
+            max_length: Some(40),
+            ..Default::default()
+        });
     let rc_arr = if (runoff_coeff - 1.0).abs() > 1e-12 {
         let mut a = Array2D::from_vec(
-            dem.width(),
-            dem.height(),
-            vec![runoff_coeff; dem.data().len()],
+            raw_dem.width(),
+            raw_dem.height(),
+            vec![runoff_coeff; raw_dem.data().len()],
         )
         .map_err(to_js_err)?;
-        a.copy_metadata_from(&dem);
+        a.copy_metadata_from(&raw_dem);
         Some(a)
     } else {
         None
@@ -1047,72 +1024,51 @@ pub fn simulate_inundation_advanced(
         }
         _ => None,
     };
-    let forcing = InundationForcing {
-        runoff_coeff: rc_arr.as_ref(),
-        infiltration_cm_h: None,
-        antecedent_depth: None,
-        hyetograph: hyeto.as_deref(),
+    let scaled_hyetograph: Option<Vec<(f64, f64)>> = hyeto.as_ref().map(|h| {
+        h.iter()
+            .map(|&(dt, cm_h)| (dt, cm_h * runoff_coeff))
+            .collect()
+    });
+    let opts = InMemoryFullPipelineOptions {
+        kernel_size,
+        breach,
+        simulation: SimulateInundationOptions {
+            min_size,
+            min_depth,
+            interval,
+            rain_intensity_cm_h,
+            rain_duration_h,
+            time_step_h,
+            compress: false,
+        },
+        forcing: InundationForcing {
+            runoff_coeff: rc_arr.as_ref(),
+            infiltration_cm_h: None,
+            antecedent_depth: None,
+            hyetograph: hyeto.as_deref(),
+        },
+        scalar_runoff_coeff: runoff_coeff,
+        stream_vector: None,
     };
-    let (fill_time, num_regions) = simulate_inundation_with_forcing_in_memory(
-        &sinks.sink,
-        &catchment_hierarchy,
-        &sim_opts,
-        &forcing,
-    )
-    .map_err(to_js_err)?;
+    let pipe = run_full_pipeline_in_memory(&raw_dem, &opts).map_err(to_js_err)?;
 
-    let num_steps = ((rain_duration_h / time_step_h).ceil() as usize).max(1);
-    let steps = compute_inundation_step_summaries(&sinks.sink, &fill_time, num_steps, time_step_h);
-    let spill_paths =
-        delineate_spill_flow_paths_in_memory(&sinks.dem_refined, &depressions, &fill_time)
-            .map_err(to_js_err)?;
+    let rating_curves_json = serde_json::to_string(&pipe.rating_curves).map_err(to_js_err)?;
+    let rating_curves_csv = rating_curves_to_csv_string(&pipe.rating_curves);
+    let connectivity_graph_json =
+        serde_json::to_string(&pipe.connectivity_graph).map_err(to_js_err)?;
+    let connectivity_graphml = connectivity_graph_to_graphml_string(&pipe.connectivity_graph);
+    let inundation_curve_csv = pipe.inundation_curve_csv;
 
-    let rating_curves =
-        compute_rating_curves(&sinks.sink, &depressions, interval.abs()).map_err(to_js_err)?;
-    let rating_curves_json = serde_json::to_string(&rating_curves).map_err(to_js_err)?;
-    let rating_curves_csv = rating_curves_to_csv_string(&rating_curves);
-
-    let effective_rain_cm_h = rain_intensity_cm_h * runoff_coeff;
-    let graph = build_connectivity_graph(
-        &depressions,
-        &catchment_records,
-        &fill_time,
-        &spill_paths,
-        effective_rain_cm_h,
-        None,
-    )
-    .map_err(to_js_err)?;
-    let connectivity_graph_json = serde_json::to_string(&graph).map_err(to_js_err)?;
-    let connectivity_graphml = connectivity_graph_to_graphml_string(&graph);
-
-    let mut inundation_curve_csv = String::from(
-        "step,time_hours,runoff_mm,inundated_cells,inundated_area,inundated_fraction\n",
-    );
-    {
-        use std::fmt::Write as _;
-        let eff_mm_h = effective_rain_cm_h * 10.0;
-        for s in &steps {
-            let _ = writeln!(
-                inundation_curve_csv,
-                "{},{:.4},{:.4},{},{:.4},{:.6}",
-                s.step,
-                s.time_hours,
-                s.time_hours * eff_mm_h,
-                s.inundated_cells,
-                s.inundated_area,
-                s.inundated_fraction
-            );
-        }
-    }
-
-    let hillshade_rgb = compute_hillshade_rgb(&sinks.dem_refined, &HillshadeOptions::default());
+    let hillshade_rgb =
+        compute_hillshade_rgb(&pipe.sinks.dem_refined, &HillshadeOptions::default());
     let hillshade_rgba = rgb_to_rgba(&hillshade_rgb);
-    let depth_rgba = colorize_f64_rgba(&sinks.depth, true, false, false);
-    let level_rgba = colorize_i32_rgba(&depressions.depression_level);
-    let fill_time_rgba = colorize_f64_rgba(&fill_time, false, true, true);
+    let depth_rgba = colorize_f64_rgba(&pipe.sinks.depth, true, false, false);
+    let level_rgba = colorize_i32_rgba(&pipe.depressions.depression_level);
+    let fill_time_rgba = colorize_f64_rgba(&pipe.fill_time, false, true, true);
 
-    let ft_nd = fill_time.no_data();
-    let fill_time_values: Vec<f64> = fill_time
+    let ft_nd = pipe.fill_time.no_data();
+    let fill_time_values: Vec<f64> = pipe
+        .fill_time
         .data()
         .iter()
         .map(|&v| {
@@ -1123,31 +1079,34 @@ pub fn simulate_inundation_advanced(
             }
         })
         .collect();
-    let depression_id_values: Vec<i32> = depressions.depression_id.data().to_vec();
+    let depression_id_values: Vec<i32> = pipe.depressions.depression_id.data().to_vec();
 
-    let depressions_json = serde_json::to_string(&depressions.depressions).map_err(to_js_err)?;
-    let catchment_hierarchy_json = serde_json::to_string(&catchment_records).map_err(to_js_err)?;
-    let steps_json = serde_json::to_string(&steps).map_err(to_js_err)?;
-    let spill_paths_json = serde_json::to_string(&spill_paths).map_err(to_js_err)?;
-    let fill_time_tif = write_array2d_tif(&fill_time, "fill_time.tif")?;
-    let catchment_hir_tif = write_array2d_tif(&catchment_hierarchy, "catchment_hir.tif")?;
-    let sink_tif = write_array2d_tif(&sinks.sink, "sink.tif")?;
-    let level_tif = write_array2d_tif(&depressions.depression_level, "depression_level.tif")?;
-    let depressions_geojson = polygonize_array_to_geojson(&depressions.depression_id, "id")?;
+    let depressions_json =
+        serde_json::to_string(&pipe.depressions.depressions).map_err(to_js_err)?;
+    let catchment_hierarchy_json =
+        serde_json::to_string(&pipe.catchment_records).map_err(to_js_err)?;
+    let steps_json = serde_json::to_string(&pipe.steps).map_err(to_js_err)?;
+    let spill_paths_json = serde_json::to_string(&pipe.spill_paths).map_err(to_js_err)?;
+    let fill_time_tif = write_array2d_tif(&pipe.fill_time, "fill_time.tif")?;
+    let catchment_hir_tif = write_array2d_tif(&pipe.catchment_hierarchy, "catchment_hir.tif")?;
+    let sink_tif = write_array2d_tif(&pipe.sinks.sink, "sink.tif")?;
+    let level_tif = write_array2d_tif(&pipe.depressions.depression_level, "depression_level.tif")?;
+    let depressions_geojson = polygonize_array_to_geojson(&pipe.depressions.depression_id, "id")?;
 
     Ok(InundationOutput {
         width: raw_dem.width(),
         height: raw_dem.height(),
         projection: raw_dem.projection,
-        max_level: depressions.max_level,
-        num_regions,
-        num_steps: steps.len(),
+        max_level: pipe.depressions.max_level,
+        num_regions: pipe.num_regions,
+        num_steps: pipe.steps.len(),
         time_step_h,
         rain_intensity_cm_h,
         runoff_coeff,
-        dem_refined: sinks.dem_refined,
-        fill_time,
-        spill_paths,
+        scaled_hyetograph,
+        dem_refined: pipe.sinks.dem_refined,
+        fill_time: pipe.fill_time,
+        spill_paths: pipe.spill_paths,
         depressions_json,
         catchment_hierarchy_json,
         steps_json,
