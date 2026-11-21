@@ -1,6 +1,6 @@
 [project]
 site_name = "lidar-rs"
-site_description = "Pure-Rust port of opengeos/lidar for delineating nested surface depressions and mounts in DEMs, powered by terrio and richdem"
+site_description = "High-performance nested depression delineation and fill-and-spill inundation simulation in pure Rust, powered by terrio and richdem"
 site_author = "opengeos"
 site_url = "https://lidar-rs.opengeos.org"
 repo_url = "https://github.com/opengeos/lidar-rs"
