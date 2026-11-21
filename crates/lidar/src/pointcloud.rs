@@ -8,6 +8,7 @@
 //! generation, and Canopy Height Model (CHM) creation.
 
 use std::path::Path;
+use std::str::FromStr;
 
 pub use terrio::pointcloud::{
     Dimension, LasHeader, PointCloud, PointFilter, PointFormat, PointReadOptions,
@@ -50,6 +51,43 @@ pub enum GroundFilterMethod {
     Csf,
     /// Progressive Morphological Filter (Zhang et al., 2003) via `terrio`.
     Pmf,
+}
+
+impl FromStr for GroundFilterMethod {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "preclassified" => Ok(Self::Preclassified),
+            "csf" => Ok(Self::Csf),
+            "pmf" => Ok(Self::Pmf),
+            other => Err(Error::InvalidArgument(format!(
+                "unknown ground filter method '{other}'; expected preclassified, csf, or pmf"
+            ))),
+        }
+    }
+}
+
+/// Parses a single LiDAR pulse return kind name (`"first"`, `"last"`, `"intermediate"`,
+/// or `"only"` / `"single"`, case-insensitive).
+pub fn parse_return_kind(s: &str) -> Result<ReturnKind> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "first" => Ok(ReturnKind::First),
+        "last" => Ok(ReturnKind::Last),
+        "intermediate" => Ok(ReturnKind::Intermediate),
+        "only" | "single" => Ok(ReturnKind::Only),
+        other => Err(Error::InvalidArgument(format!(
+            "unknown return kind '{other}'; expected first, last, intermediate, or only"
+        ))),
+    }
+}
+
+/// Parses a comma-separated list of LiDAR return kinds using [`parse_return_kind`].
+pub fn parse_return_kinds(s: &str) -> Result<Vec<ReturnKind>> {
+    s.split(',')
+        .filter(|part| !part.trim().is_empty())
+        .map(parse_return_kind)
+        .collect()
 }
 
 /// Options for [`lidar_to_dsm`].

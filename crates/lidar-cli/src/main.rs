@@ -99,18 +99,7 @@ fn parse_u8_list(s: &str) -> lidar::Result<Vec<u8>> {
 }
 
 fn parse_return_kinds(s: &str) -> lidar::Result<Vec<ReturnKind>> {
-    s.split(',')
-        .filter(|part| !part.trim().is_empty())
-        .map(|part| match part.trim().to_ascii_lowercase().as_str() {
-            "first" => Ok(ReturnKind::First),
-            "last" => Ok(ReturnKind::Last),
-            "intermediate" => Ok(ReturnKind::Intermediate),
-            "only" | "single" => Ok(ReturnKind::Only),
-            other => Err(lidar::Error::InvalidArgument(format!(
-                "unknown return kind '{other}'; expected first, last, intermediate, or only"
-            ))),
-        })
-        .collect()
+    lidar::pointcloud::parse_return_kinds(s)
 }
 
 #[derive(Subcommand)]

@@ -85,47 +85,21 @@ fn from_py_array2_with_cell(
 }
 
 fn parse_breach_mode(mode: &str) -> PyResult<BreachMode> {
-    match mode.to_ascii_lowercase().as_str() {
-        "complete" => Ok(BreachMode::Complete),
-        "selective" => Ok(BreachMode::Selective),
-        "constrained" => Ok(BreachMode::Constrained),
-        other => Err(PyValueError::new_err(format!(
-            "Unknown breach mode: {other}"
-        ))),
-    }
+    mode.parse::<BreachMode>().map_err(to_py_err)
 }
 
 fn parse_ground_method(method: &str) -> PyResult<GroundFilterMethod> {
-    match method.to_ascii_lowercase().as_str() {
-        "preclassified" => Ok(GroundFilterMethod::Preclassified),
-        "csf" => Ok(GroundFilterMethod::Csf),
-        "pmf" => Ok(GroundFilterMethod::Pmf),
-        other => Err(PyValueError::new_err(format!(
-            "Unknown ground filter method: {other}"
-        ))),
-    }
+    method.parse::<GroundFilterMethod>().map_err(to_py_err)
 }
 
 fn parse_return_kinds_py(kinds: Option<Vec<String>>) -> PyResult<Option<Vec<ReturnKind>>> {
     let Some(list) = kinds else {
         return Ok(None);
     };
-    let mut out = Vec::with_capacity(list.len());
-    for s in list {
-        let rk = match s.trim().to_ascii_lowercase().as_str() {
-            "first" => ReturnKind::First,
-            "last" => ReturnKind::Last,
-            "intermediate" => ReturnKind::Intermediate,
-            "only" | "single" => ReturnKind::Only,
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "Unknown return kind: {other}"
-                )));
-            }
-        };
-        out.push(rk);
-    }
-    Ok(Some(out))
+    list.iter()
+        .map(|s| lidar::pointcloud::parse_return_kind(s).map_err(to_py_err))
+        .collect::<PyResult<Vec<_>>>()
+        .map(Some)
 }
 
 fn sink_dep_to_dict<'py>(py: Python<'py>, d: &SinkDepression) -> PyResult<Bound<'py, PyDict>> {

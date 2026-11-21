@@ -5,6 +5,7 @@
 //! dependencies.
 
 use std::path::Path;
+use std::str::FromStr;
 
 use richdem::{
     Array2D, DemNum, LindsayMode, Topology, complete_breaching_lindsay2016, lindsay2016,
@@ -12,6 +13,7 @@ use richdem::{
 };
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
+use terrio::crs::SpatialRef;
 use terrio::{Geometry, VectorOpenOptions};
 
 use crate::error::{Error, Result};
@@ -28,6 +30,21 @@ pub enum BreachMode {
     Selective,
     /// Drill a breach path up to `max_depth` and `max_length`, leaving deeper/longer sinks intact.
     Constrained,
+}
+
+impl FromStr for BreachMode {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "complete" => Ok(Self::Complete),
+            "selective" => Ok(Self::Selective),
+            "constrained" => Ok(Self::Constrained),
+            other => Err(Error::InvalidArgument(format!(
+                "unknown breach mode '{other}'; expected complete, selective, or constrained"
+            ))),
+        }
+    }
 }
 
 impl From<BreachMode> for LindsayMode {
@@ -460,10 +477,28 @@ pub fn burn_culverts(
         ))
     })?;
     let ds = terrio::open_vector(vec_str, &VectorOpenOptions::default())?;
+    let dem_srs = if dem.projection.is_empty() {
+        None
+    } else {
+        SpatialRef::parse(&dem.projection)
+            .ok()
+            .filter(|s| !s.is_unknown())
+    };
     let mut out = dem.clone();
     let mut total_carved = 0usize;
 
     for layer in &ds.layers {
+        if let Some(ref d_srs) = dem_srs {
+            let l_srs = SpatialRef::from_layer(layer);
+            if !l_srs.is_unknown() && !d_srs.same_as(&l_srs) {
+                return Err(Error::InvalidArgument(format!(
+                    "culvert vector layer '{}' CRS ({}) does not match DEM CRS ({})",
+                    layer.name,
+                    l_srs.label(),
+                    d_srs.label()
+                )));
+            }
+        }
         for feat in &layer.features {
             let Some(ref geom) = feat.geometry else {
                 continue;
@@ -604,5 +639,40 @@ mod tests {
         assert!(conditioned.get(5, 5) < 10.0);
         // Embankment away from culvert (row 1) remains at 15.0 m
         assert!((conditioned.get(5, 1) - 15.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn burn_culverts_rejects_crs_mismatch() {
+        let mut dem = Array2D::from_vec(5, 5, vec![10.0f64; 25]).unwrap();
+        dem.set_no_data(-9999.0);
+        dem.geotransform = [500_000.0, 1.0, 0.0, 4_000_005.0, 0.0, -1.0];
+        dem.projection = "EPSG:26916".to_string();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let culvert_path = tmp.path().join("culverts_4326.gpkg");
+        let mut layer = Layer::new("culverts".to_string()).with_geom_type(GeometryType::LineString);
+        SpatialRef::parse("EPSG:4326")
+            .unwrap()
+            .apply_to_layer(&mut layer);
+        layer.features.push(Feature {
+            fid: 1,
+            geometry: Some(Geometry::LineString(vec![
+                Coord::xy(-86.0, 37.0),
+                Coord::xy(-85.99, 37.0),
+            ])),
+            attributes: vec![],
+        });
+        terrio::write_vector(
+            &[layer],
+            culvert_path.to_str().unwrap(),
+            &VectorWriteOptions::default(),
+        )
+        .unwrap();
+
+        let err = burn_culverts(&dem, &culvert_path, &BurnCulvertsOptions::default());
+        assert!(
+            err.is_err(),
+            "mismatched culvert vector CRS must be rejected"
+        );
     }
 }

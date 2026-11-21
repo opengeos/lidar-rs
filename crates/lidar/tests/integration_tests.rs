@@ -652,8 +652,13 @@ fn test_hydro_conditioning_breach_and_culverts() {
 
     // Culvert burning across a polyline inside DEM bounds
     let gt = breached.geotransform;
-    let culvert_path = tmp.path().join("culverts.geojson");
+    let culvert_path = tmp.path().join("culverts.gpkg");
     let mut layer = Layer::new("culverts".to_string()).with_geom_type(GeometryType::LineString);
+    if !breached.projection.is_empty()
+        && let Ok(srs) = terrio::crs::SpatialRef::parse(&breached.projection)
+    {
+        srs.apply_to_layer(&mut layer);
+    }
     layer.features.push(Feature {
         fid: 1,
         geometry: Some(Geometry::LineString(vec![

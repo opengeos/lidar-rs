@@ -1162,19 +1162,22 @@ pub struct InundationForcing<'a> {
 /// depth (`precip_mm > 0`) into a spatially variable effective runoff-coefficient raster
 /// (`Q / P` in `[0, 1]`) using the standard NRCS TR-55 rainfall-runoff equation
 /// (`S = 25400 / CN - 254`, `Ia = 0.2 * S`).
+///
+/// Non-finite and NoData CN cells propagate as NoData (`-9999.0`) in the output raster.
 pub fn scs_curve_number_runoff(cn: &Array2D<f64>, precip_mm: f64) -> Result<Array2D<f64>> {
     if !precip_mm.is_finite() || precip_mm <= 0.0 {
         return Err(Error::InvalidArgument(format!(
             "precip_mm must be finite and > 0, got {precip_mm}"
         )));
     }
+    const OUT_NODATA: f64 = -9999.0;
     let nd = cn.no_data();
     let data: Vec<f64> = cn
         .data()
         .iter()
         .map(|&v| {
             if !v.is_finite() || v.rd_eq(nd) {
-                return 1.0;
+                return OUT_NODATA;
             }
             if v <= 0.0 {
                 return 0.0;
@@ -1192,7 +1195,7 @@ pub fn scs_curve_number_runoff(cn: &Array2D<f64>, precip_mm: f64) -> Result<Arra
         .collect();
     let mut out = Array2D::from_vec(cn.width(), cn.height(), data)?;
     out.copy_metadata_from(cn);
-    out.set_no_data(-9999.0);
+    out.set_no_data(OUT_NODATA);
     Ok(out)
 }
 
@@ -2770,13 +2773,14 @@ mod tests {
 
     #[test]
     fn scs_cn_preserves_small_positive_cn_values() {
-        let mut cn = Array2D::from_vec(3, 1, vec![5e-7, 0.0, 100.0]).unwrap();
+        let mut cn = Array2D::from_vec(4, 1, vec![5e-7, 0.0, 100.0, -9999.0]).unwrap();
         cn.set_no_data(-9999.0);
         // For CN = 5e-7, S ~= 5.08e10 and Ia ~= 1.016e10 > 6e9 -> Q must be 0.0.
         let coeff = scs_curve_number_runoff(&cn, 6e9).unwrap();
         assert_eq!(coeff.data()[0], 0.0);
         assert_eq!(coeff.data()[1], 0.0);
         assert!((coeff.data()[2] - 1.0).abs() < 1e-12);
+        assert_eq!(coeff.data()[3], coeff.no_data());
     }
 
     #[test]
