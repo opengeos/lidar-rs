@@ -4,7 +4,7 @@ Add `lidar` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-lidar = "0.3"
+lidar = "0.4"
 ```
 
 ## Example Pipeline
