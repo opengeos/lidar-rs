@@ -69,6 +69,7 @@ Run **`lidar-rs`** directly in your browser via WebAssembly — DEM smoothing, P
             <button type="button" id="lp-prev-btn" class="lp-icon-btn" title="Previous time step">&#9664;</button>
             <button type="button" id="lp-next-btn" class="lp-icon-btn" title="Next time step">&#9654;</button>
             <input type="range" id="lp-slider" min="0" max="1" value="0" aria-label="Simulation time step">
+            <label class="lp-inline-check"><input type="checkbox" id="lp-spill-paths" checked> Spill paths</label>
             <label class="lp-inline-check"><input type="checkbox" id="lp-pingpong" checked> Ping-pong</label>
             <select id="lp-speed" aria-label="Playback speed">
               <option value="400">0.5×</option>

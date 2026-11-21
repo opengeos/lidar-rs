@@ -16,6 +16,7 @@ use richdem::{Array2D, DemNum, load_raster};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::inundation::SpillFlowPath;
 use crate::raster_ops::ensure_no_path_collision;
 
 /// Parameters for directional shaded relief (`hill_shade` in `7_Play_Animation.py`).
@@ -413,12 +414,137 @@ fn compute_gif_dimensions(
     Ok((dw, dh, total_h))
 }
 
-/// Shared internal GIF renderer used by both [`animate_inundation`] (disk frames -> file)
-/// and [`animate_inundation_to_bytes`] (in-memory `fill_time` -> byte buffer).
+fn put_pixel_rgb(buf: &mut [u8], w: usize, h: usize, x: isize, y: isize, rgb: [u8; 3]) {
+    if x < 0 || y < 0 || x >= w as isize || y >= h as isize {
+        return;
+    }
+    let p = ((y as usize) * w + (x as usize)) * 3;
+    buf[p] = rgb[0];
+    buf[p + 1] = rgb[1];
+    buf[p + 2] = rgb[2];
+}
+
+fn draw_thick_segment(
+    buf: &mut [u8],
+    w: usize,
+    h: usize,
+    p0: (f64, f64),
+    p1: (f64, f64),
+    radius: isize,
+    rgb: [u8; 3],
+) {
+    let (x0, y0) = p0;
+    let (x1, y1) = p1;
+    let steps = (x1 - x0).hypot(y1 - y0).ceil().max(1.0) as usize;
+    for s in 0..=steps {
+        let f = s as f64 / steps as f64;
+        let cx = (x0 + (x1 - x0) * f).round() as isize;
+        let cy = (y0 + (y1 - y0) * f).round() as isize;
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx * dx + dy * dy <= radius * radius + radius {
+                    put_pixel_rgb(buf, w, h, cx + dx, cy + dy, rgb);
+                }
+            }
+        }
+    }
+}
+
+/// Draws active overland spill flow paths (whose upstream depression is full at `t_hours`
+/// and whose overland channel still has dry cells) onto the RGB frame body.
+#[allow(clippy::too_many_arguments)]
+fn draw_active_spill_paths(
+    body: &mut [u8],
+    dw: usize,
+    dh: usize,
+    sw: usize,
+    sh: usize,
+    wet: &[bool],
+    t_hours: f64,
+    spill_paths: &[SpillFlowPath],
+) {
+    if spill_paths.is_empty() || sw == 0 || sh == 0 {
+        return;
+    }
+    let sx_scale = dw as f64 / sw as f64;
+    let sy_scale = dh as f64 / sh as f64;
+    const HALO: [u8; 3] = [12, 32, 68];
+    const CORE: [u8; 3] = [56, 189, 248];
+
+    for path in spill_paths {
+        if t_hours < path.spill_time_h || path.cells.len() < 2 {
+            continue;
+        }
+        // Locate the unsubmerged (dry) overland span along this spill channel at `t_hours`.
+        let mut first_dry: Option<usize> = None;
+        let mut last_dry: Option<usize> = None;
+        for (i, &(c, r)) in path.cells.iter().enumerate() {
+            if c < sw && r < sh && !wet[r * sw + c] {
+                if first_dry.is_none() {
+                    first_dry = Some(i);
+                }
+                last_dry = Some(i);
+            }
+        }
+        let (Some(fd), Some(ld)) = (first_dry, last_dry) else {
+            continue; // Saddle is completely submerged (lakes have merged).
+        };
+        let start = fd.saturating_sub(1);
+        let end = (ld + 1).min(path.cells.len() - 1);
+        if end <= start {
+            continue;
+        }
+        let seg = &path.cells[start..=end];
+
+        // Dark halo pass, then vivid cyan core pass.
+        for (radius, color) in [(2isize, HALO), (1isize, CORE)] {
+            for pair in seg.windows(2) {
+                let p0 = (
+                    (pair[0].0 as f64 + 0.5) * sx_scale,
+                    (pair[0].1 as f64 + 0.5) * sy_scale,
+                );
+                let p1 = (
+                    (pair[1].0 as f64 + 0.5) * sx_scale,
+                    (pair[1].1 as f64 + 0.5) * sy_scale,
+                );
+                draw_thick_segment(body, dw, dh, p0, p1, radius, color);
+            }
+        }
+
+        // Directional arrowhead at downstream shoreline tip.
+        let tip = seg[seg.len() - 1];
+        let tail_idx = seg.len().saturating_sub(5);
+        let tail = seg[tail_idx];
+        let tx = (tip.0 as f64 + 0.5) * sx_scale;
+        let ty = (tip.1 as f64 + 0.5) * sy_scale;
+        let dx = tx - (tail.0 as f64 + 0.5) * sx_scale;
+        let dy = ty - (tail.1 as f64 + 0.5) * sy_scale;
+        let len = dx.hypot(dy);
+        if len > 1e-3 {
+            let ux = dx / len;
+            let uy = dy / len;
+            let head_len = 5.5;
+            let spread = 0.52f64;
+            let (sin_s, cos_s) = spread.sin_cos();
+            let lx = tx - head_len * (ux * cos_s - uy * sin_s);
+            let ly = ty - head_len * (ux * sin_s + uy * cos_s);
+            let rx = tx - head_len * (ux * cos_s + uy * sin_s);
+            let ry = ty - head_len * (-ux * sin_s + uy * cos_s);
+            for (radius, color) in [(2isize, HALO), (1isize, CORE)] {
+                draw_thick_segment(body, dw, dh, (tx, ty), (lx, ly), radius, color);
+                draw_thick_segment(body, dw, dh, (tx, ty), (rx, ry), radius, color);
+            }
+        }
+    }
+}
+
+/// Shared internal GIF renderer used by [`animate_inundation`],
+/// [`animate_inundation_to_bytes`], and [`animate_inundation_to_bytes_with_spill_paths`].
 fn render_inundation_gif<W, F>(
     dem: &Array2D<f64>,
     num_steps: usize,
     options: &AnimateInundationOptions,
+    spill_paths: &[SpillFlowPath],
     writer: W,
     mut load_wet_mask: F,
 ) -> Result<(usize, usize, usize)>
@@ -509,6 +635,13 @@ where
             }
         }
 
+        if !spill_paths.is_empty()
+            && let Some(dt) = options.time_step_h
+        {
+            let t_hours = (src_idx + 1) as f64 * dt;
+            draw_active_spill_paths(body, dw, dh, sw, sh, &wet, t_hours, spill_paths);
+        }
+
         let mut gif_frame = Frame::from_rgb_speed(dw as u16, total_h as u16, &frame_rgb, 10);
         gif_frame.delay = delay_cs;
         encoder
@@ -575,7 +708,7 @@ pub fn animate_inundation(
 
     let file = BufWriter::new(File::create(out_gif)?);
     let (frame_count, width, height) =
-        render_inundation_gif(&dem, frames.len(), options, file, |src_idx| {
+        render_inundation_gif(&dem, frames.len(), options, &[], file, |src_idx| {
             let flood = load_raster::<f64>(&frames[src_idx], None)?;
             let fnd = flood.no_data();
             Ok(flood
@@ -605,6 +738,27 @@ pub fn animate_inundation_to_bytes(
     time_step_h: f64,
     options: &AnimateInundationOptions,
 ) -> Result<(Vec<u8>, usize, usize, usize)> {
+    animate_inundation_to_bytes_with_spill_paths(
+        dem,
+        fill_time,
+        num_steps,
+        time_step_h,
+        &[],
+        options,
+    )
+}
+
+/// Like [`animate_inundation_to_bytes`], additionally rendering active overland
+/// [`SpillFlowPath`] channels (with directional arrowheads) once each upstream depression
+/// fills and before the connecting saddle submerges.
+pub fn animate_inundation_to_bytes_with_spill_paths(
+    dem: &Array2D<f64>,
+    fill_time: &Array2D<f64>,
+    num_steps: usize,
+    time_step_h: f64,
+    spill_paths: &[SpillFlowPath],
+    options: &AnimateInundationOptions,
+) -> Result<(Vec<u8>, usize, usize, usize)> {
     if !time_step_h.is_finite() || time_step_h <= 0.0 {
         return Err(Error::InvalidArgument(format!(
             "time_step_h must be finite and > 0, got {time_step_h}"
@@ -626,14 +780,20 @@ pub fn animate_inundation_to_bytes(
     let ft_data = fill_time.data();
     let ft_nd = fill_time.no_data();
     let mut gif_bytes = Vec::new();
-    let (frame_count, width, height) =
-        render_inundation_gif(dem, num_steps, &effective_opts, &mut gif_bytes, |src_idx| {
+    let (frame_count, width, height) = render_inundation_gif(
+        dem,
+        num_steps,
+        &effective_opts,
+        spill_paths,
+        &mut gif_bytes,
+        |src_idx| {
             let t_hours = (src_idx + 1) as f64 * time_step_h;
             Ok(ft_data
                 .iter()
                 .map(|&ft| ft.is_finite() && !ft.rd_eq(ft_nd) && (0.0..=t_hours).contains(&ft))
                 .collect())
-        })?;
+        },
+    )?;
 
     Ok((gif_bytes, frame_count, width, height))
 }
@@ -776,5 +936,60 @@ mod tests {
             decoded_frames += 1;
         }
         assert_eq!(decoded_frames, frames);
+    }
+
+    #[test]
+    fn animate_inundation_to_bytes_with_spill_paths_renders_channels() {
+        let mut dem_data = vec![0.0; 24 * 24];
+        let mut ft_data = vec![-1.0; 24 * 24];
+        for r in 0..24 {
+            for c in 0..24 {
+                dem_data[r * 24 + c] = 100.0 + (r as f64) * 0.1;
+                if r <= 4 && c <= 4 {
+                    ft_data[r * 24 + c] = 0.5;
+                } else if r >= 18 && c >= 18 {
+                    ft_data[r * 24 + c] = 1.0;
+                }
+            }
+        }
+        let dem = Array2D::from_vec(24, 24, dem_data).unwrap();
+        let mut ft = Array2D::from_vec(24, 24, ft_data).unwrap();
+        ft.set_no_data(-1.0);
+
+        let spill = SpillFlowPath {
+            from_dep_id: 1,
+            from_level: 1,
+            to_dep_id: 2,
+            spill_time_h: 0.5,
+            merge_time_h: Some(5.0),
+            spill_elev: 101.0,
+            cells: (4..=18).map(|i| (i, i)).collect(),
+        };
+        let opts = AnimateInundationOptions {
+            ping_pong: false,
+            ..Default::default()
+        };
+
+        let (plain_bytes, frames0, w0, h0) =
+            animate_inundation_to_bytes(&dem, &ft, 3, 1.0, &opts).unwrap();
+        let (spill_bytes, frames1, w1, h1) =
+            animate_inundation_to_bytes_with_spill_paths(&dem, &ft, 3, 1.0, &[spill], &opts)
+                .unwrap();
+
+        assert_eq!((frames0, w0, h0), (frames1, w1, h1));
+        assert!(spill_bytes.starts_with(b"GIF89a"));
+        assert_ne!(
+            plain_bytes, spill_bytes,
+            "active spill path should visibly modify rendered GIF frames"
+        );
+
+        let mut decoder = gif::DecodeOptions::new()
+            .read_info(std::io::Cursor::new(&spill_bytes))
+            .unwrap();
+        let mut decoded = 0usize;
+        while decoder.read_next_frame().unwrap().is_some() {
+            decoded += 1;
+        }
+        assert_eq!(decoded, frames1);
     }
 }

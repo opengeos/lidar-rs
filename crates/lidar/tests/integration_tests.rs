@@ -535,3 +535,62 @@ fn test_full_inundation_hydrology_pipeline_on_sample_dem() {
     let bytes = std::fs::read(&gif_path).unwrap();
     assert!(bytes.starts_with(b"GIF89a"));
 }
+
+#[test]
+fn test_spill_flow_paths_on_sample_dem() {
+    use lidar::{
+        InundationPipelineOptions, SimulateInundationOptions,
+        simulate_inundation_pipeline_in_memory,
+    };
+
+    let dem_path = test_data_dir().join("dem.tif");
+    let dem = load_raster::<f64>(&dem_path, None).unwrap();
+    let pipe = simulate_inundation_pipeline_in_memory(
+        &dem,
+        &InundationPipelineOptions {
+            kernel_size: 3,
+            simulation: SimulateInundationOptions {
+                min_size: 1000,
+                min_depth: 0.3,
+                interval: 0.3,
+                rain_intensity_cm_h: 5.0,
+                rain_duration_h: 50.0,
+                time_step_h: 1.0,
+                compress: false,
+            },
+        },
+    )
+    .unwrap();
+
+    eprintln!(
+        "Total depressions: {}, spill paths: {}",
+        pipe.depressions.depressions.len(),
+        pipe.spill_paths.len()
+    );
+    for p in &pipe.spill_paths {
+        eprintln!(
+            "  dep {} (L{}) -> dep {} | spill_t={:.2}h merge_t={:?} elev={:.2} len={} start={:?} end={:?}",
+            p.from_dep_id,
+            p.from_level,
+            p.to_dep_id,
+            p.spill_time_h,
+            p.merge_time_h.map(|v| format!("{v:.2}h")),
+            p.spill_elev,
+            p.cells.len(),
+            p.cells.first(),
+            p.cells.last(),
+        );
+    }
+    assert!(
+        pipe.spill_paths.len() >= 3,
+        "expected at least 3 inter-depression spill flow paths on sample DEM, got {}",
+        pipe.spill_paths.len()
+    );
+    for p in &pipe.spill_paths {
+        assert!(p.cells.len() >= 2);
+        assert!(p.spill_time_h.is_finite() && p.spill_time_h >= 0.0);
+        if let Some(mt) = p.merge_time_h {
+            assert!(mt > p.spill_time_h);
+        }
+    }
+}

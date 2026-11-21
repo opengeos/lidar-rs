@@ -136,6 +136,92 @@
     ctx.putImageData(new ImageData(out, width, height), 0, 0);
   }
 
+  function drawActiveSpillPaths(ctx, width, height, fillTimes, tHours, spillPaths, stepIdx) {
+    if (!spillPaths || !spillPaths.length) return 0;
+    let activeCount = 0;
+    for (const path of spillPaths) {
+      if (tHours < path.spill_time_h || !path.cells || path.cells.length < 2) continue;
+
+      // Locate unsubmerged (dry) overland portion of the spill channel at tHours
+      let firstDry = -1;
+      let lastDry = -1;
+      for (let i = 0; i < path.cells.length; i++) {
+        const [c, r] = path.cells[i];
+        const ft = fillTimes[r * width + c];
+        if (!(ft >= 0 && ft <= tHours)) {
+          if (firstDry === -1) firstDry = i;
+          lastDry = i;
+        }
+      }
+      if (firstDry === -1) continue; // Saddle is completely submerged (lakes merged)
+
+      const start = Math.max(0, firstDry - 1);
+      const end = Math.min(path.cells.length - 1, lastDry + 1);
+      if (end <= start) continue;
+
+      activeCount++;
+      ctx.save();
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+
+      // Dark halo for crisp contrast over hillshade
+      ctx.beginPath();
+      ctx.moveTo(path.cells[start][0] + 0.5, path.cells[start][1] + 0.5);
+      for (let i = start + 1; i <= end; i++) {
+        ctx.lineTo(path.cells[i][0] + 0.5, path.cells[i][1] + 0.5);
+      }
+      ctx.strokeStyle = "rgba(10, 26, 62, 0.85)";
+      ctx.lineWidth = 4.2;
+      ctx.stroke();
+
+      // Solid sky-blue stream channel
+      ctx.strokeStyle = "#38bdf8";
+      ctx.lineWidth = 2.2;
+      ctx.stroke();
+
+      // Animated bright-white flowing dashes showing downstream spill direction
+      ctx.setLineDash([4, 6]);
+      ctx.lineDashOffset = -(stepIdx * 3);
+      ctx.strokeStyle = "rgba(224, 242, 254, 0.92)";
+      ctx.lineWidth = 1.4;
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Directional arrowhead at downstream shoreline tip
+      const [tx, ty] = [path.cells[end][0] + 0.5, path.cells[end][1] + 0.5];
+      const tailIdx = Math.max(start, end - 6);
+      const [bx, by] = [path.cells[tailIdx][0] + 0.5, path.cells[tailIdx][1] + 0.5];
+      const dx = tx - bx;
+      const dy = ty - by;
+      const len = Math.hypot(dx, dy);
+      if (len > 0.5) {
+        const ux = dx / len;
+        const uy = dy / len;
+        const headLen = 8.5;
+        const spread = 0.52;
+        const cosS = Math.cos(spread);
+        const sinS = Math.sin(spread);
+        const lx = tx - headLen * (ux * cosS - uy * sinS);
+        const ly = ty - headLen * (ux * sinS + uy * cosS);
+        const rx = tx - headLen * (ux * cosS + uy * sinS);
+        const ry = ty - headLen * (-ux * sinS + uy * cosS);
+
+        ctx.beginPath();
+        ctx.moveTo(tx, ty);
+        ctx.lineTo(lx, ly);
+        ctx.lineTo(rx, ry);
+        ctx.closePath();
+        ctx.fillStyle = "#38bdf8";
+        ctx.fill();
+        ctx.strokeStyle = "rgba(10, 26, 62, 0.9)";
+        ctx.lineWidth = 1.2;
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+    return activeCount;
+  }
+
   function renderPlayerFrame() {
     if (!player) return;
     const {
@@ -144,6 +230,7 @@
       hillshade,
       fillTimes,
       steps,
+      spillPaths,
       rainIntensity,
       areaUnit,
       frameBuf,
@@ -186,7 +273,13 @@
       canvas.width = width;
       canvas.height = height;
     }
-    canvas.getContext("2d").putImageData(new ImageData(frameBuf, width, height), 0, 0);
+    const ctx = canvas.getContext("2d");
+    ctx.putImageData(new ImageData(frameBuf, width, height), 0, 0);
+
+    const showSpills = $("lp-spill-paths") ? $("lp-spill-paths").checked : true;
+    const activeSpills = showSpills
+      ? drawActiveSpillPaths(ctx, width, height, fillTimes, tHours, spillPaths, stepIdx)
+      : 0;
 
     const slider = $("lp-slider");
     if (slider) slider.value = String(stepIdx);
@@ -198,8 +291,9 @@
       const cumRain = (tHours * rainIntensity).toFixed(1);
       const pct = (step.inundated_fraction * 100).toFixed(1);
       const areaStr = formatArea(step.inundated_area, areaUnit);
+      const spillSuffix = showSpills ? ` · Active spills: ${activeSpills}` : "";
       telemetry.textContent =
-        `${phase} · T = ${tHours.toFixed(1)} / ${totalHours.toFixed(1)} h · Rain: ${cumRain} cm · Inundated: ${step.inundated_cells.toLocaleString()} cells (${areaStr}, ${pct}% of sinks)`;
+        `${phase} · T = ${tHours.toFixed(1)} / ${totalHours.toFixed(1)} h · Rain: ${cumRain} cm · Inundated: ${step.inundated_cells.toLocaleString()} cells (${areaStr}, ${pct}% of sinks)${spillSuffix}`;
     }
 
     renderInundationChart();
@@ -321,7 +415,16 @@
     playTimer = setInterval(stepPlayer, delayMs);
   }
 
-  function initPlayer(width, height, hillshade, fillTimes, steps, rainIntensity, areaUnit) {
+  function initPlayer(
+    width,
+    height,
+    hillshade,
+    fillTimes,
+    steps,
+    spillPaths,
+    rainIntensity,
+    areaUnit,
+  ) {
     stopPlayer();
     player = {
       width,
@@ -329,6 +432,7 @@
       hillshade,
       fillTimes,
       steps,
+      spillPaths,
       rainIntensity,
       areaUnit,
       frameBuf: new Uint8ClampedArray(width * height * 4),
@@ -353,13 +457,14 @@
     const simRef = currentSim;
     if (!simRef) throw new Error("No active inundation simulation");
     const pingPong = $("lp-pingpong") ? $("lp-pingpong").checked : true;
+    const showSpills = $("lp-spill-paths") ? $("lp-spill-paths").checked : true;
     setStatus("Encoding animated inundation GIF in WebAssembly…");
     await nextTick();
     if (currentSim !== simRef) {
       return null;
     }
     const t0 = performance.now();
-    const gifBytes = simRef.encodeGif(150, pingPong, 400);
+    const gifBytes = simRef.encodeGif(150, pingPong, 400, showSpills);
     if (currentSim !== simRef) {
       return null;
     }
@@ -527,6 +632,7 @@
         const fillTimes = sim.fillTimeValues();
         const depressions = JSON.parse(sim.depressionsJson());
         const steps = JSON.parse(sim.stepsJson());
+        const spillPaths = JSON.parse(sim.spillPathsJson());
         const lastStep = steps.length > 0 ? steps[steps.length - 1] : null;
 
         $("lp-results").hidden = false;
@@ -539,7 +645,7 @@
         const gifImg = $("lp-gif");
         if (gifImg) gifImg.removeAttribute("src");
 
-        initPlayer(w, h, hill, fillTimes, steps, rain, areaUnit);
+        initPlayer(w, h, hill, fillTimes, steps, spillPaths, rain, areaUnit);
 
         drawRgba($("lp-c-hillshade"), w, h, hill, null);
         drawRgba($("lp-c-depth"), w, h, depth, hill);
@@ -551,14 +657,15 @@
           ["Sink Regions", String(sim.numRegions)],
           ["Nested Depressions", String(depressions.length)],
           ["Max Level", String(sim.maxLevel)],
+          ["Spill Paths", String(spillPaths.length)],
           ["Final Inundated", lastStep ? `${(lastStep.inundated_fraction * 100).toFixed(1)}%` : "0%"],
-          ["Time Steps", String(steps.length)],
           ["WASM Runtime", `${elapsed.toFixed(0)} ms`],
         ]);
 
         renderDownloads(
           [
             { label: "Depressions GeoJSON", filename: `${stem}_depressions.geojson`, data: sim.depressionsGeojson(), mime: "application/geo+json" },
+            { label: "Spill Flow Paths GeoJSON", filename: `${stem}_spill_paths.geojson`, data: sim.spillPathsGeojson(), mime: "application/geo+json" },
             { label: "Depression Level GeoTIFF", filename: `${stem}_level.tif`, data: sim.levelTif(), mime: "image/tiff" },
             { label: "Fill Time GeoTIFF", filename: `${stem}_fill_time.tif`, data: sim.fillTimeTif(), mime: "image/tiff" },
             { label: "Catchment Hierarchy GeoTIFF", filename: `${stem}_catchment_hir.tif`, data: sim.catchmentHirTif(), mime: "image/tiff" },
@@ -717,14 +824,19 @@
       });
     }
 
-    // Invalidate cached GIF when ping-pong option changes; refresh if preview is open
-    $("lp-pingpong").addEventListener("change", () => {
+    // Invalidate cached GIF when ping-pong or spill-paths options change; refresh if open
+    const refreshGifOptions = () => {
       cachedGifUrl = null;
       const gifImg = $("lp-gif");
       if (gifImg) gifImg.removeAttribute("src");
       if (gifDetails && gifDetails.open && currentSim) {
         ensureGifUrl().catch((e) => setStatus(`GIF preview failed: ${errMsg(e)}`, true));
       }
+    };
+    $("lp-pingpong").addEventListener("change", refreshGifOptions);
+    $("lp-spill-paths").addEventListener("change", () => {
+      if (player) renderPlayerFrame();
+      refreshGifOptions();
     });
 
     // Interactive inundation player controls

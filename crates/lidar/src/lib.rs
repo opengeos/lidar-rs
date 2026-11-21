@@ -52,7 +52,8 @@ pub mod slicing;
 
 pub use animation::{
     ANIMATION_BANNER_HEIGHT, AnimateInundationOptions, AnimateInundationResult, HillshadeOptions,
-    animate_inundation, animate_inundation_to_bytes, compute_hillshade_rgb,
+    animate_inundation, animate_inundation_to_bytes, animate_inundation_to_bytes_with_spill_paths,
+    compute_hillshade_rgb,
 };
 pub use catchment::{
     CatchmentHierarchyOptions, CatchmentHierarchyRecord, CatchmentHierarchyResult, CatchmentRecord,
@@ -74,8 +75,9 @@ pub use filtering::{
 };
 pub use inundation::{
     InMemoryInundationPipeline, InundationPipelineOptions, InundationStep, InundationStepSummary,
-    SimulateInundationOptions, SimulateInundationResult, compute_inundation_step_summaries,
-    simulate_inundation, simulate_inundation_in_memory, simulate_inundation_pipeline_in_memory,
+    SimulateInundationOptions, SimulateInundationResult, SpillFlowPath,
+    compute_inundation_step_summaries, delineate_spill_flow_paths_in_memory, simulate_inundation,
+    simulate_inundation_in_memory, simulate_inundation_pipeline_in_memory,
     write_inundation_summary_csv,
 };
 pub use mounts::{
