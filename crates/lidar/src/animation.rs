@@ -450,8 +450,8 @@ fn draw_thick_segment(
     }
 }
 
-/// Draws active overland spill flow paths (whose upstream depression is full at `t_hours`
-/// and whose overland channel still has dry cells) onto the RGB frame body.
+/// Draws active overland spill flow paths (whose upstream depression is full at `t_hours`,
+/// before `merge_time_h`, and along each contiguous dry overland portion) onto the RGB frame body.
 #[allow(clippy::too_many_arguments)]
 fn draw_active_spill_paths(
     body: &mut [u8],
@@ -463,76 +463,93 @@ fn draw_active_spill_paths(
     t_hours: f64,
     spill_paths: &[SpillFlowPath],
 ) {
-    if spill_paths.is_empty() || sw == 0 || sh == 0 {
+    if spill_paths.is_empty() || sw == 0 || sh == 0 || dw == 0 || dh == 0 {
         return;
     }
     let sx_scale = dw as f64 / sw as f64;
     let sy_scale = dh as f64 / sh as f64;
+    let max_x = (dw - 1) as f64;
+    let max_y = (dh - 1) as f64;
+    let map_pt = |(c, r): (usize, usize)| -> (f64, f64) {
+        (
+            ((c as f64 + 0.5) * sx_scale - 0.5).clamp(0.0, max_x),
+            ((r as f64 + 0.5) * sy_scale - 0.5).clamp(0.0, max_y),
+        )
+    };
     const HALO: [u8; 3] = [12, 32, 68];
     const CORE: [u8; 3] = [56, 189, 248];
 
     for path in spill_paths {
-        if t_hours < path.spill_time_h || path.cells.len() < 2 {
+        if t_hours < path.spill_time_h
+            || path.merge_time_h.is_some_and(|mt| t_hours >= mt)
+            || path.cells.len() < 2
+        {
             continue;
         }
-        // Locate the unsubmerged (dry) overland span along this spill channel at `t_hours`.
-        let mut first_dry: Option<usize> = None;
-        let mut last_dry: Option<usize> = None;
-        for (i, &(c, r)) in path.cells.iter().enumerate() {
-            if c < sw && r < sh && !wet[r * sw + c] {
-                if first_dry.is_none() {
-                    first_dry = Some(i);
+        // Draw each contiguous unsubmerged (dry) overland run separately so channels never
+        // bridge across submerged intermediate pockets.
+        let n_cells = path.cells.len();
+        let mut i = 0usize;
+        while i < n_cells {
+            let (c, r) = path.cells[i];
+            if c >= sw || r >= sh || wet[r * sw + c] {
+                i += 1;
+                continue;
+            }
+            let run_start = i;
+            while i + 1 < n_cells {
+                let (nc, nr) = path.cells[i + 1];
+                if nc < sw && nr < sh && !wet[nr * sw + nc] {
+                    i += 1;
+                } else {
+                    break;
                 }
-                last_dry = Some(i);
             }
-        }
-        let (Some(fd), Some(ld)) = (first_dry, last_dry) else {
-            continue; // Saddle is completely submerged (lakes have merged).
-        };
-        let start = fd.saturating_sub(1);
-        let end = (ld + 1).min(path.cells.len() - 1);
-        if end <= start {
-            continue;
-        }
-        let seg = &path.cells[start..=end];
+            let run_end = i;
+            i += 1;
 
-        // Dark halo pass, then vivid cyan core pass.
-        for (radius, color) in [(2isize, HALO), (1isize, CORE)] {
-            for pair in seg.windows(2) {
-                let p0 = (
-                    (pair[0].0 as f64 + 0.5) * sx_scale,
-                    (pair[0].1 as f64 + 0.5) * sy_scale,
-                );
-                let p1 = (
-                    (pair[1].0 as f64 + 0.5) * sx_scale,
-                    (pair[1].1 as f64 + 0.5) * sy_scale,
-                );
-                draw_thick_segment(body, dw, dh, p0, p1, radius, color);
+            let start = run_start.saturating_sub(1);
+            let end = (run_end + 1).min(n_cells - 1);
+            if end <= start {
+                continue;
             }
-        }
+            let seg = &path.cells[start..=end];
 
-        // Directional arrowhead at downstream shoreline tip.
-        let tip = seg[seg.len() - 1];
-        let tail_idx = seg.len().saturating_sub(5);
-        let tail = seg[tail_idx];
-        let tx = (tip.0 as f64 + 0.5) * sx_scale;
-        let ty = (tip.1 as f64 + 0.5) * sy_scale;
-        let dx = tx - (tail.0 as f64 + 0.5) * sx_scale;
-        let dy = ty - (tail.1 as f64 + 0.5) * sy_scale;
-        let len = dx.hypot(dy);
-        if len > 1e-3 {
-            let ux = dx / len;
-            let uy = dy / len;
-            let head_len = 5.5;
-            let spread = 0.52f64;
-            let (sin_s, cos_s) = spread.sin_cos();
-            let lx = tx - head_len * (ux * cos_s - uy * sin_s);
-            let ly = ty - head_len * (ux * sin_s + uy * cos_s);
-            let rx = tx - head_len * (ux * cos_s + uy * sin_s);
-            let ry = ty - head_len * (-ux * sin_s + uy * cos_s);
+            // Dark halo pass, then vivid cyan core pass.
             for (radius, color) in [(2isize, HALO), (1isize, CORE)] {
-                draw_thick_segment(body, dw, dh, (tx, ty), (lx, ly), radius, color);
-                draw_thick_segment(body, dw, dh, (tx, ty), (rx, ry), radius, color);
+                for pair in seg.windows(2) {
+                    draw_thick_segment(
+                        body,
+                        dw,
+                        dh,
+                        map_pt(pair[0]),
+                        map_pt(pair[1]),
+                        radius,
+                        color,
+                    );
+                }
+            }
+
+            // Directional arrowhead at downstream shoreline tip.
+            let (tx, ty) = map_pt(seg[seg.len() - 1]);
+            let (bx, by) = map_pt(seg[seg.len().saturating_sub(5)]);
+            let dx = tx - bx;
+            let dy = ty - by;
+            let len = dx.hypot(dy);
+            if len > 1e-3 {
+                let ux = dx / len;
+                let uy = dy / len;
+                let head_len = 5.5;
+                let spread = 0.52f64;
+                let (sin_s, cos_s) = spread.sin_cos();
+                let lx = tx - head_len * (ux * cos_s - uy * sin_s);
+                let ly = ty - head_len * (ux * sin_s + uy * cos_s);
+                let rx = tx - head_len * (ux * cos_s + uy * sin_s);
+                let ry = ty - head_len * (-ux * sin_s + uy * cos_s);
+                for (radius, color) in [(2isize, HALO), (1isize, CORE)] {
+                    draw_thick_segment(body, dw, dh, (tx, ty), (lx, ly), radius, color);
+                    draw_thick_segment(body, dw, dh, (tx, ty), (rx, ry), radius, color);
+                }
             }
         }
     }
@@ -946,9 +963,9 @@ mod tests {
             for c in 0..24 {
                 dem_data[r * 24 + c] = 100.0 + (r as f64) * 0.1;
                 if r <= 4 && c <= 4 {
-                    ft_data[r * 24 + c] = 0.5;
+                    ft_data[r * 24 + c] = 1.5;
                 } else if r >= 18 && c >= 18 {
-                    ft_data[r * 24 + c] = 1.0;
+                    ft_data[r * 24 + c] = 2.0;
                 }
             }
         }
@@ -956,12 +973,13 @@ mod tests {
         let mut ft = Array2D::from_vec(24, 24, ft_data).unwrap();
         ft.set_no_data(-1.0);
 
+        // Steps are at T = 1.0 h (before spill), T = 2.0 h (active spill), T = 3.0 h (at merge).
         let spill = SpillFlowPath {
             from_dep_id: 1,
             from_level: 1,
             to_dep_id: 2,
-            spill_time_h: 0.5,
-            merge_time_h: Some(5.0),
+            spill_time_h: 1.5,
+            merge_time_h: Some(3.0),
             spill_elev: 101.0,
             cells: (4..=18).map(|i| (i, i)).collect(),
         };
@@ -978,18 +996,48 @@ mod tests {
 
         assert_eq!((frames0, w0, h0), (frames1, w1, h1));
         assert!(spill_bytes.starts_with(b"GIF89a"));
-        assert_ne!(
-            plain_bytes, spill_bytes,
-            "active spill path should visibly modify rendered GIF frames"
-        );
 
-        let mut decoder = gif::DecodeOptions::new()
-            .read_info(std::io::Cursor::new(&spill_bytes))
-            .unwrap();
-        let mut decoded = 0usize;
-        while decoder.read_next_frame().unwrap().is_some() {
-            decoded += 1;
-        }
-        assert_eq!(decoded, frames1);
+        // Decode both GIFs to RGB per frame and verify channel timing:
+        // frame 0 (T=1.0h < spill_time_h): channel region identical to plain GIF;
+        // frame 1 (T=2.0h in [spill_time_h, merge_time_h)): channel visibly painted;
+        // frame 2 (T=3.0h >= merge_time_h): channel disappears and matches plain GIF.
+        let decode_rgb_frames = |bytes: &[u8]| -> Vec<Vec<u8>> {
+            let mut dec_opts = gif::DecodeOptions::new();
+            dec_opts.set_color_output(gif::ColorOutput::RGBA);
+            let mut decoder = dec_opts.read_info(std::io::Cursor::new(bytes)).unwrap();
+            let mut out = Vec::new();
+            while let Some(frame) = decoder.read_next_frame().unwrap() {
+                out.push(frame.buffer.to_vec());
+            }
+            out
+        };
+        let plain_frames = decode_rgb_frames(&plain_bytes);
+        let spill_frames = decode_rgb_frames(&spill_bytes);
+        assert_eq!(plain_frames.len(), 3);
+        assert_eq!(spill_frames.len(), 3);
+
+        let channel_diff_count = |a: &[u8], b: &[u8]| -> usize {
+            (6..=16)
+                .filter(|&i| {
+                    let y = i + ANIMATION_BANNER_HEIGHT;
+                    let p = (y * w0 + i) * 4;
+                    a[p..p + 3] != b[p..p + 3]
+                })
+                .count()
+        };
+        assert_eq!(
+            channel_diff_count(&plain_frames[0], &spill_frames[0]),
+            0,
+            "channel must not render before spill_time_h"
+        );
+        assert!(
+            channel_diff_count(&plain_frames[1], &spill_frames[1]) >= 8,
+            "channel must render along active dry path between spill_time_h and merge_time_h"
+        );
+        assert_eq!(
+            channel_diff_count(&plain_frames[2], &spill_frames[2]),
+            0,
+            "channel must disappear at merge_time_h"
+        );
     }
 }

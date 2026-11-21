@@ -532,6 +532,10 @@ impl Ord for HeapCell {
 /// pit (`NO_FLOW`) or DEM boundary, returning `Some((trace, target_dep))` if the path drains
 /// away from `in_source` without ever re-entering it, or `None` if it drains back into `in_source`.
 ///
+/// Cells known to drain back into `in_source` for the current depression are memoized in
+/// `drains_to_source` (stamped with `reject_gen`) so each rejected cell is walked at most once
+/// across the entire outward Priority-Flood search.
+///
 /// Tracing all the way to the receiving pit (rather than stopping at a dry outer rim of a
 /// parent depression) produces the complete physical overland flow channel so that rendering
 /// can dynamically trim the submerged ends at any simulation timestamp `t`.
@@ -543,17 +547,24 @@ fn trace_downstream_away_from_source(
     flowdirs: &[u8],
     dep_ids: &[i32],
     in_source: &[bool],
-    excluded_targets: &HashSet<u32>,
+    desc_ids: &HashSet<u32>,
+    ancestor_ids: &HashSet<u32>,
+    drains_to_source: &mut [u32],
+    reject_gen: u32,
     seen_stamp: &mut [u32],
     stamp: u32,
 ) -> Option<(Vec<usize>, u32)> {
     let mut trace = Vec::new();
     let mut target_dep = 0u32;
+    let mut fallback_ancestor_dep = 0u32;
     let mut cur = start_idx;
     let max_steps = w * h;
 
     for _ in 0..max_steps {
-        if in_source[cur] {
+        if in_source[cur] || drains_to_source[cur] == reject_gen {
+            for &idx in &trace {
+                drains_to_source[idx] = reject_gen;
+            }
             return None;
         }
         if seen_stamp[cur] == stamp {
@@ -563,13 +574,25 @@ fn trace_downstream_away_from_source(
         trace.push(cur);
 
         let did = dep_ids[cur];
-        if did > 0 && !excluded_targets.contains(&(did as u32)) {
-            target_dep = did as u32;
+        if did > 0 {
+            let uid = did as u32;
+            if !desc_ids.contains(&uid) {
+                if !ancestor_ids.contains(&uid) {
+                    target_dep = uid;
+                } else {
+                    fallback_ancestor_dep = uid;
+                }
+            }
         }
 
         let dir = flowdirs[cur] as usize;
         if dir == NO_FLOW as usize || dir > 8 {
-            return Some((trace, target_dep));
+            let resolved_target = if target_dep != 0 {
+                target_dep
+            } else {
+                fallback_ancestor_dep
+            };
+            return Some((trace, resolved_target));
         }
         let r = cur / w;
         let c = cur % w;
@@ -581,7 +604,12 @@ fn trace_downstream_away_from_source(
         cur = (nr as usize) * w + (nc as usize);
     }
 
-    Some((trace, target_dep))
+    let resolved_target = if target_dep != 0 {
+        target_dep
+    } else {
+        fallback_ancestor_dep
+    };
+    Some((trace, resolved_target))
 }
 
 /// Delineates overland fill-and-spill flow paths connecting each nested depression to its
@@ -649,10 +677,12 @@ pub fn delineate_spill_flow_paths_in_memory(
     // Reusable work buffers across depressions.
     let mut in_source = vec![false; n];
     let mut visited_pf = vec![0u32; n];
+    let mut drains_to_source = vec![0u32; n];
     let mut pf_gen = 0u32;
     let mut parent_cell = vec![usize::MAX; n];
     let mut trace_seen = vec![0u32; n];
     let mut trace_gen = 0u32;
+    let mut heap: BinaryHeap<HeapCell> = BinaryHeap::new();
 
     let mut raw_paths: Vec<SpillFlowPath> = Vec::new();
 
@@ -669,7 +699,7 @@ pub fn delineate_spill_flow_paths_in_memory(
             continue;
         }
 
-        // Collect all descendant IDs (including dep.id) and ancestor IDs (including dep.id).
+        // Collect all descendant IDs (including dep.id) and strictly enclosing ancestor IDs.
         let mut desc_ids: HashSet<u32> = HashSet::new();
         let mut stack = vec![dep.id];
         while let Some(cur_id) = stack.pop() {
@@ -679,10 +709,10 @@ pub fn delineate_spill_flow_paths_in_memory(
                 stack.extend(kids.iter().copied());
             }
         }
-        let mut excluded_targets = desc_ids.clone();
+        let mut ancestor_ids: HashSet<u32> = HashSet::new();
         let mut anc = parent_map.get(&dep.id).copied();
         while let Some(pid) = anc {
-            excluded_targets.insert(pid);
+            ancestor_ids.insert(pid);
             anc = parent_map.get(&pid).copied();
         }
 
@@ -697,8 +727,11 @@ pub fn delineate_spill_flow_paths_in_memory(
             continue;
         }
 
-        // Compute full-fill time of depression `dep`: max valid fill_time over `dep.id`'s
-        // own rim cells (falling back to all cells in `source_cells`).
+        // Compute baseline full-fill time of `dep` as the 95th-percentile valid `fill_time`
+        // over `dep.id`'s own cells (falling back to all cells in `source_cells`). Once the
+        // spill outlet cell `cell_indices[0]` is found below, `spill_time_h` is raised to at
+        // least that outlet cell's valid fill time so spilling never starts before water
+        // reaches the saddle rim.
         let mut rim_times: Vec<f64> = pixels_by_id
             .get(&dep.id)
             .into_iter()
@@ -721,14 +754,13 @@ pub fn delineate_spill_flow_paths_in_memory(
             continue;
         }
         rim_times.sort_by(f64::total_cmp);
-        // Use the 95th percentile rim fill time so a single isolated rim outlier cannot
-        // artificially delay spilling past when the basin visibly fills.
         let p95_idx = ((rim_times.len() - 1) * 95) / 100;
-        let spill_time_h = rim_times[p95_idx];
+        let baseline_spill_time_h = rim_times[p95_idx];
 
         pf_gen = pf_gen.wrapping_add(1);
         if pf_gen == 0 {
             visited_pf.fill(0);
+            drains_to_source.fill(0);
             pf_gen = 1;
         }
         for &idx in &source_cells {
@@ -738,7 +770,7 @@ pub fn delineate_spill_flow_paths_in_memory(
         }
 
         // Seed min-heap with perimeter cells of M_A.
-        let mut heap: BinaryHeap<HeapCell> = BinaryHeap::new();
+        heap.clear();
         for &idx in &source_cells {
             let r = idx / w;
             let c = idx % w;
@@ -782,7 +814,10 @@ pub fn delineate_spill_flow_paths_in_memory(
                     fdata,
                     dep_ids,
                     &in_source,
-                    &excluded_targets,
+                    &desc_ids,
+                    &ancestor_ids,
+                    &mut drains_to_source,
+                    pf_gen,
                     &mut trace_seen,
                     trace_gen,
                 ) {
@@ -842,6 +877,15 @@ pub fn delineate_spill_flow_paths_in_memory(
         if cell_indices.len() < 2 {
             continue;
         }
+
+        // Ensure spill_time_h is at least the selected outlet rim cell's fill time when valid,
+        // falling back to the 95th-percentile basin fill time when outlet timing is unavailable.
+        let outlet_ft = ft_data[cell_indices[0]];
+        let spill_time_h = if outlet_ft.is_finite() && !outlet_ft.rd_eq(ft_nd) && outlet_ft >= 0.0 {
+            baseline_spill_time_h.max(outlet_ft)
+        } else {
+            baseline_spill_time_h
+        };
 
         // Compute merge_time_h from the interior overland channel cells (excluding source rim
         // and final target shoreline pixel).

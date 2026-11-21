@@ -547,41 +547,70 @@ pub fn delineate_catchments(
 fn spill_paths_to_geojson(
     paths: &[SpillFlowPath],
     geotransform: &[f64; 6],
+    projection: &str,
 ) -> Result<String, JsValue> {
-    let features: Vec<serde_json::Value> = paths
-        .iter()
-        .enumerate()
-        .map(|(idx, p)| {
-            let coords: Vec<[f64; 2]> = p
-                .cells
-                .iter()
-                .map(|&(col, row)| {
-                    let cf = col as f64 + 0.5;
-                    let rf = row as f64 + 0.5;
-                    let x = geotransform[0] + cf * geotransform[1] + rf * geotransform[2];
-                    let y = geotransform[3] + cf * geotransform[4] + rf * geotransform[5];
-                    [x, y]
-                })
-                .collect();
-            serde_json::json!({
-                "type": "Feature",
-                "id": idx + 1,
-                "geometry": {
-                    "type": "LineString",
-                    "coordinates": coords,
-                },
-                "properties": {
-                    "from_dep_id": p.from_dep_id,
-                    "from_level": p.from_level,
-                    "to_dep_id": p.to_dep_id,
-                    "spill_time_h": p.spill_time_h,
-                    "merge_time_h": p.merge_time_h,
-                    "spill_elev": p.spill_elev,
-                    "cell_count": p.cells.len(),
-                },
-            })
-        })
-        .collect();
+    let trimmed = projection.trim();
+    if trimmed.is_empty() {
+        return Err(JsValue::from_str(
+            "Cannot export spill flow paths as RFC 7946 GeoJSON: input DEM has no CRS metadata",
+        ));
+    }
+    let src_srs = terrio::crs::SpatialRef::parse(trimmed).map_err(|e| {
+        JsValue::from_str(&format!(
+            "Cannot export spill flow paths as RFC 7946 GeoJSON: unsupported DEM CRS ({e})"
+        ))
+    })?;
+    if src_srs.is_unknown() {
+        return Err(JsValue::from_str(
+            "Cannot export spill flow paths as RFC 7946 GeoJSON: input DEM CRS is unknown",
+        ));
+    }
+    let transformer = if src_srs.epsg == Some(4326) {
+        None
+    } else {
+        let wgs84 = terrio::crs::SpatialRef::parse("EPSG:4326").map_err(to_js_err)?;
+        Some(
+            terrio::crs::Transformer::new(&src_srs, &wgs84).map_err(|e| {
+                JsValue::from_str(&format!(
+                    "Cannot reproject spill flow paths to WGS 84 (EPSG:4326): {e}"
+                ))
+            })?,
+        )
+    };
+
+    let mut features: Vec<serde_json::Value> = Vec::with_capacity(paths.len());
+    for (idx, p) in paths.iter().enumerate() {
+        let mut coords: Vec<[f64; 2]> = Vec::with_capacity(p.cells.len());
+        for &(col, row) in &p.cells {
+            let cf = col as f64 + 0.5;
+            let rf = row as f64 + 0.5;
+            let x = geotransform[0] + cf * geotransform[1] + rf * geotransform[2];
+            let y = geotransform[3] + cf * geotransform[4] + rf * geotransform[5];
+            let (lon, lat) = if let Some(ref tr) = transformer {
+                tr.transform(x, y).map_err(to_js_err)?
+            } else {
+                (x, y)
+            };
+            coords.push([lon, lat]);
+        }
+        features.push(serde_json::json!({
+            "type": "Feature",
+            "id": idx + 1,
+            "geometry": {
+                "type": "LineString",
+                "coordinates": coords,
+            },
+            "properties": {
+                "from_dep_id": p.from_dep_id,
+                "from_level": p.from_level,
+                "to_dep_id": p.to_dep_id,
+                "spill_time_h": p.spill_time_h,
+                "merge_time_h": p.merge_time_h,
+                "spill_elev": p.spill_elev,
+                "cell_count": p.cells.len(),
+            },
+        }));
+    }
     serde_json::to_string(&serde_json::json!({
         "type": "FeatureCollection",
         "name": "spill_flow_paths",
@@ -612,7 +641,6 @@ pub struct InundationOutput {
     catchment_hierarchy_json: String,
     steps_json: String,
     spill_paths_json: String,
-    spill_paths_geojson: String,
     fill_time_tif: Vec<u8>,
     catchment_hir_tif: Vec<u8>,
     sink_tif: Vec<u8>,
@@ -667,9 +695,15 @@ impl InundationOutput {
     pub fn spill_paths_json(&self) -> String {
         self.spill_paths_json.clone()
     }
+    /// Exports delineated spill flow paths as an RFC 7946 GeoJSON FeatureCollection in WGS 84
+    /// longitude/latitude coordinates (reprojected from the DEM CRS when necessary).
     #[wasm_bindgen(js_name = spillPathsGeojson)]
-    pub fn spill_paths_geojson(&self) -> String {
-        self.spill_paths_geojson.clone()
+    pub fn spill_paths_geojson(&self) -> Result<String, JsValue> {
+        spill_paths_to_geojson(
+            &self.spill_paths,
+            &self.dem_refined.geotransform,
+            &self.projection,
+        )
     }
     #[wasm_bindgen(js_name = fillTimeTif)]
     pub fn fill_time_tif(&self) -> Vec<u8> {
@@ -843,8 +877,6 @@ pub fn simulate_inundation(
         serde_json::to_string(&pipe.catchment_records).map_err(to_js_err)?;
     let steps_json = serde_json::to_string(&pipe.steps).map_err(to_js_err)?;
     let spill_paths_json = serde_json::to_string(&pipe.spill_paths).map_err(to_js_err)?;
-    let spill_paths_geojson =
-        spill_paths_to_geojson(&pipe.spill_paths, &pipe.sinks.dem_refined.geotransform)?;
     let fill_time_tif = write_array2d_tif(&pipe.fill_time, "fill_time.tif")?;
     let catchment_hir_tif = write_array2d_tif(&pipe.catchment_hierarchy, "catchment_hir.tif")?;
     let sink_tif = write_array2d_tif(&pipe.sinks.sink, "sink.tif")?;
@@ -867,7 +899,6 @@ pub fn simulate_inundation(
         catchment_hierarchy_json,
         steps_json,
         spill_paths_json,
-        spill_paths_geojson,
         fill_time_tif,
         catchment_hir_tif,
         sink_tif,

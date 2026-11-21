@@ -98,6 +98,11 @@ assert.ok(spillPaths.length >= 3, `expected >= 3 spill paths, got ${spillPaths.l
 const spillGeo = JSON.parse(sim.spillPathsGeojson());
 assert.equal(spillGeo.type, "FeatureCollection");
 assert.equal(spillGeo.features.length, spillPaths.length);
+const [firstLon, firstLat] = spillGeo.features[0].geometry.coordinates[0];
+assert.ok(
+  firstLon >= -180 && firstLon <= 180 && firstLat >= -90 && firstLat <= 90,
+  `expected WGS 84 lon/lat coordinates, got [${firstLon}, ${firstLat}]`,
+);
 
 const gif = sim.encodeGif(150, true, 200, true);
 const header = new TextDecoder().decode(gif.slice(0, 6));
