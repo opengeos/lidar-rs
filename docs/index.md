@@ -3,7 +3,7 @@
 [![CI](https://github.com/opengeos/lidar-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/opengeos/lidar-rs/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/lidar.svg)](https://crates.io/crates/lidar)
 [![PyPI](https://img.shields.io/pypi/v/lidar-rs)](https://pypi.org/project/lidar-rs/)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24411444.svg)](https://doi.org/10.5281/zenodo.24411444)
+[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.24411444-blue.svg)](https://doi.org/10.5281/zenodo.24411444)
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/opengeos/lidar-rs/blob/main/examples/lidar_rs_demo.ipynb)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/opengeos/lidar-rs/blob/main/LICENSE)
 

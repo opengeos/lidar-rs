@@ -462,12 +462,12 @@ pub struct SpillFlowPath {
     pub from_dep_id: u32,
     /// Hierarchy level of the spilling depression.
     pub from_level: u32,
-    /// Downstream receiving depression ID (`0` if spilling to the DEM boundary/upland).
+    /// Downstream receiving depression ID, or `0` when spilling to the DEM boundary.
     ///
-    /// Always identifies a distinct downstream depression (never the spilling basin, its
-    /// descendants, or an enclosing ancestor ring). Sub-threshold `NO_FLOW` micro-pits inside
-    /// enclosing ancestor rings are stepped across rather than used as fallback targets, and a
-    /// basin with no reachable non-trapped outlet emits no spill path.
+    /// When non-zero, identifies a distinct downstream depression (never the spilling basin, its
+    /// descendants, or an enclosing ancestor ring). Interior `NO_FLOW` micro-pits are stepped
+    /// across rather than used as fallback targets, and a basin with no reachable overland outlet
+    /// emits no spill path.
     pub to_dep_id: u32,
     /// Time in hours when the upstream depression becomes fully filled and begins spilling.
     pub spill_time_h: f64,
@@ -536,15 +536,15 @@ impl Ord for HeapCell {
 /// Traces D8 flow downhill from `start_idx` to a receiving pit (`NO_FLOW`) or DEM boundary,
 /// returning `Some((trace, target_dep_id))` when the path drains away from `in_source` into a
 /// distinct downstream depression (`target_dep_id != 0`, excluded from `desc_ids` and
-/// `ancestor_ids`, and not terminating inside an enclosing ancestor-ring pit) or exits the DEM
-/// (`target_dep_id == 0`).
+/// `ancestor_ids`, truncated to the last cell inside `target_dep_id`, and not terminating in an
+/// enclosing ancestor-ring pit) or reaches the DEM boundary (`target_dep_id == 0`).
 ///
 /// Tracing all the way to the receiving pit (rather than stopping at a dry outer rim) produces
 /// the complete physical overland flow channel so rendering can dynamically trim submerged ends
 /// at any simulation timestamp `t`.
 ///
 /// Returns `None` when the path drains back into `in_source` (memoized in `drains_to_source`)
-/// or terminates at a `NO_FLOW` trap or cycle without ending outside an ancestor-ring pit
+/// or terminates at an interior `NO_FLOW` micro-pit or cycle without a valid downstream target
 /// (memoized in `trapped_in_pit`), so the outward Priority-Flood search steps across
 /// sub-threshold micro-pits until it locates a valid overland outlet.
 #[allow(clippy::too_many_arguments)]
@@ -563,8 +563,11 @@ fn trace_downstream_away_from_source(
     seen_stamp: &mut [u32],
     stamp: u32,
 ) -> Option<(Vec<usize>, u32)> {
+    let is_ancestor =
+        |idx: usize| dep_ids[idx] > 0 && ancestor_ids.contains(&(dep_ids[idx] as u32));
     let mut trace = Vec::new();
     let mut target_dep = 0u32;
+    let mut last_target_len = 0usize;
     let mut cur = start_idx;
     let max_steps = w * h;
 
@@ -575,6 +578,9 @@ fn trace_downstream_away_from_source(
             }
             return None;
         }
+        // Only short-circuit on `trapped_in_pit` before entering a downstream target: a trace
+        // that already passed through `target_dep` still needs to check whether the terminal pit
+        // is an ancestor-ring trap (rejected) or an unlabelled pit (truncated back to `target_dep`).
         if target_dep == 0 && trapped_in_pit[cur] == reject_gen {
             for &idx in &trace {
                 trapped_in_pit[idx] = reject_gen;
@@ -592,35 +598,41 @@ fn trace_downstream_away_from_source(
             let uid = did as u32;
             if !desc_ids.contains(&uid) && !ancestor_ids.contains(&uid) {
                 target_dep = uid;
+                last_target_len = trace.len();
             }
         }
 
+        let r = cur / w;
+        let c = cur % w;
+        let on_boundary = r == 0 || r + 1 == h || c == 0 || c + 1 == w;
         let dir = flowdirs[cur] as usize;
         if dir == NO_FLOW as usize || dir > 8 {
-            let sink_in_ancestor =
-                dep_ids[cur] > 0 && ancestor_ids.contains(&(dep_ids[cur] as u32));
-            if target_dep != 0 && !sink_in_ancestor {
+            if target_dep != 0 && !is_ancestor(cur) {
+                trace.truncate(last_target_len);
                 return Some((trace, target_dep));
+            }
+            if on_boundary && !is_ancestor(cur) {
+                return Some((trace, 0));
             }
             for &idx in &trace {
                 trapped_in_pit[idx] = reject_gen;
             }
             return None;
         }
-        let r = cur / w;
-        let c = cur % w;
         let nr = r as isize + D8Y[dir] as isize;
         let nc = c as isize + D8X[dir] as isize;
         if nr < 0 || nc < 0 || nr >= h as isize || nc >= w as isize {
+            if target_dep != 0 {
+                trace.truncate(last_target_len);
+            }
             return Some((trace, target_dep));
         }
         cur = (nr as usize) * w + (nc as usize);
     }
 
-    let end_in_ancestor = trace
-        .last()
-        .is_some_and(|&last| dep_ids[last] > 0 && ancestor_ids.contains(&(dep_ids[last] as u32)));
+    let end_in_ancestor = trace.last().is_some_and(|&last| is_ancestor(last));
     if target_dep != 0 && !end_in_ancestor {
+        trace.truncate(last_target_len);
         Some((trace, target_dep))
     } else {
         for &idx in &trace {
@@ -1550,6 +1562,97 @@ mod tests {
         assert!(
             paths.is_empty(),
             "isolated basin with only ancestor-ring micro-pits and no reachable outlet should emit no spill path, got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn trace_handles_boundary_no_flow_and_truncates_target_before_grid_exit() {
+        // 3x5 grid:
+        // Row 1 has interior cells (cols 1..4) and boundary cell (col 4, row 1).
+        // Case 1: unlabelled interior NO_FLOW pit at (col=2, row=1) -> rejected (None).
+        // Case 2: flow from (col=3, row=1) east to boundary NO_FLOW cell (col=4, row=1) -> Some((.., 0)).
+        // Case 3: flow from (col=1, row=1, dep=3) east through unlabelled (col=2..4) and exiting
+        //         grid -> Some((trace, 3)) truncated so endpoint lies inside dep 3.
+        let w = 5usize;
+        let h = 3usize;
+        let mut flowdirs = vec![NO_FLOW as u8; w * h];
+        let mut dep_ids = vec![0i32; w * h];
+        let in_source = vec![false; w * h];
+        let desc_ids: HashSet<u32> = [2].into_iter().collect();
+        let ancestor_ids: HashSet<u32> = HashSet::new();
+        let mut drains_to_source = vec![0u32; w * h];
+        let mut trapped_in_pit = vec![0u32; w * h];
+        let mut seen_stamp = vec![0u32; w * h];
+
+        // Interior pit at (2, 1), boundary NO_FLOW at (4, 1), east flow at (3, 1) -> (4, 1)
+        flowdirs[w + 3] = 5u8; // east -> (4, 1) which is NO_FLOW on boundary
+
+        let interior_pit = trace_downstream_away_from_source(
+            w + 2,
+            w,
+            h,
+            &flowdirs,
+            &dep_ids,
+            &in_source,
+            &desc_ids,
+            &ancestor_ids,
+            &mut drains_to_source,
+            &mut trapped_in_pit,
+            1,
+            &mut seen_stamp,
+            1,
+        );
+        assert!(
+            interior_pit.is_none(),
+            "unlabelled interior NO_FLOW micro-pit must be rejected"
+        );
+
+        let boundary_exit = trace_downstream_away_from_source(
+            w + 3,
+            w,
+            h,
+            &flowdirs,
+            &dep_ids,
+            &in_source,
+            &desc_ids,
+            &ancestor_ids,
+            &mut drains_to_source,
+            &mut trapped_in_pit,
+            2,
+            &mut seen_stamp,
+            2,
+        );
+        let (b_trace, b_target) =
+            boundary_exit.expect("boundary NO_FLOW cell must be accepted as a DEM-edge spill");
+        assert_eq!(b_target, 0);
+        assert_eq!(*b_trace.last().unwrap(), w + 4);
+
+        // Now connect (1, 1, dep=3) -> (2, 1) -> (3, 1) -> (4, 1) -> off-grid east
+        dep_ids[w + 1] = 3;
+        flowdirs[w + 1] = 5u8;
+        flowdirs[w + 2] = 5u8;
+        flowdirs[w + 4] = 5u8;
+        let trunc = trace_downstream_away_from_source(
+            w + 1,
+            w,
+            h,
+            &flowdirs,
+            &dep_ids,
+            &in_source,
+            &desc_ids,
+            &ancestor_ids,
+            &mut drains_to_source,
+            &mut trapped_in_pit,
+            3,
+            &mut seen_stamp,
+            3,
+        );
+        let (t_trace, t_target) = trunc.expect("trace visiting target 3 should succeed");
+        assert_eq!(t_target, 3);
+        assert_eq!(
+            dep_ids[*t_trace.last().unwrap()],
+            3,
+            "trace must be truncated to end inside target depression 3"
         );
     }
 }
