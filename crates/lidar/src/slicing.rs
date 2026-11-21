@@ -4,16 +4,20 @@
 //! labeling, moment-based region geometry, parallel per-region level-set
 //! slicing, and `terrio` for GeoTIFF and Shapefile output.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::f64::consts::PI;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
-use richdem::{Array2D, DemNum, load_raster, save_raster};
+use richdem::{Array2D, DemNum, array2d_to_dataset, load_raster, save_raster};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
+use terrio::crs::SpatialRef;
+use terrio::ops::polygonize::{PolygonizeOptions, polygonize as terrio_polygonize};
+use terrio::{Feature, FieldDef, FieldType, FieldValue, GeometryType, Layer, VectorWriteOptions};
 
 use crate::error::{Error, Result};
 use crate::raster_ops::{ensure_no_path_collision, polygonize};
@@ -66,6 +70,24 @@ pub struct NestedDepression {
     pub orientation: f64,
     /// Ratio of pixel count to bounding-box pixel area.
     pub area_bbox_ratio: f64,
+    /// Direct enclosing parent depression ID (`0` for top-level root depressions).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub parent_id: u32,
+    /// Isoperimetric circularity (`4 * pi * area / perimeter^2`, clamped to `[0, 1]`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub circularity: f64,
+    /// Depth-to-equivalent-diameter ratio (`max_depth / (2 * sqrt(area / pi))`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub depth_diam_ratio: f64,
+    /// Hypsometric integral (`avg_depth / max_depth`, clamped to `[0, 1]`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub hypsometric_integral: f64,
+    /// Mean rim-to-floor side-slope angle in degrees (`atan(max_depth / eq_radius)`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub rim_slope_deg: f64,
+    /// Heuristic flag for likely linear ditch / road-embankment artifacts.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub artifact_flag: bool,
 }
 
 /// Options controlling [`delineate_depressions`] and [`crate::mounts::delineate_mounts`].
@@ -83,6 +105,8 @@ pub struct DelineateOptions {
     pub bool_comb_tif: bool,
     /// Whether to DEFLATE-compress output GeoTIFFs.
     pub compress: bool,
+    /// Whether to also export a unified multi-level GeoPackage (`depressions.gpkg`) with full attribute names.
+    pub export_gpkg: bool,
 }
 
 impl Default for DelineateOptions {
@@ -94,6 +118,7 @@ impl Default for DelineateOptions {
             bool_level_shp: false,
             bool_comb_tif: false,
             compress: false,
+            export_gpkg: false,
         }
     }
 }
@@ -112,6 +137,9 @@ pub struct DelineateResult {
     pub csv_path: PathBuf,
     /// Per-level shapefiles generated when `bool_level_shp = true`.
     pub level_shapefiles: Vec<PathBuf>,
+    /// Optional unified multi-level GeoPackage path (`depressions.gpkg`) when `export_gpkg = true`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub gpkg_path: Option<PathBuf>,
     /// All delineated nested depressions across all sink regions.
     pub depressions: Vec<NestedDepression>,
     /// Maximum hierarchy level observed (`0` if no depressions).
@@ -135,7 +163,55 @@ pub struct InMemoryDepressions {
     pub num_regions: u32,
 }
 
+fn extended_morphometrics(
+    area: f64,
+    perimeter: f64,
+    avg_depth: f64,
+    max_depth: f64,
+    elongatedness: f64,
+    area_bbox_ratio: f64,
+) -> (f64, f64, f64, f64, bool) {
+    let circularity = if perimeter > 0.0 && area > 0.0 {
+        (4.0 * PI * area / (perimeter * perimeter)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let eq_radius = if area > 0.0 { (area / PI).sqrt() } else { 0.0 };
+    let depth_diam_ratio = if eq_radius > 0.0 {
+        max_depth / (2.0 * eq_radius)
+    } else {
+        0.0
+    };
+    let hypsometric_integral = if max_depth > 0.0 {
+        (avg_depth / max_depth).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let rim_slope_deg = if eq_radius > 0.0 && max_depth > 0.0 {
+        (max_depth / eq_radius).atan().to_degrees()
+    } else {
+        0.0
+    };
+    let artifact_flag = elongatedness > 6.0 && area_bbox_ratio < 0.25;
+    (
+        circularity,
+        depth_diam_ratio,
+        hypsometric_integral,
+        rim_slope_deg,
+        artifact_flag,
+    )
+}
+
 fn depression_from_props(id: u32, region_id: u32, p: &RegionProps) -> NestedDepression {
+    let (circularity, depth_diam_ratio, hypsometric_integral, rim_slope_deg, artifact_flag) =
+        extended_morphometrics(
+            p.area,
+            p.perimeter,
+            p.mean_depth,
+            p.max_depth,
+            p.elongatedness,
+            p.area_bbox_ratio,
+        );
     NestedDepression {
         id,
         level: 1,
@@ -155,6 +231,12 @@ fn depression_from_props(id: u32, region_id: u32, p: &RegionProps) -> NestedDepr
         eccentricity: p.eccentricity,
         orientation: p.orientation,
         area_bbox_ratio: p.area_bbox_ratio,
+        parent_id: 0,
+        circularity,
+        depth_diam_ratio,
+        hypsometric_integral,
+        rim_slope_deg,
+        artifact_flag,
     }
 }
 
@@ -227,6 +309,8 @@ fn level_set_region(
             let min = res_x;
             (maj, maj, min, maj / min, 90.0)
         };
+        let (circularity, depth_diam_ratio, hypsometric_integral, rim_slope_deg, artifact_flag) =
+            extended_morphometrics(area, perimeter, mean_depth, max_depth, elongatedness, 1.0);
         let dep = NestedDepression {
             id: 1,
             level: 1,
@@ -246,6 +330,12 @@ fn level_set_region(
             eccentricity: 1.0,
             orientation,
             area_bbox_ratio: 1.0,
+            parent_id: 0,
+            circularity,
+            depth_diam_ratio,
+            hypsometric_integral,
+            rim_slope_deg,
+            artifact_flag,
         };
         for i in 0..img.len() {
             if img[i].is_finite() {
@@ -365,25 +455,32 @@ fn level_set_region(
 }
 
 /// Bottom-up hierarchy level assignment: leaf depressions have `level = 1`,
-/// parent depressions have `level = 1 + max(child.level)`.
+/// parent depressions have `level = 1 + max(child.level)`, and each child's
+/// `parent_id` is populated from its enclosing parent.
 fn update_levels(dep_list: &mut [NestedDepression]) {
     for i in (0..dep_list.len()).rev() {
+        let cur_id = dep_list[i].id;
         if dep_list[i].children_ids.is_empty() {
             dep_list[i].level = 1;
         } else {
             let mut max_child_level = 0u32;
-            for &cid in &dep_list[i].children_ids {
-                let child_lvl = dep_list[(cid - 1) as usize].level;
+            let children = dep_list[i].children_ids.clone();
+            for cid in children {
+                let cidx = (cid - 1) as usize;
+                let child_lvl = dep_list[cidx].level;
                 if child_lvl > max_child_level {
                     max_child_level = child_lvl;
                 }
+                dep_list[cidx].parent_id = cur_id;
             }
             dep_list[i].level = max_child_level + 1;
         }
     }
 }
 
-/// Writes nested depression hierarchy attributes to a CSV file matching `lidar/slicing.py`.
+/// Writes nested depression hierarchy attributes (24 columns: original 18 columns plus
+/// `parent_id`, `circularity`, `depth_diam_ratio`, `hypsometric_integral`, `rim_slope_deg`,
+/// and `artifact_flag`) to a CSV file.
 pub fn write_depressions_csv(
     depressions: &[NestedDepression],
     csv_path: impl AsRef<Path>,
@@ -392,7 +489,7 @@ pub fn write_depressions_csv(
     let mut w = BufWriter::new(file);
     writeln!(
         w,
-        "id,level,count,area,volume,avg_depth,max_depth,min_elev,max_elev,children_id,region_id,perimeter,major_axis,minor_axis,elongatedness,eccentricity,orientation,area_bbox_ratio"
+        "id,level,count,area,volume,avg_depth,max_depth,min_elev,max_elev,children_id,region_id,perimeter,major_axis,minor_axis,elongatedness,eccentricity,orientation,area_bbox_ratio,parent_id,circularity,depth_diam_ratio,hypsometric_integral,rim_slope_deg,artifact_flag"
     )?;
     for d in depressions {
         let children_str = if d.children_ids.is_empty() {
@@ -408,7 +505,7 @@ pub fn write_depressions_csv(
         };
         writeln!(
             w,
-            "{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
+            "{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{:.4},{:.4},{:.4},{:.2},{}",
             d.id,
             d.level,
             d.count,
@@ -427,9 +524,127 @@ pub fn write_depressions_csv(
             d.eccentricity,
             d.orientation,
             d.area_bbox_ratio,
+            d.parent_id,
+            d.circularity,
+            d.depth_diam_ratio,
+            d.hypsometric_integral,
+            d.rim_slope_deg,
+            d.artifact_flag,
         )?;
     }
     w.flush()?;
+    Ok(())
+}
+
+/// Exports all nested depressions into a unified multi-level vector file (`.gpkg` or `.geojson`)
+/// with full untrimmed attribute names.
+pub fn write_depressions_vector(
+    depression_id: &Array2D<i32>,
+    depressions: &[NestedDepression],
+    out_path: impl AsRef<Path>,
+) -> Result<()> {
+    let out_path = out_path.as_ref();
+    if let Some(parent) = out_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let out_str = out_path
+        .to_str()
+        .ok_or_else(|| Error::InvalidArgument(format!("non-UTF-8 path: {}", out_path.display())))?;
+
+    let ds = array2d_to_dataset(depression_id)?;
+    let poly_layer = terrio_polygonize(
+        &ds,
+        &PolygonizeOptions {
+            band: 0,
+            field_name: "id".to_string(),
+            layer_name: "depressions".to_string(),
+            connectedness8: false,
+            ignore_nodata: false,
+            mask: None,
+        },
+    )?;
+
+    let dep_map: HashMap<u32, &NestedDepression> = depressions.iter().map(|d| (d.id, d)).collect();
+    let mut layer = Layer::new("depressions".to_string()).with_geom_type(GeometryType::Polygon);
+    layer.crs = poly_layer.crs.clone();
+    if layer.crs.is_none()
+        && !depression_id.projection.is_empty()
+        && let Ok(srs) = SpatialRef::parse(&depression_id.projection)
+    {
+        srs.apply_to_layer(&mut layer);
+    }
+
+    for (name, ftype) in [
+        ("id", FieldType::Integer),
+        ("parent_id", FieldType::Integer),
+        ("level", FieldType::Integer),
+        ("region_id", FieldType::Integer),
+        ("count", FieldType::Integer),
+        ("area", FieldType::Float),
+        ("volume", FieldType::Float),
+        ("avg_depth", FieldType::Float),
+        ("max_depth", FieldType::Float),
+        ("min_elev", FieldType::Float),
+        ("max_elev", FieldType::Float),
+        ("perimeter", FieldType::Float),
+        ("major_axis", FieldType::Float),
+        ("minor_axis", FieldType::Float),
+        ("elongatedness", FieldType::Float),
+        ("eccentricity", FieldType::Float),
+        ("orientation", FieldType::Float),
+        ("area_bbox_ratio", FieldType::Float),
+        ("circularity", FieldType::Float),
+        ("depth_diam_ratio", FieldType::Float),
+        ("hypsometric_integral", FieldType::Float),
+        ("rim_slope_deg", FieldType::Float),
+        ("artifact_flag", FieldType::Integer),
+    ] {
+        layer.schema.add_field(FieldDef::new(name, ftype));
+    }
+
+    for feat in poly_layer.features {
+        let did = match feat.attributes.first() {
+            Some(FieldValue::Integer(i)) if *i > 0 => *i as u32,
+            Some(FieldValue::Float(f)) if *f > 0.0 && f.is_finite() => *f as u32,
+            _ => continue,
+        };
+        let Some(d) = dep_map.get(&did) else {
+            continue;
+        };
+        layer.features.push(Feature {
+            fid: (layer.features.len() + 1) as u64,
+            geometry: feat.geometry,
+            attributes: vec![
+                FieldValue::Integer(d.id as i64),
+                FieldValue::Integer(d.parent_id as i64),
+                FieldValue::Integer(d.level as i64),
+                FieldValue::Integer(d.region_id as i64),
+                FieldValue::Integer(d.count as i64),
+                FieldValue::Float(d.area),
+                FieldValue::Float(d.volume),
+                FieldValue::Float(d.avg_depth),
+                FieldValue::Float(d.max_depth),
+                FieldValue::Float(d.min_elev),
+                FieldValue::Float(d.max_elev),
+                FieldValue::Float(d.perimeter),
+                FieldValue::Float(d.major_axis),
+                FieldValue::Float(d.minor_axis),
+                FieldValue::Float(d.elongatedness),
+                FieldValue::Float(d.eccentricity),
+                FieldValue::Float(d.orientation),
+                FieldValue::Float(d.area_bbox_ratio),
+                FieldValue::Float(d.circularity),
+                FieldValue::Float(d.depth_diam_ratio),
+                FieldValue::Float(d.hypsometric_integral),
+                FieldValue::Float(d.rim_slope_deg),
+                FieldValue::Integer(i64::from(d.artifact_flag)),
+            ],
+        });
+    }
+
+    terrio::write_vector(&[layer], out_str, &VectorWriteOptions::default())?;
     Ok(())
 }
 
@@ -558,6 +773,9 @@ pub fn delineate_depressions_in_memory(
 
         for dep in &mut local_deps {
             dep.id += uid_offset;
+            if dep.parent_id > 0 {
+                dep.parent_id += uid_offset;
+            }
             for cid in &mut dep.children_ids {
                 *cid += uid_offset;
             }
@@ -745,6 +963,14 @@ pub fn delineate_depressions(
     polygonize(&out_obj_file, &out_vec_file, "id")?;
     write_depressions_csv(&mem.depressions, &out_csv_file)?;
 
+    let gpkg_path = if options.export_gpkg {
+        let p = out_dir.join("depressions.gpkg");
+        write_depressions_vector(&mem.depression_id, &mem.depressions, &p)?;
+        Some(p)
+    } else {
+        None
+    };
+
     let level_shapefiles = if options.bool_level_shp {
         // Remove only previously exported Single_level_* / Combined_level_* artifacts,
         // preserving any unrelated caller files inside shp-level/.
@@ -778,6 +1004,7 @@ pub fn delineate_depressions(
         shapefile_path: out_vec_file,
         csv_path: out_csv_file,
         level_shapefiles,
+        gpkg_path,
         depressions: mem.depressions,
         max_level: mem.max_level,
         num_regions: mem.num_regions,

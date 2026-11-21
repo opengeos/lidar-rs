@@ -69,6 +69,22 @@ pub struct AnimateInundationOptions {
     pub time_step_h: Option<f64>,
     /// Optional rainfall intensity in cm/h for the banner title.
     pub rain_intensity_cm_h: Option<f64>,
+    /// Draw a bottom-left scale bar in map units (default `false`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub show_scale_bar: bool,
+    /// Draw a compact bottom-right color swatch legend (default `false`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub show_legend: bool,
+    /// Optional vector polylines (in source DEM `(col, row)` coordinates) overlaid onto each frame.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub overlay_polylines: Vec<Vec<(usize, usize)>>,
+    /// RGB color for `overlay_polylines` (default `[12, 60, 140]`).
+    #[cfg_attr(feature = "serde", serde(default = "default_overlay_rgb"))]
+    pub overlay_rgb: [u8; 3],
+}
+
+fn default_overlay_rgb() -> [u8; 3] {
+    [12, 60, 140]
 }
 
 impl Default for AnimateInundationOptions {
@@ -83,6 +99,10 @@ impl Default for AnimateInundationOptions {
             hillshade: HillshadeOptions::default(),
             time_step_h: Some(1.0),
             rain_intensity_cm_h: None,
+            show_scale_bar: false,
+            show_legend: false,
+            overlay_polylines: Vec::new(),
+            overlay_rgb: default_overlay_rgb(),
         }
     }
 }
@@ -652,11 +672,31 @@ where
             }
         }
 
+        if !options.overlay_polylines.is_empty() {
+            draw_overlay_polylines(
+                body,
+                dw,
+                dh,
+                sw,
+                sh,
+                &options.overlay_polylines,
+                options.overlay_rgb,
+            );
+        }
+
         if !spill_paths.is_empty()
             && let Some(dt) = options.time_step_h
         {
             let t_hours = (src_idx + 1) as f64 * dt;
             draw_active_spill_paths(body, dw, dh, sw, sh, &wet, t_hours, spill_paths);
+        }
+
+        if options.show_scale_bar {
+            let cell_m = dem.geotransform[1].hypot(dem.geotransform[4]).max(1e-6);
+            draw_scale_bar(body, dw, dh, sw, cell_m);
+        }
+        if options.show_legend {
+            draw_legend_box(body, dw, dh, options.water_rgb, !spill_paths.is_empty());
         }
 
         let mut gif_frame = Frame::from_rgb_speed(dw as u16, total_h as u16, &frame_rgb, 10);
@@ -813,6 +853,371 @@ pub fn animate_inundation_to_bytes_with_spill_paths(
     )?;
 
     Ok((gif_bytes, frame_count, width, height))
+}
+
+fn draw_text_5x7(
+    buf: &mut [u8],
+    width: usize,
+    height: usize,
+    x0: usize,
+    y0: usize,
+    text: &str,
+    rgb: [u8; 3],
+) {
+    let char_w = 6usize;
+    for (ci, ch) in text.chars().enumerate() {
+        let glyph = glyph_5x7(ch);
+        let gx0 = x0 + ci * char_w;
+        for (gy, row_bits) in glyph.iter().enumerate() {
+            let py = y0 + gy;
+            if py >= height {
+                continue;
+            }
+            for gx in 0..5usize {
+                if (row_bits & (1 << (4 - gx))) != 0 {
+                    let px = gx0 + gx;
+                    if px < width {
+                        let p = (py * width + px) * 3;
+                        buf[p] = rgb[0];
+                        buf[p + 1] = rgb[1];
+                        buf[p + 2] = rgb[2];
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn draw_overlay_polylines(
+    body: &mut [u8],
+    dw: usize,
+    dh: usize,
+    sw: usize,
+    sh: usize,
+    polylines: &[Vec<(usize, usize)>],
+    rgb: [u8; 3],
+) {
+    let sx = dw as f64 / sw.max(1) as f64;
+    let sy = dh as f64 / sh.max(1) as f64;
+    for line in polylines {
+        for seg in line.windows(2) {
+            let x0 = (seg[0].0 as f64 * sx).round() as isize;
+            let y0 = (seg[0].1 as f64 * sy).round() as isize;
+            let x1 = (seg[1].0 as f64 * sx).round() as isize;
+            let y1 = (seg[1].1 as f64 * sy).round() as isize;
+            let steps = (x1 - x0).abs().max((y1 - y0).abs()).max(1);
+            for s in 0..=steps {
+                let px = x0 + (x1 - x0) * s / steps;
+                let py = y0 + (y1 - y0) * s / steps;
+                if px >= 0 && py >= 0 && (px as usize) < dw && (py as usize) < dh {
+                    let p = (py as usize * dw + px as usize) * 3;
+                    body[p] = rgb[0];
+                    body[p + 1] = rgb[1];
+                    body[p + 2] = rgb[2];
+                }
+            }
+        }
+    }
+}
+
+fn draw_scale_bar(body: &mut [u8], dw: usize, dh: usize, sw: usize, cell_m: f64) {
+    if dw < 90 || dh < 36 {
+        return;
+    }
+    let total_m = sw as f64 * cell_m;
+    let target_m = total_m * 0.22;
+    let nice_vals = [
+        10.0, 25.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0,
+    ];
+    let bar_m = nice_vals
+        .iter()
+        .copied()
+        .min_by(|a, b| (a - target_m).abs().total_cmp(&(b - target_m).abs()))
+        .unwrap_or(100.0);
+    let bar_px = ((bar_m / total_m.max(1e-6)) * dw as f64)
+        .round()
+        .clamp(24.0, (dw as f64 * 0.35).max(24.0)) as usize;
+    let bx0 = 10usize;
+    let by0 = dh.saturating_sub(24);
+    let pad = 4usize;
+    let box_w = (bar_px + 2 * pad).min(dw.saturating_sub(bx0));
+    let box_h = 20usize.min(dh.saturating_sub(by0));
+    for y in by0..(by0 + box_h) {
+        for x in bx0..(bx0 + box_w) {
+            let p = (y * dw + x) * 3;
+            body[p] = ((body[p] as u16 + 24) / 3) as u8;
+            body[p + 1] = ((body[p + 1] as u16 + 28) / 3) as u8;
+            body[p + 2] = ((body[p + 2] as u16 + 36) / 3) as u8;
+        }
+    }
+    let label = if bar_m >= 1000.0 {
+        format!("{} KM", (bar_m / 1000.0) as u32)
+    } else {
+        format!("{} M", bar_m as u32)
+    };
+    draw_text_5x7(body, dw, dh, bx0 + pad, by0 + 2, &label, [245, 248, 255]);
+    let bar_y = by0 + 12;
+    let half = bar_px / 2;
+    for y in bar_y..(bar_y + 4).min(dh) {
+        for x in 0..bar_px {
+            let px = bx0 + pad + x;
+            if px < dw {
+                let p = (y * dw + px) * 3;
+                let c = if x < half { 245 } else { 40 };
+                body[p] = c;
+                body[p + 1] = c;
+                body[p + 2] = c;
+            }
+        }
+    }
+}
+
+fn draw_legend_box(body: &mut [u8], dw: usize, dh: usize, water_rgb: [u8; 3], has_spills: bool) {
+    let box_w = 84usize;
+    let box_h = if has_spills { 30usize } else { 18usize };
+    if dw < box_w + 16 || dh < box_h + 16 {
+        return;
+    }
+    let lx0 = dw - box_w - 8;
+    let ly0 = dh - box_h - 8;
+    for y in ly0..(ly0 + box_h) {
+        for x in lx0..(lx0 + box_w) {
+            let p = (y * dw + x) * 3;
+            body[p] = ((body[p] as u16 + 20) / 3) as u8;
+            body[p + 1] = ((body[p + 1] as u16 + 24) / 3) as u8;
+            body[p + 2] = ((body[p + 2] as u16 + 32) / 3) as u8;
+        }
+    }
+    // Water swatch
+    for y in (ly0 + 5)..(ly0 + 11) {
+        for x in (lx0 + 5)..(lx0 + 13) {
+            let p = (y * dw + x) * 3;
+            body[p] = water_rgb[0];
+            body[p + 1] = water_rgb[1];
+            body[p + 2] = water_rgb[2];
+        }
+    }
+    draw_text_5x7(body, dw, dh, lx0 + 17, ly0 + 5, "WATER", [245, 248, 255]);
+    if has_spills {
+        for y in (ly0 + 17)..(ly0 + 23) {
+            for x in (lx0 + 5)..(lx0 + 13) {
+                let p = (y * dw + x) * 3;
+                body[p] = 56;
+                body[p + 1] = 189;
+                body[p + 2] = 248;
+            }
+        }
+        draw_text_5x7(body, dw, dh, lx0 + 17, ly0 + 17, "SPILL", [245, 248, 255]);
+    }
+}
+
+/// Encodes an RGB24 buffer (`3 * width * height` bytes) into a pure-Rust PNG byte vector.
+pub fn encode_rgb_to_png_bytes(rgb: &[u8], width: usize, height: usize) -> Result<Vec<u8>> {
+    if rgb.len() != width * height * 3 {
+        return Err(Error::DimensionMismatch(format!(
+            "RGB buffer length {} does not match {width}x{height}x3",
+            rgb.len()
+        )));
+    }
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, width as u32, height as u32);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| Error::Algorithm(format!("PNG header error: {e}")))?;
+        writer
+            .write_image_data(rgb)
+            .map_err(|e| Error::Algorithm(format!("PNG encode error: {e}")))?;
+    }
+    Ok(out)
+}
+
+/// Renders a single shaded-relief inundation frame at `t_hours` into PNG bytes
+/// with banner, optional active spill paths, optional scale bar, and optional legend.
+pub fn render_inundation_frame_png_bytes(
+    dem: &Array2D<f64>,
+    fill_time: &Array2D<f64>,
+    t_hours: f64,
+    progress: f64,
+    spill_paths: &[SpillFlowPath],
+    options: &AnimateInundationOptions,
+) -> Result<Vec<u8>> {
+    let sw = dem.width();
+    let sh = dem.height();
+    let (dw, dh, total_h) = compute_gif_dimensions(sw, sh, options)?;
+    let full_bg = compute_hillshade_rgb(dem, &options.hillshade);
+    let bg = downscale_rgb(&full_bg, sw, sh, dw, dh);
+    let alpha = options.water_alpha.clamp(0.0, 1.0);
+    let inv_alpha = 1.0 - alpha;
+    let [wr, wg, wb] = options.water_rgb;
+    let ft_data = fill_time.data();
+    let ft_nd = fill_time.no_data();
+    let cell_m = dem.geotransform[1].hypot(dem.geotransform[4]).max(1e-6);
+
+    let wet: Vec<bool> = ft_data
+        .iter()
+        .map(|&ft| {
+            t_hours > 0.0 && ft.is_finite() && !ft.rd_eq(ft_nd) && (0.0..=t_hours).contains(&ft)
+        })
+        .collect();
+
+    let mut frame_rgb = vec![0u8; dw * total_h * 3];
+    let label = match options.rain_intensity_cm_h {
+        Some(r) => format!("T = {t_hours:.1}H  ({:.0} MM)", t_hours * r * 10.0),
+        None => format!("T = {t_hours:.1}H"),
+    };
+    draw_banner(
+        &mut frame_rgb,
+        dw,
+        ANIMATION_BANNER_HEIGHT,
+        &label,
+        progress.clamp(0.0, 1.0),
+        [56, 189, 248],
+    );
+
+    let body = &mut frame_rgb[ANIMATION_BANNER_HEIGHT * dw * 3..];
+    body.copy_from_slice(&bg);
+    for dr in 0..dh {
+        let sr = dr * sh / dh;
+        for dc in 0..dw {
+            let sc = dc * sw / dw;
+            if wet[sr * sw + sc] {
+                let p = (dr * dw + dc) * 3;
+                body[p] = (body[p] as f32 * inv_alpha + wr as f32 * alpha).round() as u8;
+                body[p + 1] = (body[p + 1] as f32 * inv_alpha + wg as f32 * alpha).round() as u8;
+                body[p + 2] = (body[p + 2] as f32 * inv_alpha + wb as f32 * alpha).round() as u8;
+            }
+        }
+    }
+    if !options.overlay_polylines.is_empty() {
+        draw_overlay_polylines(
+            body,
+            dw,
+            dh,
+            sw,
+            sh,
+            &options.overlay_polylines,
+            options.overlay_rgb,
+        );
+    }
+    if !spill_paths.is_empty() && t_hours > 0.0 {
+        draw_active_spill_paths(body, dw, dh, sw, sh, &wet, t_hours, spill_paths);
+    }
+    if options.show_scale_bar {
+        draw_scale_bar(body, dw, dh, sw, cell_m);
+    }
+    if options.show_legend {
+        draw_legend_box(body, dw, dh, options.water_rgb, !spill_paths.is_empty());
+    }
+    encode_rgb_to_png_bytes(&frame_rgb, dw, total_h)
+}
+
+/// Exports individual time-series inundation frames as numbered PNG files (`frame_001.png`, ...)
+/// with optional banner, scale bar, legend, spill paths, and vector overlays.
+pub fn export_inundation_frames_png(
+    dem: &Array2D<f64>,
+    fill_time: &Array2D<f64>,
+    num_steps: usize,
+    time_step_h: f64,
+    spill_paths: &[SpillFlowPath],
+    out_dir: impl AsRef<Path>,
+    options: &AnimateInundationOptions,
+) -> Result<Vec<PathBuf>> {
+    if !time_step_h.is_finite() || time_step_h <= 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "time_step_h must be finite and > 0, got {time_step_h}"
+        )));
+    }
+    if num_steps == 0 || num_steps > 10_000 {
+        return Err(Error::InvalidArgument(format!(
+            "num_steps must be in 1..=10000, got {num_steps}"
+        )));
+    }
+    let out_dir = out_dir.as_ref();
+    std::fs::create_dir_all(out_dir)?;
+
+    let sw = dem.width();
+    let sh = dem.height();
+    let (dw, dh, total_h) = compute_gif_dimensions(sw, sh, options)?;
+    let full_bg = compute_hillshade_rgb(dem, &options.hillshade);
+    let bg = downscale_rgb(&full_bg, sw, sh, dw, dh);
+    let alpha = options.water_alpha.clamp(0.0, 1.0);
+    let inv_alpha = 1.0 - alpha;
+    let [wr, wg, wb] = options.water_rgb;
+    let ft_data = fill_time.data();
+    let ft_nd = fill_time.no_data();
+    let digits = (num_steps as f64).log10().floor() as usize + 1;
+    let cell_m = dem.geotransform[1].hypot(dem.geotransform[4]).max(1e-6);
+
+    let mut frame_rgb = vec![0u8; dw * total_h * 3];
+    let mut paths = Vec::with_capacity(num_steps);
+
+    for src_idx in 0..num_steps {
+        let t_hours = (src_idx + 1) as f64 * time_step_h;
+        let wet: Vec<bool> = ft_data
+            .iter()
+            .map(|&ft| ft.is_finite() && !ft.rd_eq(ft_nd) && (0.0..=t_hours).contains(&ft))
+            .collect();
+
+        let label = match options.rain_intensity_cm_h {
+            Some(r) => format!("T = {t_hours:.1}H  ({:.0} MM)", t_hours * r * 10.0),
+            None => format!("T = {t_hours:.1}H"),
+        };
+        let progress = (src_idx + 1) as f64 / num_steps as f64;
+        draw_banner(
+            &mut frame_rgb,
+            dw,
+            ANIMATION_BANNER_HEIGHT,
+            &label,
+            progress,
+            [56, 189, 248],
+        );
+
+        let body = &mut frame_rgb[ANIMATION_BANNER_HEIGHT * dw * 3..];
+        body.copy_from_slice(&bg);
+        for dr in 0..dh {
+            let sr = dr * sh / dh;
+            for dc in 0..dw {
+                let sc = dc * sw / dw;
+                if wet[sr * sw + sc] {
+                    let p = (dr * dw + dc) * 3;
+                    body[p] = (body[p] as f32 * inv_alpha + wr as f32 * alpha).round() as u8;
+                    body[p + 1] =
+                        (body[p + 1] as f32 * inv_alpha + wg as f32 * alpha).round() as u8;
+                    body[p + 2] =
+                        (body[p + 2] as f32 * inv_alpha + wb as f32 * alpha).round() as u8;
+                }
+            }
+        }
+        if !options.overlay_polylines.is_empty() {
+            draw_overlay_polylines(
+                body,
+                dw,
+                dh,
+                sw,
+                sh,
+                &options.overlay_polylines,
+                options.overlay_rgb,
+            );
+        }
+        if !spill_paths.is_empty() {
+            draw_active_spill_paths(body, dw, dh, sw, sh, &wet, t_hours, spill_paths);
+        }
+        if options.show_scale_bar {
+            draw_scale_bar(body, dw, dh, sw, cell_m);
+        }
+        if options.show_legend {
+            draw_legend_box(body, dw, dh, options.water_rgb, !spill_paths.is_empty());
+        }
+
+        let png_bytes = encode_rgb_to_png_bytes(&frame_rgb, dw, total_h)?;
+        let out_path = out_dir.join(format!("frame_{:0digits$}.png", src_idx + 1));
+        std::fs::write(&out_path, png_bytes)?;
+        paths.push(out_path);
+    }
+    Ok(paths)
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 # Playground
 
-Run **`lidar-rs`** directly in your browser via WebAssembly — DEM smoothing, Priority-Flood sink extraction, Wu et al. (2019) nested depression/mount hierarchy delineation, D8 catchment hierarchy, surface inundation simulation, and animated GIF encoding all execute locally in browser memory. Files are **never uploaded** to any server.
+Run **`lidar-rs`** directly in your browser via WebAssembly: DEM smoothing, selective depression breaching, Priority-Flood sink extraction, Wu et al. (2019) nested depression/mount hierarchy delineation, single-pass D8 catchment hierarchy, surface inundation simulation, stage-storage rating curves, connectivity graphs, and PNG/GIF export all execute locally in browser memory. Files are **never uploaded** to any server.
 
 <div id="lidar-playground" markdown="0">
   <p class="lp-status" id="lp-status">Loading lidar-rs WebAssembly module…</p>
@@ -9,8 +9,8 @@ Run **`lidar-rs`** directly in your browser via WebAssembly — DEM smoothing, P
     <p><strong>Drop a DEM or DSM GeoTIFF here</strong> or <label class="lp-link">choose a file<input type="file" id="lp-file" accept=".tif,.tiff,.img,.asc" class="lp-visually-hidden"></label>.</p>
     <p class="lp-hint">Single-band GeoTIFF / COG elevation rasters. Everything stays in your browser memory.</p>
     <p class="lp-samples">Or try a bundled sample:
-      <button type="button" id="lp-sample-dem">Sample DEM — Depressions &amp; Inundation (400×400)</button>
-      <button type="button" id="lp-sample-dsm">Sample DSM — Mounts / Canopies (400×400)</button>
+      <button type="button" id="lp-sample-dem">Sample DEM: Depressions &amp; Inundation (400×400)</button>
+      <button type="button" id="lp-sample-dsm">Sample DSM: Mounts / Canopies (400×400)</button>
     </p>
   </div>
 
@@ -25,6 +25,10 @@ Run **`lidar-rs`** directly in your browser via WebAssembly — DEM smoothing, P
     <div class="lp-field lp-inundation-only">
       <label for="lp-kernel">Median filter (px)</label>
       <input type="number" id="lp-kernel" value="3" min="1" max="15" step="2">
+    </div>
+    <div class="lp-field lp-inundation-only">
+      <label for="lp-breach">Selective breach (m, 0=off)</label>
+      <input type="number" id="lp-breach" value="0" min="0" max="10" step="0.1">
     </div>
     <div class="lp-field">
       <label for="lp-min-size">Min size (cells)</label>
@@ -41,6 +45,10 @@ Run **`lidar-rs`** directly in your browser via WebAssembly — DEM smoothing, P
     <div class="lp-field lp-inundation-only">
       <label for="lp-rain">Rain intensity (cm/h)</label>
       <input type="number" id="lp-rain" value="5" min="0.5" max="100" step="0.5">
+    </div>
+    <div class="lp-field lp-inundation-only">
+      <label for="lp-runoff-coeff">Runoff coeff C (0..1)</label>
+      <input type="number" id="lp-runoff-coeff" value="1.0" min="0.05" max="1.0" step="0.05">
     </div>
     <div class="lp-field lp-inundation-only">
       <label for="lp-duration">Rain duration (h)</label>
@@ -62,7 +70,7 @@ Run **`lidar-rs`** directly in your browser via WebAssembly — DEM smoothing, P
       <h3>Interactive Inundation Simulation</h3>
       <div class="lp-player-grid">
         <div class="lp-player-stage">
-          <canvas id="lp-player-canvas"></canvas>
+          <canvas id="lp-player-canvas" title="Click any depression to inspect hierarchy, morphometry, and stage-volume curve"></canvas>
           <div class="lp-player-telemetry" id="lp-player-telemetry"></div>
           <div class="lp-player-bar">
             <button type="button" id="lp-play-btn" class="md-button md-button--primary">Pause</button>
@@ -81,8 +89,21 @@ Run **`lidar-rs`** directly in your browser via WebAssembly — DEM smoothing, P
         </div>
         <div class="lp-player-side">
           <h4>Inundation Curve</h4>
-          <p class="lp-hint">Click the chart or drag the slider to inspect any time step.</p>
-          <canvas id="lp-chart" width="420" height="240"></canvas>
+          <p class="lp-hint">Click the chart or drag the slider to inspect any time step. Click any depression on the map or table to inspect it.</p>
+          <canvas id="lp-chart" width="420" height="200"></canvas>
+
+          <div class="lp-inspector" id="lp-inspector">
+            <div class="lp-inspector-head">
+              <h4 id="lp-inspector-title">Depression Inspector</h4>
+              <button type="button" id="lp-inspector-clear" class="lp-icon-btn" hidden>Clear</button>
+            </div>
+            <p class="lp-hint" id="lp-inspector-empty">Click any depression on the map or in the feature table below to view its parent/child hierarchy, morphometry, spill threshold, and stage-volume rating curve.</p>
+            <div id="lp-inspector-body" hidden>
+              <div class="lp-inspector-grid" id="lp-inspector-stats"></div>
+              <canvas id="lp-rating-chart" width="420" height="145"></canvas>
+            </div>
+          </div>
+
           <details class="lp-gif-details" id="lp-gif-details">
             <summary>Preview exported animated GIF</summary>
             <div class="lp-gif-wrap">
@@ -123,12 +144,15 @@ Run **`lidar-rs`** directly in your browser via WebAssembly — DEM smoothing, P
           <tr>
             <th>ID</th>
             <th>Level</th>
+            <th>Parent</th>
             <th>Region</th>
             <th>Cells</th>
             <th>Area</th>
             <th>Volume</th>
-            <th>Mean Depth</th>
             <th>Max Depth</th>
+            <th>Circularity</th>
+            <th>HI</th>
+            <th>Rim Slope</th>
           </tr>
         </thead>
         <tbody id="lp-tbody"></tbody>

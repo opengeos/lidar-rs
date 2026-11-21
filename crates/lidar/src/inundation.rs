@@ -25,13 +25,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::catchment::{
     CatchmentHierarchyRecord, d8_flow_directions_resolved, delineate_catchment_hierarchy_in_memory,
+    write_catchment_hierarchy_csv,
 };
+use crate::conditioning::{BreachOptions, BurnCulvertsOptions, breach_depressions, burn_culverts};
 use crate::error::{Error, Result};
 use crate::filling::{InMemorySinks, extract_sinks_in_memory};
 use crate::filtering::median_filter;
+#[cfg(feature = "serde")]
+use crate::graph::write_connectivity_graph_json;
+use crate::graph::{
+    build_connectivity_graph, compute_rating_curves, write_connectivity_graphml,
+    write_rating_curves_csv, write_spill_paths_vector,
+};
 use crate::raster_ops::ensure_no_path_collision;
 use crate::region::{region_group, region_props_xy};
-use crate::slicing::{InMemoryDepressions, delineate_depressions_in_memory};
+use crate::slicing::{
+    InMemoryDepressions, delineate_depressions_in_memory, write_depressions_csv,
+    write_depressions_vector,
+};
 
 /// Maximum vertical slices permitted per region to guard against tiny intervals.
 const MAX_SLICES_PER_REGION: usize = 100_000;
@@ -1130,6 +1141,829 @@ pub fn simulate_inundation_pipeline_in_memory(
     })
 }
 
+/// Optional spatially variable hydrologic forcing and storm hyetograph inputs for
+/// [`simulate_inundation_with_forcing_in_memory`].
+#[derive(Debug, Clone, Default)]
+pub struct InundationForcing<'a> {
+    /// Optional per-cell effective runoff coefficient raster (`0.0..=1.0`).
+    /// When `None`, spatially uniform `C = 1.0` is assumed.
+    pub runoff_coeff: Option<&'a Array2D<f64>>,
+    /// Optional per-cell vertical infiltration / karst swallow-hole loss rate raster (`cm/h`).
+    pub infiltration_cm_h: Option<&'a Array2D<f64>>,
+    /// Optional per-cell antecedent water depth raster (vertical DEM units `>= 0.0`) pre-filling
+    /// depressions before storm onset.
+    pub antecedent_depth: Option<&'a Array2D<f64>>,
+    /// Optional piecewise-constant storm hyetograph as `(step_duration_h, intensity_cm_h)` pairs.
+    /// When `Some`, overrides constant `options.rain_intensity_cm_h`.
+    pub hyetograph: Option<&'a [(f64, f64)]>,
+}
+
+/// Converts an NRCS Curve Number (`CN` in `(0, 100]`) raster and storm precipitation
+/// depth (`precip_mm > 0`) into a spatially variable effective runoff-coefficient raster
+/// (`Q / P` in `[0, 1]`) using the standard NRCS TR-55 rainfall-runoff equation
+/// (`S = 25400 / CN - 254`, `Ia = 0.2 * S`).
+pub fn scs_curve_number_runoff(cn: &Array2D<f64>, precip_mm: f64) -> Result<Array2D<f64>> {
+    if !precip_mm.is_finite() || precip_mm <= 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "precip_mm must be finite and > 0, got {precip_mm}"
+        )));
+    }
+    let nd = cn.no_data();
+    let data: Vec<f64> = cn
+        .data()
+        .iter()
+        .map(|&v| {
+            if !v.is_finite() || v.rd_eq(nd) {
+                return 1.0;
+            }
+            let c = v.clamp(1.0, 100.0);
+            let s = 25_400.0 / c - 254.0;
+            let ia = 0.2 * s;
+            if precip_mm <= ia {
+                0.0
+            } else {
+                let q = (precip_mm - ia).powi(2) / (precip_mm - ia + s);
+                (q / precip_mm).clamp(0.0, 1.0)
+            }
+        })
+        .collect();
+    let mut out = Array2D::from_vec(cn.width(), cn.height(), data)?;
+    out.copy_metadata_from(cn);
+    out.set_no_data(-9999.0);
+    Ok(out)
+}
+
+/// Generates a piecewise-constant SCS Type II design storm hyetograph as
+/// `(step_duration_h, intensity_cm_h)` pairs whose cumulative depth equals `total_precip_mm`.
+pub fn scs_type2_hyetograph(
+    total_precip_mm: f64,
+    duration_h: f64,
+    time_step_h: f64,
+) -> Result<Vec<(f64, f64)>> {
+    if !total_precip_mm.is_finite() || total_precip_mm <= 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "total_precip_mm must be finite and > 0, got {total_precip_mm}"
+        )));
+    }
+    if !duration_h.is_finite()
+        || duration_h <= 0.0
+        || !time_step_h.is_finite()
+        || time_step_h <= 0.0
+    {
+        return Err(Error::InvalidArgument(
+            "duration_h and time_step_h must be finite and > 0".into(),
+        ));
+    }
+    // Standard 24-h NRCS SCS Type II dimensionless cumulative rainfall curve `(t/T, P/P_tot)`.
+    const TYPE2: &[(f64, f64)] = &[
+        (0.000, 0.000),
+        (0.083, 0.022),
+        (0.167, 0.048),
+        (0.250, 0.080),
+        (0.333, 0.120),
+        (0.417, 0.181),
+        (0.458, 0.235),
+        (0.479, 0.283),
+        (0.490, 0.357),
+        (0.500, 0.663),
+        (0.521, 0.735),
+        (0.542, 0.772),
+        (0.583, 0.820),
+        (0.667, 0.880),
+        (0.750, 0.922),
+        (0.833, 0.952),
+        (0.917, 0.977),
+        (1.000, 1.000),
+    ];
+    let interp = |u: f64| -> f64 {
+        let u = u.clamp(0.0, 1.0);
+        for w in TYPE2.windows(2) {
+            if u <= w[1].0 {
+                let f = if w[1].0 > w[0].0 {
+                    (u - w[0].0) / (w[1].0 - w[0].0)
+                } else {
+                    0.0
+                };
+                return w[0].1 + f * (w[1].1 - w[0].1);
+            }
+        }
+        1.0
+    };
+    let n_steps = ((duration_h / time_step_h).ceil() as usize).clamp(1, MAX_SIMULATION_STEPS);
+    let mut out = Vec::with_capacity(n_steps);
+    let mut prev_t = 0.0f64;
+    let mut prev_frac = 0.0f64;
+    for k in 1..=n_steps {
+        let t = (k as f64 * time_step_h).min(duration_h);
+        let dt = (t - prev_t).max(1e-9);
+        let frac = interp(t / duration_h);
+        let d_mm = ((frac - prev_frac) * total_precip_mm).max(0.0);
+        let intensity_cm_h = (d_mm / 10.0) / dt;
+        out.push((dt, intensity_cm_h));
+        prev_t = t;
+        prev_frac = frac;
+    }
+    Ok(out)
+}
+
+/// Maps a required cumulative effective runoff depth (meters) onto elapsed time (hours)
+/// along a piecewise-constant hyetograph `[(dt_h, intensity_cm_h)]`, deducting optional
+/// continuous vertical loss rate `loss_m_h`.
+fn invert_hyetograph_time(
+    req_volume_m3: f64,
+    eff_cat_area_m2: f64,
+    dep_area_m2: f64,
+    loss_m_h: f64,
+    hyetograph: &[(f64, f64)],
+) -> f64 {
+    if req_volume_m3 <= 0.0 {
+        return 0.0;
+    }
+    let mut rem_vol = req_volume_m3;
+    let mut elapsed_h = 0.0f64;
+    for &(dt, rain_cm_h) in hyetograph {
+        if dt <= 0.0 {
+            continue;
+        }
+        let inflow_m3_h = eff_cat_area_m2 * (rain_cm_h / 100.0) - dep_area_m2 * loss_m_h;
+        if inflow_m3_h > 0.0 {
+            let step_vol = inflow_m3_h * dt;
+            if step_vol >= rem_vol {
+                return elapsed_h + rem_vol / inflow_m3_h;
+            }
+            rem_vol -= step_vol;
+        }
+        elapsed_h += dt;
+    }
+    f64::INFINITY
+}
+
+struct ForcedRegionFillTask {
+    bbox: (usize, usize, usize, usize),
+    roi_elev: Vec<f64>,
+    roi_catchment: Vec<f64>,
+    roi_runoff_coeff: Option<Vec<f64>>,
+    roi_infil_m_h: Option<Vec<f64>>,
+    roi_antecedent: Option<Vec<f64>>,
+}
+
+fn region_fill_times_forced(
+    task: &ForcedRegionFillTask,
+    options: &SimulateInundationOptions,
+    hyetograph: Option<&[(f64, f64)]>,
+    metrics: (f64, f64, f64),
+) -> Result<Vec<f64>> {
+    let min_size = options.min_size;
+    let min_depth = options.min_depth;
+    let step = options.interval.abs();
+    let rain_m_h = options.rain_intensity_cm_h / 100.0;
+    let (res_x, res_y, cell_area) = metrics;
+    let (r0, c0, r1, c1) = task.bbox;
+    let bh = r1 - r0;
+    let bw = c1 - c0;
+    let mut img = task.roi_elev.clone();
+    let mut fill_time = vec![f64::INFINITY; bw * bh];
+
+    // Cells with antecedent depth > 0 are already inundated at t = 0.0 h.
+    if let Some(ref ant) = task.roi_antecedent {
+        for (ft, (&z, &h0)) in fill_time.iter_mut().zip(img.iter().zip(ant.iter())) {
+            if z.is_finite() && h0 > 0.0 {
+                *ft = 0.0;
+            }
+        }
+    }
+
+    let mut min_elev = f64::INFINITY;
+    let mut max_elev = f64::NEG_INFINITY;
+    for &v in &img {
+        if v.is_finite() {
+            if v < min_elev {
+                min_elev = v;
+            }
+            if v > max_elev {
+                max_elev = v;
+            }
+        }
+    }
+    if !min_elev.is_finite() || !max_elev.is_finite() {
+        return Ok(fill_time);
+    }
+
+    let elev_span = (max_elev - min_elev).max(0.0);
+    let est_slices = (elev_span / step).ceil();
+    if !est_slices.is_finite() || est_slices > MAX_SLICES_PER_REGION as f64 {
+        return Err(Error::InvalidArgument(format!(
+            "interval={step} requires {est_slices} slices (exceeds MAX_SLICES_PER_REGION={MAX_SLICES_PER_REGION})"
+        )));
+    }
+
+    let mut slice_idx = 0usize;
+    loop {
+        let elev = max_elev - (slice_idx as f64) * step;
+        if slice_idx > 0 && elev <= min_elev {
+            break;
+        }
+        slice_idx += 1;
+
+        for v in &mut img {
+            if v.is_finite() && *v > elev {
+                *v = f64::NAN;
+            }
+        }
+
+        let (label_objects, nb_labels) = region_group(&img, bw, bh, min_size, |v| v.is_finite());
+        if nb_labels == 0 {
+            break;
+        }
+
+        let objects = region_props_xy(
+            &label_objects,
+            nb_labels,
+            &img,
+            bw,
+            bh,
+            res_x,
+            res_y,
+            cell_area,
+        );
+        for obj in &objects {
+            if obj.max_depth < min_depth {
+                continue;
+            }
+            let (fr, fc) = obj.first_pixel;
+            let raw_cat = task.roi_catchment[fr * bw + fc];
+            let cat_area = if raw_cat.is_finite() && raw_cat > 0.0 {
+                raw_cat
+            } else {
+                obj.area
+            };
+            if cat_area <= 0.0 {
+                continue;
+            }
+
+            let (or0, oc0, or1, oc1) = obj.bbox;
+            // Compute remaining unfilled volume (deducting antecedent water) and mean C / infiltration.
+            let mut rem_vol = obj.volume;
+            let mut c_sum = 0.0f64;
+            let mut c_cnt = 0usize;
+            let mut inf_sum = 0.0f64;
+            let mut inf_cnt = 0usize;
+            if task.roi_antecedent.is_some()
+                || task.roi_runoff_coeff.is_some()
+                || task.roi_infil_m_h.is_some()
+            {
+                let mut ant_vol = 0.0f64;
+                for r in or0..or1 {
+                    let off = r * bw;
+                    for c in oc0..oc1 {
+                        if label_objects[off + c] != obj.label {
+                            continue;
+                        }
+                        if let Some(ref ant) = task.roi_antecedent {
+                            let h0 = ant[off + c].max(0.0);
+                            if h0 > 0.0 {
+                                let cell_depth = (obj.max_elev - img[off + c]).max(0.0);
+                                ant_vol += h0.min(cell_depth) * cell_area;
+                            }
+                        }
+                        if let Some(ref rc) = task.roi_runoff_coeff {
+                            c_sum += rc[off + c].clamp(0.0, 1.0);
+                            c_cnt += 1;
+                        }
+                        if let Some(ref inf) = task.roi_infil_m_h {
+                            inf_sum += inf[off + c].max(0.0);
+                            inf_cnt += 1;
+                        }
+                    }
+                }
+                rem_vol = (obj.volume - ant_vol).max(0.0);
+            }
+            let mean_c = if c_cnt > 0 { c_sum / c_cnt as f64 } else { 1.0 };
+            let mean_inf_m_h = if inf_cnt > 0 {
+                inf_sum / inf_cnt as f64
+            } else {
+                0.0
+            };
+            let eff_cat = cat_area * mean_c;
+
+            let t_fill = if rem_vol <= 0.0 {
+                0.0
+            } else if let Some(hyeto) = hyetograph {
+                invert_hyetograph_time(rem_vol, eff_cat, obj.area, mean_inf_m_h, hyeto)
+            } else {
+                let net_q = eff_cat * rain_m_h - obj.area * mean_inf_m_h;
+                if net_q <= 0.0 {
+                    f64::INFINITY
+                } else {
+                    rem_vol / net_q
+                }
+            };
+            if !t_fill.is_finite() {
+                continue;
+            }
+            for r in or0..or1 {
+                let off = r * bw;
+                for c in oc0..oc1 {
+                    if label_objects[off + c] == obj.label && t_fill < fill_time[off + c] {
+                        fill_time[off + c] = t_fill;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(fill_time)
+}
+
+/// Computes per-pixel inundation times in memory with optional spatially variable runoff
+/// coefficients, vertical infiltration losses, antecedent ponded water depths, and a
+/// time-varying storm hyetograph.
+pub fn simulate_inundation_with_forcing_in_memory(
+    sink: &Array2D<f64>,
+    catchment_area: &Array2D<f64>,
+    options: &SimulateInundationOptions,
+    forcing: &InundationForcing<'_>,
+) -> Result<(Array2D<f64>, usize)> {
+    if forcing.runoff_coeff.is_none()
+        && forcing.infiltration_cm_h.is_none()
+        && forcing.antecedent_depth.is_none()
+        && forcing.hyetograph.is_none()
+    {
+        return simulate_inundation_in_memory(sink, catchment_area, options);
+    }
+    let _ = validate_options(options)?;
+    let w = sink.width();
+    let h = sink.height();
+    let check_dim = |arr: &Array2D<f64>, name: &str| -> Result<()> {
+        if arr.width() != w || arr.height() != h {
+            return Err(Error::DimensionMismatch(format!(
+                "{name} ({}x{}) does not match sink ({w}x{h})",
+                arr.width(),
+                arr.height()
+            )));
+        }
+        Ok(())
+    };
+    check_dim(catchment_area, "catchment raster")?;
+    if let Some(rc) = forcing.runoff_coeff {
+        check_dim(rc, "runoff_coeff")?;
+    }
+    if let Some(inf) = forcing.infiltration_cm_h {
+        check_dim(inf, "infiltration_cm_h")?;
+    }
+    if let Some(ant) = forcing.antecedent_depth {
+        check_dim(ant, "antecedent_depth")?;
+    }
+
+    let metrics = affine_metrics(&sink.geotransform);
+    let nd = sink.no_data();
+    let c_nd = catchment_area.no_data();
+
+    let (labels, nb_regions_u32) = region_group(sink.data(), w, h, options.min_size, |v| {
+        v.is_finite() && !v.rd_eq(nd)
+    });
+    let nb_regions = nb_regions_u32 as usize;
+
+    let mut fill_time_data = vec![-1.0f64; w * h];
+    if nb_regions == 0 {
+        let mut out = Array2D::from_vec(w, h, fill_time_data)?;
+        out.copy_metadata_from(sink);
+        out.set_no_data(-1.0);
+        return Ok((out, 0));
+    }
+
+    let mut bboxes = vec![(usize::MAX, usize::MAX, 0usize, 0usize); nb_regions];
+    for r in 0..h {
+        let off = r * w;
+        for c in 0..w {
+            let lbl = labels[off + c];
+            if lbl > 0 {
+                let b = &mut bboxes[(lbl - 1) as usize];
+                b.0 = b.0.min(r);
+                b.1 = b.1.min(c);
+                b.2 = b.2.max(r + 1);
+                b.3 = b.3.max(c + 1);
+            }
+        }
+    }
+
+    let sdata = sink.data();
+    let cdata = catchment_area.data();
+    let tasks: Vec<ForcedRegionFillTask> = (0..nb_regions)
+        .map(|ri| {
+            let lbl = (ri + 1) as u32;
+            let bbox = bboxes[ri];
+            let (r0, c0, r1, c1) = bbox;
+            let bh = r1 - r0;
+            let bw = c1 - c0;
+            let mut roi_elev = vec![f64::NAN; bw * bh];
+            let mut roi_catchment = vec![0.0f64; bw * bh];
+            let mut roi_rc = forcing.runoff_coeff.map(|_| vec![1.0f64; bw * bh]);
+            let mut roi_inf = forcing.infiltration_cm_h.map(|_| vec![0.0f64; bw * bh]);
+            let mut roi_ant = forcing.antecedent_depth.map(|_| vec![0.0f64; bw * bh]);
+            for r in r0..r1 {
+                let g_off = r * w;
+                let l_off = (r - r0) * bw;
+                for c in c0..c1 {
+                    if labels[g_off + c] == lbl {
+                        let gi = g_off + c;
+                        let li = l_off + (c - c0);
+                        roi_elev[li] = sdata[gi];
+                        let cv = cdata[gi];
+                        roi_catchment[li] = if cv.is_finite() && !cv.rd_eq(c_nd) && cv > 0.0 {
+                            cv
+                        } else {
+                            0.0
+                        };
+                        if let (Some(dst), Some(src)) = (&mut roi_rc, forcing.runoff_coeff) {
+                            let v = src.get_i(gi);
+                            if v.is_finite() && !v.rd_eq(src.no_data()) {
+                                dst[li] = v.clamp(0.0, 1.0);
+                            }
+                        }
+                        if let (Some(dst), Some(src)) = (&mut roi_inf, forcing.infiltration_cm_h) {
+                            let v = src.get_i(gi);
+                            if v.is_finite() && !v.rd_eq(src.no_data()) && v > 0.0 {
+                                dst[li] = v / 100.0; // cm/h -> m/h
+                            }
+                        }
+                        if let (Some(dst), Some(src)) = (&mut roi_ant, forcing.antecedent_depth) {
+                            let v = src.get_i(gi);
+                            if v.is_finite() && !v.rd_eq(src.no_data()) && v > 0.0 {
+                                dst[li] = v;
+                            }
+                        }
+                    }
+                }
+            }
+            ForcedRegionFillTask {
+                bbox,
+                roi_elev,
+                roi_catchment,
+                roi_runoff_coeff: roi_rc,
+                roi_infil_m_h: roi_inf,
+                roi_antecedent: roi_ant,
+            }
+        })
+        .collect();
+
+    #[cfg(feature = "parallel")]
+    let region_results: Result<Vec<Vec<f64>>> = tasks
+        .par_iter()
+        .map(|t| region_fill_times_forced(t, options, forcing.hyetograph, metrics))
+        .collect();
+
+    #[cfg(not(feature = "parallel"))]
+    let region_results: Result<Vec<Vec<f64>>> = tasks
+        .iter()
+        .map(|t| region_fill_times_forced(t, options, forcing.hyetograph, metrics))
+        .collect();
+
+    for (task, times) in tasks.iter().zip(region_results?) {
+        let (r0, c0, r1, c1) = task.bbox;
+        let bw = c1 - c0;
+        for r in r0..r1 {
+            let g_off = r * w;
+            let l_off = (r - r0) * bw;
+            for c in c0..c1 {
+                let t = times[l_off + (c - c0)];
+                if t.is_finite() {
+                    fill_time_data[g_off + c] = t;
+                }
+            }
+        }
+    }
+
+    let mut out = Array2D::from_vec(w, h, fill_time_data)?;
+    out.copy_metadata_from(sink);
+    out.set_no_data(-1.0);
+    Ok((out, nb_regions))
+}
+
+/// Options for the all-in-one end-to-end [`run_pipeline`] workflow.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct RunPipelineOptions {
+    /// Median filter kernel size (`<= 1` skips smoothing; default `3`).
+    pub kernel_size: usize,
+    /// Optional selective depression breaching applied prior to sink extraction.
+    pub breach: Option<BreachOptions>,
+    /// Optional culvert vector path burned into the DEM prior to sink extraction.
+    pub culverts_vector: Option<PathBuf>,
+    /// Culvert burning parameters used when `culverts_vector` is `Some`.
+    pub burn_culverts: BurnCulvertsOptions,
+    /// Level-set and inundation simulation parameters.
+    pub simulation: SimulateInundationOptions,
+    /// Optional spatially variable runoff-coefficient raster path (`0.0..=1.0`).
+    pub runoff_coeff_path: Option<PathBuf>,
+    /// Optional spatially variable infiltration loss raster path (`cm/h`).
+    pub infiltration_path: Option<PathBuf>,
+    /// Optional antecedent water-depth raster path (vertical DEM units).
+    pub antecedent_depth_path: Option<PathBuf>,
+    /// Optional piecewise-constant storm hyetograph `[(dt_h, intensity_cm_h)]`.
+    pub hyetograph: Option<Vec<(f64, f64)>>,
+    /// Optional stream/ditch polyline vector path for computing spill-to-stream distances.
+    pub stream_vector: Option<PathBuf>,
+    /// Load source DEM as `f32` before widening to reduce peak I/O memory (default `false`).
+    pub use_f32: bool,
+    /// Save raster GeoTIFF outputs (`depth.tif`, `depression_id.tif`, `depression_level.tif`, `catchment_hir.tif`, `fill_time.tif`).
+    pub save_rasters: bool,
+    /// Export unified `depressions.gpkg` and `spill_paths.gpkg` vector layers (default `true`).
+    pub export_vectors: bool,
+    /// Export `rating_curves.csv`, `connectivity_graph.json`, and `connectivity_graph.graphml` (default `true`).
+    pub export_graph: bool,
+}
+
+impl Default for RunPipelineOptions {
+    fn default() -> Self {
+        Self {
+            kernel_size: 3,
+            breach: None,
+            culverts_vector: None,
+            burn_culverts: BurnCulvertsOptions::default(),
+            simulation: SimulateInundationOptions::default(),
+            runoff_coeff_path: None,
+            infiltration_path: None,
+            antecedent_depth_path: None,
+            hyetograph: None,
+            stream_vector: None,
+            use_f32: false,
+            save_rasters: true,
+            export_vectors: true,
+            export_graph: true,
+        }
+    }
+}
+
+/// Output summary and generated file paths from [`run_pipeline`].
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct RunPipelineResult {
+    pub out_dir: PathBuf,
+    pub width: usize,
+    pub height: usize,
+    pub num_sink_regions: usize,
+    pub num_depressions: usize,
+    pub max_level: u32,
+    pub total_storage_m3: f64,
+    pub num_spill_paths: usize,
+    pub depressions_csv: PathBuf,
+    pub catchments_csv: PathBuf,
+    pub inundation_csv: PathBuf,
+    pub summary_json: PathBuf,
+    pub depressions_gpkg: Option<PathBuf>,
+    pub spill_paths_gpkg: Option<PathBuf>,
+    pub rating_curves_csv: Option<PathBuf>,
+    pub connectivity_graph_json: Option<PathBuf>,
+    pub connectivity_graphml: Option<PathBuf>,
+}
+
+/// Runs the complete `lidar-rs` workflow end to end in memory from a single DEM file
+/// with zero intermediate GeoTIFF re-reads, writing structured CSV, JSON, GraphML,
+/// GeoPackage, and optional compressed GeoTIFF outputs into `out_dir`.
+pub fn run_pipeline(
+    in_dem: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+    options: &RunPipelineOptions,
+) -> Result<RunPipelineResult> {
+    let in_dem = in_dem.as_ref();
+    let out_dir = out_dir.as_ref();
+    std::fs::create_dir_all(out_dir)?;
+
+    let num_steps = validate_options(&options.simulation)?;
+    let sim_opts = &options.simulation;
+
+    let mut dem = if options.use_f32 {
+        let d32 = load_raster::<f32>(in_dem, None)?;
+        let nd32 = d32.no_data();
+        let data: Vec<f64> = d32
+            .data()
+            .iter()
+            .map(|&v| {
+                if v.rd_eq(nd32) || !v.is_finite() {
+                    -9999.0
+                } else {
+                    v as f64
+                }
+            })
+            .collect();
+        let mut out = Array2D::from_vec(d32.width(), d32.height(), data)?;
+        out.copy_metadata_from(&d32);
+        out.set_no_data(-9999.0);
+        out
+    } else {
+        load_raster::<f64>(in_dem, None)?
+    };
+
+    // Optional hydro-conditioning (culvert burning -> selective breaching -> median smoothing)
+    if let Some(ref culv) = options.culverts_vector {
+        let (burned, _) = burn_culverts(&dem, culv, &options.burn_culverts)?;
+        dem = burned;
+    }
+    if let Some(ref breach_opts) = options.breach {
+        dem = breach_depressions(&dem, breach_opts)?;
+    }
+    if options.kernel_size > 1 {
+        dem = median_filter(&dem, options.kernel_size)?;
+    }
+
+    let sinks = extract_sinks_in_memory(&dem, sim_opts.min_size, Topology::D8)?;
+    let depressions = delineate_depressions_in_memory(
+        &sinks.sink,
+        sim_opts.min_size,
+        sim_opts.min_depth,
+        sim_opts.interval,
+    )?;
+    let (catchment_hierarchy, catchment_records) = delineate_catchment_hierarchy_in_memory(
+        &sinks.dem_refined,
+        &depressions.depression_level,
+        sim_opts.min_size,
+    )?;
+
+    let rc_arr = match &options.runoff_coeff_path {
+        Some(p) => Some(load_raster::<f64>(p, None)?),
+        None => None,
+    };
+    let inf_arr = match &options.infiltration_path {
+        Some(p) => Some(load_raster::<f64>(p, None)?),
+        None => None,
+    };
+    let ant_arr = match &options.antecedent_depth_path {
+        Some(p) => Some(load_raster::<f64>(p, None)?),
+        None => None,
+    };
+    let forcing = InundationForcing {
+        runoff_coeff: rc_arr.as_ref(),
+        infiltration_cm_h: inf_arr.as_ref(),
+        antecedent_depth: ant_arr.as_ref(),
+        hyetograph: options.hyetograph.as_deref(),
+    };
+    let (fill_time, _num_sim_regions) = simulate_inundation_with_forcing_in_memory(
+        &sinks.sink,
+        &catchment_hierarchy,
+        sim_opts,
+        &forcing,
+    )?;
+    let steps =
+        compute_inundation_step_summaries(&sinks.sink, &fill_time, num_steps, sim_opts.time_step_h);
+    let spill_paths =
+        delineate_spill_flow_paths_in_memory(&sinks.dem_refined, &depressions, &fill_time)?;
+
+    let (_, _, cell_area) = affine_metrics(&dem.geotransform);
+    let d_nd = sinks.depth.no_data();
+    let total_storage_m3: f64 = sinks
+        .depth
+        .data()
+        .iter()
+        .filter(|&&v| v.is_finite() && !v.rd_eq(d_nd) && v > 0.0)
+        .map(|&v| v * cell_area)
+        .sum();
+
+    let depressions_csv = out_dir.join("depressions.csv");
+    let catchments_csv = out_dir.join("catchments.csv");
+    let inundation_csv = out_dir.join("inundation_curve.csv");
+    let summary_json = out_dir.join("summary.json");
+
+    write_depressions_csv(&depressions.depressions, &depressions_csv)?;
+    write_catchment_hierarchy_csv(&catchment_records, &catchments_csv)?;
+    {
+        let mut w = BufWriter::new(File::create(&inundation_csv)?);
+        writeln!(
+            w,
+            "step,time_hours,runoff_mm,inundated_cells,inundated_area,inundated_fraction"
+        )?;
+        let rain_mm_h = sim_opts.rain_intensity_cm_h * 10.0;
+        for s in &steps {
+            writeln!(
+                w,
+                "{},{:.4},{:.4},{},{:.4},{:.6}",
+                s.step,
+                s.time_hours,
+                s.time_hours * rain_mm_h,
+                s.inundated_cells,
+                s.inundated_area,
+                s.inundated_fraction
+            )?;
+        }
+        w.flush()?;
+    }
+
+    if options.save_rasters {
+        let comp = sim_opts.compress;
+        save_raster(&sinks.depth, out_dir.join("depth.tif"), None, comp)?;
+        save_raster(
+            &depressions.depression_id,
+            out_dir.join("depression_id.tif"),
+            None,
+            comp,
+        )?;
+        save_raster(
+            &depressions.depression_level,
+            out_dir.join("depression_level.tif"),
+            None,
+            comp,
+        )?;
+        save_raster(
+            &catchment_hierarchy,
+            out_dir.join("catchment_hir.tif"),
+            None,
+            comp,
+        )?;
+        save_raster(&fill_time, out_dir.join("fill_time.tif"), None, comp)?;
+    }
+
+    let (depressions_gpkg, spill_paths_gpkg) = if options.export_vectors {
+        let dg = out_dir.join("depressions.gpkg");
+        let sg = out_dir.join("spill_paths.gpkg");
+        write_depressions_vector(&depressions.depression_id, &depressions.depressions, &dg)?;
+        write_spill_paths_vector(
+            &spill_paths,
+            &dem.geotransform,
+            &dem.projection,
+            sim_opts.rain_intensity_cm_h,
+            &sg,
+        )?;
+        (Some(dg), Some(sg))
+    } else {
+        (None, None)
+    };
+
+    let (rating_curves_csv, connectivity_graph_json, connectivity_graphml) = if options.export_graph
+    {
+        let rc_path = out_dir.join("rating_curves.csv");
+        let curves = compute_rating_curves(&sinks.sink, &depressions, sim_opts.interval.abs())?;
+        write_rating_curves_csv(&curves, &rc_path)?;
+
+        let graph = build_connectivity_graph(
+            &depressions,
+            &catchment_records,
+            &fill_time,
+            &spill_paths,
+            sim_opts.rain_intensity_cm_h,
+            options.stream_vector.as_deref(),
+        )?;
+        let gml_path = out_dir.join("connectivity_graph.graphml");
+        write_connectivity_graphml(&graph, &gml_path)?;
+
+        #[cfg(feature = "serde")]
+        let gj_path = {
+            let p = out_dir.join("connectivity_graph.json");
+            write_connectivity_graph_json(&graph, &p)?;
+            Some(p)
+        };
+        #[cfg(not(feature = "serde"))]
+        let gj_path = None;
+
+        (Some(rc_path), gj_path, Some(gml_path))
+    } else {
+        (None, None, None)
+    };
+
+    let result = RunPipelineResult {
+        out_dir: out_dir.to_path_buf(),
+        width: dem.width(),
+        height: dem.height(),
+        num_sink_regions: sinks.depressions.len(),
+        num_depressions: depressions.depressions.len(),
+        max_level: depressions.max_level,
+        total_storage_m3,
+        num_spill_paths: spill_paths.len(),
+        depressions_csv,
+        catchments_csv,
+        inundation_csv,
+        summary_json: summary_json.clone(),
+        depressions_gpkg,
+        spill_paths_gpkg,
+        rating_curves_csv,
+        connectivity_graph_json,
+        connectivity_graphml,
+    };
+
+    #[cfg(feature = "serde")]
+    {
+        let json = serde_json::to_string_pretty(&result)
+            .map_err(|e| Error::Algorithm(format!("failed to serialize summary: {e}")))?;
+        std::fs::write(&summary_json, json)?;
+    }
+    #[cfg(not(feature = "serde"))]
+    {
+        std::fs::write(
+            &summary_json,
+            format!(
+                "{{\"width\":{},\"height\":{},\"num_depressions\":{},\"max_level\":{},\"total_storage_m3\":{:.4},\"num_spill_paths\":{}}}\n",
+                result.width,
+                result.height,
+                result.num_depressions,
+                result.max_level,
+                result.total_storage_m3,
+                result.num_spill_paths
+            ),
+        )?;
+    }
+
+    Ok(result)
+}
+
 /// Simulates surface inundation dynamics over time and writes `flood_*.tif`,
 /// `fill_time.tif`, and `inundation_summary.csv` into `out_dir`.
 ///
@@ -1413,6 +2247,12 @@ mod tests {
                 eccentricity: 0.0,
                 orientation: 0.0,
                 area_bbox_ratio: 1.0,
+                parent_id: 0,
+                circularity: 1.0,
+                depth_diam_ratio: 0.2,
+                hypsometric_integral: 0.5,
+                rim_slope_deg: 20.0,
+                artifact_flag: false,
             }
         };
         let deps = InMemoryDepressions {
@@ -1545,6 +2385,12 @@ mod tests {
                 eccentricity: 0.0,
                 orientation: 0.0,
                 area_bbox_ratio: 1.0,
+                parent_id: 0,
+                circularity: 1.0,
+                depth_diam_ratio: 0.2,
+                hypsometric_integral: 0.5,
+                rim_slope_deg: 20.0,
+                artifact_flag: false,
             }
         };
         let deps = InMemoryDepressions {

@@ -113,6 +113,7 @@ fn test_delineate_depressions_on_sample_sink() {
         interval: 0.3,
         bool_level_shp: true,
         bool_comb_tif: false,
+        export_gpkg: true,
         compress: false,
     };
     let res = delineate_depressions(&sink_path, tmp.path(), &opts).unwrap();
@@ -120,6 +121,7 @@ fn test_delineate_depressions_on_sample_sink() {
     assert!(res.depression_id_path.exists());
     assert!(res.depression_level_path.exists());
     assert!(res.shapefile_path.exists());
+    assert!(res.gpkg_path.as_ref().unwrap().exists());
     assert!(res.csv_path.exists());
     assert!(res.num_regions >= 1);
     assert!(res.max_level >= 1);
@@ -128,12 +130,12 @@ fn test_delineate_depressions_on_sample_sink() {
         assert!(shp.exists(), "missing level shapefile: {}", shp.display());
     }
 
-    // Verify CSV has expected 18-column header and row count.
+    // Verify CSV has expected 24-column header and row count.
     let csv = std::fs::read_to_string(&res.csv_path).unwrap();
     let lines: Vec<&str> = csv.lines().collect();
     assert_eq!(
         lines[0],
-        "id,level,count,area,volume,avg_depth,max_depth,min_elev,max_elev,children_id,region_id,perimeter,major_axis,minor_axis,elongatedness,eccentricity,orientation,area_bbox_ratio"
+        "id,level,count,area,volume,avg_depth,max_depth,min_elev,max_elev,children_id,region_id,perimeter,major_axis,minor_axis,elongatedness,eccentricity,orientation,area_bbox_ratio,parent_id,circularity,depth_diam_ratio,hypsometric_integral,rim_slope_deg,artifact_flag"
     );
     assert_eq!(lines.len(), res.depressions.len() + 1);
 }
@@ -604,4 +606,386 @@ fn test_spill_flow_paths_on_sample_dem() {
             );
         }
     }
+}
+
+#[test]
+fn test_hydro_conditioning_breach_and_culverts() {
+    use lidar::{
+        BreachMode, BreachOptions, BurnCulvertsOptions, breach_depressions_file, burn_culverts_file,
+    };
+    use terrio::vector::Coord;
+    use terrio::{Feature, Geometry, GeometryType, Layer, VectorWriteOptions};
+
+    let dem_path = test_data_dir().join("dem.tif");
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Selective breaching preserves deep wetlands while carving shallow barriers
+    let breached_path = tmp.path().join("breached.tif");
+    let breached = breach_depressions_file(
+        &dem_path,
+        &breached_path,
+        &BreachOptions {
+            mode: BreachMode::Selective,
+            max_depth: Some(0.5),
+            max_length: Some(15),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(breached_path.exists());
+    assert_eq!((breached.width(), breached.height()), (400, 400));
+
+    // Culvert burning across a polyline inside DEM bounds
+    let gt = breached.geotransform;
+    let culvert_path = tmp.path().join("culverts.geojson");
+    let mut layer = Layer::new("culverts".to_string()).with_geom_type(GeometryType::LineString);
+    layer.features.push(Feature {
+        fid: 1,
+        geometry: Some(Geometry::LineString(vec![
+            Coord::xy(gt[0] + 100.0 * gt[1], gt[3] + 200.0 * gt[5]),
+            Coord::xy(gt[0] + 120.0 * gt[1], gt[3] + 200.0 * gt[5]),
+        ])),
+        attributes: vec![],
+    });
+    terrio::write_vector(
+        &[layer],
+        culvert_path.to_str().unwrap(),
+        &VectorWriteOptions::default(),
+    )
+    .unwrap();
+
+    let burned_path = tmp.path().join("burned.tif");
+    let (_burned, carved) = burn_culverts_file(
+        &dem_path,
+        &culvert_path,
+        &burned_path,
+        &BurnCulvertsOptions::default(),
+    )
+    .unwrap();
+    assert!(burned_path.exists());
+    assert!(carved >= 1);
+}
+
+#[test]
+fn test_inundation_forcing_scs_and_run_pipeline() {
+    use lidar::{
+        InundationForcing, RunPipelineOptions, SimulateInundationOptions,
+        delineate_catchment_hierarchy_in_memory, delineate_depressions_in_memory,
+        extract_sinks_in_memory, median_filter, run_pipeline, scs_curve_number_runoff,
+        scs_type2_hyetograph, simulate_inundation_with_forcing_in_memory,
+    };
+
+    // Verify SCS-CN runoff equation and Type II hyetograph
+    let cn_grid = lidar::Array2D::from_vec(2, 1, vec![70.0, 90.0]).unwrap();
+    let q0 = scs_curve_number_runoff(&cn_grid, 5.0).unwrap();
+    let q100 = scs_curve_number_runoff(&cn_grid, 100.0).unwrap();
+    assert_eq!(q0.get(0, 0), 0.0);
+    assert!(q100.get(0, 0) > 0.2 && q100.get(0, 0) < 0.6);
+    assert!(q100.get(1, 0) > q100.get(0, 0));
+
+    let hyeto = scs_type2_hyetograph(100.0, 24.0, 1.0).unwrap();
+    assert_eq!(hyeto.len(), 24);
+    let sum_mm: f64 = hyeto.iter().map(|&(dt, cm_h)| dt * cm_h * 10.0).sum();
+    assert!((sum_mm - 100.0).abs() < 1e-3);
+
+    // Forced inundation with runoff_coeff < 1 should delay fill times relative to C = 1
+    let dem = load_raster::<f64>(test_data_dir().join("dem.tif"), None).unwrap();
+    let med = median_filter(&dem, 3).unwrap();
+    let sinks = extract_sinks_in_memory(&med, 1000, lidar::Topology::D8).unwrap();
+    let deps = delineate_depressions_in_memory(&sinks.sink, 1000, 0.3, 0.3).unwrap();
+    let (hir, _) =
+        delineate_catchment_hierarchy_in_memory(&sinks.dem_refined, &deps.depression_level, 1000)
+            .unwrap();
+    let sim_opts = SimulateInundationOptions {
+        min_size: 1000,
+        min_depth: 0.3,
+        interval: 0.3,
+        rain_intensity_cm_h: 5.0,
+        rain_duration_h: 20.0,
+        time_step_h: 2.0,
+        compress: false,
+    };
+    let (ft_full, _) = simulate_inundation_with_forcing_in_memory(
+        &sinks.sink,
+        &hir,
+        &sim_opts,
+        &InundationForcing::default(),
+    )
+    .unwrap();
+    let mut rc_half =
+        lidar::Array2D::from_vec(dem.width(), dem.height(), vec![0.5; dem.data().len()]).unwrap();
+    rc_half.copy_metadata_from(&dem);
+    let mut infil =
+        lidar::Array2D::from_vec(dem.width(), dem.height(), vec![0.5; dem.data().len()]).unwrap();
+    infil.copy_metadata_from(&dem);
+    let (ft_half, _) = simulate_inundation_with_forcing_in_memory(
+        &sinks.sink,
+        &hir,
+        &sim_opts,
+        &InundationForcing {
+            runoff_coeff: Some(&rc_half),
+            infiltration_cm_h: Some(&infil),
+            antecedent_depth: None,
+            hyetograph: Some(&hyeto),
+        },
+    )
+    .unwrap();
+    assert!(ft_full.data().iter().any(|&v| v >= 0.0));
+    assert!(ft_half.data().iter().any(|&v| v >= 0.0));
+
+    // Full all-in-one run_pipeline end-to-end
+    let tmp = tempfile::tempdir().unwrap();
+    let res = run_pipeline(
+        test_data_dir().join("dem.tif"),
+        tmp.path(),
+        &RunPipelineOptions {
+            kernel_size: 3,
+            simulation: SimulateInundationOptions {
+                min_size: 1000,
+                min_depth: 0.3,
+                interval: 0.3,
+                rain_intensity_cm_h: 5.0,
+                rain_duration_h: 20.0,
+                time_step_h: 2.0,
+                compress: false,
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(res.num_depressions >= 2);
+    assert!(res.max_level >= 2);
+    assert!(res.num_spill_paths >= 1);
+    assert!(res.depressions_csv.exists());
+    assert!(res.depressions_gpkg.as_ref().unwrap().exists());
+    assert!(res.spill_paths_gpkg.as_ref().unwrap().exists());
+    assert!(res.rating_curves_csv.as_ref().unwrap().exists());
+    assert!(res.connectivity_graph_json.as_ref().unwrap().exists());
+    assert!(res.connectivity_graphml.as_ref().unwrap().exists());
+    assert!(res.inundation_csv.exists());
+    assert!(tmp.path().join("fill_time.tif").exists());
+    assert!(res.summary_json.exists());
+
+    // Verify GraphML has valid XML graph tags and morphometry fields exist in GeoPackage
+    let graphml = std::fs::read_to_string(res.connectivity_graphml.as_ref().unwrap()).unwrap();
+    assert!(graphml.contains("<graphml") && graphml.contains("<node id="));
+    let vds = terrio::open_vector(
+        res.depressions_gpkg.as_ref().unwrap().to_str().unwrap(),
+        &Default::default(),
+    )
+    .unwrap();
+    let fnames: Vec<&str> = vds.layers[0]
+        .schema
+        .fields()
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    assert!(fnames.contains(&"parent_id"));
+    assert!(fnames.contains(&"circularity"));
+    assert!(fnames.contains(&"hypsometric_integral"));
+    assert!(fnames.contains(&"rim_slope_deg"));
+    assert!(fnames.contains(&"artifact_flag"));
+}
+
+#[test]
+fn test_tiled_delineation_and_png_frame_export() {
+    use lidar::{
+        AnimateInundationOptions, InundationPipelineOptions, SimulateInundationOptions,
+        TiledDelineationOptions, delineate_depressions_tiled, export_inundation_frames_png,
+        simulate_inundation_pipeline_in_memory,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let tiled_dir = tmp.path().join("tiled");
+    let tiled = delineate_depressions_tiled(
+        test_data_dir().join("dem.tif"),
+        &tiled_dir,
+        &TiledDelineationOptions {
+            tile_size: 200,
+            overlap: 50,
+            kernel_size: 3,
+            min_size: 1000,
+            min_depth: 0.3,
+            interval: 0.3,
+            use_f32: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(tiled.num_tiles, 4);
+    assert!(!tiled.depressions.is_empty());
+    assert!(tiled.csv_path.exists());
+
+    // PNG frame sequence export with scale bar and legend
+    let dem = load_raster::<f64>(test_data_dir().join("dem.tif"), None).unwrap();
+    let pipe = simulate_inundation_pipeline_in_memory(
+        &dem,
+        &InundationPipelineOptions {
+            kernel_size: 3,
+            simulation: SimulateInundationOptions {
+                min_size: 1000,
+                min_depth: 0.3,
+                interval: 0.3,
+                rain_intensity_cm_h: 5.0,
+                rain_duration_h: 6.0,
+                time_step_h: 2.0,
+                compress: false,
+            },
+        },
+    )
+    .unwrap();
+    let frames_dir = tmp.path().join("frames");
+    let pngs = export_inundation_frames_png(
+        &pipe.sinks.dem_refined,
+        &pipe.fill_time,
+        pipe.steps.len(),
+        2.0,
+        &pipe.spill_paths,
+        &frames_dir,
+        &AnimateInundationOptions {
+            max_dimension: Some(200),
+            rain_intensity_cm_h: Some(5.0),
+            show_scale_bar: true,
+            show_legend: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(pngs.len(), 3);
+    for p in &pngs {
+        assert!(p.exists());
+        let b = std::fs::read(p).unwrap();
+        assert_eq!(&b[..8], b"\x89PNG\r\n\x1a\n");
+    }
+}
+
+#[cfg(feature = "pointcloud")]
+#[test]
+fn test_pointcloud_filtering_dtm_and_chm() {
+    use lidar::pointcloud::{
+        Dimension, GroundFilterMethod, LidarToDsmOptions, LidarToDtmOptions, PointCloud,
+        PointWriteOptions, ReturnKind, Values, lidar_to_chm, lidar_to_dsm, lidar_to_dtm,
+        write_lidar,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let las_path = tmp.path().join("forest.las");
+
+    // 25x25 ground plane at z=100 m (class 2, return 2/2) + elevated canopy points at z=115 m (class 5, return 1/2)
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    let mut zs = Vec::new();
+    let mut cls = Vec::new();
+    let mut rn = Vec::new();
+    let mut nr = Vec::new();
+    for r in 0..25 {
+        for c in 0..25 {
+            let x = 500_000.0 + c as f64;
+            let y = 4_000_000.0 + r as f64;
+            // Ground point
+            xs.push(x);
+            ys.push(y);
+            zs.push(100.0 + 0.05 * c as f64);
+            cls.push(2u8);
+            rn.push(2u8);
+            nr.push(2u8);
+            // Canopy point in central patch
+            if (8..17).contains(&r) && (8..17).contains(&c) {
+                xs.push(x);
+                ys.push(y);
+                zs.push(115.0 + 0.05 * c as f64);
+                cls.push(5u8);
+                rn.push(1u8);
+                nr.push(2u8);
+            }
+        }
+    }
+    let cloud = PointCloud::new(
+        vec![
+            Dimension::new("x", Values::F64(xs)),
+            Dimension::new("y", Values::F64(ys)),
+            Dimension::new("z", Values::F64(zs)),
+            Dimension::new("classification", Values::U8(cls)),
+            Dimension::new("return_number", Values::U8(rn)),
+            Dimension::new("number_of_returns", Values::U8(nr)),
+        ],
+        terrio::crs::SpatialRef::parse("EPSG:32615").unwrap(),
+    );
+    write_lidar(&cloud, &las_path, &PointWriteOptions::default()).unwrap();
+
+    // DSM filtered to class 2 + Last returns should match bare ground (~100 m)
+    let dsm_ground = tmp.path().join("dsm_ground.tif");
+    lidar_to_dsm(
+        &las_path,
+        &dsm_ground,
+        &LidarToDsmOptions {
+            resolution: 1.0,
+            classifications: Some(vec![2]),
+            return_kinds: Some(vec![ReturnKind::Last]),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let dsm_arr = load_raster::<f64>(&dsm_ground, None).unwrap();
+    let max_g = dsm_arr
+        .data()
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .fold(f64::NEG_INFINITY, f64::max);
+    assert!(
+        max_g < 103.0,
+        "ground-filtered DSM max should be < 103, got {max_g}"
+    );
+
+    // DTM using preclassified and CSF
+    let dtm_pre = tmp.path().join("dtm_pre.tif");
+    lidar_to_dtm(
+        &las_path,
+        &dtm_pre,
+        &LidarToDtmOptions {
+            resolution: 1.0,
+            ground_method: GroundFilterMethod::Preclassified,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(dtm_pre.exists());
+
+    let dtm_csf = tmp.path().join("dtm_csf.tif");
+    lidar_to_dtm(
+        &las_path,
+        &dtm_csf,
+        &LidarToDtmOptions {
+            resolution: 1.0,
+            ground_method: GroundFilterMethod::Csf,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(dtm_csf.exists());
+
+    // CHM = DSM - DTM should capture ~15 m canopy height in the center and ~0 m outside
+    let chm_path = tmp.path().join("chm.tif");
+    lidar_to_chm(
+        &las_path,
+        &chm_path,
+        &LidarToDtmOptions {
+            resolution: 1.0,
+            ground_method: GroundFilterMethod::Preclassified,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let chm_arr = load_raster::<f64>(&chm_path, None).unwrap();
+    let max_chm = chm_arr
+        .data()
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .fold(0.0f64, f64::max);
+    assert!(
+        max_chm > 12.0 && max_chm < 18.0,
+        "expected ~15 m CHM peak, got {max_chm}"
+    );
 }

@@ -141,6 +141,7 @@ def delineate_depressions(
     out_dir: str | os.PathLike[str],
     bool_level_shp: bool = False,
     bool_comb_tif: bool = False,
+    export_gpkg: bool = False,
     compress: bool = False,
 ) -> dict[str, Any]:
     """Delineate nested depressions using Wu et al. (2019) level-set method."""
@@ -152,6 +153,7 @@ def delineate_depressions(
         _as_path_str(out_dir),
         bool_level_shp,
         bool_comb_tif,
+        export_gpkg,
         compress,
     )
 
@@ -354,6 +356,8 @@ def lidar_to_dsm(
     stat: str = "max",
     method: str = "statistics",
     window_size: int = 0,
+    classifications: list[int] | None = None,
+    return_kinds: list[str] | None = None,
 ) -> tuple[int, int]:
     """Grid a LiDAR point cloud into a Digital Surface Model (DSM) GeoTIFF."""
     cols, rows = _lidar_rs.lidar_to_dsm(
@@ -365,6 +369,56 @@ def lidar_to_dsm(
         maxz,
         stat,
         method,
+        int(window_size),
+        [int(c) for c in classifications] if classifications is not None else None,
+        list(return_kinds) if return_kinds is not None else None,
+    )
+    return int(cols), int(rows)
+
+
+def lidar_to_dtm(
+    filename: str | os.PathLike[str],
+    output: str | os.PathLike[str],
+    resolution: float = 1.0,
+    ground_method: str = "csf",
+    ground_class: int = 2,
+    radius: float | None = None,
+    method: str = "linear",
+    stat: str = "idw",
+    window_size: int = 5,
+) -> tuple[int, int]:
+    """Generate a bare-earth DTM GeoTIFF from a LiDAR point cloud (preclassified, CSF, or PMF)."""
+    cols, rows = _lidar_rs.lidar_to_dtm(
+        _as_path_str(filename),
+        _as_path_str(output),
+        float(resolution),
+        ground_method,
+        int(ground_class),
+        radius,
+        method,
+        stat,
+        int(window_size),
+    )
+    return int(cols), int(rows)
+
+
+def lidar_to_chm(
+    filename: str | os.PathLike[str],
+    output: str | os.PathLike[str],
+    resolution: float = 1.0,
+    ground_method: str = "csf",
+    ground_class: int = 2,
+    radius: float | None = None,
+    window_size: int = 5,
+) -> tuple[int, int]:
+    """Generate a Canopy Height Model (CHM = DSM - DTM) GeoTIFF from a LiDAR point cloud."""
+    cols, rows = _lidar_rs.lidar_to_chm(
+        _as_path_str(filename),
+        _as_path_str(output),
+        float(resolution),
+        ground_method,
+        int(ground_class),
+        radius,
         int(window_size),
     )
     return int(cols), int(rows)
@@ -525,6 +579,8 @@ def animate_inundation(
     rain_intensity_cm_h: float | None = None,
     azimuth_deg: float = 135.0,
     elevation_deg: float = 45.0,
+    show_scale_bar: bool = False,
+    show_legend: bool = False,
 ) -> dict[str, Any]:
     """Render a shaded-relief inundation animated GIF (ports 7_Play_Animation.py)."""
     return _lidar_rs.animate_inundation(
@@ -540,6 +596,266 @@ def animate_inundation(
         float(rain_intensity_cm_h) if rain_intensity_cm_h is not None else None,
         float(azimuth_deg),
         float(elevation_deg),
+        bool(show_scale_bar),
+        bool(show_legend),
+    )
+
+
+def export_inundation_frames_png(
+    in_dem: str | os.PathLike[str],
+    in_fill_time: str | os.PathLike[str],
+    out_dir: str | os.PathLike[str],
+    num_steps: int = 10,
+    time_step_h: float = 1.0,
+    rain_intensity_cm_h: float | None = None,
+    water_alpha: float = 0.55,
+    max_dimension: int | None = None,
+    show_scale_bar: bool = True,
+    show_legend: bool = True,
+    azimuth_deg: float = 135.0,
+    elevation_deg: float = 45.0,
+) -> list[str]:
+    """Export numbered shaded-relief inundation PNG frames with optional scale bar and legend."""
+    return list(
+        _lidar_rs.export_inundation_frames_png(
+            _as_path_str(in_dem),
+            _as_path_str(in_fill_time),
+            _as_path_str(out_dir),
+            int(num_steps),
+            float(time_step_h),
+            float(rain_intensity_cm_h) if rain_intensity_cm_h is not None else None,
+            float(water_alpha),
+            int(max_dimension) if max_dimension is not None else None,
+            bool(show_scale_bar),
+            bool(show_legend),
+            float(azimuth_deg),
+            float(elevation_deg),
+        )
+    )
+
+
+def breach_depressions(
+    in_dem: str | os.PathLike[str] | np.ndarray,
+    out_dem: str | os.PathLike[str] | None = None,
+    mode: str = "selective",
+    max_depth: float | None = 1.5,
+    max_length: int | None = 50,
+    fill_remaining: bool = False,
+    compress: bool = False,
+    no_data: float | None = None,
+) -> str | np.ndarray:
+    """Breach depressions using Lindsay (2016) on a GeoTIFF path or 2D NumPy array."""
+    if isinstance(in_dem, np.ndarray):
+        arr = np.ascontiguousarray(in_dem, dtype=np.float64)
+        return _lidar_rs.breach_depressions_array(
+            arr, mode, max_depth, max_length, bool(fill_remaining), no_data
+        )
+    if out_dem is None:
+        raise ValueError("out_dem is required when in_dem is a file path")
+    return str(
+        _lidar_rs.breach_depressions(
+            _as_path_str(in_dem),
+            _as_path_str(out_dem),
+            mode,
+            max_depth,
+            max_length,
+            bool(fill_remaining),
+            bool(compress),
+        )
+    )
+
+
+def burn_culverts(
+    in_dem: str | os.PathLike[str],
+    culverts_vector: str | os.PathLike[str],
+    out_dem: str | os.PathLike[str],
+    half_width_cells: int = 0,
+    depth_offset: float = 0.05,
+    point_radius_cells: int = 5,
+    compress: bool = False,
+) -> int:
+    """Burn polyline or point culvert vectors across road embankments into a DEM."""
+    return int(
+        _lidar_rs.burn_culverts(
+            _as_path_str(in_dem),
+            _as_path_str(culverts_vector),
+            _as_path_str(out_dem),
+            int(half_width_cells),
+            float(depth_offset),
+            int(point_radius_cells),
+            bool(compress),
+        )
+    )
+
+
+def scs_curve_number_runoff(
+    cn_arr: np.ndarray,
+    precip_mm: float,
+    no_data: float | None = None,
+) -> np.ndarray:
+    """Convert an NRCS Curve Number 2D NumPy array and rainfall depth (mm) into runoff coefficients (0..1)."""
+    arr = np.ascontiguousarray(cn_arr, dtype=np.float64)
+    return _lidar_rs.scs_curve_number_runoff(arr, float(precip_mm), no_data)
+
+
+def scs_type2_hyetograph(
+    total_precip_mm: float,
+    duration_h: float = 24.0,
+    time_step_h: float = 1.0,
+) -> list[tuple[float, float]]:
+    """Generate an SCS Type II design storm hyetograph as `[(dt_h, intensity_cm_h), ...]`."""
+    return list(
+        _lidar_rs.scs_type2_hyetograph(
+            float(total_precip_mm), float(duration_h), float(time_step_h)
+        )
+    )
+
+
+def extract_sinks_array(
+    dem_arr: np.ndarray,
+    min_size: int = 1000,
+    topology: str = "D8",
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+) -> dict[str, Any]:
+    """Extract surface sinks completely in memory from a 2D NumPy DEM array."""
+    arr = np.ascontiguousarray(dem_arr, dtype=np.float64)
+    return _lidar_rs.extract_sinks_array(arr, int(min_size), topology, no_data, float(cell_size))
+
+
+def delineate_depressions_array(
+    sink_arr: np.ndarray,
+    min_size: int = 1000,
+    min_depth: float = 0.3,
+    interval: float = 0.3,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+) -> dict[str, Any]:
+    """Delineate nested depression hierarchy completely in memory from a 2D NumPy sink array."""
+    arr = np.ascontiguousarray(sink_arr, dtype=np.float64)
+    return _lidar_rs.delineate_depressions_array(
+        arr, int(min_size), float(min_depth), float(interval), no_data, float(cell_size)
+    )
+
+
+def simulate_inundation_array(
+    dem_arr: np.ndarray,
+    kernel_size: int = 3,
+    min_size: int = 1000,
+    min_depth: float = 0.3,
+    interval: float = 0.3,
+    rain_intensity_cm_h: float = 5.0,
+    rain_duration_h: float = 50.0,
+    time_step_h: float = 1.0,
+    runoff_coeff_arr: np.ndarray | None = None,
+    infiltration_arr: np.ndarray | None = None,
+    antecedent_depth_arr: np.ndarray | None = None,
+    hyetograph: list[tuple[float, float]] | None = None,
+    breach_max_depth: float | None = None,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+) -> dict[str, Any]:
+    """Run the complete hydrology and inundation pipeline in memory on a 2D NumPy DEM array."""
+    arr = np.ascontiguousarray(dem_arr, dtype=np.float64)
+    rc = np.ascontiguousarray(runoff_coeff_arr, dtype=np.float64) if runoff_coeff_arr is not None else None
+    inf = np.ascontiguousarray(infiltration_arr, dtype=np.float64) if infiltration_arr is not None else None
+    ant = (
+        np.ascontiguousarray(antecedent_depth_arr, dtype=np.float64)
+        if antecedent_depth_arr is not None
+        else None
+    )
+    return _lidar_rs.simulate_inundation_array(
+        arr,
+        int(kernel_size),
+        int(min_size),
+        float(min_depth),
+        float(interval),
+        float(rain_intensity_cm_h),
+        float(rain_duration_h),
+        float(time_step_h),
+        rc,
+        inf,
+        ant,
+        hyetograph,
+        breach_max_depth,
+        no_data,
+        float(cell_size),
+    )
+
+
+def run_pipeline(
+    in_dem: str | os.PathLike[str],
+    out_dir: str | os.PathLike[str],
+    kernel_size: int = 3,
+    min_size: int = 1000,
+    min_depth: float = 0.3,
+    interval: float = 0.3,
+    rain_intensity_cm_h: float = 5.0,
+    rain_duration_h: float = 50.0,
+    time_step_h: float = 1.0,
+    breach_max_depth: float | None = None,
+    breach_max_length: int = 40,
+    culverts_vector: str | os.PathLike[str] | None = None,
+    runoff_coeff_path: str | os.PathLike[str] | None = None,
+    infiltration_path: str | os.PathLike[str] | None = None,
+    antecedent_depth_path: str | os.PathLike[str] | None = None,
+    hyetograph: list[tuple[float, float]] | None = None,
+    stream_vector: str | os.PathLike[str] | None = None,
+    use_f32: bool = False,
+    save_rasters: bool = True,
+    export_vectors: bool = True,
+    export_graph: bool = True,
+    compress: bool = False,
+) -> dict[str, Any]:
+    """Run the all-in-one in-memory hydrology pipeline from a raw DEM file to GeoPackage, CSV, GraphML, and rasters."""
+    return _lidar_rs.run_pipeline(
+        _as_path_str(in_dem),
+        _as_path_str(out_dir),
+        int(kernel_size),
+        int(min_size),
+        float(min_depth),
+        float(interval),
+        float(rain_intensity_cm_h),
+        float(rain_duration_h),
+        float(time_step_h),
+        breach_max_depth,
+        int(breach_max_length),
+        _as_path_str(culverts_vector) if culverts_vector is not None else None,
+        _as_path_str(runoff_coeff_path) if runoff_coeff_path is not None else None,
+        _as_path_str(infiltration_path) if infiltration_path is not None else None,
+        _as_path_str(antecedent_depth_path) if antecedent_depth_path is not None else None,
+        hyetograph,
+        _as_path_str(stream_vector) if stream_vector is not None else None,
+        bool(use_f32),
+        bool(save_rasters),
+        bool(export_vectors),
+        bool(export_graph),
+        bool(compress),
+    )
+
+
+def delineate_depressions_tiled(
+    in_dem: str | os.PathLike[str],
+    out_dir: str | os.PathLike[str],
+    tile_size: int = 2048,
+    overlap: int = 128,
+    kernel_size: int = 3,
+    min_size: int = 1000,
+    min_depth: float = 0.3,
+    interval: float = 0.3,
+    use_f32: bool = True,
+) -> dict[str, Any]:
+    """Delineate nested depressions across large DEMs using parallel overlapping tiles."""
+    return _lidar_rs.delineate_depressions_tiled(
+        _as_path_str(in_dem),
+        _as_path_str(out_dir),
+        int(tile_size),
+        int(overlap),
+        int(kernel_size),
+        int(min_size),
+        float(min_depth),
+        float(interval),
+        bool(use_f32),
     )
 
 
@@ -595,13 +911,23 @@ __all__ = [
     "gaussian_filter",
     "flip_dem",
     "extract_sinks",
+    "extract_sinks_array",
     "delineate_depressions",
+    "delineate_depressions_array",
+    "delineate_depressions_tiled",
     "delineate_mounts",
     "delineate_catchments",
     "delineate_flow_paths",
     "delineate_catchment_hierarchy",
     "simulate_inundation",
+    "simulate_inundation_array",
+    "run_pipeline",
+    "breach_depressions",
+    "burn_culverts",
+    "scs_curve_number_runoff",
+    "scs_type2_hyetograph",
     "animate_inundation",
+    "export_inundation_frames_png",
     "polygonize",
     "mosaic",
     "reproject_image",
@@ -614,4 +940,6 @@ __all__ = [
     "csv_points_to_shp",
     "convert_lidar",
     "lidar_to_dsm",
+    "lidar_to_dtm",
+    "lidar_to_chm",
 ]

@@ -136,11 +136,211 @@
   }
 
   function formatArea(area, unit) {
-    if (!Number.isFinite(area)) return `— ${unit}`;
+    if (!Number.isFinite(area)) return `N/A ${unit}`;
     if (unit === "deg²" || (area > 0 && area < 1)) {
       return `${area.toPrecision(4)} ${unit}`;
     }
     return `${area.toLocaleString(undefined, { maximumFractionDigits: 0 })} ${unit}`;
+  }
+
+  function renderSelectedOverlay(ctx, width, height, depIds, selectedId, depsById, spillPaths) {
+    if (!selectedId || !depIds || !depsById) return;
+    const sel = depsById.get(selectedId);
+    if (!sel) return;
+    const related = new Set([selectedId]);
+    if (sel.parent_id > 0) related.add(sel.parent_id);
+    if (Array.isArray(sel.children_ids)) {
+      for (const cid of sel.children_ids) related.add(cid);
+    }
+
+    // Draw crisp gold contour around the selected depression (and soft amber around parent/children)
+    const img = ctx.getImageData(0, 0, width, height);
+    const d = img.data;
+    for (let r = 0; r < height; r++) {
+      const rowOff = r * width;
+      for (let c = 0; c < width; c++) {
+        const idx = rowOff + c;
+        const id = depIds[idx];
+        if (!related.has(id)) continue;
+        const isBorder =
+          c === 0 ||
+          c + 1 === width ||
+          r === 0 ||
+          r + 1 === height ||
+          depIds[idx - 1] !== id ||
+          depIds[idx + 1] !== id ||
+          depIds[idx - width] !== id ||
+          depIds[idx + width] !== id;
+        const p = idx * 4;
+        if (id === selectedId) {
+          if (isBorder) {
+            d[p] = 251;
+            d[p + 1] = 191;
+            d[p + 2] = 36;
+            d[p + 3] = 255;
+          } else {
+            d[p] = Math.min(255, Math.round(d[p] * 0.72 + 251 * 0.28));
+            d[p + 1] = Math.min(255, Math.round(d[p + 1] * 0.72 + 191 * 0.28));
+            d[p + 2] = Math.min(255, Math.round(d[p + 2] * 0.72 + 36 * 0.28));
+          }
+        } else if (isBorder) {
+          d[p] = 249;
+          d[p + 1] = 115;
+          d[p + 2] = 22;
+          d[p + 3] = 255;
+        }
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+
+    // Highlight outgoing spill path from selected depression in vivid amber
+    if (Array.isArray(spillPaths)) {
+      for (const sp of spillPaths) {
+        if (sp.from_dep_id !== selectedId || !sp.cells || sp.cells.length < 2) continue;
+        ctx.save();
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.beginPath();
+        ctx.moveTo(sp.cells[0][0] + 0.5, sp.cells[0][1] + 0.5);
+        for (let i = 1; i < sp.cells.length; i++) {
+          ctx.lineTo(sp.cells[i][0] + 0.5, sp.cells[i][1] + 0.5);
+        }
+        ctx.strokeStyle = "rgba(120, 53, 15, 0.9)";
+        ctx.lineWidth = 4.6;
+        ctx.stroke();
+        ctx.strokeStyle = "#fbbf24";
+        ctx.lineWidth = 2.4;
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+  }
+
+  function renderRatingChart(points) {
+    const canvas = $("lp-rating-chart");
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const w = canvas.width;
+    const h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    if (!points || points.length === 0) return;
+
+    const pad = { left: 54, right: 16, top: 18, bottom: 28 };
+    const pw = w - pad.left - pad.right;
+    const ph = h - pad.top - pad.bottom;
+    const fg = getComputedStyle(document.body).color || "#333";
+    const maxD = Math.max(...points.map((p) => p.depth), 1e-6);
+    const maxV = Math.max(...points.map((p) => p.volume), 1e-6);
+
+    const xOf = (d) => pad.left + (d / maxD) * pw;
+    const yOf = (v) => pad.top + ph * (1 - v / maxV);
+
+    ctx.strokeStyle = "rgba(128,128,128,0.22)";
+    ctx.lineWidth = 1;
+    ctx.font = "10px sans-serif";
+    ctx.fillStyle = fg;
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    for (const frac of [0, 0.5, 1]) {
+      const y = pad.top + ph * (1 - frac);
+      ctx.beginPath();
+      ctx.moveTo(pad.left, y);
+      ctx.lineTo(pad.left + pw, y);
+      ctx.stroke();
+      const val = maxV * frac;
+      ctx.fillText(val >= 1000 ? `${(val / 1000).toFixed(1)}k` : val.toFixed(0), pad.left - 5, y);
+    }
+
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    for (const frac of [0, 0.5, 1]) {
+      const d = maxD * frac;
+      ctx.fillText(`${d.toFixed(2)}m`, xOf(d), pad.top + ph + 5);
+    }
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    ctx.fillText("Stage-Volume Rating Curve (m³ vs depth)", pad.left, 3);
+
+    ctx.beginPath();
+    ctx.moveTo(xOf(0), yOf(0));
+    for (const p of points) {
+      ctx.lineTo(xOf(p.depth), yOf(p.volume));
+    }
+    ctx.lineTo(xOf(points[points.length - 1].depth), yOf(0));
+    ctx.closePath();
+    ctx.fillStyle = "rgba(245, 158, 11, 0.22)";
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.moveTo(xOf(0), yOf(0));
+    for (const p of points) {
+      ctx.lineTo(xOf(p.depth), yOf(p.volume));
+    }
+    ctx.strokeStyle = "#d97706";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  function selectDepression(depId) {
+    if (!player) return;
+    player.selectedDepId = depId || 0;
+    const titleEl = $("lp-inspector-title");
+    const emptyEl = $("lp-inspector-empty");
+    const bodyEl = $("lp-inspector-body");
+    const clearBtn = $("lp-inspector-clear");
+    const statsEl = $("lp-inspector-stats");
+
+    document.querySelectorAll("#lp-tbody tr").forEach((tr) => {
+      tr.classList.toggle("lp-row-selected", Number(tr.dataset.depId) === player.selectedDepId);
+    });
+
+    if (!player.selectedDepId || !player.depsById.has(player.selectedDepId)) {
+      if (titleEl) titleEl.textContent = "Depression Inspector";
+      if (emptyEl) emptyEl.hidden = false;
+      if (bodyEl) bodyEl.hidden = true;
+      if (clearBtn) clearBtn.hidden = true;
+      renderPlayerFrame();
+      return;
+    }
+
+    const d = player.depsById.get(player.selectedDepId);
+    const outSpill = (player.spillPaths || []).find((s) => s.from_dep_id === d.id);
+    const effMmH = player.rainIntensity * player.runoffCoeff * 10.0;
+    const spillRunoff = outSpill ? `${(outSpill.spill_time_h * effMmH).toFixed(1)} mm` : "N/A";
+    const childrenStr =
+      Array.isArray(d.children_ids) && d.children_ids.length > 0 ? d.children_ids.join(", ") : "None";
+    const parentStr = d.parent_id > 0 ? `#${d.parent_id}` : "Root";
+
+    if (titleEl) titleEl.textContent = `Depression #${d.id} (Level ${d.level}, Region ${d.region_id})`;
+    if (emptyEl) emptyEl.hidden = true;
+    if (bodyEl) bodyEl.hidden = false;
+    if (clearBtn) clearBtn.hidden = false;
+
+    if (statsEl) {
+      statsEl.innerHTML = "";
+      const items = [
+        ["Area", formatArea(d.area, player.areaUnit)],
+        ["Volume", `${d.volume.toLocaleString(undefined, { maximumFractionDigits: 1 })} m³`],
+        ["Max / Mean Depth", `${d.max_depth.toFixed(2)} / ${d.avg_depth.toFixed(2)} m`],
+        ["Parent / Children", `${parentStr} / ${childrenStr}`],
+        ["Circularity / HI", `${d.circularity.toFixed(2)} / ${d.hypsometric_integral.toFixed(2)}`],
+        ["Rim Slope / Spill", `${d.rim_slope_deg.toFixed(1)}° / ${spillRunoff}`],
+      ];
+      for (const [k, v] of items) {
+        const div = document.createElement("div");
+        div.className = "lp-ins-item";
+        const strong = document.createElement("strong");
+        strong.textContent = v;
+        const span = document.createElement("span");
+        span.textContent = k;
+        div.append(strong, span);
+        statsEl.appendChild(div);
+      }
+    }
+
+    const rcPts = (player.ratingCurvesByDep.get(d.id) || []).slice().sort((a, b) => a.depth - b.depth);
+    renderRatingChart(rcPts);
+    renderPlayerFrame();
   }
 
   function drawRgba(canvas, width, height, rgba, baseRgba) {
@@ -336,6 +536,18 @@
       ? drawActiveSpillPaths(ctx, width, height, fillTimes, tHours, spillPaths, stepIdx)
       : 0;
 
+    if (player.selectedDepId > 0) {
+      renderSelectedOverlay(
+        ctx,
+        width,
+        height,
+        player.depIds,
+        player.selectedDepId,
+        player.depsById,
+        spillPaths,
+      );
+    }
+
     const slider = $("lp-slider");
     if (slider) slider.value = String(stepIdx);
 
@@ -343,12 +555,13 @@
     if (telemetry && step) {
       const phase = direction >= 0 ? "RISING" : "FALLING";
       const totalHours = steps[steps.length - 1].time_hours;
-      const cumRain = (tHours * rainIntensity).toFixed(1);
+      const effRunoffMm = (tHours * rainIntensity * player.runoffCoeff * 10.0).toFixed(0);
       const pct = (step.inundated_fraction * 100).toFixed(1);
       const areaStr = formatArea(step.inundated_area, areaUnit);
       const spillSuffix = showSpills ? ` · Active spills: ${activeSpills}` : "";
+      const cNote = player.runoffCoeff < 0.999 ? ` (C=${player.runoffCoeff.toFixed(2)})` : "";
       telemetry.textContent =
-        `${phase} · T = ${tHours.toFixed(1)} / ${totalHours.toFixed(1)} h · Rain: ${cumRain} cm · Inundated: ${step.inundated_cells.toLocaleString()} cells (${areaStr}, ${pct}% of sinks)${spillSuffix}`;
+        `${phase} · T = ${tHours.toFixed(1)} / ${totalHours.toFixed(1)} h · Runoff: ${effRunoffMm} mm${cNote} · Inundated: ${step.inundated_cells.toLocaleString()} cells (${areaStr}, ${pct}%)${spillSuffix}`;
     }
 
     renderInundationChart();
@@ -475,12 +688,29 @@
     height,
     hillshade,
     fillTimes,
+    depIds,
+    depressions,
+    ratingCurves,
     steps,
     spillPaths,
     rainIntensity,
+    runoffCoeff,
     areaUnit,
   ) {
     stopPlayer();
+    const depsById = new Map();
+    for (const d of depressions || []) {
+      depsById.set(d.id, d);
+    }
+    const ratingCurvesByDep = new Map();
+    for (const pt of ratingCurves || []) {
+      let arr = ratingCurvesByDep.get(pt.dep_id);
+      if (!arr) {
+        arr = [];
+        ratingCurvesByDep.set(pt.dep_id, arr);
+      }
+      arr.push(pt);
+    }
     // Prepend the dry initial state (T = 0 h) so playback, scrubbing, and chart clicks start at T0.
     const playerSteps =
       steps.length > 0 && steps[0].time_hours > 0
@@ -500,9 +730,14 @@
       height,
       hillshade,
       fillTimes,
+      depIds,
+      depsById,
+      ratingCurvesByDep,
+      selectedDepId: 0,
       steps: playerSteps,
       spillPaths,
       rainIntensity,
+      runoffCoeff,
       areaUnit,
       frameBuf: new Uint8ClampedArray(width * height * 4),
       stepIdx: 0,
@@ -515,7 +750,7 @@
       slider.max = String(Math.max(0, playerSteps.length - 1));
       slider.value = "0";
     }
-    renderPlayerFrame();
+    selectDepression(0);
     if (playerSteps.length > 1) {
       startPlayer();
     }
@@ -655,24 +890,37 @@
         ? `(showing first ${limit} of ${features.length} features)`
         : `(${features.length} total)`;
 
-    const fmt = (n) => (typeof n === "number" && Number.isFinite(n) ? n.toFixed(2) : "—");
+    const fmt = (n, dec = 2) =>
+      typeof n === "number" && Number.isFinite(n) ? n.toFixed(dec) : "N/A";
     for (const d of shown) {
       const tr = document.createElement("tr");
+      tr.dataset.depId = String(d.id);
       const cols = [
         d.id,
         d.level,
+        d.parent_id > 0 ? d.parent_id : "Root",
         d.region_id,
         d.count,
-        fmt(d.area),
-        fmt(d.volume),
-        fmt(d.avg_depth),
-        fmt(d.max_depth),
+        fmt(d.area, 1),
+        fmt(d.volume, 1),
+        fmt(d.max_depth, 2),
+        fmt(d.circularity, 2),
+        fmt(d.hypsometric_integral, 2),
+        typeof d.rim_slope_deg === "number" && Number.isFinite(d.rim_slope_deg)
+          ? `${d.rim_slope_deg.toFixed(1)}°`
+          : "N/A",
       ];
       for (const val of cols) {
         const td = document.createElement("td");
         td.textContent = String(val);
         tr.appendChild(td);
       }
+      tr.addEventListener("click", () => {
+        if (player) {
+          stopPlayer();
+          selectDepression(d.id);
+        }
+      });
       tbody.appendChild(tr);
     }
   }
@@ -689,10 +937,13 @@
     const token = ++runToken;
     const mode = $("lp-mode").value;
     const kernelSize = Math.max(1, parseInt($("lp-kernel").value, 10) || 1);
+    const breachVal = Math.max(0, parseFloat($("lp-breach")?.value) || 0);
+    const breachMaxDepth = breachVal > 0 ? breachVal : undefined;
     const minSize = Math.max(1, parseInt($("lp-min-size").value, 10) || 1000);
     const minDepth = Math.max(0.01, parseFloat($("lp-min-depth").value) || 0.3);
     const interval = Math.max(0.01, parseFloat($("lp-interval").value) || 0.3);
     const rain = Math.max(0.1, parseFloat($("lp-rain").value) || 5.0);
+    const runoffCoeff = Math.min(1.0, Math.max(0.05, parseFloat($("lp-runoff-coeff")?.value) || 1.0));
     const duration = Math.max(0.5, parseFloat($("lp-duration").value) || 70.0);
     const step = Math.max(0.1, parseFloat($("lp-step").value) || 1.0);
 
@@ -711,17 +962,33 @@
       const stem = loadedFile.name.replace(/\.[^.]+$/, "");
 
       if (mode === "inundation") {
-        const sim = wasm.simulateInundation(
-          loadedFile.bytes,
-          loadedFile.name,
-          kernelSize,
-          minSize,
-          minDepth,
-          interval,
-          rain,
-          duration,
-          step,
-        );
+        const sim =
+          typeof wasm.simulateInundationAdvanced === "function"
+            ? wasm.simulateInundationAdvanced(
+                loadedFile.bytes,
+                loadedFile.name,
+                kernelSize,
+                minSize,
+                minDepth,
+                interval,
+                rain,
+                duration,
+                step,
+                breachMaxDepth,
+                runoffCoeff,
+                undefined,
+              )
+            : wasm.simulateInundation(
+                loadedFile.bytes,
+                loadedFile.name,
+                kernelSize,
+                minSize,
+                minDepth,
+                interval,
+                rain,
+                duration,
+                step,
+              );
         if (token !== runToken) {
           sim.free();
           return;
@@ -742,7 +1009,11 @@
         const level = sim.levelRgba();
         const fill = sim.fillTimeRgba();
         const fillTimes = sim.fillTimeValues();
+        const depIds =
+          typeof sim.depressionIdValues === "function" ? sim.depressionIdValues() : null;
         const depressions = JSON.parse(sim.depressionsJson());
+        const ratingCurves =
+          typeof sim.ratingCurvesJson === "function" ? JSON.parse(sim.ratingCurvesJson()) : [];
         const steps = JSON.parse(sim.stepsJson());
         const spillPaths = JSON.parse(sim.spillPathsJson());
         const lastStep = steps.length > 0 ? steps[steps.length - 1] : null;
@@ -757,7 +1028,20 @@
         const gifImg = $("lp-gif");
         if (gifImg) gifImg.removeAttribute("src");
 
-        initPlayer(w, h, hill, fillTimes, steps, spillPaths, rain, areaUnit);
+        initPlayer(
+          w,
+          h,
+          hill,
+          fillTimes,
+          depIds,
+          depressions,
+          ratingCurves,
+          steps,
+          spillPaths,
+          rain,
+          runoffCoeff,
+          areaUnit,
+        );
 
         drawRgba($("lp-c-hillshade"), w, h, hill, null);
         drawRgba($("lp-c-depth"), w, h, depth, hill);
@@ -775,17 +1059,29 @@
           ["WASM Runtime", `${elapsed.toFixed(0)} ms`],
         ]);
 
-        renderDownloads(
-          [
-            { label: "Depressions GeoJSON", filename: `${stem}_depressions.geojson`, data: sim.depressionsGeojson(), mime: "application/geo+json" },
-            { label: "Spill Flow Paths GeoJSON", filename: `${stem}_spill_paths.geojson`, getData: () => sim.spillPathsGeojson(), mime: "application/geo+json" },
-            { label: "Depression Level GeoTIFF", filename: `${stem}_level.tif`, data: sim.levelTif(), mime: "image/tiff" },
-            { label: "Fill Time GeoTIFF", filename: `${stem}_fill_time.tif`, data: sim.fillTimeTif(), mime: "image/tiff" },
-            { label: "Catchment Hierarchy GeoTIFF", filename: `${stem}_catchment_hir.tif`, data: sim.catchmentHirTif(), mime: "image/tiff" },
-            { label: "Sink GeoTIFF", filename: `${stem}_sink.tif`, data: sim.sinkTif(), mime: "image/tiff" },
-          ],
-          true,
-        );
+        const downloadItems = [
+          {
+            label: "Export PNG Snapshot (Scale + Legend)",
+            filename: `${stem}_snapshot.png`,
+            getData: () => {
+              const showSpills = $("lp-spill-paths") ? $("lp-spill-paths").checked : true;
+              const idx = player ? player.stepIdx : 0;
+              return sim.renderFramePng(idx, true, true, showSpills);
+            },
+            mime: "image/png",
+          },
+          { label: "Depressions GeoJSON", filename: `${stem}_depressions.geojson`, data: sim.depressionsGeojson(), mime: "application/geo+json" },
+          { label: "Spill Flow Paths GeoJSON", filename: `${stem}_spill_paths.geojson`, getData: () => sim.spillPathsGeojson(), mime: "application/geo+json" },
+          { label: "Connectivity Graph JSON", filename: `${stem}_connectivity_graph.json`, getData: () => sim.connectivityGraphJson(), mime: "application/json" },
+          { label: "Connectivity GraphML", filename: `${stem}_connectivity_graph.graphml`, getData: () => sim.connectivityGraphml(), mime: "application/xml" },
+          { label: "Rating Curves CSV", filename: `${stem}_rating_curves.csv`, getData: () => sim.ratingCurvesCsv(), mime: "text/csv" },
+          { label: "Inundation Curve CSV", filename: `${stem}_inundation_curve.csv`, getData: () => sim.inundationCurveCsv(), mime: "text/csv" },
+          { label: "Depression Level GeoTIFF", filename: `${stem}_level.tif`, data: sim.levelTif(), mime: "image/tiff" },
+          { label: "Fill Time GeoTIFF", filename: `${stem}_fill_time.tif`, data: sim.fillTimeTif(), mime: "image/tiff" },
+          { label: "Catchment Hierarchy GeoTIFF", filename: `${stem}_catchment_hir.tif`, data: sim.catchmentHirTif(), mime: "image/tiff" },
+          { label: "Sink GeoTIFF", filename: `${stem}_sink.tif`, data: sim.sinkTif(), mime: "image/tiff" },
+        ];
+        renderDownloads(downloadItems, true);
 
         renderTable(depressions);
         setStatus(
@@ -992,6 +1288,20 @@
       if (player && player.playing) {
         startPlayer();
       }
+    });
+    const inspectorClear = $("lp-inspector-clear");
+    if (inspectorClear) {
+      inspectorClear.addEventListener("click", () => selectDepression(0));
+    }
+    $("lp-player-canvas").addEventListener("click", (e) => {
+      if (!player || !player.depIds) return;
+      const rect = e.currentTarget.getBoundingClientRect();
+      const col = Math.floor(((e.clientX - rect.left) / rect.width) * player.width);
+      const row = Math.floor(((e.clientY - rect.top) / rect.height) * player.height);
+      if (col < 0 || col >= player.width || row < 0 || row >= player.height) return;
+      const depId = player.depIds[row * player.width + col];
+      stopPlayer();
+      selectDepression(depId > 0 ? depId : 0);
     });
     $("lp-chart").addEventListener("click", (e) => {
       if (!player || !player.steps.length) return;

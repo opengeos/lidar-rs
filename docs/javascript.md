@@ -109,10 +109,11 @@ try {
 | `meanFilter` | `(bytes, filename, kernelSize)` | `Uint8Array` — filtered GeoTIFF bytes |
 | `medianFilter` | `(bytes, filename, kernelSize)` | `Uint8Array` — filtered GeoTIFF bytes |
 | `gaussianFilter` | `(bytes, filename, sigma)` | `Uint8Array` — filtered GeoTIFF bytes |
-| `flipDem` | `(bytes, filename, delta)` | `Uint8Array` — inverted GeoTIFF bytes |
-| `hillshadeRgba` | `(bytes, filename, azimuthDeg, elevationDeg, zFactor)` | `Uint8Array` — `width × height × 4` RGBA pixels for `ImageData` |
-| `imageToCog` | `(bytes, filename, compression)` | `Uint8Array` — Cloud Optimized GeoTIFF bytes |
-| `polygonizeToGeojson` | `(bytes, filename, fieldName)` | `string` — GeoJSON FeatureCollection |
+| `flipDem` | `(bytes, filename, delta)` | `Uint8Array`: inverted GeoTIFF bytes |
+| `breachDem` | `(bytes, filename, mode, maxDepth?, maxLength?, fillRemaining)` | `Uint8Array`: Lindsay (2016) breached GeoTIFF bytes (`"complete"`, `"selective"`, or `"constrained"`) |
+| `hillshadeRgba` | `(bytes, filename, azimuthDeg, elevationDeg, zFactor)` | `Uint8Array`: `width × height × 4` RGBA pixels for `ImageData` |
+| `imageToCog` | `(bytes, filename, compression)` | `Uint8Array`: Cloud Optimized GeoTIFF bytes |
+| `polygonizeToGeojson` | `(bytes, filename, fieldName)` | `string`: GeoJSON FeatureCollection |
 
 ### Hydrology & Delineation Pipelines
 
@@ -122,7 +123,8 @@ try {
 | `delineateDepressions` | `(sinkBytes, filename, minSize, minDepth, interval)` | `DepressionsOutput` (`width`, `height`, `maxLevel`, `numRegions`, `depressionsJson()`, `idTif()`, `levelTif()`, `geojson()`, `levelRgba()`) |
 | `delineateMounts` | `(dsmBytes, filename, minSize, minHeight, interval)` | `DepressionsOutput` (same fields as `delineateDepressions`) |
 | `delineateCatchments` | `(demBytes, sinkOrRegionBytes, demFilename, sinkFilename)` | `CatchmentsOutput` (`recordsJson()`, `watershedTif()`, `geojson()`) |
-| `simulateInundation` | `(demBytes, filename, kernelSize, minSize, minDepth, interval, rainIntensityCmH, rainDurationH, timeStepH)` | `InundationOutput` (`width`, `height`, `projection`, `maxLevel`, `numRegions`, `numSteps`, `depressionsJson()`, `catchmentHierarchyJson()`, `stepsJson()`, `spillPathsJson()`, `spillPathsGeojson()` *(RFC 7946 WGS 84)*, `encodeGif(frameDelayMs, pingPong, maxDim, showSpillPaths?)` *(`showSpillPaths` defaults to `true`; pass `false` to omit the overlay)*, `fillTimeTif()`, `catchmentHirTif()`, `sinkTif()`, `levelTif()`, `depressionsGeojson()`, `hillshadeRgba()`, `depthRgba()`, `levelRgba()`, `fillTimeRgba()`, `fillTimeValues()`) |
+| `simulateInundation` | `(demBytes, filename, kernelSize, minSize, minDepth, interval, rainIntensityCmH, rainDurationH, timeStepH)` | `InundationOutput` (`width`, `height`, `projection`, `maxLevel`, `numRegions`, `numSteps`, `runoffCoeff`, `depressionsJson()`, `catchmentHierarchyJson()`, `stepsJson()`, `spillPathsJson()`, `spillPathsGeojson()`, `ratingCurvesJson()`, `ratingCurvesCsv()`, `connectivityGraphJson()`, `connectivityGraphml()`, `inundationCurveCsv()`, `depressionIdValues()`, `renderFramePng(stepIndex, showScaleBar, showLegend, showSpillPaths?)`, `encodeGif(frameDelayMs, pingPong, maxDim, showSpillPaths?)`, `fillTimeTif()`, `catchmentHirTif()`, `sinkTif()`, `levelTif()`, `depressionsGeojson()`, `hillshadeRgba()`, `depthRgba()`, `levelRgba()`, `fillTimeRgba()`, `fillTimeValues()`) |
+| `simulateInundationAdvanced` | `(demBytes, filename, kernelSize, minSize, minDepth, interval, rainIntensityCmH, rainDurationH, timeStepH, breachMaxDepth?, runoffCoeff, scsType2Mm?)` | `InundationOutput` with optional selective breaching, runoff coefficient, and SCS Type II design storm hyetograph |
 
 !!! tip "Memory Management"
     `SinksOutput`, `DepressionsOutput`, `CatchmentsOutput`, and `InundationOutput` hold WebAssembly heap allocations. Call `.free()` (ideally in a `finally` block) once you have copied the buffers or strings you need.

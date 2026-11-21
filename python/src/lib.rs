@@ -8,11 +8,15 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use lidar::pointcloud::{GridMethod, GridStat, LidarToDsmOptions};
+use lidar::pointcloud::{
+    GridMethod, GridStat, GroundFilterMethod, LidarToDsmOptions, LidarToDtmOptions, ReturnKind,
+};
 use lidar::{
-    AnimateInundationOptions, Array2D, CatchmentHierarchyOptions, DelineateCatchmentsOptions,
-    DelineateFlowPathsOptions, DelineateOptions, ExtractSinksOptions, HillshadeOptions,
-    NestedDepression, SimulateInundationOptions, SinkDepression, Topology,
+    AnimateInundationOptions, Array2D, BreachMode, BreachOptions, BurnCulvertsOptions,
+    CatchmentHierarchyOptions, DelineateCatchmentsOptions, DelineateFlowPathsOptions,
+    DelineateOptions, ExtractSinksOptions, HillshadeOptions, InundationForcing, NestedDepression,
+    RunPipelineOptions, SimulateInundationOptions, SinkDepression, TiledDelineationOptions,
+    Topology,
 };
 
 fn to_py_err(e: lidar::Error) -> PyErr {
@@ -46,6 +50,77 @@ fn to_py_array2<'py>(py: Python<'py>, arr: Array2D<f64>) -> PyResult<Bound<'py, 
     let nd = Array2::from_shape_vec((h, w), arr.into_vec())
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     Ok(nd.into_pyarray(py))
+}
+
+fn to_py_array2_i32<'py>(
+    py: Python<'py>,
+    arr: Array2D<i32>,
+) -> PyResult<Bound<'py, PyArray2<i32>>> {
+    let (w, h) = (arr.width(), arr.height());
+    let nd = Array2::from_shape_vec((h, w), arr.into_vec())
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    Ok(nd.into_pyarray(py))
+}
+
+fn from_py_array2_with_cell(
+    arr: PyReadonlyArray2<'_, f64>,
+    no_data: Option<f64>,
+    cell_size: f64,
+) -> PyResult<Array2D<f64>> {
+    let mut a = from_py_array2(arr, no_data)?;
+    a.geotransform = [
+        0.0,
+        cell_size,
+        0.0,
+        (a.height() as f64) * cell_size,
+        0.0,
+        -cell_size,
+    ];
+    Ok(a)
+}
+
+fn parse_breach_mode(mode: &str) -> PyResult<BreachMode> {
+    match mode.to_ascii_lowercase().as_str() {
+        "complete" => Ok(BreachMode::Complete),
+        "selective" => Ok(BreachMode::Selective),
+        "constrained" => Ok(BreachMode::Constrained),
+        other => Err(PyValueError::new_err(format!(
+            "Unknown breach mode: {other}"
+        ))),
+    }
+}
+
+fn parse_ground_method(method: &str) -> PyResult<GroundFilterMethod> {
+    match method.to_ascii_lowercase().as_str() {
+        "preclassified" => Ok(GroundFilterMethod::Preclassified),
+        "csf" => Ok(GroundFilterMethod::Csf),
+        "pmf" => Ok(GroundFilterMethod::Pmf),
+        other => Err(PyValueError::new_err(format!(
+            "Unknown ground filter method: {other}"
+        ))),
+    }
+}
+
+fn parse_return_kinds_py(kinds: Option<Vec<String>>) -> PyResult<Option<Vec<ReturnKind>>> {
+    let Some(list) = kinds else {
+        return Ok(None);
+    };
+    let mut out = Vec::with_capacity(list.len());
+    for s in list {
+        let rk = match s.trim().to_ascii_lowercase().as_str() {
+            "first" => ReturnKind::First,
+            "last" => ReturnKind::Last,
+            "intermediate" => ReturnKind::Intermediate,
+            "only" | "single" => ReturnKind::Only,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "Unknown return kind: {other}"
+                )));
+            }
+        };
+        out.push(rk);
+    }
+    Ok(Some(out))
 }
 
 fn sink_dep_to_dict<'py>(py: Python<'py>, d: &SinkDepression) -> PyResult<Bound<'py, PyDict>> {
@@ -88,6 +163,12 @@ fn nested_dep_to_dict<'py>(py: Python<'py>, d: &NestedDepression) -> PyResult<Bo
     dict.set_item("eccentricity", d.eccentricity)?;
     dict.set_item("orientation", d.orientation)?;
     dict.set_item("area_bbox_ratio", d.area_bbox_ratio)?;
+    dict.set_item("parent_id", d.parent_id)?;
+    dict.set_item("circularity", d.circularity)?;
+    dict.set_item("depth_diam_ratio", d.depth_diam_ratio)?;
+    dict.set_item("hypsometric_integral", d.hypsometric_integral)?;
+    dict.set_item("rim_slope_deg", d.rim_slope_deg)?;
+    dict.set_item("artifact_flag", d.artifact_flag)?;
     Ok(dict)
 }
 
@@ -339,7 +420,7 @@ fn extract_sinks<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (in_sink, min_size, min_depth, interval, out_dir, bool_level_shp=false, bool_comb_tif=false, compress=false))]
+#[pyo3(signature = (in_sink, min_size, min_depth, interval, out_dir, bool_level_shp=false, bool_comb_tif=false, export_gpkg=false, compress=false))]
 #[allow(clippy::too_many_arguments)]
 fn delineate_depressions<'py>(
     py: Python<'py>,
@@ -350,6 +431,7 @@ fn delineate_depressions<'py>(
     out_dir: &str,
     bool_level_shp: bool,
     bool_comb_tif: bool,
+    export_gpkg: bool,
     compress: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let opts = DelineateOptions {
@@ -358,6 +440,7 @@ fn delineate_depressions<'py>(
         interval,
         bool_level_shp,
         bool_comb_tif,
+        export_gpkg,
         compress,
     };
     let in_sink = in_sink.to_string();
@@ -379,6 +462,7 @@ fn delineate_depressions<'py>(
         "shapefile_path",
         res.shapefile_path.to_string_lossy().as_ref(),
     )?;
+    dict.set_item("gpkg_path", opt_path_to_py(res.gpkg_path.as_ref()))?;
     dict.set_item("csv_path", res.csv_path.to_string_lossy().as_ref())?;
     let level_shps: Vec<String> = res
         .level_shapefiles
@@ -415,6 +499,7 @@ fn delineate_mounts<'py>(
         interval,
         bool_level_shp: bool_shp,
         bool_comb_tif: false,
+        export_gpkg: false,
         compress,
     };
     let in_dem = in_dem.to_string();
@@ -591,7 +676,7 @@ fn convert_lidar(
 }
 
 #[pyfunction]
-#[pyo3(signature = (in_lidar, out_dsm, resolution=1.0, radius=None, min_z=None, max_z=None, stat="max", method="statistics", window_size=0))]
+#[pyo3(signature = (in_lidar, out_dsm, resolution=1.0, radius=None, min_z=None, max_z=None, stat="max", method="statistics", window_size=0, classifications=None, return_kinds=None))]
 #[allow(clippy::too_many_arguments)]
 fn lidar_to_dsm(
     py: Python<'_>,
@@ -604,12 +689,16 @@ fn lidar_to_dsm(
     stat: &str,
     method: &str,
     window_size: usize,
+    classifications: Option<Vec<u8>>,
+    return_kinds: Option<Vec<String>>,
 ) -> PyResult<(usize, usize)> {
     let opts = LidarToDsmOptions {
         resolution,
         radius,
         min_z,
         max_z,
+        classifications,
+        return_kinds: parse_return_kinds_py(return_kinds)?,
         stat: GridStat::parse(stat).map_err(|e| to_py_err(e.into()))?,
         method: GridMethod::parse(method).map_err(|e| to_py_err(e.into()))?,
         window_size,
@@ -618,6 +707,64 @@ fn lidar_to_dsm(
     let in_lidar = in_lidar.to_string();
     let out_dsm = out_dsm.to_string();
     py.detach(move || lidar::lidar_to_dsm(&in_lidar, &out_dsm, &opts))
+        .map_err(to_py_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (in_lidar, out_dtm, resolution=1.0, ground_method="csf", ground_class=2, radius=None, method="linear", stat="idw", window_size=5))]
+#[allow(clippy::too_many_arguments)]
+fn lidar_to_dtm(
+    py: Python<'_>,
+    in_lidar: &str,
+    out_dtm: &str,
+    resolution: f64,
+    ground_method: &str,
+    ground_class: u8,
+    radius: Option<f64>,
+    method: &str,
+    stat: &str,
+    window_size: usize,
+) -> PyResult<(usize, usize)> {
+    let opts = LidarToDtmOptions {
+        resolution,
+        ground_method: parse_ground_method(ground_method)?,
+        ground_class,
+        radius,
+        method: GridMethod::parse(method).map_err(|e| to_py_err(e.into()))?,
+        stat: GridStat::parse(stat).map_err(|e| to_py_err(e.into()))?,
+        window_size,
+        ..Default::default()
+    };
+    let in_lidar = in_lidar.to_string();
+    let out_dtm = out_dtm.to_string();
+    py.detach(move || lidar::lidar_to_dtm(&in_lidar, &out_dtm, &opts))
+        .map_err(to_py_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (in_lidar, out_chm, resolution=1.0, ground_method="csf", ground_class=2, radius=None, window_size=5))]
+#[allow(clippy::too_many_arguments)]
+fn lidar_to_chm(
+    py: Python<'_>,
+    in_lidar: &str,
+    out_chm: &str,
+    resolution: f64,
+    ground_method: &str,
+    ground_class: u8,
+    radius: Option<f64>,
+    window_size: usize,
+) -> PyResult<(usize, usize)> {
+    let opts = LidarToDtmOptions {
+        resolution,
+        ground_method: parse_ground_method(ground_method)?,
+        ground_class,
+        radius,
+        window_size,
+        ..Default::default()
+    };
+    let in_lidar = in_lidar.to_string();
+    let out_chm = out_chm.to_string();
+    py.detach(move || lidar::lidar_to_chm(&in_lidar, &out_chm, &opts))
         .map_err(to_py_err)
 }
 
@@ -837,7 +984,7 @@ fn simulate_inundation<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (in_dem, in_flood_dir, out_gif, frame_delay_ms=200, ping_pong=true, loops=0, water_alpha=0.55, max_dimension=None, time_step_h=Some(1.0), rain_intensity_cm_h=None, azimuth_deg=135.0, elevation_deg=45.0))]
+#[pyo3(signature = (in_dem, in_flood_dir, out_gif, frame_delay_ms=200, ping_pong=true, loops=0, water_alpha=0.55, max_dimension=None, time_step_h=Some(1.0), rain_intensity_cm_h=None, azimuth_deg=135.0, elevation_deg=45.0, show_scale_bar=false, show_legend=false))]
 #[allow(clippy::too_many_arguments)]
 fn animate_inundation<'py>(
     py: Python<'py>,
@@ -853,6 +1000,8 @@ fn animate_inundation<'py>(
     rain_intensity_cm_h: Option<f64>,
     azimuth_deg: f64,
     elevation_deg: f64,
+    show_scale_bar: bool,
+    show_legend: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let in_dem = in_dem.to_string();
     let in_flood_dir = in_flood_dir.to_string();
@@ -865,6 +1014,8 @@ fn animate_inundation<'py>(
         max_dimension,
         time_step_h,
         rain_intensity_cm_h,
+        show_scale_bar,
+        show_legend,
         hillshade: HillshadeOptions {
             azimuth_deg,
             elevation_deg,
@@ -884,6 +1035,552 @@ fn animate_inundation<'py>(
     Ok(dict)
 }
 
+#[pyfunction]
+#[pyo3(signature = (in_dem, in_fill_time, out_dir, num_steps=10, time_step_h=1.0, rain_intensity_cm_h=None, water_alpha=0.55, max_dimension=None, show_scale_bar=true, show_legend=true, azimuth_deg=135.0, elevation_deg=45.0))]
+#[allow(clippy::too_many_arguments)]
+fn export_inundation_frames_png(
+    py: Python<'_>,
+    in_dem: &str,
+    in_fill_time: &str,
+    out_dir: &str,
+    num_steps: usize,
+    time_step_h: f64,
+    rain_intensity_cm_h: Option<f64>,
+    water_alpha: f32,
+    max_dimension: Option<usize>,
+    show_scale_bar: bool,
+    show_legend: bool,
+    azimuth_deg: f64,
+    elevation_deg: f64,
+) -> PyResult<Vec<String>> {
+    let in_dem = in_dem.to_string();
+    let in_fill_time = in_fill_time.to_string();
+    let out_dir = out_dir.to_string();
+    let opts = AnimateInundationOptions {
+        water_alpha,
+        max_dimension,
+        time_step_h: Some(time_step_h),
+        rain_intensity_cm_h,
+        show_scale_bar,
+        show_legend,
+        hillshade: HillshadeOptions {
+            azimuth_deg,
+            elevation_deg,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let paths = py
+        .detach(move || {
+            let dem = lidar::load_raster::<f64>(&in_dem, None)?;
+            let ft = lidar::load_raster::<f64>(&in_fill_time, None)?;
+            lidar::export_inundation_frames_png(
+                &dem,
+                &ft,
+                num_steps,
+                time_step_h,
+                &[],
+                &out_dir,
+                &opts,
+            )
+        })
+        .map_err(to_py_err)?;
+    Ok(paths
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect())
+}
+
+#[pyfunction]
+#[pyo3(signature = (arr, mode="selective", max_depth=Some(1.5), max_length=Some(50), fill_remaining=false, no_data=None))]
+fn breach_depressions_array<'py>(
+    py: Python<'py>,
+    arr: PyReadonlyArray2<'_, f64>,
+    mode: &str,
+    max_depth: Option<f64>,
+    max_length: Option<u32>,
+    fill_remaining: bool,
+    no_data: Option<f64>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let dem = from_py_array2(arr, no_data)?;
+    let opts = BreachOptions {
+        mode: parse_breach_mode(mode)?,
+        max_depth,
+        max_length,
+        fill_remaining,
+        ..Default::default()
+    };
+    let out = py
+        .detach(move || lidar::breach_depressions(&dem, &opts))
+        .map_err(to_py_err)?;
+    to_py_array2(py, out)
+}
+
+#[pyfunction]
+#[pyo3(signature = (in_dem, out_dem, mode="selective", max_depth=Some(1.5), max_length=Some(50), fill_remaining=false, compress=false))]
+#[allow(clippy::too_many_arguments)]
+fn breach_depressions(
+    py: Python<'_>,
+    in_dem: &str,
+    out_dem: &str,
+    mode: &str,
+    max_depth: Option<f64>,
+    max_length: Option<u32>,
+    fill_remaining: bool,
+    compress: bool,
+) -> PyResult<String> {
+    let in_dem = in_dem.to_string();
+    let out_dem_s = out_dem.to_string();
+    let opts = BreachOptions {
+        mode: parse_breach_mode(mode)?,
+        max_depth,
+        max_length,
+        fill_remaining,
+        compress,
+        ..Default::default()
+    };
+    let out_ret = out_dem_s.clone();
+    py.detach(move || lidar::breach_depressions_file(&in_dem, &out_dem_s, &opts))
+        .map_err(to_py_err)?;
+    Ok(out_ret)
+}
+
+#[pyfunction]
+#[pyo3(signature = (in_dem, culverts_vector, out_dem, half_width_cells=0, depth_offset=0.05, point_radius_cells=5, compress=false))]
+#[allow(clippy::too_many_arguments)]
+fn burn_culverts(
+    py: Python<'_>,
+    in_dem: &str,
+    culverts_vector: &str,
+    out_dem: &str,
+    half_width_cells: usize,
+    depth_offset: f64,
+    point_radius_cells: usize,
+    compress: bool,
+) -> PyResult<usize> {
+    let in_dem = in_dem.to_string();
+    let culverts_vector = culverts_vector.to_string();
+    let out_dem = out_dem.to_string();
+    let opts = BurnCulvertsOptions {
+        half_width_cells,
+        depth_offset,
+        point_radius_cells,
+        compress,
+    };
+    let (_out, carved) = py
+        .detach(move || lidar::burn_culverts_file(&in_dem, &culverts_vector, &out_dem, &opts))
+        .map_err(to_py_err)?;
+    Ok(carved)
+}
+
+#[pyfunction]
+#[pyo3(signature = (cn_arr, precip_mm, no_data=None))]
+fn scs_curve_number_runoff<'py>(
+    py: Python<'py>,
+    cn_arr: PyReadonlyArray2<'_, f64>,
+    precip_mm: f64,
+    no_data: Option<f64>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let cn = from_py_array2(cn_arr, no_data)?;
+    let out = py
+        .detach(move || lidar::scs_curve_number_runoff(&cn, precip_mm))
+        .map_err(to_py_err)?;
+    to_py_array2(py, out)
+}
+
+#[pyfunction]
+#[pyo3(signature = (total_precip_mm, duration_h=24.0, time_step_h=1.0))]
+fn scs_type2_hyetograph(
+    total_precip_mm: f64,
+    duration_h: f64,
+    time_step_h: f64,
+) -> PyResult<Vec<(f64, f64)>> {
+    lidar::scs_type2_hyetograph(total_precip_mm, duration_h, time_step_h).map_err(to_py_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (arr, min_size=1000, topology="D8", no_data=None, cell_size=1.0))]
+fn extract_sinks_array<'py>(
+    py: Python<'py>,
+    arr: PyReadonlyArray2<'_, f64>,
+    min_size: usize,
+    topology: &str,
+    no_data: Option<f64>,
+    cell_size: f64,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dem = from_py_array2_with_cell(arr, no_data, cell_size)?;
+    let topo = parse_topology(topology)?;
+    let mem = py
+        .detach(move || lidar::extract_sinks_in_memory(&dem, min_size, topo))
+        .map_err(to_py_err)?;
+
+    let dict = PyDict::new(py);
+    dict.set_item("sink", to_py_array2(py, mem.sink)?)?;
+    dict.set_item("dem_refined", to_py_array2(py, mem.dem_refined)?)?;
+    dict.set_item("dem_filled", to_py_array2(py, mem.dem_filled)?)?;
+    dict.set_item("dem_diff", to_py_array2(py, mem.dem_diff)?)?;
+    dict.set_item("depth", to_py_array2(py, mem.depth)?)?;
+    dict.set_item("region", to_py_array2_i32(py, mem.region)?)?;
+    let deps = PyList::empty(py);
+    for d in &mem.depressions {
+        deps.append(sink_dep_to_dict(py, d)?)?;
+    }
+    dict.set_item("depressions", deps)?;
+    Ok(dict)
+}
+
+#[pyfunction]
+#[pyo3(signature = (sink_arr, min_size=1000, min_depth=0.3, interval=0.3, no_data=None, cell_size=1.0))]
+fn delineate_depressions_array<'py>(
+    py: Python<'py>,
+    sink_arr: PyReadonlyArray2<'_, f64>,
+    min_size: usize,
+    min_depth: f64,
+    interval: f64,
+    no_data: Option<f64>,
+    cell_size: f64,
+) -> PyResult<Bound<'py, PyDict>> {
+    let sink = from_py_array2_with_cell(sink_arr, no_data, cell_size)?;
+    let mem = py
+        .detach(move || {
+            lidar::delineate_depressions_in_memory(&sink, min_size, min_depth, interval)
+        })
+        .map_err(to_py_err)?;
+
+    let dict = PyDict::new(py);
+    dict.set_item("depression_id", to_py_array2_i32(py, mem.depression_id)?)?;
+    dict.set_item(
+        "depression_level",
+        to_py_array2_i32(py, mem.depression_level)?,
+    )?;
+    dict.set_item("max_level", mem.max_level)?;
+    dict.set_item("num_regions", mem.num_regions)?;
+    let deps = PyList::empty(py);
+    for d in &mem.depressions {
+        deps.append(nested_dep_to_dict(py, d)?)?;
+    }
+    dict.set_item("depressions", deps)?;
+    Ok(dict)
+}
+
+#[pyfunction]
+#[pyo3(signature = (dem_arr, kernel_size=3, min_size=1000, min_depth=0.3, interval=0.3, rain_intensity_cm_h=5.0, rain_duration_h=50.0, time_step_h=1.0, runoff_coeff_arr=None, infiltration_arr=None, antecedent_depth_arr=None, hyetograph=None, breach_max_depth=None, no_data=None, cell_size=1.0))]
+#[allow(clippy::too_many_arguments)]
+fn simulate_inundation_array<'py>(
+    py: Python<'py>,
+    dem_arr: PyReadonlyArray2<'_, f64>,
+    kernel_size: usize,
+    min_size: usize,
+    min_depth: f64,
+    interval: f64,
+    rain_intensity_cm_h: f64,
+    rain_duration_h: f64,
+    time_step_h: f64,
+    runoff_coeff_arr: Option<PyReadonlyArray2<'_, f64>>,
+    infiltration_arr: Option<PyReadonlyArray2<'_, f64>>,
+    antecedent_depth_arr: Option<PyReadonlyArray2<'_, f64>>,
+    hyetograph: Option<Vec<(f64, f64)>>,
+    breach_max_depth: Option<f64>,
+    no_data: Option<f64>,
+    cell_size: f64,
+) -> PyResult<Bound<'py, PyDict>> {
+    let raw_dem = from_py_array2_with_cell(dem_arr, no_data, cell_size)?;
+    let rc = runoff_coeff_arr
+        .map(|a| from_py_array2_with_cell(a, None, cell_size))
+        .transpose()?;
+    let inf = infiltration_arr
+        .map(|a| from_py_array2_with_cell(a, None, cell_size))
+        .transpose()?;
+    let ant = antecedent_depth_arr
+        .map(|a| from_py_array2_with_cell(a, None, cell_size))
+        .transpose()?;
+
+    let sim_opts = SimulateInundationOptions {
+        min_size,
+        min_depth,
+        interval,
+        rain_intensity_cm_h,
+        rain_duration_h,
+        time_step_h,
+        compress: false,
+    };
+
+    let (dep_id, dep_level, hir, fill_time, depressions, steps, spill_paths, rating_curves, graph) =
+        py.detach(move || -> lidar::Result<_> {
+            let mut dem = raw_dem;
+            if let Some(md) = breach_max_depth {
+                dem = lidar::breach_depressions(
+                    &dem,
+                    &BreachOptions {
+                        mode: BreachMode::Selective,
+                        max_depth: Some(md),
+                        ..Default::default()
+                    },
+                )?;
+            }
+            if kernel_size > 1 {
+                dem = lidar::median_filter(&dem, kernel_size)?;
+            }
+            let sinks = lidar::extract_sinks_in_memory(&dem, min_size, Topology::D8)?;
+            let deps =
+                lidar::delineate_depressions_in_memory(&sinks.sink, min_size, min_depth, interval)?;
+            let (hir, cat_recs) = lidar::delineate_catchment_hierarchy_in_memory(
+                &sinks.dem_refined,
+                &deps.depression_level,
+                min_size,
+            )?;
+            let forcing = InundationForcing {
+                runoff_coeff: rc.as_ref(),
+                infiltration_cm_h: inf.as_ref(),
+                antecedent_depth: ant.as_ref(),
+                hyetograph: hyetograph.as_deref(),
+            };
+            let (fill_time, _) = lidar::simulate_inundation_with_forcing_in_memory(
+                &sinks.sink,
+                &hir,
+                &sim_opts,
+                &forcing,
+            )?;
+            let num_steps = ((rain_duration_h / time_step_h).ceil() as usize).max(1);
+            let steps = lidar::compute_inundation_step_summaries(
+                &sinks.sink,
+                &fill_time,
+                num_steps,
+                time_step_h,
+            );
+            let spill_paths =
+                lidar::delineate_spill_flow_paths_in_memory(&sinks.dem_refined, &deps, &fill_time)?;
+            let rating_curves = lidar::compute_rating_curves(&sinks.sink, &deps, interval.abs())?;
+            let graph = lidar::build_connectivity_graph(
+                &deps,
+                &cat_recs,
+                &fill_time,
+                &spill_paths,
+                rain_intensity_cm_h,
+                None,
+            )?;
+            Ok((
+                deps.depression_id,
+                deps.depression_level,
+                hir,
+                fill_time,
+                deps.depressions,
+                steps,
+                spill_paths,
+                rating_curves,
+                graph,
+            ))
+        })
+        .map_err(to_py_err)?;
+
+    let dict = PyDict::new(py);
+    dict.set_item("depression_id", to_py_array2_i32(py, dep_id)?)?;
+    dict.set_item("depression_level", to_py_array2_i32(py, dep_level)?)?;
+    dict.set_item("catchment_hierarchy", to_py_array2(py, hir)?)?;
+    dict.set_item("fill_time", to_py_array2(py, fill_time)?)?;
+
+    let py_deps = PyList::empty(py);
+    for d in &depressions {
+        py_deps.append(nested_dep_to_dict(py, d)?)?;
+    }
+    dict.set_item("depressions", py_deps)?;
+
+    let py_steps = PyList::empty(py);
+    for s in &steps {
+        let d = PyDict::new(py);
+        d.set_item("step", s.step)?;
+        d.set_item("time_hours", s.time_hours)?;
+        d.set_item("inundated_cells", s.inundated_cells)?;
+        d.set_item("inundated_area", s.inundated_area)?;
+        d.set_item("inundated_fraction", s.inundated_fraction)?;
+        py_steps.append(d)?;
+    }
+    dict.set_item("steps", py_steps)?;
+
+    let py_spills = PyList::empty(py);
+    for sp in &spill_paths {
+        let d = PyDict::new(py);
+        d.set_item("from_dep_id", sp.from_dep_id)?;
+        d.set_item("from_level", sp.from_level)?;
+        d.set_item("to_dep_id", sp.to_dep_id)?;
+        d.set_item("spill_time_h", sp.spill_time_h)?;
+        d.set_item("merge_time_h", sp.merge_time_h)?;
+        d.set_item("spill_elev", sp.spill_elev)?;
+        d.set_item("cells", sp.cells.clone())?;
+        py_spills.append(d)?;
+    }
+    dict.set_item("spill_paths", py_spills)?;
+
+    let py_rc = PyList::empty(py);
+    for pt in &rating_curves {
+        let d = PyDict::new(py);
+        d.set_item("dep_id", pt.dep_id)?;
+        d.set_item("level", pt.level)?;
+        d.set_item("region_id", pt.region_id)?;
+        d.set_item("stage", pt.stage)?;
+        d.set_item("depth", pt.depth)?;
+        d.set_item("area", pt.area)?;
+        d.set_item("volume", pt.volume)?;
+        py_rc.append(d)?;
+    }
+    dict.set_item("rating_curves", py_rc)?;
+    dict.set_item("graph_node_count", graph.nodes.len())?;
+    dict.set_item("graph_edge_count", graph.edges.len())?;
+    Ok(dict)
+}
+
+#[pyfunction]
+#[pyo3(signature = (in_dem, out_dir, kernel_size=3, min_size=1000, min_depth=0.3, interval=0.3, rain_intensity_cm_h=5.0, rain_duration_h=50.0, time_step_h=1.0, breach_max_depth=None, breach_max_length=40, culverts_vector=None, runoff_coeff_path=None, infiltration_path=None, antecedent_depth_path=None, hyetograph=None, stream_vector=None, use_f32=false, save_rasters=true, export_vectors=true, export_graph=true, compress=false))]
+#[allow(clippy::too_many_arguments)]
+fn run_pipeline<'py>(
+    py: Python<'py>,
+    in_dem: &str,
+    out_dir: &str,
+    kernel_size: usize,
+    min_size: usize,
+    min_depth: f64,
+    interval: f64,
+    rain_intensity_cm_h: f64,
+    rain_duration_h: f64,
+    time_step_h: f64,
+    breach_max_depth: Option<f64>,
+    breach_max_length: u32,
+    culverts_vector: Option<&str>,
+    runoff_coeff_path: Option<&str>,
+    infiltration_path: Option<&str>,
+    antecedent_depth_path: Option<&str>,
+    hyetograph: Option<Vec<(f64, f64)>>,
+    stream_vector: Option<&str>,
+    use_f32: bool,
+    save_rasters: bool,
+    export_vectors: bool,
+    export_graph: bool,
+    compress: bool,
+) -> PyResult<Bound<'py, PyDict>> {
+    let in_dem = in_dem.to_string();
+    let out_dir = out_dir.to_string();
+    let breach = breach_max_depth.map(|md| BreachOptions {
+        mode: BreachMode::Selective,
+        max_depth: Some(md),
+        max_length: Some(breach_max_length),
+        ..Default::default()
+    });
+    let opts = RunPipelineOptions {
+        kernel_size,
+        breach,
+        culverts_vector: culverts_vector.map(PathBuf::from),
+        simulation: SimulateInundationOptions {
+            min_size,
+            min_depth,
+            interval,
+            rain_intensity_cm_h,
+            rain_duration_h,
+            time_step_h,
+            compress,
+        },
+        runoff_coeff_path: runoff_coeff_path.map(PathBuf::from),
+        infiltration_path: infiltration_path.map(PathBuf::from),
+        antecedent_depth_path: antecedent_depth_path.map(PathBuf::from),
+        hyetograph,
+        stream_vector: stream_vector.map(PathBuf::from),
+        use_f32,
+        save_rasters,
+        export_vectors,
+        export_graph,
+        ..Default::default()
+    };
+    let res = py
+        .detach(move || lidar::run_pipeline(&in_dem, &out_dir, &opts))
+        .map_err(to_py_err)?;
+
+    let dict = PyDict::new(py);
+    dict.set_item("out_dir", res.out_dir.to_string_lossy().as_ref())?;
+    dict.set_item("width", res.width)?;
+    dict.set_item("height", res.height)?;
+    dict.set_item("num_sink_regions", res.num_sink_regions)?;
+    dict.set_item("num_depressions", res.num_depressions)?;
+    dict.set_item("max_level", res.max_level)?;
+    dict.set_item("total_storage_m3", res.total_storage_m3)?;
+    dict.set_item("num_spill_paths", res.num_spill_paths)?;
+    dict.set_item(
+        "depressions_csv",
+        res.depressions_csv.to_string_lossy().as_ref(),
+    )?;
+    dict.set_item(
+        "catchments_csv",
+        res.catchments_csv.to_string_lossy().as_ref(),
+    )?;
+    dict.set_item(
+        "inundation_csv",
+        res.inundation_csv.to_string_lossy().as_ref(),
+    )?;
+    dict.set_item("summary_json", res.summary_json.to_string_lossy().as_ref())?;
+    dict.set_item(
+        "depressions_gpkg",
+        opt_path_to_py(res.depressions_gpkg.as_ref()),
+    )?;
+    dict.set_item(
+        "spill_paths_gpkg",
+        opt_path_to_py(res.spill_paths_gpkg.as_ref()),
+    )?;
+    dict.set_item(
+        "rating_curves_csv",
+        opt_path_to_py(res.rating_curves_csv.as_ref()),
+    )?;
+    dict.set_item(
+        "connectivity_graph_json",
+        opt_path_to_py(res.connectivity_graph_json.as_ref()),
+    )?;
+    dict.set_item(
+        "connectivity_graphml",
+        opt_path_to_py(res.connectivity_graphml.as_ref()),
+    )?;
+    Ok(dict)
+}
+
+#[pyfunction]
+#[pyo3(signature = (in_dem, out_dir, tile_size=2048, overlap=128, kernel_size=3, min_size=1000, min_depth=0.3, interval=0.3, use_f32=true))]
+#[allow(clippy::too_many_arguments)]
+fn delineate_depressions_tiled<'py>(
+    py: Python<'py>,
+    in_dem: &str,
+    out_dir: &str,
+    tile_size: usize,
+    overlap: usize,
+    kernel_size: usize,
+    min_size: usize,
+    min_depth: f64,
+    interval: f64,
+    use_f32: bool,
+) -> PyResult<Bound<'py, PyDict>> {
+    let in_dem = in_dem.to_string();
+    let out_dir = out_dir.to_string();
+    let opts = TiledDelineationOptions {
+        tile_size,
+        overlap,
+        kernel_size,
+        min_size,
+        min_depth,
+        interval,
+        use_f32,
+        ..Default::default()
+    };
+    let res = py
+        .detach(move || lidar::delineate_depressions_tiled(&in_dem, &out_dir, &opts))
+        .map_err(to_py_err)?;
+
+    let dict = PyDict::new(py);
+    dict.set_item("num_tiles", res.num_tiles)?;
+    dict.set_item("max_level", res.max_level)?;
+    dict.set_item("csv_path", res.csv_path.to_string_lossy().as_ref())?;
+    let deps = PyList::empty(py);
+    for d in &res.depressions {
+        deps.append(nested_dep_to_dict(py, d)?)?;
+    }
+    dict.set_item("depressions", deps)?;
+    Ok(dict)
+}
+
 #[pymodule]
 fn _lidar_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", lidar::VERSION)?;
@@ -896,13 +1593,24 @@ fn _lidar_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(gaussian_filter_file, m)?)?;
     m.add_function(wrap_pyfunction!(flip_dem_file, m)?)?;
     m.add_function(wrap_pyfunction!(extract_sinks, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_sinks_array, m)?)?;
     m.add_function(wrap_pyfunction!(delineate_depressions, m)?)?;
+    m.add_function(wrap_pyfunction!(delineate_depressions_array, m)?)?;
+    m.add_function(wrap_pyfunction!(delineate_depressions_tiled, m)?)?;
     m.add_function(wrap_pyfunction!(delineate_mounts, m)?)?;
     m.add_function(wrap_pyfunction!(delineate_catchments, m)?)?;
     m.add_function(wrap_pyfunction!(delineate_flow_paths, m)?)?;
     m.add_function(wrap_pyfunction!(delineate_catchment_hierarchy, m)?)?;
     m.add_function(wrap_pyfunction!(simulate_inundation, m)?)?;
+    m.add_function(wrap_pyfunction!(simulate_inundation_array, m)?)?;
+    m.add_function(wrap_pyfunction!(run_pipeline, m)?)?;
+    m.add_function(wrap_pyfunction!(breach_depressions, m)?)?;
+    m.add_function(wrap_pyfunction!(breach_depressions_array, m)?)?;
+    m.add_function(wrap_pyfunction!(burn_culverts, m)?)?;
+    m.add_function(wrap_pyfunction!(scs_curve_number_runoff, m)?)?;
+    m.add_function(wrap_pyfunction!(scs_type2_hyetograph, m)?)?;
     m.add_function(wrap_pyfunction!(animate_inundation, m)?)?;
+    m.add_function(wrap_pyfunction!(export_inundation_frames_png, m)?)?;
     m.add_function(wrap_pyfunction!(polygonize, m)?)?;
     m.add_function(wrap_pyfunction!(mosaic, m)?)?;
     m.add_function(wrap_pyfunction!(reproject_image, m)?)?;
@@ -914,5 +1622,7 @@ fn _lidar_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(csv_to_vector, m)?)?;
     m.add_function(wrap_pyfunction!(convert_lidar, m)?)?;
     m.add_function(wrap_pyfunction!(lidar_to_dsm, m)?)?;
+    m.add_function(wrap_pyfunction!(lidar_to_dtm, m)?)?;
+    m.add_function(wrap_pyfunction!(lidar_to_chm, m)?)?;
     Ok(())
 }

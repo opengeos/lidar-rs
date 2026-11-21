@@ -18,15 +18,17 @@ parallel = ["dep:rayon", "richdem/parallel"]
 ## LiDAR point cloud I/O, conversion, and DSM gridding via `terrio/pointcloud` (LAS, LAZ, COPC, PLY, E57)
 pointcloud = ["terrio/pointcloud"]
 ## Serialization of depression and result structs via `serde`
-serde = ["dep:serde", "richdem/serde"]
+serde = ["dep:serde", "dep:serde_json", "richdem/serde"]
 
 [dependencies]
 gif.workspace = true
+png.workspace = true
 richdem.workspace = true
 terrio.workspace = true
 thiserror.workspace = true
 rayon = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
