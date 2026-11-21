@@ -14,11 +14,12 @@ use wasm_bindgen::prelude::*;
 
 use lidar::{
     ANIMATION_BANNER_HEIGHT, AnimateInundationOptions, HillshadeOptions, InundationPipelineOptions,
-    SimulateInundationOptions, animate_inundation_to_bytes, compute_hillshade_rgb,
-    delineate_catchments_in_memory, delineate_depressions_in_memory, delineate_mounts_in_memory,
-    extract_sink_labels_from_raster, extract_sinks_in_memory, flip_dem as core_flip_dem,
-    gaussian_filter as core_gaussian_filter, mean_filter as core_mean_filter,
-    median_filter as core_median_filter, simulate_inundation_pipeline_in_memory,
+    SimulateInundationOptions, SpillFlowPath, animate_inundation_to_bytes_with_spill_paths,
+    compute_hillshade_rgb, delineate_catchments_in_memory, delineate_depressions_in_memory,
+    delineate_mounts_in_memory, extract_sink_labels_from_raster, extract_sinks_in_memory,
+    flip_dem as core_flip_dem, gaussian_filter as core_gaussian_filter,
+    mean_filter as core_mean_filter, median_filter as core_median_filter,
+    simulate_inundation_pipeline_in_memory,
 };
 
 /// Upper bound on total pixels (`frames * width * height`) encoded in a single synchronous
@@ -543,11 +544,86 @@ pub fn delineate_catchments(
     })
 }
 
+fn spill_paths_to_geojson(
+    paths: &[SpillFlowPath],
+    geotransform: &[f64; 6],
+    projection: &str,
+) -> Result<String, JsValue> {
+    let trimmed = projection.trim();
+    if trimmed.is_empty() {
+        return Err(JsValue::from_str(
+            "Cannot export spill flow paths as RFC 7946 GeoJSON: input DEM has no CRS metadata",
+        ));
+    }
+    let src_srs = terrio::crs::SpatialRef::parse(trimmed).map_err(|e| {
+        JsValue::from_str(&format!(
+            "Cannot export spill flow paths as RFC 7946 GeoJSON: unsupported DEM CRS ({e})"
+        ))
+    })?;
+    if src_srs.is_unknown() {
+        return Err(JsValue::from_str(
+            "Cannot export spill flow paths as RFC 7946 GeoJSON: input DEM CRS is unknown",
+        ));
+    }
+    let transformer = if src_srs.epsg == Some(4326) {
+        None
+    } else {
+        let wgs84 = terrio::crs::SpatialRef::parse("EPSG:4326").map_err(to_js_err)?;
+        Some(
+            terrio::crs::Transformer::new(&src_srs, &wgs84).map_err(|e| {
+                JsValue::from_str(&format!(
+                    "Cannot reproject spill flow paths to WGS 84 (EPSG:4326): {e}"
+                ))
+            })?,
+        )
+    };
+
+    let mut features: Vec<serde_json::Value> = Vec::with_capacity(paths.len());
+    for (idx, p) in paths.iter().enumerate() {
+        let mut coords: Vec<[f64; 2]> = Vec::with_capacity(p.cells.len());
+        for &(col, row) in &p.cells {
+            let cf = col as f64 + 0.5;
+            let rf = row as f64 + 0.5;
+            let x = geotransform[0] + cf * geotransform[1] + rf * geotransform[2];
+            let y = geotransform[3] + cf * geotransform[4] + rf * geotransform[5];
+            let (lon, lat) = if let Some(ref tr) = transformer {
+                tr.transform(x, y).map_err(to_js_err)?
+            } else {
+                (x, y)
+            };
+            coords.push([lon, lat]);
+        }
+        features.push(serde_json::json!({
+            "type": "Feature",
+            "id": idx + 1,
+            "geometry": {
+                "type": "LineString",
+                "coordinates": coords,
+            },
+            "properties": {
+                "from_dep_id": p.from_dep_id,
+                "from_level": p.from_level,
+                "to_dep_id": p.to_dep_id,
+                "spill_time_h": p.spill_time_h,
+                "merge_time_h": p.merge_time_h,
+                "spill_elev": p.spill_elev,
+                "cell_count": p.cells.len(),
+            },
+        }));
+    }
+    serde_json::to_string(&serde_json::json!({
+        "type": "FeatureCollection",
+        "name": "spill_flow_paths",
+        "features": features,
+    }))
+    .map_err(to_js_err)
+}
+
 /// Output container returned by [`simulate_inundation`].
 ///
-/// Returns live playback data (`fillTimeValues`, `hillshadeRgba`, `stepsJson`, spatial previews,
-/// and downloadable rasters/GeoJSON) immediately without blocking on GIF quantization. Call
-/// [`InundationOutput::encode_gif`] on demand to generate an animated GIF byte buffer.
+/// Returns live playback data (`fillTimeValues`, `hillshadeRgba`, `stepsJson`, `spillPathsJson`,
+/// spatial previews, and downloadable rasters/GeoJSON) immediately without blocking on GIF
+/// quantization. Call [`InundationOutput::encode_gif`] on demand to generate an animated GIF.
 #[wasm_bindgen]
 pub struct InundationOutput {
     width: usize,
@@ -560,9 +636,11 @@ pub struct InundationOutput {
     rain_intensity_cm_h: f64,
     dem_refined: Array2D<f64>,
     fill_time: Array2D<f64>,
+    spill_paths: Vec<SpillFlowPath>,
     depressions_json: String,
     catchment_hierarchy_json: String,
     steps_json: String,
+    spill_paths_json: String,
     fill_time_tif: Vec<u8>,
     catchment_hir_tif: Vec<u8>,
     sink_tif: Vec<u8>,
@@ -613,6 +691,20 @@ impl InundationOutput {
     pub fn steps_json(&self) -> String {
         self.steps_json.clone()
     }
+    #[wasm_bindgen(js_name = spillPathsJson)]
+    pub fn spill_paths_json(&self) -> String {
+        self.spill_paths_json.clone()
+    }
+    /// Exports delineated spill flow paths as an RFC 7946 GeoJSON FeatureCollection in WGS 84
+    /// longitude/latitude coordinates (reprojected from the DEM CRS when necessary).
+    #[wasm_bindgen(js_name = spillPathsGeojson)]
+    pub fn spill_paths_geojson(&self) -> Result<String, JsValue> {
+        spill_paths_to_geojson(
+            &self.spill_paths,
+            &self.dem_refined.geotransform,
+            &self.projection,
+        )
+    }
     #[wasm_bindgen(js_name = fillTimeTif)]
     pub fn fill_time_tif(&self) -> Vec<u8> {
         self.fill_time_tif.clone()
@@ -662,6 +754,7 @@ impl InundationOutput {
         frame_delay_ms: u16,
         ping_pong: bool,
         max_dim: usize,
+        show_spill_paths: Option<bool>,
     ) -> Result<Vec<u8>, JsValue> {
         let total_frames = if ping_pong && self.num_steps > 1 {
             self.num_steps.saturating_mul(2).saturating_sub(1)
@@ -704,11 +797,17 @@ impl InundationOutput {
             rain_intensity_cm_h: Some(self.rain_intensity_cm_h),
             ..Default::default()
         };
-        let (gif_bytes, _, _, _) = animate_inundation_to_bytes(
+        let paths: &[SpillFlowPath] = if show_spill_paths.unwrap_or(true) {
+            &self.spill_paths
+        } else {
+            &[]
+        };
+        let (gif_bytes, _, _, _) = animate_inundation_to_bytes_with_spill_paths(
             &self.dem_refined,
             &self.fill_time,
             self.num_steps,
             self.time_step_h,
+            paths,
             &anim_opts,
         )
         .map_err(to_js_err)?;
@@ -777,6 +876,7 @@ pub fn simulate_inundation(
     let catchment_hierarchy_json =
         serde_json::to_string(&pipe.catchment_records).map_err(to_js_err)?;
     let steps_json = serde_json::to_string(&pipe.steps).map_err(to_js_err)?;
+    let spill_paths_json = serde_json::to_string(&pipe.spill_paths).map_err(to_js_err)?;
     let fill_time_tif = write_array2d_tif(&pipe.fill_time, "fill_time.tif")?;
     let catchment_hir_tif = write_array2d_tif(&pipe.catchment_hierarchy, "catchment_hir.tif")?;
     let sink_tif = write_array2d_tif(&pipe.sinks.sink, "sink.tif")?;
@@ -794,9 +894,11 @@ pub fn simulate_inundation(
         rain_intensity_cm_h,
         dem_refined: pipe.sinks.dem_refined,
         fill_time: pipe.fill_time,
+        spill_paths: pipe.spill_paths,
         depressions_json,
         catchment_hierarchy_json,
         steps_json,
+        spill_paths_json,
         fill_time_tif,
         catchment_hir_tif,
         sink_tif,
