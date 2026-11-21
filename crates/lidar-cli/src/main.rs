@@ -502,9 +502,9 @@ enum Commands {
         /// Rainfall intensity in cm/h
         #[arg(long, default_value_t = 5.0)]
         rain_intensity: f64,
-        /// Total rainfall duration in hours
-        #[arg(long, default_value_t = 50.0)]
-        duration: f64,
+        /// Total rainfall duration in hours (defaults to 24.0 when --scs-type2-mm is set, else 50.0)
+        #[arg(long)]
+        duration: Option<f64>,
         /// Simulation time step in hours
         #[arg(long, default_value_t = 1.0)]
         time_step: f64,
@@ -1150,6 +1150,7 @@ fn run() -> lidar::Result<()> {
             compress,
             json,
         } => {
+            let duration = duration.unwrap_or(if scs_type2_mm.is_some() { 24.0 } else { 50.0 });
             let hyetograph = scs_type2_mm
                 .map(|mm| scs_type2_hyetograph(mm, duration, time_step))
                 .transpose()?;

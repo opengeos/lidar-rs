@@ -12,7 +12,9 @@ use std::path::Path;
 pub use terrio::pointcloud::{
     Dimension, LasHeader, PointCloud, PointFilter, PointFormat, PointReadOptions,
     PointWriteOptions, ReturnKind, ValueType, Values,
-    filters::{CsfOptions, PmfOptions, csf as terrio_csf, pmf as terrio_pmf},
+    filters::{
+        CsfOptions, PmfOptions, csf as terrio_csf, csf_classes, pmf as terrio_pmf, pmf_classes,
+    },
     grid::{GridMethod, GridOptions, GridStat},
 };
 
@@ -299,6 +301,30 @@ pub fn lidar_to_dsm(
     Ok(dims)
 }
 
+fn select_ground_points(
+    raw: &PointCloud,
+    method: GroundFilterMethod,
+    ground_class: u8,
+) -> Result<PointCloud> {
+    match method {
+        GroundFilterMethod::Preclassified => filter_by_classification(raw, &[ground_class]),
+        GroundFilterMethod::Csf | GroundFilterMethod::Pmf => {
+            if ground_class != 2 {
+                return Err(Error::InvalidArgument(format!(
+                    "{method:?} always assigns ASPRS ground class 2; set ground_class=2 or use GroundFilterMethod::Preclassified (got ground_class={ground_class})"
+                )));
+            }
+            let classes = match method {
+                GroundFilterMethod::Csf => csf_classes(raw, &CsfOptions::default())?,
+                GroundFilterMethod::Pmf => pmf_classes(raw, &PmfOptions::default())?,
+                GroundFilterMethod::Preclassified => unreachable!(),
+            };
+            let keep: Vec<bool> = classes.iter().map(|&c| c == Some(2)).collect();
+            Ok(raw.select(&keep))
+        }
+    }
+}
+
 /// Generates a bare-earth Digital Terrain Model (DTM) GeoTIFF from a LiDAR point cloud.
 ///
 /// Uses existing ASPRS ground returns (`Preclassified`) or runs pure-Rust ground
@@ -328,15 +354,8 @@ pub fn lidar_to_dtm(
             read_lidar_filtered(in_lidar, filter)?
         }
         method => {
-            if options.ground_class != 2 {
-                return Err(Error::InvalidArgument(format!(
-                    "{method:?} always assigns ASPRS ground class 2; set ground_class=2 or use GroundFilterMethod::Preclassified (got ground_class={})",
-                    options.ground_class
-                )));
-            }
             let raw = read_lidar(in_lidar)?;
-            let classified = classify_ground(&raw, method)?;
-            filter_by_classification(&classified, &[2])?
+            select_ground_points(&raw, method, options.ground_class)?
         }
     };
 
@@ -383,21 +402,7 @@ pub fn lidar_to_chm(
     if raw.is_empty() {
         return Err(Error::Algorithm("input point cloud is empty".into()));
     }
-    let ground = match options.ground_method {
-        GroundFilterMethod::Preclassified => {
-            filter_by_classification(&raw, &[options.ground_class])?
-        }
-        method => {
-            if options.ground_class != 2 {
-                return Err(Error::InvalidArgument(format!(
-                    "{method:?} always assigns ASPRS ground class 2; set ground_class=2 or use GroundFilterMethod::Preclassified (got ground_class={})",
-                    options.ground_class
-                )));
-            }
-            let classified = classify_ground(&raw, method)?;
-            filter_by_classification(&classified, &[2])?
-        }
-    };
+    let ground = select_ground_points(&raw, options.ground_method, options.ground_class)?;
     if ground.is_empty() {
         return Err(Error::Algorithm(format!(
             "no ground points found (class={})",
@@ -476,4 +481,66 @@ pub fn lidar_to_chm(
     chm.set_no_data(nd);
     richdem::save_raster(&chm, out_path, Some("lidar_to_chm"), false)?;
     Ok((w, h))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn select_ground_points_rejects_stale_class2_canopy_returns() {
+        let mut xs = Vec::new();
+        let mut ys = Vec::new();
+        let mut zs = Vec::new();
+        let mut cls = Vec::new();
+        let mut rn = Vec::new();
+        let mut nr = Vec::new();
+        for r in 0..16 {
+            for c in 0..16 {
+                xs.push(500_000.0 + c as f64);
+                ys.push(4_000_000.0 + r as f64);
+                zs.push(100.0);
+                cls.push(1u8); // initially unclassified ground
+                rn.push(2u8);
+                nr.push(2u8);
+            }
+        }
+        // Add elevated canopy points that carry a stale pre-existing class 2 label on first return
+        // (which CSF ignores in its default Last/Only return set) and on only-return points.
+        xs.push(500_008.0);
+        ys.push(4_000_008.0);
+        zs.push(125.0);
+        cls.push(2u8);
+        rn.push(1u8);
+        nr.push(2u8);
+
+        xs.push(500_009.0);
+        ys.push(4_000_009.0);
+        zs.push(125.0);
+        cls.push(2u8);
+        rn.push(1u8);
+        nr.push(1u8);
+
+        let cloud = PointCloud::new(
+            vec![
+                Dimension::new("x", Values::F64(xs)),
+                Dimension::new("y", Values::F64(ys)),
+                Dimension::new("z", Values::F64(zs)),
+                Dimension::new("classification", Values::U8(cls)),
+                Dimension::new("return_number", Values::U8(rn)),
+                Dimension::new("number_of_returns", Values::U8(nr)),
+            ],
+            terrio::crs::SpatialRef::parse("EPSG:32615").unwrap(),
+        );
+
+        let ground = select_ground_points(&cloud, GroundFilterMethod::Csf, 2).unwrap();
+        assert!(!ground.is_empty());
+        let Values::F64(gz) = &ground.dim("z").unwrap().values else {
+            panic!("expected f64 z dimension");
+        };
+        assert!(
+            gz.iter().all(|&z| z < 105.0),
+            "stale class-2 canopy points must not leak into CSF ground subset"
+        );
+    }
 }
