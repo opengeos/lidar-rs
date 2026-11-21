@@ -10,6 +10,8 @@
 
 High-performance nested depression delineation and fill-and-spill inundation simulation from Digital Elevation Models (DEMs) in **pure Rust**, ported from [`opengeos/lidar`](https://github.com/opengeos/lidar) and powered by [`terrio`](https://github.com/opengeos/terrio) and [`richdem`](https://github.com/opengeos/richdem-rs) with **zero GDAL or C/C++ dependencies**.
 
+[![Interactive inundation simulation and inundation curve in the lidar-rs WebAssembly Playground](https://files.opengeos.org/inundation_demo.gif)](https://lidar-rs.opengeos.org/playground/)
+
 ## Highlights
 
 - **DEM smoothing filters:** Mean (`mean_filter`), median (`median_filter`), and Gaussian (`gaussian_filter`) filters with symmetric boundary reflection, NoData preservation, and optional `rayon` row parallelism.

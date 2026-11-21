@@ -11,6 +11,8 @@ High-performance nested depression delineation and fill-and-spill inundation sim
 
 Try it interactively in your browser with no local setup via the live [WebAssembly Playground](playground.md) or the [Google Colab notebook](https://colab.research.google.com/github/opengeos/lidar-rs/blob/main/examples/lidar_rs_demo.ipynb).
 
+[![Interactive inundation simulation and inundation curve in the lidar-rs WebAssembly Playground](https://files.opengeos.org/inundation_demo.gif)](playground.md)
+
 ## Key Features
 
 - **DEM smoothing filters:** Mean, median, and Gaussian filters with symmetric boundary reflection and NoData safety.
