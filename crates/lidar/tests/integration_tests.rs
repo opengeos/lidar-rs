@@ -592,5 +592,16 @@ fn test_spill_flow_paths_on_sample_dem() {
         if let Some(mt) = p.merge_time_h {
             assert!(mt > p.spill_time_h);
         }
+        if p.to_dep_id != 0 {
+            let &(end_c, end_r) = p.cells.last().unwrap();
+            assert_eq!(
+                pipe.depressions.depression_id.get(end_c, end_r) as u32,
+                p.to_dep_id,
+                "spill path {} -> {} must terminate inside target depression {}",
+                p.from_dep_id,
+                p.to_dep_id,
+                p.to_dep_id
+            );
+        }
     }
 }

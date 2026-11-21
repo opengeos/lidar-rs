@@ -680,7 +680,7 @@
     const minDepth = Math.max(0.01, parseFloat($("lp-min-depth").value) || 0.3);
     const interval = Math.max(0.01, parseFloat($("lp-interval").value) || 0.3);
     const rain = Math.max(0.1, parseFloat($("lp-rain").value) || 5.0);
-    const duration = Math.max(0.5, parseFloat($("lp-duration").value) || 25.0);
+    const duration = Math.max(0.5, parseFloat($("lp-duration").value) || 70.0);
     const step = Math.max(0.1, parseFloat($("lp-step").value) || 1.0);
 
     const runBtn = $("lp-run");

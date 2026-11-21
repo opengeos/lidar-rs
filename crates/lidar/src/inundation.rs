@@ -539,6 +539,15 @@ impl Ord for HeapCell {
 /// Tracing all the way to the receiving pit (rather than stopping at a dry outer rim of a
 /// parent depression) produces the complete physical overland flow channel so that rendering
 /// can dynamically trim the submerged ends at any simulation timestamp `t`.
+/// Traces D8 flow downhill from `start_idx` and returns `Some((path_cells, target_dep_id))`
+/// when the path drains away from `source` (`in_source`) into a real downstream depression
+/// (`target_dep_id != 0`, distinct from `desc_ids` and `ancestor_ids`) or exits the DEM
+/// (`target_dep_id == 0`).
+///
+/// Cells that loop back into `in_source` are cached in `drains_to_source`. Cells that end at
+/// a `NO_FLOW` sub-threshold micro-pit without reaching a non-ancestor depression are cached
+/// in `trapped_in_pit` and rejected (`None`) so the outward Priority-Flood search steps
+/// across the micro-pit until it finds the true overland outlet into the downstream basin.
 #[allow(clippy::too_many_arguments)]
 fn trace_downstream_away_from_source(
     start_idx: usize,
@@ -550,13 +559,13 @@ fn trace_downstream_away_from_source(
     desc_ids: &HashSet<u32>,
     ancestor_ids: &HashSet<u32>,
     drains_to_source: &mut [u32],
+    trapped_in_pit: &mut [u32],
     reject_gen: u32,
     seen_stamp: &mut [u32],
     stamp: u32,
 ) -> Option<(Vec<usize>, u32)> {
     let mut trace = Vec::new();
     let mut target_dep = 0u32;
-    let mut fallback_ancestor_dep = 0u32;
     let mut cur = start_idx;
     let max_steps = w * h;
 
@@ -564,6 +573,12 @@ fn trace_downstream_away_from_source(
         if in_source[cur] || drains_to_source[cur] == reject_gen {
             for &idx in &trace {
                 drains_to_source[idx] = reject_gen;
+            }
+            return None;
+        }
+        if target_dep == 0 && trapped_in_pit[cur] == reject_gen {
+            for &idx in &trace {
+                trapped_in_pit[idx] = reject_gen;
             }
             return None;
         }
@@ -576,23 +591,20 @@ fn trace_downstream_away_from_source(
         let did = dep_ids[cur];
         if did > 0 {
             let uid = did as u32;
-            if !desc_ids.contains(&uid) {
-                if !ancestor_ids.contains(&uid) {
-                    target_dep = uid;
-                } else {
-                    fallback_ancestor_dep = uid;
-                }
+            if !desc_ids.contains(&uid) && !ancestor_ids.contains(&uid) {
+                target_dep = uid;
             }
         }
 
         let dir = flowdirs[cur] as usize;
         if dir == NO_FLOW as usize || dir > 8 {
-            let resolved_target = if target_dep != 0 {
-                target_dep
-            } else {
-                fallback_ancestor_dep
-            };
-            return Some((trace, resolved_target));
+            if target_dep != 0 {
+                return Some((trace, target_dep));
+            }
+            for &idx in &trace {
+                trapped_in_pit[idx] = reject_gen;
+            }
+            return None;
         }
         let r = cur / w;
         let c = cur % w;
@@ -604,12 +616,14 @@ fn trace_downstream_away_from_source(
         cur = (nr as usize) * w + (nc as usize);
     }
 
-    let resolved_target = if target_dep != 0 {
-        target_dep
+    if target_dep != 0 {
+        Some((trace, target_dep))
     } else {
-        fallback_ancestor_dep
-    };
-    Some((trace, resolved_target))
+        for &idx in &trace {
+            trapped_in_pit[idx] = reject_gen;
+        }
+        None
+    }
 }
 
 /// Delineates overland fill-and-spill flow paths connecting each nested depression to its
@@ -678,6 +692,7 @@ pub fn delineate_spill_flow_paths_in_memory(
     let mut in_source = vec![false; n];
     let mut visited_pf = vec![0u32; n];
     let mut drains_to_source = vec![0u32; n];
+    let mut trapped_in_pit = vec![0u32; n];
     let mut pf_gen = 0u32;
     let mut parent_cell = vec![usize::MAX; n];
     let mut trace_seen = vec![0u32; n];
@@ -761,6 +776,7 @@ pub fn delineate_spill_flow_paths_in_memory(
         if pf_gen == 0 {
             visited_pf.fill(0);
             drains_to_source.fill(0);
+            trapped_in_pit.fill(0);
             pf_gen = 1;
         }
         for &idx in &source_cells {
@@ -817,6 +833,7 @@ pub fn delineate_spill_flow_paths_in_memory(
                     &desc_ids,
                     &ancestor_ids,
                     &mut drains_to_source,
+                    &mut trapped_in_pit,
                     pf_gen,
                     &mut trace_seen,
                     trace_gen,
@@ -1284,6 +1301,129 @@ mod tests {
         assert!(
             core_t <= rim_t,
             "inner core ({core_t}h) should inundate no later than outer rim ({rim_t}h)"
+        );
+    }
+
+    #[test]
+    fn spill_path_crosses_sub_threshold_micropit_into_downstream_depression() {
+        // 11x25 terrain inside a compound parent sink (id=1, level=2) containing two
+        // sibling leaf basins:
+        //   - upstream basin A (id=2, level=1) at cols 2..6, rows 3..8 (floor 10.0)
+        //   - downstream basin B (id=3, level=1) at cols 18..22, rows 3..8 (floor 8.0)
+        // Separated by a saddle containing a small sub-threshold micro-pit at (col=11, row=5, z=11.4)
+        // between a 11.6 rim on A's side and a 11.55 bump on B's side. The spill path from A
+        // must cross the micro-pit and terminate inside downstream basin B (id=3), never stopping
+        // at the parent ring (id=1).
+        let w = 25usize;
+        let h = 11usize;
+        let mut z = vec![20.0f64; w * h];
+        let mut dep_id = vec![0i32; w * h];
+        let mut dep_lvl = vec![0i32; w * h];
+        let mut ft = vec![-1.0f64; w * h];
+
+        for r in 1..10 {
+            for c in 1..24 {
+                z[r * w + c] = 14.0;
+                dep_id[r * w + c] = 1;
+                dep_lvl[r * w + c] = 2;
+                ft[r * w + c] = 10.0;
+            }
+        }
+        // Saddle corridor along row 5 from col 6..18 with a micro-pit at col 11.
+        let corridor_z = [
+            (6, 11.55),
+            (7, 11.60),
+            (8, 11.58),
+            (9, 11.52),
+            (10, 11.46),
+            (11, 11.40), // local micro-pit inside parent ring (id=1)
+            (12, 11.48),
+            (13, 11.55), // low micro-ridge separating pit from B
+            (14, 11.30),
+            (15, 10.80),
+            (16, 10.20),
+            (17, 9.60),
+        ];
+        for (c, elev) in corridor_z {
+            z[5 * w + c] = elev;
+        }
+        // Basin A (id=2, fills early at 2.0h)
+        for r in 3..8 {
+            for c in 2..6 {
+                let d = ((r as isize - 5).abs() + (c as isize - 4).abs()) as f64;
+                z[r * w + c] = 10.0 + 0.3 * d;
+                dep_id[r * w + c] = 2;
+                dep_lvl[r * w + c] = 1;
+                ft[r * w + c] = 2.0;
+            }
+        }
+        // Basin B (id=3, deeper, fills later at 5.0h)
+        for r in 3..8 {
+            for c in 18..22 {
+                let d = ((r as isize - 5).abs() + (c as isize - 20).abs()) as f64;
+                z[r * w + c] = 8.0 + 0.3 * d;
+                dep_id[r * w + c] = 3;
+                dep_lvl[r * w + c] = 1;
+                ft[r * w + c] = 5.0;
+            }
+        }
+
+        let mut dem = Array2D::from_vec(w, h, z).unwrap();
+        dem.set_no_data(-9999.0);
+        let mut id_arr = Array2D::from_vec(w, h, dep_id).unwrap();
+        id_arr.set_no_data(0);
+        let mut lvl_arr = Array2D::from_vec(w, h, dep_lvl).unwrap();
+        lvl_arr.set_no_data(0);
+        let mut ft_arr = Array2D::from_vec(w, h, ft).unwrap();
+        ft_arr.set_no_data(-1.0);
+
+        let dummy_dep = |id: u32, level: u32, min_elev: f64, children_ids: Vec<u32>| {
+            crate::slicing::NestedDepression {
+                id,
+                level,
+                count: 20,
+                area: 20.0,
+                volume: 20.0,
+                avg_depth: 1.0,
+                max_depth: 2.0,
+                min_elev,
+                max_elev: min_elev + 2.0,
+                children_ids,
+                region_id: 1,
+                perimeter: 16.0,
+                major_axis: 5.0,
+                minor_axis: 5.0,
+                elongatedness: 1.0,
+                eccentricity: 0.0,
+                orientation: 0.0,
+                area_bbox_ratio: 1.0,
+            }
+        };
+        let deps = InMemoryDepressions {
+            depression_id: id_arr,
+            depression_level: lvl_arr,
+            depressions: vec![
+                dummy_dep(1, 2, 8.0, vec![2, 3]),
+                dummy_dep(2, 1, 10.0, vec![]),
+                dummy_dep(3, 1, 8.0, vec![]),
+            ],
+            num_regions: 1,
+            max_level: 2,
+        };
+
+        let paths = delineate_spill_flow_paths_in_memory(&dem, &deps, &ft_arr).unwrap();
+        assert_eq!(paths.len(), 1, "expected 1 deduplicated spill path A -> B");
+        let p = &paths[0];
+        assert_eq!(p.from_dep_id, 2);
+        assert_eq!(
+            p.to_dep_id, 3,
+            "spill path must cross the micro-pit and connect to downstream basin 3, not parent 1"
+        );
+        let &(end_c, end_r) = p.cells.last().unwrap();
+        assert_eq!(
+            deps.depression_id.get(end_c, end_r),
+            3,
+            "path endpoint ({end_c}, {end_r}) must lie inside downstream basin 3"
         );
     }
 }

@@ -44,7 +44,7 @@ Run **`lidar-rs`** directly in your browser via WebAssembly — DEM smoothing, P
     </div>
     <div class="lp-field lp-inundation-only">
       <label for="lp-duration">Rain duration (h)</label>
-      <input type="number" id="lp-duration" value="25" min="1" max="200" step="1">
+      <input type="number" id="lp-duration" value="70" min="1" max="200" step="1">
     </div>
     <div class="lp-field lp-inundation-only">
       <label for="lp-step">Time step (h)</label>
