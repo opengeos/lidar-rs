@@ -307,8 +307,7 @@
       const p = i * 4;
       const ft = fillTimes[i];
       if (tHours > 0 && ft >= 0 && ft <= tHours) {
-        const freshness =
-          tHours > 0 ? Math.min(1, Math.max(0, (tHours - ft) / Math.max(tHours, 1))) : 0;
+        const freshness = Math.min(1, Math.max(0, (tHours - ft) / Math.max(tHours, 1)));
         const r = Math.round(wr * (1 - 0.35 * freshness));
         const g = Math.round(wg * (1 - 0.3 * freshness));
         const b = Math.round(wb * (1 - 0.12 * freshness));
