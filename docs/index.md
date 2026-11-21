@@ -3,13 +3,15 @@
 [![CI](https://github.com/opengeos/lidar-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/opengeos/lidar-rs/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/lidar.svg)](https://crates.io/crates/lidar)
 [![PyPI](https://img.shields.io/pypi/v/lidar-rs)](https://pypi.org/project/lidar-rs/)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24411444.svg)](https://doi.org/10.5281/zenodo.24411444)
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/opengeos/lidar-rs/blob/main/examples/lidar_rs_demo.ipynb)
+[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.24411444-blue.svg)](https://doi.org/10.5281/zenodo.24411444)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/opengeos/lidar-rs/blob/main/LICENSE)
 
 High-performance nested depression delineation and fill-and-spill inundation simulation from digital elevation models (DEMs) in **pure Rust**, ported from [`opengeos/lidar`](https://github.com/opengeos/lidar) and powered by [`terrio`](https://github.com/opengeos/terrio) and [`richdem`](https://github.com/opengeos/richdem-rs) with **zero GDAL or C/C++ dependencies**.
 
 Try it interactively in your browser with no local setup via the live [WebAssembly Playground](playground.md) or the [Google Colab notebook](https://colab.research.google.com/github/opengeos/lidar-rs/blob/main/examples/lidar_rs_demo.ipynb).
+
+[![Interactive inundation simulation and inundation curve in the lidar-rs WebAssembly Playground](https://files.opengeos.org/inundation_demo.gif)](playground.md)
 
 ## Key Features
 
