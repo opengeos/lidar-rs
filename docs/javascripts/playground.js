@@ -172,7 +172,7 @@
   }
 
   function drawActiveSpillPaths(ctx, width, height, fillTimes, tHours, spillPaths, stepIdx) {
-    if (!spillPaths || !spillPaths.length) return 0;
+    if (!spillPaths || !spillPaths.length || tHours <= 0) return 0;
     let activeCount = 0;
     for (const path of spillPaths) {
       if (
@@ -306,7 +306,7 @@
     for (let i = 0; i < n; i++) {
       const p = i * 4;
       const ft = fillTimes[i];
-      if (ft >= 0 && ft <= tHours) {
+      if (tHours > 0 && ft >= 0 && ft <= tHours) {
         const freshness =
           tHours > 0 ? Math.min(1, Math.max(0, (tHours - ft) / Math.max(tHours, 1))) : 0;
         const r = Math.round(wr * (1 - 0.35 * freshness));
@@ -482,12 +482,26 @@
     areaUnit,
   ) {
     stopPlayer();
+    // Prepend the dry initial state (T = 0 h) so playback, scrubbing, and chart clicks start at T0.
+    const playerSteps =
+      steps.length > 0 && steps[0].time_hours > 0
+        ? [
+            {
+              step: 0,
+              time_hours: 0,
+              inundated_cells: 0,
+              inundated_area: 0,
+              inundated_fraction: 0,
+            },
+            ...steps,
+          ]
+        : steps;
     player = {
       width,
       height,
       hillshade,
       fillTimes,
-      steps,
+      steps: playerSteps,
       spillPaths,
       rainIntensity,
       areaUnit,
@@ -499,11 +513,11 @@
     const slider = $("lp-slider");
     if (slider) {
       slider.min = "0";
-      slider.max = String(Math.max(0, steps.length - 1));
+      slider.max = String(Math.max(0, playerSteps.length - 1));
       slider.value = "0";
     }
     renderPlayerFrame();
-    if (steps.length > 1) {
+    if (playerSteps.length > 1) {
       startPlayer();
     }
   }
@@ -992,7 +1006,18 @@
         Math.max(0, (x - padLeft) / (e.currentTarget.width - padLeft - padRight)),
       );
       stopPlayer();
-      player.stepIdx = Math.round(frac * (player.steps.length - 1));
+      const maxT = Math.max(player.steps[player.steps.length - 1].time_hours, 1e-6);
+      const targetT = frac * maxT;
+      let bestIdx = 0;
+      let bestDiff = Infinity;
+      for (let i = 0; i < player.steps.length; i++) {
+        const diff = Math.abs(player.steps[i].time_hours - targetT);
+        if (diff < bestDiff) {
+          bestDiff = diff;
+          bestIdx = i;
+        }
+      }
+      player.stepIdx = bestIdx;
       renderPlayerFrame();
     });
 
