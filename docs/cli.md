@@ -10,7 +10,7 @@ lidar pipeline dem.tif out_pipe --min-size 1000 --min-depth 0.3 --interval 0.3 -
 lidar breach-depressions dem.tif out/breached.tif --mode selective --max-depth 1.5 --max-length 40
 lidar burn-culverts dem.tif culverts.geojson out/burned.tif --half-width 1 --depth-offset 0.05
 
-# Tiled out-of-core delineation for large regional DEMs (with f32 memory savings)
+# Tiled regional delineation with overlapping halos (and optional f32 loading)
 lidar tiled-depressions large_dem.tif out_tiled --tile-size 2048 --overlap 256 --use-f32
 
 # Smooth a DEM

@@ -1,9 +1,11 @@
-//! Tiled/out-of-core regional depression delineation and `f32` memory-efficient helpers.
+//! Tiled regional depression delineation with overlapping halos and optional `f32` loading.
 //!
 //! Splits large DEM rasters into overlapping square tiles, delineates nested
 //! depressions independently per tile (in parallel when the `parallel` feature is
 //! enabled), deduplicates features along tile overlap seams using non-overlapping
-//! tile cores, and merges globally numbered depression attributes.
+//! tile cores and minimum-elevation keys, and merges globally numbered depression
+//! attributes. Peak per-tile working memory is bounded by the tile size, while the
+//! source raster is loaded into memory (optionally as `f32` to halve RAM usage).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -154,8 +156,10 @@ fn process_one_tile(
 
     // Compute pixel centroid and global minimum-elevation cell for each top-level sink region.
     // Keeping complete regions whose centroid falls inside this tile's non-overlapping core
-    // preserves parent-child hierarchy integrity, and global deduplication by `min_cell` prevents
-    // any region wider than `overlap` from being emitted twice across neighbouring tiles.
+    // preserves parent-child hierarchy integrity for depressions that fit within the overlap halo.
+    // Global deduplication by `min_cell` removes duplicates when both neighbouring tiles see the
+    // same lowest cell; basins wider than `overlap` can still be clipped at a tile edge, so
+    // callers should set `overlap` larger than the expected maximum basin width.
     let tw = deps.depression_id.width();
     let th = deps.depression_id.height();
     let id_data = deps.depression_id.data();
@@ -291,9 +295,9 @@ fn run_tiled_generic<T: DemNum>(
         .map(run_one)
         .collect::<Result<Vec<_>>>()?;
 
-    // Global deduplication across tile seams keyed by each sink region's global lowest pixel:
-    // if a depression wider than `overlap` landed in two neighbouring tiles, keep the tile copy
-    // with the largest pixel count (least clipped).
+    // Global deduplication across tile seams keyed by each sink region's lowest pixel within
+    // the padded tile: when two neighbouring tiles observe the same lowest cell, keep the copy
+    // with the largest pixel count (least clipped). Exact for depressions fitting within `overlap`.
     let mut best_by_min_cell: HashMap<(usize, usize), TileRegionOutput> = HashMap::new();
     for tile_regions in per_tile {
         for reg in tile_regions {

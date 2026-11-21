@@ -1176,10 +1176,13 @@ pub fn scs_curve_number_runoff(cn: &Array2D<f64>, precip_mm: f64) -> Result<Arra
             if !v.is_finite() || v.rd_eq(nd) {
                 return 1.0;
             }
-            let c = v.clamp(1e-6, 100.0);
+            if v <= 0.0 {
+                return 0.0;
+            }
+            let c = v.min(100.0);
             let s = 25_400.0 / c - 254.0;
             let ia = 0.2 * s;
-            if precip_mm <= ia {
+            if !s.is_finite() || !ia.is_finite() || precip_mm <= ia {
                 0.0
             } else {
                 let q = (precip_mm - ia).powi(2) / (precip_mm - ia + s);
@@ -1576,6 +1579,15 @@ pub fn simulate_inundation_with_forcing_in_memory(
     let w = sink.width();
     let h = sink.height();
     let sink_gt = sink.geotransform;
+    let cell_x = sink_gt[1].hypot(sink_gt[2]).max(1e-9);
+    let cell_y = sink_gt[4].hypot(sink_gt[5]).max(1e-9);
+    let sink_srs = if sink.projection.is_empty() {
+        None
+    } else {
+        terrio::crs::SpatialRef::parse(&sink.projection)
+            .ok()
+            .filter(|s| !s.is_unknown())
+    };
     let check_grid = |arr: &Array2D<f64>, name: &str| -> Result<()> {
         if arr.width() != w || arr.height() != h {
             return Err(Error::DimensionMismatch(format!(
@@ -1585,12 +1597,28 @@ pub fn simulate_inundation_with_forcing_in_memory(
             )));
         }
         for (k, (&a, &b)) in arr.geotransform.iter().zip(sink_gt.iter()).enumerate() {
-            let tol = 1e-6 * a.abs().max(b.abs()).max(1.0);
+            let tol = match k {
+                0 => 1e-3 * cell_x,
+                3 => 1e-3 * cell_y,
+                _ => 1e-6 * a.abs().max(b.abs()).max(1e-12),
+            };
             if (a - b).abs() > tol {
                 return Err(Error::DimensionMismatch(format!(
                     "{name} geotransform[{k}] ({a}) does not match sink ({b})"
                 )));
             }
+        }
+        if let Some(ref s_srs) = sink_srs
+            && !arr.projection.is_empty()
+            && let Ok(a_srs) = terrio::crs::SpatialRef::parse(&arr.projection)
+            && !a_srs.is_unknown()
+            && !s_srs.same_as(&a_srs)
+        {
+            return Err(Error::InvalidArgument(format!(
+                "{name} CRS ({}) does not match sink CRS ({})",
+                a_srs.label(),
+                s_srs.label()
+            )));
         }
         Ok(())
     };
@@ -1968,6 +1996,18 @@ pub fn run_pipeline(
     }
     let candidate_refs: Vec<&Path> = candidate_outputs.iter().map(PathBuf::as_path).collect();
     crate::raster_ops::ensure_no_path_collision(in_dem, &candidate_refs)?;
+    for opt_in in [
+        options.culverts_vector.as_deref(),
+        options.runoff_coeff_path.as_deref(),
+        options.infiltration_path.as_deref(),
+        options.antecedent_depth_path.as_deref(),
+        options.stream_vector.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        crate::raster_ops::ensure_no_path_collision(opt_in, &candidate_refs)?;
+    }
 
     let mut dem = if options.use_f32 {
         let d32 = load_raster::<f32>(in_dem, None)?;
@@ -2726,5 +2766,61 @@ mod tests {
             3,
             "trace must be truncated to end inside target depression 3"
         );
+    }
+
+    #[test]
+    fn scs_cn_preserves_small_positive_cn_values() {
+        let mut cn = Array2D::from_vec(3, 1, vec![5e-7, 0.0, 100.0]).unwrap();
+        cn.set_no_data(-9999.0);
+        // For CN = 5e-7, S ~= 5.08e10 and Ia ~= 1.016e10 > 6e9 -> Q must be 0.0.
+        let coeff = scs_curve_number_runoff(&cn, 6e9).unwrap();
+        assert_eq!(coeff.data()[0], 0.0);
+        assert_eq!(coeff.data()[1], 0.0);
+        assert!((coeff.data()[2] - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn forced_inundation_rejects_one_pixel_shift_and_crs_mismatch() {
+        let mut sink = Array2D::from_vec(4, 4, vec![100.0f64; 16]).unwrap();
+        sink.set_no_data(-9999.0);
+        sink.geotransform = [500_000.0, 1.0, 0.0, 5_000_000.0, 0.0, -1.0];
+        sink.projection = "EPSG:26916".to_string();
+
+        let mut cat = Array2D::from_vec(4, 4, vec![16.0f64; 16]).unwrap();
+        cat.set_no_data(0.0);
+        cat.geotransform = sink.geotransform;
+        cat.projection = sink.projection.clone();
+
+        let opts = SimulateInundationOptions::default();
+
+        // 1-pixel origin shift at northing 5,000,000 must fail.
+        let mut shifted_rc = Array2D::from_vec(4, 4, vec![0.5f64; 16]).unwrap();
+        shifted_rc.geotransform = [500_000.0, 1.0, 0.0, 5_000_001.0, 0.0, -1.0];
+        shifted_rc.projection = sink.projection.clone();
+        let err_shift = simulate_inundation_with_forcing_in_memory(
+            &sink,
+            &cat,
+            &opts,
+            &InundationForcing {
+                runoff_coeff: Some(&shifted_rc),
+                ..Default::default()
+            },
+        );
+        assert!(err_shift.is_err(), "1-pixel origin shift must be rejected");
+
+        // CRS mismatch must fail.
+        let mut wrong_crs_rc = Array2D::from_vec(4, 4, vec![0.5f64; 16]).unwrap();
+        wrong_crs_rc.geotransform = sink.geotransform;
+        wrong_crs_rc.projection = "EPSG:4326".to_string();
+        let err_crs = simulate_inundation_with_forcing_in_memory(
+            &sink,
+            &cat,
+            &opts,
+            &InundationForcing {
+                runoff_coeff: Some(&wrong_crs_rc),
+                ..Default::default()
+            },
+        );
+        assert!(err_crs.is_err(), "CRS mismatch must be rejected");
     }
 }
