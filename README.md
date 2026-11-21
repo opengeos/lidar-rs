@@ -4,10 +4,11 @@
 [![Docs](https://img.shields.io/badge/docs-lidar--rs.opengeos.org-teal.svg)](https://lidar-rs.opengeos.org)
 [![crates.io](https://img.shields.io/crates/v/lidar.svg)](https://crates.io/crates/lidar)
 [![PyPI](https://img.shields.io/pypi/v/lidar-rs)](https://pypi.org/project/lidar-rs/)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24411444.svg)](https://doi.org/10.5281/zenodo.24411444)
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/opengeos/lidar-rs/blob/main/examples/lidar_rs_demo.ipynb)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-High-performance nested surface depression and mount delineation from Digital Elevation Models (DEMs) in **pure Rust**, ported from [`opengeos/lidar`](https://github.com/opengeos/lidar) and powered by [`terrio`](https://github.com/opengeos/terrio) and [`richdem`](https://github.com/opengeos/richdem-rs) with **zero GDAL or C/C++ dependencies**.
+High-performance nested depression delineation and fill-and-spill inundation simulation from Digital Elevation Models (DEMs) in **pure Rust**, ported from [`opengeos/lidar`](https://github.com/opengeos/lidar) and powered by [`terrio`](https://github.com/opengeos/terrio) and [`richdem`](https://github.com/opengeos/richdem-rs) with **zero GDAL or C/C++ dependencies**.
 
 ## Highlights
 
@@ -147,6 +148,7 @@ Measured in release mode (`cargo run --release --example benchmark`) on the 400 
 
 ## Citations
 
+- **Wu, Q.** (2026). lidar-rs: High-performance nested depression delineation and fill-and-spill inundation simulation. *Zenodo*. <https://doi.org/10.5281/zenodo.24411444>
 - **Wu, Q.** (2021). lidar: A Python package for delineating nested surface depressions from digital elevation data. *Journal of Open Source Software*, 6(59), 2965. <https://doi.org/10.21105/joss.02965>
 - **Wu, Q.**, Lane, C.R., Wang, L., Vanderhoof, M.K., Christensen, J.R., & Liu, H. (2019). Efficient Delineation of Nested Depression Hierarchy in Digital Elevation Models for Hydrological Analysis Using Level-Set Method. *Journal of the American Water Resources Association*, 55(2), 354–368. <https://doi.org/10.1111/1752-1688.12689>
 
