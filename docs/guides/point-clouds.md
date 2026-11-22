@@ -6,12 +6,12 @@
 
 ## Supported Operations
 
-| Operation | CLI Subcommand | Python / Rust API | Description |
-| --- | --- | --- | --- |
-| **Format conversion** | `lidar convert-lidar` | `convert_lidar` | Convert between LAS, LAZ, COPC, PLY, and E57 with configurable point format (`0..10`). |
-| **Filtered DSM gridding** | `lidar lidar-to-dsm` | `lidar_to_dsm` | Grid raw or filtered points (by ASPRS classification codes, pulse return kinds, and `min_z`/`max_z` elevation bounds) into a GeoTIFF DSM. |
-| **Ground classification** | `lidar lidar-to-dtm` | `classify_ground`, `lidar_to_dtm` | Classify bare-earth ground points using pure-Rust **CSF** (Zhang et al., 2016), **PMF** (Zhang et al., 2003), or pre-classified ASPRS ground returns (`class == 2`), then interpolate a continuous bare-earth DTM. |
-| **Canopy Height Model** | `lidar lidar-to-chm` | `lidar_to_chm` | Grid a first-surface DSM and bare-earth DTM onto one exact shared XY lattice and compute `CHM = max(0, DSM - DTM)` in a single call. |
+| Operation | CLI Subcommand | Python API | Rust API | Description |
+| --- | --- | --- | --- | --- |
+| **Format conversion** | `lidar convert-lidar` | `convert_lidar` | `convert_lidar` | Convert between LAS, LAZ, COPC, PLY, and E57 with configurable point format (`0..10`). |
+| **Filtered DSM gridding** | `lidar lidar-to-dsm` | `lidar_to_dsm` | `lidar_to_dsm` | Grid raw or filtered points (by ASPRS classification codes, pulse return kinds, and `min_z`/`max_z` elevation bounds) into a GeoTIFF DSM. |
+| **Ground classification & DTM** | `lidar lidar-to-dtm` | `lidar_to_dtm` | `classify_ground`, `lidar_to_dtm` | Classify bare-earth ground points using pure-Rust **CSF** (Zhang et al., 2016), **PMF** (Zhang et al., 2003), or pre-classified ASPRS ground returns (`class == 2`), then interpolate a continuous bare-earth DTM (`classify_ground` is exposed in Rust; Python runs CSF/PMF via `lidar_to_dtm(..., ground_method="csf"|"pmf")`). |
+| **Canopy Height Model** | `lidar lidar-to-chm` | `lidar_to_chm` | `lidar_to_chm` | Grid a first-surface DSM and bare-earth DTM onto one exact shared XY lattice and compute `CHM = max(0, DSM - DTM)` in a single call. |
 
 ## Ground Classification Methods
 

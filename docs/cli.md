@@ -11,7 +11,7 @@ All sample files used below can be downloaded from [Sample Datasets](datasets.md
 | **All-in-One & Tiled Pipelines** | `pipeline`, `tiled-depressions` |
 | **Hydro-Conditioning** | `breach-depressions`, `burn-culverts` |
 | **DEM Smoothing & Sinks** | `mean-filter`, `median-filter`, `gaussian-filter`, `extract-sinks` |
-| **Nested Hierarchies** | `delineate-depressions`, `delineate-mounts` |
+| **Nested Hierarchies** | `delineate-depressions`, `delineate-mounts`, `flip-dem` |
 | **Catchments & Inundation** | `delineate-catchments`, `delineate-flow-paths`, `catchment-hierarchy`, `simulate-inundation` |
 | **Animation & Visualization** | `animate-inundation`, `export-frames` |
 | **LiDAR Point Clouds** | `convert-lidar`, `lidar-to-dsm`, `lidar-to-dtm`, `lidar-to-chm` |

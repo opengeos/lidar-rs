@@ -69,5 +69,10 @@ No installation is needed to try the [WebAssembly Playground](playground.md). To
 ```sh
 rustup target add wasm32-unknown-unknown
 cargo install wasm-pack
+
+# Browser ES module bundle (outputs js/pkg/)
 cd js && wasm-pack build --target web --release --out-dir pkg -- --locked
+
+# Node.js bundle (outputs js/pkg-node/)
+wasm-pack build --target nodejs --release --out-dir pkg-node -- --locked
 ```

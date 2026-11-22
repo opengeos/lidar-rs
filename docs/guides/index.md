@@ -65,7 +65,7 @@ Every delineated depression (and mount) computes 24 geometric, topological, and 
 | `depth_diam_ratio` | `f64` | Depth-to-equivalent-diameter ratio `max_depth / (2 * sqrt(area / pi))` |
 | `hypsometric_integral` | `f64` | Basin shape factor `avg_depth / max_depth` (`~0.33` cone, `~0.5` paraboloid, `~1.0` flat-bottomed) |
 | `rim_slope_deg` | `f64` | Mean rim-to-floor side slope `atan(max_depth / eq_radius)` in degrees |
-| `artifact_flag` | `bool` | Heuristic flag for narrow linear ditches or road-embankment artifacts (`elongatedness > 5`, `circularity < 0.25`, `max_depth < 0.6`) |
+| `artifact_flag` | `bool` | Heuristic flag for narrow linear ditches or road-embankment artifacts (`elongatedness > 6.0 && area_bbox_ratio < 0.25`) |
 
 ## Explore the Guides
 

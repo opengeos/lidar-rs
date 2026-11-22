@@ -25,16 +25,20 @@ Hydrologic models (SWAT+, HEC-HMS, GSSHA, MODFLOW, and custom Python/NetworkX ro
 | `stage` | DEM vertical units | Water surface elevation |
 | `depth` | DEM vertical units | Depth above depression floor (`stage - min_elev`) |
 | `area` | map units squared | Inundated surface area at `stage` |
-| `volume` | map units cubed | Cumulative stored volume below `stage` |
+| `volume` | horizontal map units² × DEM vertical units | Cumulative stored volume below `stage` (cubic map units when horizontal and vertical units match) |
 
 ## Directed Connectivity Graph Schema
 
 `build_connectivity_graph` produces a `ConnectivityGraph` exported to both pretty-printed JSON and standard GraphML XML (directly readable by NetworkX, Gephi, and igraph):
 
-- **Nodes (`GraphNode`):** `id`, `parent_id`, `level`, `region_id`, `area`, `volume`, `avg_depth`, `max_depth`, `min_elev`, `max_elev`, `circularity`, `hypsometric_integral`, `cat_area`, `fill_time_h`, and `fill_runoff_mm`. A virtual sink node `n0` represents watershed boundary exits (`to_id == 0`).
-- **Edges (`GraphEdge`):**
-  - `edge_type = "spill"`: Overland pour-point cascade from a filled basin to a downstream basin (or boundary exit `0`), with `spill_time_h`, `spill_runoff_mm`, `merge_time_h`, `spill_elev`, `length_m`, `start_xy`, `end_xy`, and optional `dist_to_stream`.
-  - `edge_type = "merge"`: Hierarchical child-to-parent coalescence link (`from_id = child`, `to_id = parent`, `merge_time_h = parent fill time`).
+- **Full JSON schema (`connectivity_graph.json`):**
+  - **Nodes (`GraphNode`):** `id`, `parent_id`, `level`, `region_id`, `area`, `volume`, `avg_depth`, `max_depth`, `min_elev`, `max_elev`, `circularity`, `hypsometric_integral`, `cat_area`, `fill_time_h`, and `fill_runoff_mm`.
+  - **Edges (`GraphEdge`):**
+    - `edge_type = "spill"`: Overland pour-point cascade from a filled basin to a downstream basin (or boundary exit `0`), with `spill_time_h`, `spill_runoff_mm`, `merge_time_h`, `spill_elev`, `length_m`, `start_xy`, `end_xy`, and optional `dist_to_stream`.
+    - `edge_type = "merge"`: Hierarchical child-to-parent coalescence link (`from_id = child`, `to_id = parent`, `merge_time_h = parent fill time`).
+- **GraphML attribute subset (`connectivity_graph.graphml`):**
+  - **Node attributes:** `level`, `region_id`, `parent_id`, `area`, `volume`, `max_depth`, `cat_area`, and `fill_runoff_mm` (plus a virtual sink node `n0` when any spill edge exits to the watershed boundary `to_id == 0`).
+  - **Edge attributes:** `edge_type`, `spill_runoff_mm`, `length_m`, and `dist_to_stream` (when finite). Use the JSON graph when you need `spill_time_h`, `merge_time_h`, `spill_elev`, `start_xy`, or `end_xy`.
 
 ## Stream Proximity Annotation (`--streams`)
 

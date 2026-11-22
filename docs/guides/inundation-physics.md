@@ -38,9 +38,16 @@ Non-finite and NoData CN cells propagate as NoData (`-9999.0`) in the output ras
     curl -LO https://files.opengeos.org/lidar/data/dem.tif
     curl -LO https://files.opengeos.org/lidar/data/sample_cn.tif
 
-    # Drive a 100 mm 24-hour SCS Type II design storm with spatially variable runoff,
-    # vertical infiltration, and antecedent ponded water
+    # 1. Run a 100 mm 24-hour SCS Type II design storm directly on dem.tif
     lidar pipeline dem.tif out_storm \
+      --min-size 1000 --min-depth 0.3 --interval 0.3 \
+      --scs-type2-mm 100 --time-step 0.5 \
+      --compress
+
+    # 2. With optional aligned forcing GeoTIFFs (same grid dimensions, geotransform, and CRS as dem.tif;
+    #    e.g., convert sample_cn.tif with scs_curve_number_runoff and write runoff_coeff.tif,
+    #    infil_cm_h.tif, and antecedent_m.tif beforehand)
+    lidar pipeline dem.tif out_storm_forced \
       --min-size 1000 --min-depth 0.3 --interval 0.3 \
       --scs-type2-mm 100 --time-step 0.5 \
       --runoff-coeff runoff_coeff.tif \
@@ -60,13 +67,17 @@ Non-finite and NoData CN cells propagate as NoData (`-9999.0`) in the output ras
     cn = tifffile.imread("sample_cn.tif").astype(np.float64)
 
     # 1. Convert NRCS Curve Number raster to effective runoff coefficient C = Q/P
+    #    (pass nodata=<val> if the CN GeoTIFF uses a finite NoData sentinel)
     rc = lidar.scs_curve_number_runoff(cn, precip_mm=150.0)
+    # Map the -9999.0 output NoData sentinel to NaN so array simulation falls back to C = 1.0
+    rc = np.where(rc == -9999.0, np.nan, rc)
 
     # 2. Generate a 24-hour SCS Type II hyetograph (30-minute pulses)
     hyeto = lidar.scs_type2_hyetograph(total_precip_mm=150.0, duration_h=24.0, time_step_h=0.5)
 
     # 3. Run forced inundation completely in memory with infiltration + antecedent water
-    infil = np.full_like(dem, 0.5)  # 0.5 cm/h vertical loss
+    infil = np.full_like(dem, 0.5)       # 0.5 cm/h vertical loss
+    antecedent = np.full_like(dem, 0.1)  # 0.1 m initial ponded depth
     sim = lidar.simulate_inundation_array(
         dem,
         kernel_size=3,
@@ -78,6 +89,7 @@ Non-finite and NoData CN cells propagate as NoData (`-9999.0`) in the output ras
         time_step_h=0.5,
         runoff_coeff_arr=rc,
         infiltration_arr=infil,
+        antecedent_depth_arr=antecedent,
         hyetograph=hyeto,
         cell_size=1.0,
     )

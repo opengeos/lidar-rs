@@ -19,7 +19,7 @@ Instead of chaining five intermediate GeoTIFF and Shapefile directories manually
       --compress
     ```
 
-    Pass `--use-f32` to load large float32 DEMs at half RAM, `--breach-max-depth 1.5` to enable selective breaching before sink extraction, `--culverts sample_culverts.gpkg` to burn culverts, or `--scs-type2-mm 100` to drive an NRCS 24-hour Type II design storm.
+    Pass `--use-f32` to load large float32 DEMs at half RAM, `--breach-max-depth 1.5` to enable selective breaching before sink extraction, `--culverts sample_culverts.gpkg` to burn culverts, or `--scs-type2-mm 100` (omitting `--duration` or setting `--duration 24`) to drive an NRCS 24-hour Type II design storm.
 
 === "Python (File Pipeline)"
 
@@ -105,7 +105,7 @@ out_pipe/
 ├── depressions.csv              # 24-column nested depression morphometry table
 ├── catchments.csv               # Per-level contributing catchment & zonal elevation stats
 ├── inundation_curve.csv         # Time-step inundation area, fraction, and cumulative runoff (mm)
-├── pipeline_summary.json        # Machine-readable summary (counts, max level, storage, paths)
+├── summary.json                 # Machine-readable summary (counts, max level, storage, paths)
 ├── depressions.gpkg             # Unified GeoPackage polygon layer with full untruncated attributes
 ├── spill_paths.gpkg             # Georeferenced overland spill-path polylines with spill timing
 ├── rating_curves.csv            # Stage-storage-area lookup curves for every depression

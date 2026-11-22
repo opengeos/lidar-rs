@@ -25,7 +25,7 @@ High-performance nested surface depression delineation, hydro-conditioning, LiDA
 - **LiDAR point clouds (`DSM`, `DTM`, `CHM`):** Native LAS/LAZ/COPC/PLY/E57 reading and conversion, ASPRS class and return filtering, pure-Rust CSF/PMF ground classification (`classify_ground`), bare-earth DTM (`lidar_to_dtm`), and Canopy Height Models (`lidar_to_chm`).
 - **Tiled regional delineation & `f32` storage (`delineate_depressions_tiled` / `tiled-depressions`):** Parallel overlapping tile windows with core-owned seam deduplication and optional `f32` DEM grids that halve source raster memory.
 - **Publication PNG & GIF rendering (`export_frames`, `animate_inundation`):** Shaded-relief inundation animations and individual PNG frames with overland spill arrows, metric scale bars, legends, and timestamp HUDs.
-- **Four interfaces, one pure-Rust core:** Rust crate (`lidar`), standalone CLI (`lidar-cli`, 25 subcommands + JSON output), Python package (`lidar-rs`, PyO3 + zero-copy NumPy arrays, Python 3.11+), and WebAssembly (`lidar-js`) powering the interactive browser [Playground](https://lidar-rs.opengeos.org/playground/) with Depression Inspector and live Stage-Volume Rating Curves.
+- **Four interfaces, one pure-Rust core:** Rust crate (`lidar`), standalone CLI (`lidar-cli`, 31 subcommands + JSON output), Python package (`lidar-rs`, PyO3 + zero-copy NumPy arrays, Python 3.11+), and WebAssembly (`lidar-js`) powering the interactive browser [Playground](https://lidar-rs.opengeos.org/playground/) with Depression Inspector and live Stage-Volume Rating Curves.
 
 ## Workspace Layout
 

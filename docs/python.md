@@ -59,6 +59,7 @@ deps_mem = lidar.delineate_depressions_array(
 # SCS Curve Number -> runoff coefficient + 24-hour SCS Type II design storm
 cn = tifffile.imread("sample_cn.tif").astype(np.float64)
 rc = lidar.scs_curve_number_runoff(cn, precip_mm=150.0)
+rc = np.where(rc == -9999.0, np.nan, rc)  # map NoData sentinel to NaN so array sim falls back to 1.0
 hyeto = lidar.scs_type2_hyetograph(total_precip_mm=150.0, duration_h=24.0, time_step_h=0.5)
 
 # Complete in-memory hydrology & forced inundation simulation
@@ -87,8 +88,8 @@ import lidar_rs as lidar
 breached_sel = lidar.breach_depressions(dem_arr, mode="selective", max_depth=1.5, max_length=40)
 breached_all = lidar.breach_depressions(dem_arr, mode="complete")  # unconstrained
 
-# Culvert burning (same CRS as DEM)
-out_dem, carved = lidar.burn_culverts("dem.tif", "sample_culverts.gpkg", "out/burned.tif", half_width_cells=1)
+# Culvert burning (same CRS as DEM; returns carved cell count)
+carved = lidar.burn_culverts("dem.tif", "sample_culverts.gpkg", "out/burned.tif", half_width_cells=1)
 
 # Tiled regional delineation with f32 source loading
 tiled = lidar.delineate_depressions_tiled(
@@ -120,8 +121,10 @@ med_path = lidar.MedianFilter("dem.tif", kernel_size=3, out_file="out/median.tif
 sink_path = lidar.ExtractSinks(med_path, min_size=1000, out_dir="out")
 dep_id, dep_level = lidar.DelineateDepressions(
     sink_path, min_size=1000, min_depth=0.3, interval=0.3,
-    out_dir="out", bool_level_shp=True, export_gpkg=True,
+    out_dir="out", bool_level_shp=True,
 )
+# Use the dict-returning snake_case wrapper when exporting a unified GeoPackage:
+# deps = lidar.delineate_depressions(sink_path, min_size=1000, min_depth=0.3, interval=0.3, out_dir="out", export_gpkg=True)
 mount_id, mount_level = lidar.DelineateMounts(
     "dsm.tif", min_size=1000, min_height=0.3, interval=0.3, out_dir="out_mounts",
 )
@@ -156,4 +159,4 @@ lidar.PlayAnimation(
 | **Catchments & Inundation** | `delineate_catchments`, `delineate_flow_paths`, `delineate_catchment_hierarchy`, `simulate_inundation` |
 | **Visualization** | `animate_inundation`, `PlayAnimation`, `export_inundation_frames_png` |
 | **Point Clouds** | `convert_lidar`, `lidar_to_dsm`, `lidar_to_dtm`, `lidar_to_chm` |
-| **Raster / Vector Utils** | `polygonize`, `mosaic`, `reproject_image`, `resample`, `clip_image`, `image_to_cog`, `add_crs`, `join_csv_to_vector`, `csv_points_to_vector`, `raster_info` |
+| **Raster / Vector Utils** | `polygonize`, `mosaic`, `reproject_image`, `resample`, `clip_image`, `image_to_cog`, `add_crs`, `join_csv_to_vector`, `csv_points_to_vector` |

@@ -39,7 +39,7 @@ Run it right now in your browser with zero installation via the live [WebAssembl
       --min-size 1000 --min-depth 0.3 --interval 0.3 \
       --rain-intensity 5 --duration 50 --time-step 1 --compress
 
-    # Export publication PNG frames with spill arrows, scale bar, and legend
+    # Export publication PNG frames with metric scale bar and legend
     lidar export-frames dem.tif out_pipe/fill_time.tif out_pipe/frames \
       --num-steps 10 --time-step 5 --rain-intensity 5 --scale-bar --legend
     ```
@@ -120,7 +120,7 @@ Run it right now in your browser with zero installation via the live [WebAssembl
 
 ## Four Interfaces, One Pure-Rust Core
 
-- **[Standalone CLI (`lidar-cli`)](cli.md):** Single static binary for Linux, macOS, and Windows with 25 subcommands and JSON output mode.
+- **[Standalone CLI (`lidar-cli`)](cli.md):** Single static binary for Linux, macOS, and Windows with 31 subcommands and JSON output mode.
 - **[Rust Library (`lidar`)](rust.md):** Ergonomic in-memory (`Array2D`) and file-based APIs with optional `parallel`, `pointcloud`, and `serde` Cargo features.
 - **[Python Package (`lidar-rs`)](python.md):** Drop-in compatibility with `opengeos/lidar` plus NumPy zero-copy array workflows (`pip install lidar-rs`, Python 3.11+).
 - **[WebAssembly (`lidar-js`)](javascript.md):** Full browser and Node.js bindings powering the client-side [Playground](playground.md).
@@ -131,4 +131,4 @@ If you use `lidar-rs` in published research, please cite:
 
 - **Wu, Q.** (2026). lidar-rs: High-performance nested depression delineation and fill-and-spill inundation simulation. *Zenodo*. <https://doi.org/10.5281/zenodo.24411444>
 - **Wu, Q.** (2021). lidar: A Python package for delineating nested surface depressions from digital elevation data. *Journal of Open Source Software*, 6(59), 2965. <https://doi.org/10.21105/joss.02965>
-- **Wu, Q.**, Lane, C.R., Wang, L., Vanderhoof, M.K., Christensen, J.R., & Liu, H. (2019). Efficient Delineation of Nested Depression Hierarchy in Digital Elevation Models for Hydrological Analysis Using Level-Set Method. *Journal of the American Water Resources Association*, 55(2), 354-368. <https://doi.org/10.1111/1752-1688.12689>
+- **Wu, Q.**, Lane, C.R., Wang, L., Vanderhoof, M.K., Christensen, J.R., & Liu, H. (2019). Efficient Delineation of Nested Depression Hierarchy in Digital Elevation Models for Hydrological Analysis Using Level-Set Method. *Journal of the American Water Resources Association*, 55(2), 354–368. <https://doi.org/10.1111/1752-1688.12689>

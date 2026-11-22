@@ -58,12 +58,12 @@ High-resolution 1-m LiDAR DEMs routinely contain artificial impoundments where r
     dem_arr = lidar.MedianFilter("dem.tif", kernel_size=3)
     breached_complete = lidar.breach_depressions(dem_arr, mode="complete")
 
-    # Vector-guided culvert burning
-    out_path, carved_cells = lidar.burn_culverts(
+    # Vector-guided culvert burning (returns carved cell count)
+    carved_cells = lidar.burn_culverts(
         "dem.tif", "sample_culverts.gpkg", "out/burned.tif",
         half_width_cells=1, depth_offset=0.05, compress=True,
     )
-    print(f"Carved {carved_cells} embankment cells into {out_path}")
+    print(f"Carved {carved_cells} embankment cells into out/burned.tif")
     ```
 
 === "Rust"
