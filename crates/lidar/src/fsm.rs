@@ -21,8 +21,15 @@
 //!    its own spill rim.
 //! 4. **Continuous hypsometric cell timing & exact mass conservation:** Per-cell `fill_time`
 //!    is interpolated continuously from each depression's exact sorted-elevation storage
-//!    curve in `O(D log D)`, and every run verifies exact mass conservation:
+//!    curve in `O(D log D)`, and every run reports the residual of exact mass conservation:
 //!    `antecedent + runoff == stored + infiltration + boundary_outflow`.
+//!
+//! ## Scaling notes
+//!
+//! Outlet discovery reuses grid-sized scratch buffers once per worker thread, while the
+//! event-driven routing loop performs `O(m)` passes per fill/merge event (`O(m^2)` worst case
+//! for `m` depressions) and stores sorted hypsometric cells per nested basin (`O(N * max_level)`
+//! memory across `N` valid sink pixels).
 
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs::File;
@@ -89,6 +96,8 @@ pub struct FsmBasinSummary {
     pub local_eff_cat_area_m2: f64,
     /// Total contributing area reaching this basin at the end of the storm duration,
     /// including merged children and active upstream spill cascades (map units squared).
+    /// For basins merged into a parent before storm end, this falls back to their pre-merge
+    /// `local_cat_area_m2`.
     pub final_routed_cat_area_m2: f64,
     /// Initial antecedent ponded water volume at `t = 0` (cubic map units).
     pub initial_volume_m3: f64,
@@ -1214,159 +1223,150 @@ pub fn simulate_fill_spill_merge_in_memory(
 
     // Helper: resolve all ready parent merges and break any full spill cycles so the
     // `FullSpilling` routing graph is guaranteed to be a DAG.
-    let resolve_merges_and_cycles =
-        |basins: &mut [BasinNode],
-         id_to_idx: &[usize],
-         t_now: f64,
-         num_merge_events: &mut usize,
-         fill_time_data: &mut [f64]| {
-            loop {
-                let mut changed = false;
+    let mut cycle_color = vec![0u8; basins.len()];
+    let resolve_merges_and_cycles = |basins: &mut [BasinNode],
+                                     id_to_idx: &[usize],
+                                     t_now: f64,
+                                     num_merge_events: &mut usize,
+                                     fill_time_data: &mut [f64],
+                                     color: &mut [u8]| {
+        loop {
+            let mut changed = false;
 
-                // (a) Check if any `Waiting` parent now has all direct children FullSpilling/Merged.
-                for idx in 0..basins.len() {
-                    if basins[idx].state != BasinState::Waiting
-                        || basins[idx].children_ids.is_empty()
-                    {
-                        continue;
-                    }
-                    let all_children_full = basins[idx].children_ids.iter().all(|&cid| {
-                        let cidx = id_to_idx[cid as usize];
-                        cidx != usize::MAX
-                            && matches!(
-                                basins[cidx].state,
-                                BasinState::FullSpilling | BasinState::Merged
-                            )
-                    });
-                    if !all_children_full {
-                        continue;
-                    }
-
-                    let child_ids = basins[idx].children_ids.clone();
-                    let mut merged_vol = basins[idx].stored_vol_m3;
-                    let mut merged_cat = basins[idx].local_cat_area_m2;
-                    let mut merged_eff_cat = basins[idx].local_eff_cat_area_m2;
-                    for cid in child_ids {
-                        let cidx = id_to_idx[cid as usize];
-                        if basins[cidx].state == BasinState::FullSpilling {
-                            merged_vol += basins[cidx].stored_vol_m3;
-                            merged_cat += basins[cidx].local_cat_area_m2;
-                            merged_eff_cat += basins[cidx].local_eff_cat_area_m2;
-                            basins[cidx].state = BasinState::Merged;
-                            basins[cidx].merge_time_h = Some(t_now);
-                        }
-                    }
-                    let p = &mut basins[idx];
-                    p.stored_vol_m3 = merged_vol.min(p.capacity_m3);
-                    p.local_cat_area_m2 = merged_cat;
-                    p.local_eff_cat_area_m2 = merged_eff_cat;
-                    p.state = BasinState::Active;
-                    *num_merge_events += 1;
-
-                    mark_cells_at_instant(p, t_now, fill_time_data);
-                    if p.stored_vol_m3 >= p.capacity_m3 - 1e-9 {
-                        p.stored_vol_m3 = p.capacity_m3;
-                        p.state = BasinState::FullSpilling;
-                        if p.first_fill_time_h.is_none() {
-                            p.first_fill_time_h = Some(t_now);
-                        }
-                        mark_cells_at_instant(p, t_now, fill_time_data);
-                    }
-                    changed = true;
+            // (a) Check if any `Waiting` parent now has all direct children FullSpilling/Merged.
+            for idx in 0..basins.len() {
+                if basins[idx].state != BasinState::Waiting || basins[idx].children_ids.is_empty() {
+                    continue;
                 }
-
-                if changed {
+                let all_children_full = basins[idx].children_ids.iter().all(|&cid| {
+                    let cidx = id_to_idx[cid as usize];
+                    cidx != usize::MAX
+                        && matches!(
+                            basins[cidx].state,
+                            BasinState::FullSpilling | BasinState::Merged
+                        )
+                });
+                if !all_children_full {
                     continue;
                 }
 
-                // (b) Detect and break any cycle among `FullSpilling` nodes.
-                let m = basins.len();
-                let mut color = vec![0u8; m]; // 0 = unvisited, 1 = visiting, 2 = done
-                let mut cycle_nodes: Option<Vec<u32>> = None;
+                let child_ids = basins[idx].children_ids.clone();
+                let mut merged_vol = basins[idx].stored_vol_m3;
+                let mut merged_cat = basins[idx].local_cat_area_m2;
+                let mut merged_eff_cat = basins[idx].local_eff_cat_area_m2;
+                for cid in child_ids {
+                    let cidx = id_to_idx[cid as usize];
+                    if basins[cidx].state == BasinState::FullSpilling {
+                        merged_vol += basins[cidx].stored_vol_m3;
+                        merged_cat += basins[cidx].local_cat_area_m2;
+                        merged_eff_cat += basins[cidx].local_eff_cat_area_m2;
+                        basins[cidx].state = BasinState::Merged;
+                        basins[cidx].merge_time_h = Some(t_now);
+                    }
+                }
+                let p = &mut basins[idx];
+                p.stored_vol_m3 = merged_vol.min(p.capacity_m3);
+                p.local_cat_area_m2 = merged_cat;
+                p.local_eff_cat_area_m2 = merged_eff_cat;
+                p.state = BasinState::Active;
+                *num_merge_events += 1;
 
-                for start_idx in 0..m {
-                    if basins[start_idx].state != BasinState::FullSpilling || color[start_idx] != 0
-                    {
-                        continue;
+                mark_cells_at_instant(p, t_now, fill_time_data);
+                if p.stored_vol_m3 >= p.capacity_m3 - 1e-9 {
+                    p.stored_vol_m3 = p.capacity_m3;
+                    p.state = BasinState::FullSpilling;
+                    if p.first_fill_time_h.is_none() {
+                        p.first_fill_time_h = Some(t_now);
                     }
-                    let mut chain: Vec<usize> = Vec::new();
-                    let mut cur_idx = start_idx;
-                    loop {
-                        if color[cur_idx] == 2 {
-                            break;
-                        }
-                        if color[cur_idx] == 1 {
-                            if let Some(pos) = chain.iter().position(|&x| x == cur_idx) {
-                                cycle_nodes =
-                                    Some(chain[pos..].iter().map(|&i| basins[i].id).collect());
-                            }
-                            break;
-                        }
-                        color[cur_idx] = 1;
-                        chain.push(cur_idx);
+                    mark_cells_at_instant(p, t_now, fill_time_data);
+                }
+                changed = true;
+            }
 
-                        let raw_dst = basins[cur_idx]
-                            .spill_override
-                            .or_else(|| basins[cur_idx].outlet.as_ref().map(|o| o.to_dep_id))
-                            .unwrap_or(0);
-                        let rep =
-                            resolve_spill_target(basins, id_to_idx, basins[cur_idx].id, raw_dst);
-                        if rep == 0 {
-                            break;
-                        }
-                        let next_idx = id_to_idx[rep as usize];
-                        if next_idx == usize::MAX
-                            || basins[next_idx].state != BasinState::FullSpilling
-                        {
-                            break;
-                        }
-                        cur_idx = next_idx;
-                    }
-                    for &ci in &chain {
-                        color[ci] = 2;
-                    }
-                    if cycle_nodes.is_some() {
+            if changed {
+                continue;
+            }
+
+            // (b) Detect and break any cycle among `FullSpilling` nodes.
+            let m = basins.len();
+            color.fill(0); // 0 = unvisited, 1 = visiting, 2 = done
+            let mut cycle_nodes: Option<Vec<u32>> = None;
+
+            for start_idx in 0..m {
+                if basins[start_idx].state != BasinState::FullSpilling || color[start_idx] != 0 {
+                    continue;
+                }
+                let mut chain: Vec<usize> = Vec::new();
+                let mut cur_idx = start_idx;
+                loop {
+                    if color[cur_idx] == 2 {
                         break;
                     }
-                }
+                    if color[cur_idx] == 1 {
+                        if let Some(pos) = chain.iter().position(|&x| x == cur_idx) {
+                            cycle_nodes =
+                                Some(chain[pos..].iter().map(|&i| basins[i].id).collect());
+                        }
+                        break;
+                    }
+                    color[cur_idx] = 1;
+                    chain.push(cur_idx);
 
-                if let Some(cyc) = cycle_nodes {
-                    let cyc_set: HashSet<u32> = cyc.iter().copied().collect();
-                    // Pick the lowest-rim member of the cycle as the break point.
-                    let break_id = *cyc
-                        .iter()
-                        .min_by(|&&a, &&b| {
-                            let za = basins[id_to_idx[a as usize]]
-                                .outlet
-                                .as_ref()
-                                .map_or(f64::INFINITY, |o| o.spill_elev);
-                            let zb = basins[id_to_idx[b as usize]]
-                                .outlet
-                                .as_ref()
-                                .map_or(f64::INFINITY, |o| o.spill_elev);
-                            za.total_cmp(&zb).then_with(|| a.cmp(&b))
-                        })
-                        .unwrap();
-
-                    let new_target = find_lca(&cyc, basins, id_to_idx)
-                        .and_then(|lca| {
-                            lowest_active_descendant(
-                                lca,
-                                |x| cyc_set.contains(&x),
-                                basins,
-                                id_to_idx,
-                            )
-                        })
+                    let raw_dst = basins[cur_idx]
+                        .spill_override
+                        .or_else(|| basins[cur_idx].outlet.as_ref().map(|o| o.to_dep_id))
                         .unwrap_or(0);
-                    basins[id_to_idx[break_id as usize]].spill_override = Some(new_target);
-                    changed = true;
+                    let rep = resolve_spill_target(basins, id_to_idx, basins[cur_idx].id, raw_dst);
+                    if rep == 0 {
+                        break;
+                    }
+                    let next_idx = id_to_idx[rep as usize];
+                    if next_idx == usize::MAX || basins[next_idx].state != BasinState::FullSpilling
+                    {
+                        break;
+                    }
+                    cur_idx = next_idx;
                 }
-
-                if !changed {
+                for &ci in &chain {
+                    color[ci] = 2;
+                }
+                if cycle_nodes.is_some() {
                     break;
                 }
             }
-        };
+
+            if let Some(cyc) = cycle_nodes {
+                let cyc_set: HashSet<u32> = cyc.iter().copied().collect();
+                // Pick the lowest-rim member of the cycle as the break point.
+                let break_id = *cyc
+                    .iter()
+                    .min_by(|&&a, &&b| {
+                        let za = basins[id_to_idx[a as usize]]
+                            .outlet
+                            .as_ref()
+                            .map_or(f64::INFINITY, |o| o.spill_elev);
+                        let zb = basins[id_to_idx[b as usize]]
+                            .outlet
+                            .as_ref()
+                            .map_or(f64::INFINITY, |o| o.spill_elev);
+                        za.total_cmp(&zb).then_with(|| a.cmp(&b))
+                    })
+                    .unwrap();
+
+                let new_target = find_lca(&cyc, basins, id_to_idx)
+                    .and_then(|lca| {
+                        lowest_active_descendant(lca, |x| cyc_set.contains(&x), basins, id_to_idx)
+                    })
+                    .unwrap_or(0);
+                basins[id_to_idx[break_id as usize]].spill_override = Some(new_target);
+                changed = true;
+            }
+
+            if !changed {
+                break;
+            }
+        }
+    };
 
     // 7. Event-driven integration loop.
     let m = basins.len();
@@ -1403,6 +1403,7 @@ pub fn simulate_fill_spill_merge_in_memory(
                 t_cur,
                 &mut num_merge_events,
                 &mut fill_time_data,
+                &mut cycle_color,
             );
 
             // Evaluate topological spill inflows; if a FullSpilling basin loses more to
@@ -1547,6 +1548,7 @@ pub fn simulate_fill_spill_merge_in_memory(
                 t_cur,
                 &mut num_merge_events,
                 &mut fill_time_data,
+                &mut cycle_color,
             );
             let _ = evaluate_topological_routing(
                 &mut basins,
@@ -1578,6 +1580,7 @@ pub fn simulate_fill_spill_merge_in_memory(
             t_cur,
             &mut num_merge_events,
             &mut fill_time_data,
+            &mut cycle_color,
         );
         let _ = evaluate_topological_routing(
             &mut basins,
@@ -1651,6 +1654,8 @@ pub fn simulate_fill_spill_merge_in_memory(
                 || is_ancestor(outlet.to_dep_id, realized_to);
             let valid_duration = b.merge_time_h.is_none_or(|mt| mt > spill_t + 1e-6);
             let show_boundary = b.parent_id > 0 || depressions.num_regions > 1;
+            // Require >= 2 vertices so exported GeoJSON/GPKG LineString geometries remain valid
+            // per RFC 7946; single-cell border touches are still reported via `spill_to_dep_id`.
             if geometry_matches
                 && valid_duration
                 && outlet.cells.len() >= 2

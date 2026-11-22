@@ -1067,7 +1067,7 @@
             : null;
         const summaryCards = [
           ["Raster Size", `${w} × ${h}`],
-          ["Routing", routingMode === "fsm" ? "Fill-Spill-Merge" : "Static"],
+          ["Routing", fsmMassBalance !== null ? "Fill-Spill-Merge" : "Static"],
           ["Sink Regions", String(sim.numRegions)],
           ["Nested Depressions", String(depressions.length)],
           ["Max Level", String(sim.maxLevel)],

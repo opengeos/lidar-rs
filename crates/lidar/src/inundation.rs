@@ -1941,7 +1941,7 @@ pub fn run_full_pipeline_in_memory(
             .map(|&(dt, cm_h)| (dt, cm_h * runoff_scale))
             .collect()
     });
-    let connectivity_graph = build_connectivity_graph(
+    let mut connectivity_graph = build_connectivity_graph(
         &depressions,
         &catchment_records,
         &fill_time,
@@ -1950,6 +1950,9 @@ pub fn run_full_pipeline_in_memory(
         scaled_hyeto.as_deref(),
         options.stream_vector,
     )?;
+    if let Some(ref basins) = fsm_basins {
+        apply_fsm_merge_times(&mut connectivity_graph, basins);
+    }
     let inundation_curve_csv =
         format_inundation_curve_csv(&steps, eff_rain, scaled_hyeto.as_deref());
 
@@ -1968,6 +1971,20 @@ pub fn run_full_pipeline_in_memory(
         fsm_basins,
         fsm_mass_balance,
     })
+}
+
+/// Updates hierarchical `"merge"` edge timestamps on a [`crate::graph::ConnectivityGraph`] to use
+/// the exact child-to-parent merge event times simulated by Fill-Spill-Merge routing.
+fn apply_fsm_merge_times(graph: &mut crate::graph::ConnectivityGraph, basins: &[FsmBasinSummary]) {
+    let merge_by_id: HashMap<u32, Option<f64>> =
+        basins.iter().map(|b| (b.dep_id, b.merge_time_h)).collect();
+    for edge in &mut graph.edges {
+        if edge.edge_type == "merge"
+            && let Some(&mt) = merge_by_id.get(&edge.from_id)
+        {
+            edge.merge_time_h = mt;
+        }
+    }
 }
 
 /// Options for the all-in-one end-to-end [`run_pipeline`] workflow.
@@ -2201,7 +2218,9 @@ pub fn run_pipeline(
         antecedent_depth: ant_arr.as_ref(),
         hyetograph: options.hyetograph.as_deref(),
     };
-    let (fill_time, spill_paths, fsm_basins_csv, fsm_mass_balance) = match options.routing {
+    let (fill_time, spill_paths, fsm_basins, fsm_basins_csv, fsm_mass_balance) = match options
+        .routing
+    {
         RoutingMode::Static => {
             let (ft, _num_sim_regions) = simulate_inundation_with_forcing_in_memory(
                 &sinks.sink,
@@ -2210,7 +2229,7 @@ pub fn run_pipeline(
                 &forcing,
             )?;
             let sp = delineate_spill_flow_paths_in_memory(&sinks.dem_refined, &depressions, &ft)?;
-            (ft, sp, None, None)
+            (ft, sp, None, None, None)
         }
         RoutingMode::FillSpillMerge => {
             let fsm = simulate_fill_spill_merge_in_memory(
@@ -2225,6 +2244,7 @@ pub fn run_pipeline(
             (
                 fsm.fill_time,
                 fsm.spill_paths,
+                Some(fsm.basins),
                 Some(basins_csv),
                 Some(fsm.mass_balance),
             )
@@ -2305,7 +2325,7 @@ pub fn run_pipeline(
         let curves = compute_rating_curves(&sinks.sink, &depressions, sim_opts.interval.abs())?;
         write_rating_curves_csv(&curves, &rc_path)?;
 
-        let graph = build_connectivity_graph(
+        let mut graph = build_connectivity_graph(
             &depressions,
             &catchment_records,
             &fill_time,
@@ -2314,6 +2334,9 @@ pub fn run_pipeline(
             scaled_hyeto.as_deref(),
             options.stream_vector.as_deref(),
         )?;
+        if let Some(ref basins) = fsm_basins {
+            apply_fsm_merge_times(&mut graph, basins);
+        }
         let gml_path = out_dir.join("connectivity_graph.graphml");
         write_connectivity_graphml(&graph, &gml_path)?;
 
