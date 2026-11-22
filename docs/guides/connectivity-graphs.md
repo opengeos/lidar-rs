@@ -50,6 +50,8 @@ When a stream flowline vector (such as USGS NHD flowlines, or the sample [sample
 
 ## Analyzing Outputs in Python (NetworkX & Pandas)
 
+Requires optional analysis packages (`pip install pandas networkx`).
+
 ```python
 import json
 import pandas as pd
@@ -78,11 +80,13 @@ print(f"Loaded {G.number_of_nodes()} nodes and {len(spill_edges)} overland spill
 graph_data = json.loads(open(res["connectivity_graph_json"]).read())
 for e in graph_data["edges"]:
     if e["edge_type"] == "spill":
+        dist = e.get("dist_to_stream")
+        dist_str = f"{dist:.1f} m" if dist is not None else "n/a"
         print(
             f"Dep #{e['from_id']} -> #{e['to_id']} | "
             f"spill={e['spill_runoff_mm']:.1f} mm | "
             f"len={e['length_m']:.1f} m | "
-            f"dist_to_stream={e['dist_to_stream']:.1f} m"
+            f"dist_to_stream={dist_str}"
         )
 
 # Load stage-storage rating curves

@@ -45,7 +45,7 @@ Stay 100% in memory with 2D NumPy `float64` arrays, ideal for Jupyter notebooks,
 
 ```python
 import numpy as np
-import tifffile
+import tifffile  # optional: pip install tifffile (or use rasterio)
 import lidar_rs as lidar
 
 dem_arr = lidar.MedianFilter("dem.tif", kernel_size=3)  # returns 2D NumPy array when out_file=None

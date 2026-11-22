@@ -12,7 +12,6 @@ Try it right now with zero installation on the interactive [WebAssembly Playgrou
 import init, {
   version,
   rasterInfo,
-  breachDem,
   simulateInundationAdvanced,
 } from "./wasm/lidar_js.js";
 
@@ -67,6 +66,11 @@ try {
   // Export GeoJSON / GeoTIFF buffers for MapLibre, Leaflet, or client-side download
   const spillGeojson = JSON.parse(sim.spillPathsGeojson());
   const fillTimeTif = sim.fillTimeTif();
+  console.log(
+    `Exports ready: ${spillGeojson.features.length} spill paths, ` +
+    `fill_time.tif (${fillTimeTif.byteLength} B), ` +
+    `GraphML (${graphmlXml.length} chars), curve CSV (${curveCsv.length} chars)`,
+  );
 } finally {
   sim.free();
 }

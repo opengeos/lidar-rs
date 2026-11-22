@@ -18,7 +18,7 @@ Processing regional 1-m USGS 3DEP DEMs (100M+ pixels) as full-grid `f64` arrays 
 
 ## `f32` Storage Helpers
 
-Most 3DEP GeoTIFF DEMs are distributed natively as 32-bit floats (`f32`). Loading them with `--use-f32` (default `true` in `TiledDelineationOptions`, opt-in `--use-f32` in `lidar pipeline`, or directly via `lidar::load_dem_f32`) halves the source DEM RAM footprint (from 8 bytes/pixel to 4 bytes/pixel) while preserving exact source NoData sentinels during per-tile conversion to `f64`.
+Most 3DEP GeoTIFF DEMs are distributed natively as 32-bit floats (`f32`). Loading them with `use_f32` (default `true` in Rust `TiledDelineationOptions` and Python `delineate_depressions_tiled`, opt-in `--use-f32` flag in `lidar tiled-depressions` and `lidar pipeline`, or directly via `lidar::load_dem_f32`) halves the source DEM RAM footprint (from 8 bytes/pixel to 4 bytes/pixel) while preserving exact source NoData sentinels during per-tile conversion to `f64`.
 
 ## Usage Examples
 

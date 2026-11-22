@@ -27,8 +27,8 @@ Earlier per-level watershed approaches ran a full raster D8 watershed pass at ev
 1. **Single-pass upland forest compression (`O(N)`):** Every non-depression upland cell (`level <= 0`) traces its resolved D8 flow path once, compressing chains so each upland cell directly credits its first entry pixel inside a depression (`upland_weight`).
 2. **Incremental per-level Disjoint-Set Union (`O(L * D)`):** Only depression cells (`D << N`) are processed bottom-up from level `1` to `L`, merging adjacent sub-basins and accumulating area, catchment area, and elevation moments via DSU.
 
-!!! tip "Regional 1-m 3DEP Karst Benchmark"
-    On the 98M-cell Park City, Kentucky 1-m USGS 3DEP karst HUC-12 watershed (43 hierarchy levels, 3,462 nested depressions, 2,716 spill flow paths), the compressed D8 + DSU engine completes the entire catchment hierarchy and fill-and-spill pipeline in **64.6 seconds** on a single workstation, compared to tens of minutes with per-level raster scans.
+!!! tip "Illustrative Regional 1-m 3DEP Karst Timing"
+    In an illustrative single-workstation run on a 98M-cell 1-m USGS 3DEP karst HUC-12 DEM near Park City, Kentucky (43 hierarchy levels, 3,462 nested depressions, 2,716 spill flow paths), the compressed D8 + DSU engine completed the catchment hierarchy and fill-and-spill pipeline in ~65 seconds (multi-GB source DEM not bundled in this repository).
 
 ## Nested Mount / Canopy Delineation
 
@@ -51,7 +51,7 @@ Every delineated depression (and mount) computes 24 geometric, topological, and 
 | `max_depth` | `f64` | Maximum depth (`max_elev - min_elev`) |
 | `min_elev` | `f64` | Minimum elevation (basin floor) |
 | `max_elev` | `f64` | Maximum elevation (spill rim) |
-| `children_id` | `string` | Colon-delimited direct child depression IDs (empty for leaves) |
+| `children_id` / `children_ids` | `string` / `list[int]` | Direct child depression IDs: colon-delimited string `children_id` in CSV/GeoPackage, list `children_ids` in Python dicts and Rust structs (empty for leaves) |
 | `region_id` | `u32` | Top-level enclosing sink region ID (1-based) |
 | `perimeter` | `f64` | Perimeter in map units (Benkrid-Crookes estimator) |
 | `major_axis` | `f64` | Equivalent-ellipse major axis length |

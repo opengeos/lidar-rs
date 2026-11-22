@@ -60,7 +60,7 @@ Non-finite and NoData CN cells propagate as NoData (`-9999.0`) in the output ras
 
     ```python
     import numpy as np
-    import tifffile
+    import tifffile  # optional: pip install tifffile (or use rasterio)
     import lidar_rs as lidar
 
     dem = tifffile.imread("dem.tif").astype(np.float64)
