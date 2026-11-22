@@ -51,6 +51,31 @@ lidar.PlayAnimation(
     sinks["refined_dem_path"], "out/simulation", "out/inundation.gif",
     rain_intensity_cm_h=5.0, display=True,  # displays inline in Jupyter / Colab
 )
+# All-in-one in-memory file pipeline (GeoPackage, CSV, rating curves, connectivity graph, rasters)
+pipe = lidar.run_pipeline(
+    "dem.tif", "out_pipe",
+    min_size=1000, min_depth=0.3, interval=0.3,
+    rain_intensity_cm_h=5.0, rain_duration_h=50.0, time_step_h=1.0,
+)
+
+# Zero-temp-file NumPy in-memory workflow (pass cell_size and no_data matching your raster)
+dem_arr = lidar.MedianFilter("dem.tif", kernel_size=3)
+sim_mem = lidar.simulate_inundation_array(
+    dem_arr, kernel_size=1, min_size=1000, min_depth=0.3, interval=0.3,
+    rain_intensity_cm_h=5.0, rain_duration_h=50.0, time_step_h=1.0,
+    cell_size=1.0, no_data=-9999.0,
+)
+
+# Hydro-conditioning, SCS-CN runoff, tiled large-DEM delineation, and point-cloud DTM/CHM
+breached = lidar.breach_depressions(dem_arr, mode="selective", max_depth=1.5, max_length=40, no_data=-9999.0)
+hyetograph = lidar.scs_type2_hyetograph(total_precip_mm=100.0, duration_h=24.0, time_step_h=1.0)
+lidar.lidar_to_dtm("cloud.laz", "dtm.tif", resolution=1.0, ground_method="csf")
+lidar.lidar_to_chm("cloud.laz", "chm.tif", resolution=1.0, ground_method="csf")
+lidar.export_inundation_frames_png(
+    "dem.tif", "out_pipe/fill_time.tif", "out_pipe/frames",
+    num_steps=10, time_step_h=5.0, rain_intensity_cm_h=5.0,
+    show_scale_bar=True, show_legend=True,
+)
 ```
 
-For rich structured metadata (depression attribute lists, file paths, max hierarchy level), use the snake_case functions `lidar.extract_sinks(...)`, `lidar.delineate_depressions(...)`, `lidar.delineate_mounts(...)`, `lidar.delineate_catchments(...)`, `lidar.delineate_flow_paths(...)`, `lidar.delineate_catchment_hierarchy(...)`, `lidar.simulate_inundation(...)`, and `lidar.animate_inundation(...)`.
+For rich structured metadata (24-column depression morphometry, rating curves, connectivity graphs, file paths, and max hierarchy level), use `lidar.run_pipeline(...)` (which writes `connectivity_graph.json`, `connectivity_graph.graphml`, `rating_curves.csv`, and GeoPackages to disk), or the in-memory NumPy helpers `lidar.extract_sinks_array(...)`, `lidar.delineate_depressions_array(...)`, and `lidar.simulate_inundation_array(...)` (which return NumPy arrays, rating-curve records, and connectivity graph node/edge counts). Additional helpers include `lidar.delineate_depressions_tiled(...)`, `lidar.breach_depressions(...)`, `lidar.burn_culverts(...)`, `lidar.lidar_to_dtm(...)`, `lidar.lidar_to_chm(...)`, and `lidar.export_inundation_frames_png(...)`.

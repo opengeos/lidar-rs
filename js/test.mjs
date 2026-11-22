@@ -107,10 +107,49 @@ assert.ok(
 const gif = sim.encodeGif(150, true, 200, true);
 const header = new TextDecoder().decode(gif.slice(0, 6));
 assert.equal(header, "GIF89a");
+
+// 5. New v0.5.0 WASM exports: depressionIdValues, rating curves, connectivity graph, PNG frame, breaching
+const depIds = sim.depressionIdValues();
+assert.ok(depIds instanceof Int32Array);
+assert.equal(depIds.length, 400 * 400);
+assert.ok(depIds.some((id) => id > 0));
+const ratingCurves = JSON.parse(sim.ratingCurvesJson());
+assert.ok(ratingCurves.length >= 2);
+assert.ok(sim.ratingCurvesCsv().startsWith("dep_id,"));
+const graph = JSON.parse(sim.connectivityGraphJson());
+assert.ok(graph.nodes.length >= 2);
+assert.ok(sim.connectivityGraphml().includes("<graphml"));
+assert.ok(sim.inundationCurveCsv().startsWith("step,time_hours,runoff_mm,"));
+const pngBytes = sim.renderFramePng(3, true, true, true);
+assert.equal(pngBytes[0], 0x89);
+assert.equal(pngBytes[1], 0x50);
+assert.equal(pngBytes[2], 0x4e);
+assert.equal(pngBytes[3], 0x47);
 console.log(
   `WASM inundation OK: ${sim.numRegions} region(s), maxLevel=${sim.maxLevel}, ` +
-    `${sim.numSteps} steps, ${spillPaths.length} spill path(s), lazy GIF ${gif.length} bytes`,
+    `${sim.numSteps} steps, ${spillPaths.length} spill path(s), lazy GIF ${gif.length} bytes, PNG ${pngBytes.length} bytes`,
 );
 sim.free();
+
+// 6. Hydro-conditioning breaching + advanced forced inundation
+const breachedBytes = lidar.breachDem(demBytes, "dem.tif", "selective", 0.5, 15, false);
+assert.ok(breachedBytes.length > 1000);
+const simAdv = lidar.simulateInundationAdvanced(
+  demBytes,
+  "dem.tif",
+  3,
+  1000,
+  0.3,
+  0.3,
+  5.0,
+  10.0,
+  2.0,
+  0.4,
+  0.75,
+  undefined,
+);
+assert.equal(simAdv.runoffCoeff, 0.75);
+assert.equal(simAdv.numSteps, 5);
+simAdv.free();
 
 console.log("ALL lidar-js WASM TESTS PASSED!");

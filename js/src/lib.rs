@@ -13,13 +13,15 @@ use terrio::{RasterWriteOptions, VectorWriteOptions};
 use wasm_bindgen::prelude::*;
 
 use lidar::{
-    ANIMATION_BANNER_HEIGHT, AnimateInundationOptions, HillshadeOptions, InundationPipelineOptions,
-    SimulateInundationOptions, SpillFlowPath, animate_inundation_to_bytes_with_spill_paths,
-    compute_hillshade_rgb, delineate_catchments_in_memory, delineate_depressions_in_memory,
-    delineate_mounts_in_memory, extract_sink_labels_from_raster, extract_sinks_in_memory,
-    flip_dem as core_flip_dem, gaussian_filter as core_gaussian_filter,
+    ANIMATION_BANNER_HEIGHT, AnimateInundationOptions, BreachMode, BreachOptions, HillshadeOptions,
+    InMemoryFullPipelineOptions, InundationForcing, SimulateInundationOptions, SpillFlowPath,
+    animate_inundation_to_bytes_with_spill_paths, breach_depressions as core_breach_depressions,
+    compute_hillshade_rgb, connectivity_graph_to_graphml_string, delineate_catchments_in_memory,
+    delineate_depressions_in_memory, delineate_mounts_in_memory, extract_sink_labels_from_raster,
+    extract_sinks_in_memory, flip_dem as core_flip_dem, gaussian_filter as core_gaussian_filter,
     mean_filter as core_mean_filter, median_filter as core_median_filter,
-    simulate_inundation_pipeline_in_memory,
+    rating_curves_to_csv_string, render_inundation_frame_png_bytes, run_full_pipeline_in_memory,
+    scs_type2_hyetograph,
 };
 
 /// Upper bound on total pixels (`frames * width * height`) encoded in a single synchronous
@@ -249,6 +251,25 @@ pub fn flip_dem(bytes: &[u8], filename: &str, delta: f64) -> Result<Vec<u8>, JsV
     let dem = read_array2d_f64(bytes, filename)?;
     let out = core_flip_dem(&dem, delta).map_err(to_js_err)?;
     write_array2d_tif(&out, "dem_flip.tif")
+}
+
+/// Breaches depressions in a DEM GeoTIFF buffer using Lindsay (2016) least-cost breaching
+/// (`mode`: `"complete"`, `"selective"`, or `"constrained"`).
+#[wasm_bindgen(js_name = breachDem)]
+pub fn breach_dem(
+    bytes: &[u8],
+    filename: &str,
+    mode: &str,
+    max_depth: Option<f64>,
+    max_length: Option<u32>,
+    fill_remaining: bool,
+) -> Result<Vec<u8>, JsValue> {
+    let dem = read_array2d_f64(bytes, filename)?;
+    let breach_mode: BreachMode = mode.parse().map_err(to_js_err)?;
+    let mut opts = BreachOptions::for_mode(breach_mode, max_depth, max_length);
+    opts.fill_remaining = fill_remaining;
+    let out = core_breach_depressions(&dem, &opts).map_err(to_js_err)?;
+    write_array2d_tif(&out, "dem_breached.tif")
 }
 
 /// Computes an RGBA shaded-relief preview buffer (`width * height * 4` bytes) suitable
@@ -634,6 +655,8 @@ pub struct InundationOutput {
     num_steps: usize,
     time_step_h: f64,
     rain_intensity_cm_h: f64,
+    runoff_coeff: f64,
+    scaled_hyetograph: Option<Vec<(f64, f64)>>,
     dem_refined: Array2D<f64>,
     fill_time: Array2D<f64>,
     spill_paths: Vec<SpillFlowPath>,
@@ -641,6 +664,11 @@ pub struct InundationOutput {
     catchment_hierarchy_json: String,
     steps_json: String,
     spill_paths_json: String,
+    rating_curves_json: String,
+    rating_curves_csv: String,
+    connectivity_graph_json: String,
+    connectivity_graphml: String,
+    inundation_curve_csv: String,
     fill_time_tif: Vec<u8>,
     catchment_hir_tif: Vec<u8>,
     sink_tif: Vec<u8>,
@@ -651,6 +679,7 @@ pub struct InundationOutput {
     level_rgba: Vec<u8>,
     fill_time_rgba: Vec<u8>,
     fill_time_values: Vec<f64>,
+    depression_id_values: Vec<i32>,
 }
 
 #[wasm_bindgen]
@@ -746,6 +775,90 @@ impl InundationOutput {
     pub fn fill_time_values(&self) -> Vec<f64> {
         self.fill_time_values.clone()
     }
+    /// Per-cell depression ID grid (`Int32Array`, `0` outside depressions) for interactive click-to-inspect.
+    #[wasm_bindgen(js_name = depressionIdValues)]
+    pub fn depression_id_values(&self) -> Vec<i32> {
+        self.depression_id_values.clone()
+    }
+    /// Effective runoff coefficient used in the simulation (`(0, 1]`).
+    #[wasm_bindgen(getter, js_name = runoffCoeff)]
+    pub fn runoff_coeff(&self) -> f64 {
+        self.runoff_coeff
+    }
+    /// Stage-storage-area rating curves across all depressions as JSON.
+    #[wasm_bindgen(js_name = ratingCurvesJson)]
+    pub fn rating_curves_json(&self) -> String {
+        self.rating_curves_json.clone()
+    }
+    /// Stage-storage-area rating curves formatted as CSV.
+    #[wasm_bindgen(js_name = ratingCurvesCsv)]
+    pub fn rating_curves_csv(&self) -> String {
+        self.rating_curves_csv.clone()
+    }
+    /// Directed nested connectivity graph as JSON.
+    #[wasm_bindgen(js_name = connectivityGraphJson)]
+    pub fn connectivity_graph_json(&self) -> String {
+        self.connectivity_graph_json.clone()
+    }
+    /// Directed nested connectivity graph as GraphML XML (NetworkX / Gephi compatible).
+    #[wasm_bindgen(js_name = connectivityGraphml)]
+    pub fn connectivity_graphml(&self) -> String {
+        self.connectivity_graphml.clone()
+    }
+    /// Time-series inundation curve (with cumulative runoff in mm) formatted as CSV.
+    #[wasm_bindgen(js_name = inundationCurveCsv)]
+    pub fn inundation_curve_csv(&self) -> String {
+        self.inundation_curve_csv.clone()
+    }
+    /// Renders a single inundation time step (`0`-based, or `0` = dry, `1..=numSteps`) as PNG bytes
+    /// with optional scale bar, legend, and active spill flow paths.
+    #[wasm_bindgen(js_name = renderFramePng)]
+    pub fn render_frame_png(
+        &self,
+        step_index: usize,
+        show_scale_bar: bool,
+        show_legend: bool,
+        show_spill_paths: Option<bool>,
+    ) -> Result<Vec<u8>, JsValue> {
+        let clamped = step_index.min(self.num_steps);
+        let t_hours = (clamped as f64) * self.time_step_h;
+        let progress = if self.num_steps > 0 {
+            clamped as f64 / self.num_steps as f64
+        } else {
+            0.0
+        };
+        let eff_intensity_cm_h = if t_hours > 0.0 {
+            let cum_mm = lidar::cumulative_runoff_mm(
+                t_hours,
+                self.rain_intensity_cm_h * self.runoff_coeff,
+                self.scaled_hyetograph.as_deref(),
+            );
+            cum_mm / (t_hours * 10.0)
+        } else {
+            self.rain_intensity_cm_h * self.runoff_coeff
+        };
+        let opts = AnimateInundationOptions {
+            time_step_h: Some(self.time_step_h),
+            rain_intensity_cm_h: Some(eff_intensity_cm_h),
+            show_scale_bar,
+            show_legend,
+            ..Default::default()
+        };
+        let paths: &[SpillFlowPath] = if show_spill_paths.unwrap_or(true) {
+            &self.spill_paths
+        } else {
+            &[]
+        };
+        render_inundation_frame_png_bytes(
+            &self.dem_refined,
+            &self.fill_time,
+            t_hours,
+            progress,
+            paths,
+            &opts,
+        )
+        .map_err(to_js_err)
+    }
     /// Encodes a shaded-relief animated inundation GIF on demand, guarding against
     /// excessive total frame-pixel counts in synchronous browser execution.
     #[wasm_bindgen(js_name = encodeGif)]
@@ -816,7 +929,7 @@ impl InundationOutput {
 }
 
 /// Runs the full in-memory hydrology & inundation pipeline:
-/// optional median filter → sink extraction → nested depressions → catchment hierarchy →
+/// optional median filter -> sink extraction -> nested depressions -> catchment hierarchy ->
 /// single-pass inundation simulation.
 ///
 /// GIF encoding is deferred to [`InundationOutput::encode_gif`] so live playback starts
@@ -834,9 +947,81 @@ pub fn simulate_inundation(
     rain_duration_h: f64,
     time_step_h: f64,
 ) -> Result<InundationOutput, JsValue> {
-    let raw_dem = read_array2d_f64(dem_bytes, filename)?;
-    let opts = InundationPipelineOptions {
+    simulate_inundation_advanced(
+        dem_bytes,
+        filename,
         kernel_size,
+        min_size,
+        min_depth,
+        interval,
+        rain_intensity_cm_h,
+        rain_duration_h,
+        time_step_h,
+        None,
+        1.0,
+        None,
+    )
+}
+
+/// Runs the full in-memory hydrology & inundation pipeline with optional selective breaching
+/// (`breach_max_depth`), effective runoff coefficient (`runoff_coeff` in `(0, 1]`), and
+/// optional SCS Type II design storm depth (`scs_type2_mm`).
+#[wasm_bindgen(js_name = simulateInundationAdvanced)]
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_inundation_advanced(
+    dem_bytes: &[u8],
+    filename: &str,
+    kernel_size: usize,
+    min_size: usize,
+    min_depth: f64,
+    interval: f64,
+    rain_intensity_cm_h: f64,
+    rain_duration_h: f64,
+    time_step_h: f64,
+    breach_max_depth: Option<f64>,
+    runoff_coeff: f64,
+    scs_type2_mm: Option<f64>,
+) -> Result<InundationOutput, JsValue> {
+    if !runoff_coeff.is_finite() || runoff_coeff <= 0.0 || runoff_coeff > 1.0 {
+        return Err(to_js_err(format!(
+            "runoff_coeff must be in (0, 1], got {runoff_coeff}"
+        )));
+    }
+    let raw_dem = read_array2d_f64(dem_bytes, filename)?;
+    let breach = breach_max_depth
+        .filter(|&md| md > 0.0)
+        .map(|md| BreachOptions {
+            mode: BreachMode::Selective,
+            max_depth: Some(md),
+            max_length: Some(40),
+            ..Default::default()
+        });
+    let rc_arr = if (runoff_coeff - 1.0).abs() > 1e-12 {
+        let mut a = Array2D::from_vec(
+            raw_dem.width(),
+            raw_dem.height(),
+            vec![runoff_coeff; raw_dem.data().len()],
+        )
+        .map_err(to_js_err)?;
+        a.copy_metadata_from(&raw_dem);
+        Some(a)
+    } else {
+        None
+    };
+    let hyeto = match scs_type2_mm {
+        Some(mm) if mm > 0.0 => {
+            Some(scs_type2_hyetograph(mm, rain_duration_h, time_step_h).map_err(to_js_err)?)
+        }
+        _ => None,
+    };
+    let scaled_hyetograph: Option<Vec<(f64, f64)>> = hyeto.as_ref().map(|h| {
+        h.iter()
+            .map(|&(dt, cm_h)| (dt, cm_h * runoff_coeff))
+            .collect()
+    });
+    let opts = InMemoryFullPipelineOptions {
+        kernel_size,
+        breach,
         simulation: SimulateInundationOptions {
             min_size,
             min_depth,
@@ -846,8 +1031,23 @@ pub fn simulate_inundation(
             time_step_h,
             compress: false,
         },
+        forcing: InundationForcing {
+            runoff_coeff: rc_arr.as_ref(),
+            infiltration_cm_h: None,
+            antecedent_depth: None,
+            hyetograph: hyeto.as_deref(),
+        },
+        scalar_runoff_coeff: runoff_coeff,
+        stream_vector: None,
     };
-    let pipe = simulate_inundation_pipeline_in_memory(&raw_dem, &opts).map_err(to_js_err)?;
+    let pipe = run_full_pipeline_in_memory(&raw_dem, &opts).map_err(to_js_err)?;
+
+    let rating_curves_json = serde_json::to_string(&pipe.rating_curves).map_err(to_js_err)?;
+    let rating_curves_csv = rating_curves_to_csv_string(&pipe.rating_curves);
+    let connectivity_graph_json =
+        serde_json::to_string(&pipe.connectivity_graph).map_err(to_js_err)?;
+    let connectivity_graphml = connectivity_graph_to_graphml_string(&pipe.connectivity_graph);
+    let inundation_curve_csv = pipe.inundation_curve_csv;
 
     let hillshade_rgb =
         compute_hillshade_rgb(&pipe.sinks.dem_refined, &HillshadeOptions::default());
@@ -869,8 +1069,8 @@ pub fn simulate_inundation(
             }
         })
         .collect();
+    let depression_id_values: Vec<i32> = pipe.depressions.depression_id.data().to_vec();
 
-    let num_steps = pipe.steps.len();
     let depressions_json =
         serde_json::to_string(&pipe.depressions.depressions).map_err(to_js_err)?;
     let catchment_hierarchy_json =
@@ -889,9 +1089,11 @@ pub fn simulate_inundation(
         projection: raw_dem.projection,
         max_level: pipe.depressions.max_level,
         num_regions: pipe.num_regions,
-        num_steps,
+        num_steps: pipe.steps.len(),
         time_step_h,
         rain_intensity_cm_h,
+        runoff_coeff,
+        scaled_hyetograph,
         dem_refined: pipe.sinks.dem_refined,
         fill_time: pipe.fill_time,
         spill_paths: pipe.spill_paths,
@@ -899,6 +1101,11 @@ pub fn simulate_inundation(
         catchment_hierarchy_json,
         steps_json,
         spill_paths_json,
+        rating_curves_json,
+        rating_curves_csv,
+        connectivity_graph_json,
+        connectivity_graphml,
+        inundation_curve_csv,
         fill_time_tif,
         catchment_hir_tif,
         sink_tif,
@@ -909,5 +1116,6 @@ pub fn simulate_inundation(
         level_rgba,
         fill_time_rgba,
         fill_time_values,
+        depression_id_values,
     })
 }

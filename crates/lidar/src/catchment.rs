@@ -1065,6 +1065,11 @@ pub fn delineate_catchment_hierarchy(
 /// Delineates the nested catchment hierarchy completely in memory from a refined DEM
 /// and the `depression_level` raster produced by [`crate::delineate_depressions_in_memory`].
 ///
+/// Compresses all non-depression upland cells in a single $O(N)$ pass onto their
+/// receiving depression cells, then evaluates levels `1..=max_level` in $O(L \cdot D)$
+/// over only the $D \ll N$ depression cells using an incremental Union-Find (DSU)
+/// instead of $O(L \cdot W \cdot H)$ repeated full-grid watershed passes.
+///
 /// Returns `(catchment_hir_f64, records)` with zero filesystem I/O (suitable for
 /// WebAssembly / browser execution and high-throughput pipelines).
 pub fn delineate_catchment_hierarchy_in_memory(
@@ -1081,10 +1086,11 @@ pub fn delineate_catchment_hierarchy_in_memory(
             depression_level.height()
         )));
     }
+    let n = w * h;
     let ldata = depression_level.data();
     let max_level = ldata.iter().copied().max().unwrap_or(0);
     if max_level <= 0 {
-        let mut empty = Array2D::from_vec(w, h, vec![0.0; w * h])?;
+        let mut empty = Array2D::from_vec(w, h, vec![0.0; n])?;
         empty.copy_metadata_from(dem);
         empty.set_no_data(0.0);
         return Ok((empty, Vec::new()));
@@ -1092,42 +1098,324 @@ pub fn delineate_catchment_hierarchy_in_memory(
 
     let cell_area = affine_cell_area(&dem.geotransform);
     let flowdirs = d8_flow_directions_resolved(dem)?;
-    let ldata_f64: Vec<f64> = ldata.iter().map(|&v| v as f64).collect();
+    let fdata = flowdirs.data();
+    let dem_data = dem.data();
+
+    // 1. Index all depression cells (level > 0) compactly as 0..d_count.
+    const NONE: u32 = u32::MAX;
+    const EXITS: u32 = u32::MAX - 1;
+    const VISITING: u32 = u32::MAX - 2;
+
+    if max_level as usize > n {
+        return Err(Error::InvalidArgument(format!(
+            "depression_level contains invalid level {max_level} exceeding grid cell count {n}"
+        )));
+    }
+
+    let mut grid_to_dep = vec![NONE; n];
+    let mut dep_to_grid: Vec<usize> = Vec::new();
+    let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); max_level as usize + 1];
+    for (idx, &lv) in ldata.iter().enumerate() {
+        if lv > 0 {
+            let d = dep_to_grid.len() as u32;
+            grid_to_dep[idx] = d;
+            dep_to_grid.push(idx);
+            buckets[lv as usize].push(d);
+        }
+    }
+    let d_count = dep_to_grid.len();
+
+    // 2. Compress all upland (level <= 0) D8 chains in one O(N) pass:
+    //    `upland_entry[idx]` stores the first depression cell index `0..d_count` reached
+    //    from `idx` (or `EXITS` if the path drains off-grid / into a non-depression pit).
+    let mut upland_entry = vec![NONE; n];
+    let mut upland_weight = vec![0u32; d_count];
+    let mut path_buf: Vec<usize> = Vec::new();
+
+    let step_d8 = |idx: usize| -> Option<usize> {
+        let dir = fdata[idx] as usize;
+        if dir == 0 || dir > 8 {
+            return None;
+        }
+        let r = (idx / w) as isize + D8Y[dir] as isize;
+        let c = (idx % w) as isize + D8X[dir] as isize;
+        if r < 0 || c < 0 || r >= h as isize || c >= w as isize {
+            None
+        } else {
+            Some((r as usize) * w + (c as usize))
+        }
+    };
+
+    for start in 0..n {
+        if grid_to_dep[start] != NONE || upland_entry[start] != NONE {
+            continue;
+        }
+        path_buf.clear();
+        let mut cur = start;
+        let resolved = loop {
+            if grid_to_dep[cur] != NONE {
+                break grid_to_dep[cur];
+            }
+            let st = upland_entry[cur];
+            if st != NONE {
+                break if st == VISITING { EXITS } else { st };
+            }
+            upland_entry[cur] = VISITING;
+            path_buf.push(cur);
+            match step_d8(cur) {
+                Some(nxt) => cur = nxt,
+                None => break EXITS,
+            }
+        };
+        for &p in &path_buf {
+            upland_entry[p] = resolved;
+        }
+        if resolved < EXITS {
+            upland_weight[resolved as usize] += path_buf.len() as u32;
+        }
+    }
+
+    // 3. Build compressed downstream link `next_dep[d]` from each depression cell `d`
+    //    across any intermediate upland cells to the next depression cell (or `EXITS`).
+    let mut next_dep = vec![EXITS; d_count];
+    for d in 0..d_count {
+        let idx = dep_to_grid[d];
+        if let Some(nxt) = step_d8(idx) {
+            let nd_dep = grid_to_dep[nxt];
+            next_dep[d] = if nd_dep != NONE {
+                nd_dep
+            } else {
+                upland_entry[nxt]
+            };
+        }
+    }
+    drop(upland_entry);
+
+    // 4. Incremental Union-Find (4-connected) over 0..d_count from level 1..=max_level,
+    //    maintaining component size, max level, earliest row-major pixel index, and
+    //    exact zonal DEM accumulators in O(alpha(D)) per merge.
+    let mut uf_parent: Vec<u32> = (0..d_count as u32).collect();
+    let mut uf_size = vec![0usize; d_count];
+    let mut uf_max_lvl = vec![0i32; d_count];
+    let mut uf_first_idx = vec![usize::MAX; d_count];
+    let mut uf_z_cnt = vec![0usize; d_count];
+    let mut uf_z_min = vec![f64::INFINITY; d_count];
+    let mut uf_z_max = vec![f64::NEG_INFINITY; d_count];
+    let mut uf_z_sum = vec![0.0f64; d_count];
+    let mut uf_z_sum_sq = vec![0.0f64; d_count];
+    let mut active = vec![false; d_count];
+
+    #[inline]
+    fn dsu_find(parent: &mut [u32], mut x: u32) -> u32 {
+        while parent[x as usize] != x {
+            parent[x as usize] = parent[parent[x as usize] as usize];
+            x = parent[x as usize];
+        }
+        x
+    }
 
     let mut all_records = Vec::new();
-    let mut hir_data = vec![0.0f64; w * h];
+    let mut hir_data = vec![0.0f64; n];
+    let mut root_to_fid = vec![0u32; d_count];
+    let mut dep_target = vec![NONE; d_count];
+    let mut d_path: Vec<u32> = Vec::new();
+    // Track all candidate roots touched up to the current level (kept deduplicated per level).
+    let mut touched_roots: Vec<u32> = Vec::new();
 
     for level_i32 in 1..=max_level {
         let level = level_i32 as u32;
-        let level_f64 = level_i32 as f64;
-        // Mirror extract_levels: group cells with 0 < level_img <= level and retain
-        // components whose peak level reaches `level`.
-        let (raw_labels, nb_labels) =
-            region_group(&ldata_f64, w, h, min_size, |v| v > 0.0 && v <= level_f64);
-        if nb_labels == 0 {
-            continue;
+        touched_roots.clear();
+
+        // Activate all cells at this exact level and merge with active 4-neighbors.
+        for &d in &buckets[level as usize] {
+            let du = d as usize;
+            let g_idx = dep_to_grid[du];
+            active[du] = true;
+            uf_size[du] = 1;
+            uf_max_lvl[du] = level_i32;
+            uf_first_idx[du] = g_idx;
+            let z = dem_data[g_idx];
+            if !is_missing(dem, z) {
+                uf_z_cnt[du] = 1;
+                uf_z_min[du] = z;
+                uf_z_max[du] = z;
+                uf_z_sum[du] = z;
+                uf_z_sum_sq[du] = z * z;
+            }
+
+            let r = g_idx / w;
+            let c = g_idx % w;
+            let nbrs = [
+                if r > 0 { Some(g_idx - w) } else { None },
+                if r + 1 < h { Some(g_idx + w) } else { None },
+                if c > 0 { Some(g_idx - 1) } else { None },
+                if c + 1 < w { Some(g_idx + 1) } else { None },
+            ];
+            for n_idx in nbrs.into_iter().flatten() {
+                let nb = grid_to_dep[n_idx];
+                if nb != NONE && active[nb as usize] {
+                    let ra = dsu_find(&mut uf_parent, d) as usize;
+                    let rb = dsu_find(&mut uf_parent, nb) as usize;
+                    if ra != rb {
+                        // Union by size so tree stays shallow.
+                        let (keep, drop_r) = if uf_size[ra] >= uf_size[rb] {
+                            (ra, rb)
+                        } else {
+                            (rb, ra)
+                        };
+                        uf_parent[drop_r] = keep as u32;
+                        uf_size[keep] += uf_size[drop_r];
+                        if uf_max_lvl[drop_r] > uf_max_lvl[keep] {
+                            uf_max_lvl[keep] = uf_max_lvl[drop_r];
+                        }
+                        if uf_first_idx[drop_r] < uf_first_idx[keep] {
+                            uf_first_idx[keep] = uf_first_idx[drop_r];
+                        }
+                        uf_z_cnt[keep] += uf_z_cnt[drop_r];
+                        if uf_z_min[drop_r] < uf_z_min[keep] {
+                            uf_z_min[keep] = uf_z_min[drop_r];
+                        }
+                        if uf_z_max[drop_r] > uf_z_max[keep] {
+                            uf_z_max[keep] = uf_z_max[drop_r];
+                        }
+                        uf_z_sum[keep] += uf_z_sum[drop_r];
+                        uf_z_sum_sq[keep] += uf_z_sum_sq[drop_r];
+                    }
+                }
+            }
+            touched_roots.push(d);
         }
-        let mut max_in_comp = vec![0i32; nb_labels as usize + 1];
-        for (&lbl, &lv) in raw_labels.iter().zip(ldata.iter()) {
-            if lbl > 0 && lv > max_in_comp[lbl as usize] {
-                max_in_comp[lbl as usize] = lv;
+
+        // Resolve unique roots among cells activated at this level whose total size > min_size
+        // (matching region_group's `count > min_size` criterion) and peak level == level_i32.
+        let mut active_roots: Vec<u32> = Vec::new();
+        for &d in &touched_roots {
+            let root = dsu_find(&mut uf_parent, d);
+            let ru = root as usize;
+            if uf_size[ru] > min_size && uf_max_lvl[ru] == level_i32 && root_to_fid[ru] == 0 {
+                root_to_fid[ru] = u32::MAX; // temporary dedup marker
+                active_roots.push(root);
             }
         }
-        let mut remap = vec![0u32; nb_labels as usize + 1];
-        let mut next_id = 0u32;
-        for (id, &max_lv) in max_in_comp.iter().enumerate().skip(1) {
-            if max_lv >= level_i32 {
-                next_id += 1;
-                remap[id] = next_id;
-            }
-        }
-        if next_id == 0 {
+        if active_roots.is_empty() {
             continue;
         }
-        let labels: Vec<u32> = raw_labels.iter().map(|&l| remap[l as usize]).collect();
-        let stats = compute_level_catchment_stats(dem, &flowdirs, cell_area, level, &labels)?;
-        paint_unclaimed_catchment_area(&mut hir_data, &labels, &stats.cat_area_by_id, 0.0);
-        all_records.extend(stats.records);
+        // Order by earliest row-major pixel index to match region_group numbering deterministically.
+        active_roots.sort_by_key(|&r| uf_first_idx[r as usize]);
+        for (i, &root) in active_roots.iter().enumerate() {
+            root_to_fid[root as usize] = (i + 1) as u32;
+        }
+
+        // Route only the compressed D depression cells (instead of W*H) along `next_dep`.
+        let num_fids = active_roots.len();
+        let mut cat_counts = vec![0usize; num_fids + 1];
+        dep_target.fill(NONE);
+
+        // Seed all cells belonging to an active level-L component directly.
+        for d in 0..d_count {
+            if active[d] {
+                let root = dsu_find(&mut uf_parent, d as u32) as usize;
+                let fid = root_to_fid[root];
+                if fid > 0 {
+                    dep_target[d] = fid;
+                }
+            }
+        }
+
+        // Trace remaining depression cells (both level > L and smaller finished components with max_lv < L).
+        for start_d in 0..d_count {
+            let fid = if dep_target[start_d] != NONE {
+                dep_target[start_d]
+            } else {
+                d_path.clear();
+                let mut cur = start_d as u32;
+                let resolved = loop {
+                    let st = dep_target[cur as usize];
+                    if st != NONE {
+                        break if st == VISITING { 0 } else { st };
+                    }
+                    dep_target[cur as usize] = VISITING;
+                    d_path.push(cur);
+                    let nxt = next_dep[cur as usize];
+                    if nxt >= EXITS {
+                        break 0;
+                    }
+                    cur = nxt;
+                };
+                for &p in &d_path {
+                    dep_target[p as usize] = resolved;
+                }
+                resolved
+            };
+            if fid > 0 {
+                cat_counts[fid as usize] += 1 + upland_weight[start_d] as usize;
+            }
+        }
+
+        // Emit records and paint unclaimed cells in `hir_data`.
+        let mut fid_cat_area = vec![0.0f64; num_fids + 1];
+        for (i, &root) in active_roots.iter().enumerate() {
+            let fid = (i + 1) as u32;
+            let ru = root as usize;
+            let count = uf_z_cnt[ru];
+            if count == 0 {
+                continue;
+            }
+            let zmin = uf_z_min[ru];
+            let zmax = uf_z_max[ru];
+            let zsum = uf_z_sum[ru];
+            let zsum_sq = uf_z_sum_sq[ru];
+            let c_cells = cat_counts[fid as usize].max(count);
+            let area = count as f64 * cell_area;
+            let cat_area = c_cells as f64 * cell_area;
+            let dep_to_cat_ratio = if cat_area > 0.0 { area / cat_area } else { 0.0 };
+            let mean_elev = zsum / count as f64;
+            let variance = ((zsum_sq / count as f64) - mean_elev * mean_elev).max(0.0);
+            let std_elev = variance.sqrt();
+            let range = zmax - zmin;
+            let volume = ((count as f64) * zmax - zsum).max(0.0) * cell_area;
+            let mean_depth = if area > 0.0 { volume / area } else { 0.0 };
+
+            fid_cat_area[fid as usize] = cat_area;
+            all_records.push(CatchmentHierarchyRecord {
+                level,
+                level_fid: fid,
+                count,
+                area,
+                cat_area,
+                dep_to_cat_ratio,
+                min_elev: zmin,
+                max_elev: zmax,
+                range,
+                mean_elev,
+                std_elev,
+                sum_elev: zsum,
+                volume,
+                mean_depth,
+            });
+        }
+
+        // Paint unclaimed cells belonging to active components at this level.
+        for d in 0..d_count {
+            if active[d] {
+                let g_idx = dep_to_grid[d];
+                if hir_data[g_idx] == 0.0 {
+                    let root = dsu_find(&mut uf_parent, d as u32) as usize;
+                    let fid = root_to_fid[root];
+                    if fid > 0 {
+                        let ca = fid_cat_area[fid as usize];
+                        if ca > 0.0 {
+                            hir_data[g_idx] = ca;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Clear root_to_fid entries before the next level.
+        for &root in &active_roots {
+            root_to_fid[root as usize] = 0;
+        }
     }
 
     let mut hir_arr = Array2D::from_vec(w, h, hir_data)?;

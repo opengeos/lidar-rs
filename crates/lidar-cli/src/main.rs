@@ -6,15 +6,22 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use lidar::pointcloud::{GridMethod, GridStat, LidarToDsmOptions, convert_lidar, lidar_to_dsm};
+use lidar::pointcloud::{
+    GridMethod, GridStat, GroundFilterMethod, LidarToDsmOptions, LidarToDtmOptions, ReturnKind,
+    convert_lidar, lidar_to_chm, lidar_to_dsm, lidar_to_dtm,
+};
 use lidar::{
-    AnimateInundationOptions, CatchmentHierarchyOptions, DelineateCatchmentsOptions,
-    DelineateFlowPathsOptions, DelineateOptions, ExtractSinksOptions, HillshadeOptions,
-    SimulateInundationOptions, Topology, add_crs, animate_inundation, clip_image,
-    csv_points_to_vector, delineate_catchment_hierarchy, delineate_catchments,
-    delineate_depressions, delineate_flow_paths, delineate_mounts, extract_sinks, flip_dem_file,
-    gaussian_filter_file, image_to_cog, join_csv_to_vector, mean_filter_file, median_filter_file,
-    mosaic, parse_resampling, polygonize, reproject_image, resample, simulate_inundation,
+    AnimateInundationOptions, BreachMode, BreachOptions, BurnCulvertsOptions,
+    CatchmentHierarchyOptions, DelineateCatchmentsOptions, DelineateFlowPathsOptions,
+    DelineateOptions, ExtractSinksOptions, HillshadeOptions, RunPipelineOptions,
+    SimulateInundationOptions, TiledDelineationOptions, Topology, add_crs, animate_inundation,
+    breach_depressions_file, burn_culverts_file, clip_image, csv_points_to_vector,
+    delineate_catchment_hierarchy, delineate_catchments, delineate_depressions,
+    delineate_depressions_tiled, delineate_flow_paths, delineate_mounts,
+    export_inundation_frames_png, extract_sinks, flip_dem_file, gaussian_filter_file, image_to_cog,
+    join_csv_to_vector, load_raster, mean_filter_file, median_filter_file, mosaic,
+    parse_resampling, polygonize, reproject_image, resample, run_pipeline, scs_type2_hyetograph,
+    simulate_inundation,
 };
 
 #[derive(Parser)]
@@ -42,6 +49,57 @@ impl From<CliTopology> for Topology {
             CliTopology::D4 => Topology::D4,
         }
     }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CliBreachMode {
+    Complete,
+    Selective,
+    Constrained,
+}
+
+impl From<CliBreachMode> for BreachMode {
+    fn from(m: CliBreachMode) -> Self {
+        match m {
+            CliBreachMode::Complete => BreachMode::Complete,
+            CliBreachMode::Selective => BreachMode::Selective,
+            CliBreachMode::Constrained => BreachMode::Constrained,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CliGroundMethod {
+    Preclassified,
+    Csf,
+    Pmf,
+}
+
+impl From<CliGroundMethod> for GroundFilterMethod {
+    fn from(m: CliGroundMethod) -> Self {
+        match m {
+            CliGroundMethod::Preclassified => GroundFilterMethod::Preclassified,
+            CliGroundMethod::Csf => GroundFilterMethod::Csf,
+            CliGroundMethod::Pmf => GroundFilterMethod::Pmf,
+        }
+    }
+}
+
+fn parse_u8_list(s: &str) -> lidar::Result<Vec<u8>> {
+    s.split(',')
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| {
+            part.trim().parse::<u8>().map_err(|_| {
+                lidar::Error::InvalidArgument(format!(
+                    "invalid ASPRS classification code: '{part}'"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn parse_return_kinds(s: &str) -> lidar::Result<Vec<ReturnKind>> {
+    lidar::pointcloud::parse_return_kinds(s)
 }
 
 #[derive(Subcommand)]
@@ -122,6 +180,9 @@ enum Commands {
         /// Also export combined level GeoTIFFs when --level-shp is set
         #[arg(long, requires = "level_shp")]
         comb_tif: bool,
+        /// Also export a unified multi-level GeoPackage (depressions.gpkg) with full attribute names
+        #[arg(long)]
+        gpkg: bool,
         /// Compress output GeoTIFFs with DEFLATE
         #[arg(short = 'c', long)]
         compress: bool,
@@ -300,6 +361,12 @@ enum Commands {
         /// Optional maximum Z filter
         #[arg(long, allow_hyphen_values = true)]
         max_z: Option<f64>,
+        /// Optional ASPRS classification codes to keep (comma-separated, e.g. "2" or "2,6")
+        #[arg(long)]
+        classification: Option<String>,
+        /// Optional pulse return kinds to keep (comma-separated: first,last,intermediate,only)
+        #[arg(long)]
+        return_kind: Option<String>,
         /// Grid statistic (max, min, mean, idw, count, stdev)
         #[arg(long, default_value = "max")]
         stat: String,
@@ -309,6 +376,236 @@ enum Commands {
         /// Gap-filling window size in cells (0 = none)
         #[arg(long, default_value_t = 0)]
         window_size: usize,
+    },
+    /// Generate a bare-earth Digital Terrain Model (DTM) from a LiDAR point cloud using CSF/PMF/preclassified ground points
+    LidarToDtm {
+        /// Input point cloud file (LAS, LAZ, COPC, PLY, E57)
+        input: PathBuf,
+        /// Output DTM GeoTIFF
+        output: PathBuf,
+        /// Ground classification method (preclassified, csf, pmf)
+        #[arg(long, value_enum, default_value_t = CliGroundMethod::Csf)]
+        ground_method: CliGroundMethod,
+        /// ASPRS ground class code (default 2)
+        #[arg(long, default_value_t = 2)]
+        ground_class: u8,
+        /// Output pixel resolution
+        #[arg(long, default_value_t = 1.0)]
+        resolution: f64,
+        /// Optional search radius around each cell center
+        #[arg(long)]
+        radius: Option<f64>,
+        /// Gridding method (linear, statistics, nearest)
+        #[arg(long, default_value = "linear")]
+        method: String,
+        /// Grid statistic when --method=statistics (idw, min, mean, max, count, stdev)
+        #[arg(long, default_value = "idw")]
+        stat: String,
+        /// Gap-filling window size in cells
+        #[arg(long, default_value_t = 5)]
+        window_size: usize,
+    },
+    /// Generate a Canopy Height Model (CHM = DSM - DTM) from a LiDAR point cloud
+    LidarToChm {
+        /// Input point cloud file (LAS, LAZ, COPC, PLY, E57)
+        input: PathBuf,
+        /// Output CHM GeoTIFF
+        output: PathBuf,
+        /// Ground classification method (preclassified, csf, pmf)
+        #[arg(long, value_enum, default_value_t = CliGroundMethod::Csf)]
+        ground_method: CliGroundMethod,
+        /// ASPRS ground class code (default 2)
+        #[arg(long, default_value_t = 2)]
+        ground_class: u8,
+        /// Output pixel resolution
+        #[arg(long, default_value_t = 1.0)]
+        resolution: f64,
+        /// Optional search radius around each cell center
+        #[arg(long)]
+        radius: Option<f64>,
+        /// Gap-filling window size in cells
+        #[arg(long, default_value_t = 5)]
+        window_size: usize,
+    },
+    /// Breach depressions using Lindsay (2016) least-cost breaching (complete, selective, or constrained)
+    BreachDepressions {
+        /// Input DEM raster
+        input: PathBuf,
+        /// Output conditioned DEM raster
+        output: PathBuf,
+        /// Breaching mode (complete, selective, constrained)
+        #[arg(long, value_enum, default_value_t = CliBreachMode::Selective)]
+        mode: CliBreachMode,
+        /// Maximum breach depth in elevation units (defaults to 1.5 for selective/constrained; pass 0 for unlimited)
+        #[arg(long)]
+        max_depth: Option<f64>,
+        /// Maximum breach path length in cells (defaults to 50 for selective/constrained; pass 0 for unlimited)
+        #[arg(long)]
+        max_length: Option<u32>,
+        /// Fill remaining unbreached depressions after selective/constrained breaching
+        #[arg(long)]
+        fill_remaining: bool,
+        /// Compress output GeoTIFF with DEFLATE
+        #[arg(short = 'c', long)]
+        compress: bool,
+    },
+    /// Burn polyline or point culvert vectors across road embankments into a DEM
+    BurnCulverts {
+        /// Input DEM raster
+        input: PathBuf,
+        /// Input culvert polyline or point vector (.geojson, .gpkg, .shp)
+        culverts: PathBuf,
+        /// Output hydro-conditioned DEM raster
+        output: PathBuf,
+        /// Half-width of carved culvert channel in grid cells (0 = 1-cell wide)
+        #[arg(long, default_value_t = 0)]
+        half_width: usize,
+        /// Elevation drop below endpoint elevation (vertical DEM units)
+        #[arg(long, default_value_t = 0.05)]
+        depth_offset: f64,
+        /// Search radius in cells around culvert point features
+        #[arg(long, default_value_t = 5)]
+        point_radius: usize,
+        /// Compress output GeoTIFF with DEFLATE
+        #[arg(short = 'c', long)]
+        compress: bool,
+    },
+    /// Run the complete in-memory hydrology pipeline from a raw DEM to vectors, rating curves, connectivity graph, and inundation rasters
+    Pipeline {
+        /// Input raw DEM raster
+        input: PathBuf,
+        /// Output directory
+        out_dir: PathBuf,
+        /// Median filter kernel size (1 = skip filtering)
+        #[arg(short = 'k', long, default_value_t = 3)]
+        kernel: usize,
+        /// Minimum depression size in pixels
+        #[arg(short = 'm', long, default_value_t = 1000)]
+        min_size: usize,
+        /// Minimum depression depth
+        #[arg(short = 'd', long, default_value_t = 0.3)]
+        min_depth: f64,
+        /// Vertical level-set slicing interval
+        #[arg(short = 'i', long, default_value_t = 0.3)]
+        interval: f64,
+        /// Rainfall intensity in cm/h
+        #[arg(long, default_value_t = 5.0)]
+        rain_intensity: f64,
+        /// Total rainfall duration in hours (defaults to 24.0 when --scs-type2-mm is set, else 50.0)
+        #[arg(long)]
+        duration: Option<f64>,
+        /// Simulation time step in hours
+        #[arg(long, default_value_t = 1.0)]
+        time_step: f64,
+        /// Optional selective breaching maximum depth (enables Lindsay 2016 pre-conditioning)
+        #[arg(long)]
+        breach_max_depth: Option<f64>,
+        /// Optional selective breaching maximum path length in cells
+        #[arg(long, default_value_t = 40)]
+        breach_max_length: u32,
+        /// Optional culvert vector (.gpkg, .geojson, .shp) to burn before sink extraction
+        #[arg(long)]
+        culverts: Option<PathBuf>,
+        /// Optional spatially variable runoff-coefficient raster (GeoTIFF, values 0..=1)
+        #[arg(long)]
+        runoff_coeff: Option<PathBuf>,
+        /// Optional spatially variable infiltration loss raster (GeoTIFF, cm/h)
+        #[arg(long)]
+        infiltration: Option<PathBuf>,
+        /// Optional antecedent water depth raster (GeoTIFF)
+        #[arg(long)]
+        antecedent_depth: Option<PathBuf>,
+        /// Optional SCS Type II design storm total precipitation in mm (overrides constant rainfall)
+        #[arg(long)]
+        scs_type2_mm: Option<f64>,
+        /// Optional stream network vector (.gpkg, .geojson, .shp) for distance-to-stream graph metrics
+        #[arg(long)]
+        streams: Option<PathBuf>,
+        /// Load DEM as f32 (halves peak RAM on large rasters)
+        #[arg(long)]
+        use_f32: bool,
+        /// Skip writing output GeoTIFF rasters (keep CSV, GeoPackage, and graph outputs)
+        #[arg(long)]
+        no_rasters: bool,
+        /// Skip writing output GeoPackage vectors
+        #[arg(long)]
+        no_vectors: bool,
+        /// Skip writing rating curves and connectivity graph
+        #[arg(long)]
+        no_graph: bool,
+        /// Compress output GeoTIFFs with DEFLATE
+        #[arg(short = 'c', long)]
+        compress: bool,
+        /// Print summary as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delineate nested depressions across large DEMs using parallel overlapping tiles
+    TiledDepressions {
+        /// Input DEM raster
+        input: PathBuf,
+        /// Output directory
+        out_dir: PathBuf,
+        /// Core tile width/height in pixels
+        #[arg(long, default_value_t = 2048)]
+        tile_size: usize,
+        /// Overlap halo around each tile in pixels
+        #[arg(long, default_value_t = 128)]
+        overlap: usize,
+        /// Median filter kernel size (1 = skip)
+        #[arg(short = 'k', long, default_value_t = 3)]
+        kernel: usize,
+        /// Minimum depression size in pixels
+        #[arg(short = 'm', long, default_value_t = 1000)]
+        min_size: usize,
+        /// Minimum depression depth
+        #[arg(short = 'd', long, default_value_t = 0.3)]
+        min_depth: f64,
+        /// Vertical level-set slicing interval
+        #[arg(short = 'i', long, default_value_t = 0.3)]
+        interval: f64,
+        /// Load DEM in f32 precision to reduce peak memory
+        #[arg(long)]
+        use_f32: bool,
+        /// Print summary as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export numbered PNG inundation frames with optional scale bar and legend
+    ExportFrames {
+        /// Background DEM raster
+        dem: PathBuf,
+        /// Fill-time raster (fill_time.tif)
+        fill_time: PathBuf,
+        /// Output directory for numbered PNG frames
+        out_dir: PathBuf,
+        /// Number of frames to export
+        #[arg(long, default_value_t = 10)]
+        num_steps: usize,
+        /// Time step in hours
+        #[arg(long, default_value_t = 1.0)]
+        time_step: f64,
+        /// Optional rainfall intensity in cm/h for banner labels
+        #[arg(long)]
+        rain_intensity: Option<f64>,
+        /// Water overlay opacity (0.0..=1.0)
+        #[arg(long, default_value_t = 0.55)]
+        water_alpha: f32,
+        /// Optional maximum width/height in pixels
+        #[arg(long)]
+        max_dim: Option<usize>,
+        /// Draw a metric scale bar on each frame
+        #[arg(long)]
+        scale_bar: bool,
+        /// Draw a legend box on each frame
+        #[arg(long)]
+        legend: bool,
+        /// Hillshade azimuth in degrees
+        #[arg(long, default_value_t = 135.0)]
+        azimuth: f64,
+        /// Hillshade elevation angle in degrees
+        #[arg(long, default_value_t = 45.0)]
+        elevation: f64,
     },
     /// Delineate contributing catchments for extracted sinks (ports 2_Delineate_Catchment.py)
     DelineateCatchments {
@@ -426,6 +723,12 @@ enum Commands {
         /// Hillshade elevation angle in degrees
         #[arg(long, default_value_t = 45.0)]
         elevation: f64,
+        /// Draw a metric scale bar on each frame
+        #[arg(long)]
+        scale_bar: bool,
+        /// Draw a legend box on each frame
+        #[arg(long)]
+        legend: bool,
     },
     /// Print metadata summary for a raster or LiDAR point cloud
     Info {
@@ -502,6 +805,7 @@ fn run() -> lidar::Result<()> {
             interval,
             level_shp,
             comb_tif,
+            gpkg,
             compress,
             json,
         } => {
@@ -511,6 +815,7 @@ fn run() -> lidar::Result<()> {
                 interval,
                 bool_level_shp: level_shp,
                 bool_comb_tif: comb_tif,
+                export_gpkg: gpkg,
                 compress,
             };
             let res = delineate_depressions(&in_sink, &out_dir, &opts)?;
@@ -533,6 +838,9 @@ fn run() -> lidar::Result<()> {
                     res.depression_level_path.display()
                 );
                 println!("  shapefile:        {}", res.shapefile_path.display());
+                if let Some(ref gp) = res.gpkg_path {
+                    println!("  gpkg:             {}", gp.display());
+                }
                 println!("  csv:              {}", res.csv_path.display());
             }
         }
@@ -552,6 +860,7 @@ fn run() -> lidar::Result<()> {
                 interval,
                 bool_level_shp: level_shp,
                 bool_comb_tif: false,
+                export_gpkg: false,
                 compress,
             };
             let res = delineate_mounts(&input, &out_dir, &opts)?;
@@ -683,15 +992,21 @@ fn run() -> lidar::Result<()> {
             radius,
             min_z,
             max_z,
+            classification,
+            return_kind,
             stat,
             method,
             window_size,
         } => {
+            let classifications = classification.as_deref().map(parse_u8_list).transpose()?;
+            let return_kinds = return_kind.as_deref().map(parse_return_kinds).transpose()?;
             let opts = LidarToDsmOptions {
                 resolution,
                 radius,
                 min_z,
                 max_z,
+                classifications,
+                return_kinds,
                 stat: GridStat::parse(&stat)?,
                 method: GridMethod::parse(&method)?,
                 window_size,
@@ -699,6 +1014,268 @@ fn run() -> lidar::Result<()> {
             };
             let (cols, rows) = lidar_to_dsm(&input, &output, &opts)?;
             println!("Generated {cols}x{rows} DSM at {}", output.display());
+        }
+        Commands::LidarToDtm {
+            input,
+            output,
+            ground_method,
+            ground_class,
+            resolution,
+            radius,
+            method,
+            stat,
+            window_size,
+        } => {
+            let opts = LidarToDtmOptions {
+                resolution,
+                ground_method: ground_method.into(),
+                ground_class,
+                radius,
+                method: GridMethod::parse(&method)?,
+                stat: GridStat::parse(&stat)?,
+                window_size,
+                ..Default::default()
+            };
+            let (cols, rows) = lidar_to_dtm(&input, &output, &opts)?;
+            println!("Generated {cols}x{rows} DTM at {}", output.display());
+        }
+        Commands::LidarToChm {
+            input,
+            output,
+            ground_method,
+            ground_class,
+            resolution,
+            radius,
+            window_size,
+        } => {
+            let opts = LidarToDtmOptions {
+                resolution,
+                ground_method: ground_method.into(),
+                ground_class,
+                radius,
+                window_size,
+                ..Default::default()
+            };
+            let (cols, rows) = lidar_to_chm(&input, &output, &opts)?;
+            println!("Generated {cols}x{rows} CHM at {}", output.display());
+        }
+        Commands::BreachDepressions {
+            input,
+            output,
+            mode,
+            max_depth,
+            max_length,
+            fill_remaining,
+            compress,
+        } => {
+            let breach_mode: BreachMode = mode.into();
+            let mut opts = BreachOptions::for_mode(breach_mode, max_depth, max_length);
+            if max_depth == Some(0.0) {
+                opts.max_depth = None;
+            }
+            if max_length == Some(0) {
+                opts.max_length = None;
+            }
+            opts.fill_remaining = fill_remaining;
+            opts.compress = compress;
+            breach_depressions_file(&input, &output, &opts)?;
+            println!("Saved breached DEM to {}", output.display());
+        }
+        Commands::BurnCulverts {
+            input,
+            culverts,
+            output,
+            half_width,
+            depth_offset,
+            point_radius,
+            compress,
+        } => {
+            let opts = BurnCulvertsOptions {
+                half_width_cells: half_width,
+                depth_offset,
+                point_radius_cells: point_radius,
+                compress,
+            };
+            let (_out, carved) = burn_culverts_file(&input, &culverts, &output, &opts)?;
+            println!(
+                "Burned culverts ({carved} cells lowered) to {}",
+                output.display()
+            );
+        }
+        Commands::Pipeline {
+            input,
+            out_dir,
+            kernel,
+            min_size,
+            min_depth,
+            interval,
+            rain_intensity,
+            duration,
+            time_step,
+            breach_max_depth,
+            breach_max_length,
+            culverts,
+            runoff_coeff,
+            infiltration,
+            antecedent_depth,
+            scs_type2_mm,
+            streams,
+            use_f32,
+            no_rasters,
+            no_vectors,
+            no_graph,
+            compress,
+            json,
+        } => {
+            let duration = duration.unwrap_or(if scs_type2_mm.is_some() { 24.0 } else { 50.0 });
+            let hyetograph = scs_type2_mm
+                .map(|mm| scs_type2_hyetograph(mm, duration, time_step))
+                .transpose()?;
+            let breach = breach_max_depth.map(|md| BreachOptions {
+                mode: BreachMode::Selective,
+                max_depth: Some(md),
+                max_length: Some(breach_max_length),
+                ..Default::default()
+            });
+            let opts = RunPipelineOptions {
+                kernel_size: kernel,
+                breach,
+                culverts_vector: culverts,
+                simulation: SimulateInundationOptions {
+                    min_size,
+                    min_depth,
+                    interval,
+                    rain_intensity_cm_h: rain_intensity,
+                    rain_duration_h: duration,
+                    time_step_h: time_step,
+                    compress,
+                },
+                runoff_coeff_path: runoff_coeff,
+                infiltration_path: infiltration,
+                antecedent_depth_path: antecedent_depth,
+                hyetograph,
+                stream_vector: streams,
+                use_f32,
+                save_rasters: !no_rasters,
+                export_vectors: !no_vectors,
+                export_graph: !no_graph,
+                ..Default::default()
+            };
+            let res = run_pipeline(&input, &out_dir, &opts)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&res)
+                        .map_err(|e| lidar::Error::Algorithm(e.to_string()))?
+                );
+            } else {
+                println!(
+                    "Pipeline complete: {} nested depression(s) across {} sink region(s) (max level = {}), {} spill path(s)",
+                    res.num_depressions, res.num_sink_regions, res.max_level, res.num_spill_paths
+                );
+                println!("  depressions CSV:  {}", res.depressions_csv.display());
+                if let Some(ref p) = res.depressions_gpkg {
+                    println!("  depressions GPKG: {}", p.display());
+                }
+                if let Some(ref p) = res.spill_paths_gpkg {
+                    println!("  spill paths GPKG: {}", p.display());
+                }
+                if let Some(ref p) = res.rating_curves_csv {
+                    println!("  rating curves:    {}", p.display());
+                }
+                if let Some(ref p) = res.connectivity_graph_json {
+                    println!("  graph JSON:       {}", p.display());
+                }
+                if let Some(ref p) = res.connectivity_graphml {
+                    println!("  graph GraphML:    {}", p.display());
+                }
+                println!("  inundation curve: {}", res.inundation_csv.display());
+                println!("  summary JSON:     {}", res.summary_json.display());
+            }
+        }
+        Commands::TiledDepressions {
+            input,
+            out_dir,
+            tile_size,
+            overlap,
+            kernel,
+            min_size,
+            min_depth,
+            interval,
+            use_f32,
+            json,
+        } => {
+            let opts = TiledDelineationOptions {
+                tile_size,
+                overlap,
+                kernel_size: kernel,
+                min_size,
+                min_depth,
+                interval,
+                use_f32,
+                ..Default::default()
+            };
+            let res = delineate_depressions_tiled(&input, &out_dir, &opts)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&res)
+                        .map_err(|e| lidar::Error::Algorithm(e.to_string()))?
+                );
+            } else {
+                println!(
+                    "Tiled delineation complete across {} tile(s): {} nested depression(s), max level = {}",
+                    res.num_tiles,
+                    res.depressions.len(),
+                    res.max_level
+                );
+                println!("  csv: {}", res.csv_path.display());
+            }
+        }
+        Commands::ExportFrames {
+            dem,
+            fill_time,
+            out_dir,
+            num_steps,
+            time_step,
+            rain_intensity,
+            water_alpha,
+            max_dim,
+            scale_bar,
+            legend,
+            azimuth,
+            elevation,
+        } => {
+            let dem_arr = load_raster::<f64>(&dem, None)?;
+            let ft_arr = load_raster::<f64>(&fill_time, None)?;
+            let opts = AnimateInundationOptions {
+                water_alpha,
+                max_dimension: max_dim,
+                time_step_h: Some(time_step),
+                rain_intensity_cm_h: rain_intensity,
+                show_scale_bar: scale_bar,
+                show_legend: legend,
+                hillshade: HillshadeOptions {
+                    azimuth_deg: azimuth,
+                    elevation_deg: elevation,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let paths = export_inundation_frames_png(
+                &dem_arr,
+                &ft_arr,
+                num_steps,
+                time_step,
+                &[],
+                &out_dir,
+                &opts,
+            )?;
+            println!(
+                "Exported {} PNG frame(s) to {}",
+                paths.len(),
+                out_dir.display()
+            );
         }
         Commands::DelineateCatchments {
             dem,
@@ -843,6 +1420,8 @@ fn run() -> lidar::Result<()> {
             rain_intensity,
             azimuth,
             elevation,
+            scale_bar,
+            legend,
         } => {
             let opts = AnimateInundationOptions {
                 frame_delay_ms: delay_ms,
@@ -852,6 +1431,8 @@ fn run() -> lidar::Result<()> {
                 max_dimension: max_dim,
                 time_step_h: Some(time_step),
                 rain_intensity_cm_h: rain_intensity,
+                show_scale_bar: scale_bar,
+                show_legend: legend,
                 hillshade: HillshadeOptions {
                     azimuth_deg: azimuth,
                     elevation_deg: elevation,
