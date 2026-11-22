@@ -497,8 +497,10 @@ pub struct SpillFlowPath {
     pub to_dep_id: u32,
     /// Time in hours when the upstream depression becomes fully filled and begins spilling.
     pub spill_time_h: f64,
-    /// Time in hours when the overland saddle submerges and the two water bodies merge
-    /// (`None` if the channel does not submerge within the basin).
+    /// Time in hours when the spilling depression merges with its downstream/enclosing water body
+    /// (`None` if it does not merge): under static routing, the time when the overland saddle
+    /// channel cells submerge; under Fill-Spill-Merge routing, the exact child-to-parent merge
+    /// event time when all sibling basins under the enclosing parent reach spill capacity.
     pub merge_time_h: Option<f64>,
     /// Saddle / pour-point elevation where water overflows out of the upstream depression.
     pub spill_elev: f64,

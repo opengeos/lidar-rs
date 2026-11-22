@@ -208,6 +208,9 @@ pub struct GraphEdge {
     pub edge_type: String,
     pub spill_time_h: Option<f64>,
     pub spill_runoff_mm: Option<f64>,
+    /// Merge time in hours: for `"spill"` edges, mirrors [`SpillFlowPath::merge_time_h`]; for
+    /// `"merge"` edges, records the parent's fill time under static routing or the exact
+    /// child-to-parent merge event time (`None` if unmerged) under Fill-Spill-Merge routing.
     pub merge_time_h: Option<f64>,
     pub spill_elev: Option<f64>,
     pub length_m: f64,

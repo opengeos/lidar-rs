@@ -26,10 +26,11 @@
 //!
 //! ## Scaling notes
 //!
-//! Outlet discovery reuses grid-sized scratch buffers once per worker thread, while the
-//! event-driven routing loop performs `O(m)` passes per fill/merge event (`O(m^2)` worst case
-//! for `m` depressions) and stores sorted hypsometric cells per nested basin (`O(N * max_level)`
-//! memory across `N` valid sink pixels).
+//! Outlet discovery checks out grid-sized scratch buffers (~25 bytes per cell) from a small pool
+//! bounded by active worker concurrency and releases them immediately once outlets are found.
+//! The event-driven routing loop performs `O(m)` passes per fill/merge event (`O(m^2)` worst case
+//! for `m` depressions) and retains sorted hypsometric cell tables (`16` bytes per entry,
+//! `O(N * max_level)` memory across `N` valid sink pixels).
 
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs::File;
@@ -240,10 +241,12 @@ struct BasinNode {
     storm_end_routed_cat_m2: f64,
 }
 
-/// Reusable grid-sized scratch buffers for outward Priority-Flood outlet discovery.
+/// Reusable grid-sized scratch buffers (~25 bytes per cell) for outward Priority-Flood outlet
+/// discovery.
 ///
-/// Allocated once per rayon worker (or once sequentially) and reused across all depressions
-/// via generation stamps so outlet discovery never re-allocates `O(N)` buffers per depression.
+/// Checked out from a pool bounded by concurrent worker count (or allocated once sequentially)
+/// and reused across depressions via generation stamps so outlet discovery never re-allocates
+/// `O(N)` buffers per depression or per Rayon work-stealing split.
 struct OutletSearchScratch {
     in_source: Vec<bool>,
     visited_pf: Vec<u32>,
@@ -957,15 +960,20 @@ pub fn simulate_fill_spill_merge_in_memory(
     }
 
     // 4. Discover topographic spill outlets for every depression (parallel when enabled),
-    // reusing one `OutletSearchScratch` per worker thread.
+    // checking out reusable scratch buffers from a pool strictly bounded by active worker count.
     #[cfg(feature = "parallel")]
-    let outlets: Vec<Option<TopographicOutlet>> = depressions
-        .depressions
-        .par_iter()
-        .map_init(
-            || OutletSearchScratch::new(n),
-            |scratch, d| {
-                find_topographic_outlet(
+    let outlets: Vec<Option<TopographicOutlet>> = {
+        let pool = std::sync::Mutex::new(Vec::<OutletSearchScratch>::new());
+        depressions
+            .depressions
+            .par_iter()
+            .map(|d| {
+                let mut scratch = pool
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .pop()
+                    .unwrap_or_else(|| OutletSearchScratch::new(n));
+                let out = find_topographic_outlet(
                     d,
                     w,
                     h,
@@ -976,11 +984,13 @@ pub fn simulate_fill_spill_merge_in_memory(
                     &children_map,
                     &parent_map,
                     &pixels_by_id,
-                    scratch,
-                )
-            },
-        )
-        .collect();
+                    &mut scratch,
+                );
+                pool.lock().unwrap_or_else(|e| e.into_inner()).push(scratch);
+                out
+            })
+            .collect()
+    };
     #[cfg(not(feature = "parallel"))]
     let outlets: Vec<Option<TopographicOutlet>> = {
         let mut scratch = OutletSearchScratch::new(n);
@@ -1073,8 +1083,12 @@ pub fn simulate_fill_spill_merge_in_memory(
     let mut basins: Vec<BasinNode> = Vec::with_capacity(depressions.depressions.len());
     let mut total_antecedent_m3 = 0.0f64;
 
-    for (dep_idx, d) in depressions.depressions.iter().enumerate() {
-        let all_cells = &all_cells_by_dep[dep_idx];
+    for (dep_idx, (d, all_cells)) in depressions
+        .depressions
+        .iter()
+        .zip(all_cells_by_dep)
+        .enumerate()
+    {
         let z_rim = z_rims[dep_idx];
 
         let mut hypso_cells: Vec<HypsoCell> = Vec::with_capacity(all_cells.len());
@@ -1100,7 +1114,7 @@ pub fn simulate_fill_spill_merge_in_memory(
         let loss_rate_m3_h = if let Some(inf) = forcing.infiltration_cm_h {
             let inf_nd = inf.no_data();
             let mut sum_m_h = 0.0f64;
-            for &(_, gi) in all_cells {
+            for &(_, gi) in &all_cells {
                 let v = inf.get_i(gi);
                 if v.is_finite() && !v.rd_eq(inf_nd) && v > 0.0 {
                     sum_m_h += (v / 100.0) * cell_area;
