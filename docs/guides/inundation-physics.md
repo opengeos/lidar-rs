@@ -67,7 +67,7 @@ Non-finite and NoData CN cells propagate as NoData (`-9999.0`) in the output ras
     cn = tifffile.imread("sample_cn.tif").astype(np.float64)
 
     # 1. Convert NRCS Curve Number raster to effective runoff coefficient C = Q/P
-    #    (pass nodata=<val> if the CN GeoTIFF uses a finite NoData sentinel)
+    #    (pass no_data=<val> if the CN GeoTIFF uses a finite NoData sentinel)
     rc = lidar.scs_curve_number_runoff(cn, precip_mm=150.0)
     # Map the -9999.0 output NoData sentinel to NaN so array simulation falls back to C = 1.0
     rc = np.where(rc == -9999.0, np.nan, rc)

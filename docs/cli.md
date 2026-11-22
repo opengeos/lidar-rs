@@ -30,6 +30,7 @@ lidar pipeline dem.tif out_pipe \
   --compress --json
 
 # Full hydro-conditioned + SCS Type II 24-h design storm + NHD stream proximity
+# (requires aligned forcing rasters; see the Inundation Physics guide for creating runoff_coeff.tif)
 lidar pipeline dem.tif out_storm \
   --culverts sample_culverts.gpkg \
   --breach-max-depth 1.5 --breach-max-length 40 \

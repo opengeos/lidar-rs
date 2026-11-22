@@ -17,7 +17,7 @@ High-performance nested surface depression delineation, hydro-conditioning, LiDA
 ## Highlights
 
 - **All-in-one in-memory pipeline (`run_pipeline` / `lidar pipeline`):** Run DEM smoothing, optional hydro-conditioning, Priority-Flood sink extraction, nested depression hierarchy, single-pass D8 catchment hierarchy, inundation simulation, rating curves, connectivity graph export, and unified multi-layer GeoPackage (`results.gpkg`) output in a single command.
-- **Compressed D8 catchment engine:** Single-pass upland D8 forest compression plus per-level Union-Find (`O(N + L*D)`), scaling to 98M-cell, 43-level 1-m USGS 3DEP karst watersheds in ~65 seconds.
+- **Compressed D8 catchment engine:** Single-pass upland D8 forest compression plus per-level Union-Find (`O(N + L*D)`). In an illustrative 98M-cell, 43-level 1-m USGS 3DEP karst run it completed in ~65 seconds (see the [User Guides](https://lidar-rs.opengeos.org/guides/)).
 - **Hydro-conditioning (`breach_depressions`, `burn_culverts`):** Pure-Rust Lindsay (2016) least-cost depression breaching (`complete`, `selective`, `constrained`) and vector-guided culvert burning across road embankments.
 - **Inundation physics & storm forcing:** Spatially variable runoff coefficients, NRCS TR-55 SCS Curve Number conversion (`cn_to_runoff_coeff`), SCS Type II design storm hyetographs, vertical infiltration losses, and antecedent ponded water depths.
 - **Rating curves & connectivity graphs:** Exact stage-storage-area rating curves (`rating_curves.csv`), directed fill-and-spill / merge networks (JSON + GraphML), georeferenced spill-path vectors (`spill_paths.gpkg`), and NHD stream-proximity metrics.

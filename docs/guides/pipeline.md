@@ -118,7 +118,7 @@ out_pipe/
 └── fill_time.tif                # Time to inundation in hours (-1.0 = dry/NoData)
 ```
 
-Use `--no-rasters`, `--no-vectors`, or `--no-graph` (or the matching boolean options in Rust/Python) to skip output groups you do not need.
+Use `--no-rasters`, `--no-vectors`, or `--no-graph` on the CLI (or set `save_rasters=False`, `export_vectors=False`, `export_graph=False` in Rust/Python, which all default to `true`) to skip output groups you do not need.
 
 ## Unified GeoPackage Export (`--gpkg`)
 
