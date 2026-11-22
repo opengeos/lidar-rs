@@ -1115,12 +1115,18 @@
           { label: "Sink GeoTIFF", filename: `${stem}_sink.tif`, data: sim.sinkTif(), mime: "image/tiff" },
         ];
         if (fsmMassBalance && typeof sim.fsmBasinsCsv === "function") {
-          downloadItems.splice(7, 0, {
+          const fsmItem = {
             label: "FSM Basins CSV",
             filename: `${stem}_fsm_basins.csv`,
             getData: () => sim.fsmBasinsCsv(),
             mime: "text/csv",
-          });
+          };
+          const curveIdx = downloadItems.findIndex((item) => item.label === "Inundation Curve CSV");
+          if (curveIdx >= 0) {
+            downloadItems.splice(curveIdx + 1, 0, fsmItem);
+          } else {
+            downloadItems.push(fsmItem);
+          }
         }
         renderDownloads(downloadItems, true);
 

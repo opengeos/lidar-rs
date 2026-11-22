@@ -146,7 +146,7 @@ By default (`RoutingMode::Static`), each depression fills independently using it
 1. **Catchment-weighted runoff attribution (`O(N)`):** Every valid cell traces its D8 flow path once to its initial receiving depression (or watershed boundary), crediting both geometric area (`cell_area`) and effective runoff area (`cell_area * runoff_coeff`) with zero double-counting between nested levels.
 2. **Dynamic spill cascades:** Once an upstream depression fills to its rim capacity at `t_spill`, its net excess discharge `(Q_in - loss).max(0)` routes over its lowest topographic saddle into the downstream receiving depression (or the DEM boundary), accelerating downstream fill times.
 3. **Hierarchical parent merging:** When all direct children of a compound parent depression reach full capacity, they merge into the parent at `t_merge`, transferring stored volume and contributing catchments to the parent as water continues rising smoothly to the enclosing rim.
-4. **Continuous hypsometric timing & mass conservation:** Per-cell `fill_time` is interpolated continuously from each basin's exact sorted-elevation stage-storage curve, and every run verifies exact watershed-scale conservation:
+4. **Continuous hypsometric timing & mass conservation:** Per-cell `fill_time` is interpolated continuously from each basin's exact sorted-elevation stage-storage curve, and every run tracks watershed-scale numerical volume accounting (detecting any routing leaks across storage, infiltration, and boundary outflow):
 
 ```text
 total_antecedent_m3 + total_runoff_m3

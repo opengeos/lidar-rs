@@ -1569,9 +1569,9 @@ fn region_fill_times_forced(
     Ok(fill_time)
 }
 
-pub(crate) fn validate_grid_alignment(
-    reference: &Array2D<f64>,
-    candidate: &Array2D<f64>,
+pub(crate) fn validate_grid_alignment<T: DemNum, U: DemNum>(
+    reference: &Array2D<T>,
+    candidate: &Array2D<U>,
     name: &str,
 ) -> Result<()> {
     let w = reference.width();
@@ -1581,7 +1581,7 @@ pub(crate) fn validate_grid_alignment(
     let cell_y = ref_gt[4].hypot(ref_gt[5]).max(1e-9);
     if candidate.width() != w || candidate.height() != h {
         return Err(Error::DimensionMismatch(format!(
-            "{name} ({}x{}) does not match sink ({w}x{h})",
+            "{name} ({}x{}) does not match reference ({w}x{h})",
             candidate.width(),
             candidate.height()
         )));
@@ -1594,7 +1594,7 @@ pub(crate) fn validate_grid_alignment(
         };
         if (a - b).abs() > tol {
             return Err(Error::DimensionMismatch(format!(
-                "{name} geotransform[{k}] ({a}) does not match sink ({b})"
+                "{name} geotransform[{k}] ({a}) does not match reference ({b})"
             )));
         }
     }
@@ -1607,7 +1607,7 @@ pub(crate) fn validate_grid_alignment(
         && !s_srs.same_as(&a_srs)
     {
         return Err(Error::InvalidArgument(format!(
-            "{name} CRS ({}) does not match sink CRS ({})",
+            "{name} CRS ({}) does not match reference CRS ({})",
             a_srs.label(),
             s_srs.label()
         )));

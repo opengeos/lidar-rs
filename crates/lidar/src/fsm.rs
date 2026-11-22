@@ -40,7 +40,8 @@ use crate::catchment::d8_flow_directions_resolved;
 use crate::error::{Error, Result};
 use crate::inundation::{
     HeapCell, InundationForcing, SimulateInundationOptions, SpillFlowPath, affine_metrics,
-    trace_downstream_away_from_source, validate_forcing_grids, validate_options_with_hyetograph,
+    trace_downstream_away_from_source, validate_forcing_grids, validate_grid_alignment,
+    validate_options_with_hyetograph,
 };
 use crate::slicing::{InMemoryDepressions, NestedDepression};
 
@@ -61,7 +62,7 @@ impl FromStr for RoutingMode {
     fn from_str(s: &str) -> Result<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "static" => Ok(Self::Static),
-            "fsm" | "fill-spill-merge" | "fill_spill_merge" | "dynamic" => Ok(Self::FillSpillMerge),
+            "fsm" | "fill-spill-merge" | "fill_spill_merge" => Ok(Self::FillSpillMerge),
             other => Err(Error::InvalidArgument(format!(
                 "unknown routing mode '{other}'; expected 'static' or 'fsm' ('fill-spill-merge')"
             ))),
@@ -224,8 +225,42 @@ struct BasinNode {
     infiltrated_vol_storm_m3: f64,
     /// Snapshot of volume at `t = storm_duration_h`.
     storm_end_vol_m3: f64,
+    /// Whether this basin had already merged into its parent at `t = storm_duration_h`.
+    storm_end_merged: bool,
     /// Snapshot of routed contributing area at `t = storm_duration_h`.
     storm_end_routed_cat_m2: f64,
+}
+
+/// Reusable grid-sized scratch buffers for outward Priority-Flood outlet discovery.
+///
+/// Allocated once per rayon worker (or once sequentially) and reused across all depressions
+/// via generation stamps so outlet discovery never re-allocates `O(N)` buffers per depression.
+struct OutletSearchScratch {
+    in_source: Vec<bool>,
+    visited_pf: Vec<u32>,
+    drains_to_source: Vec<u32>,
+    trapped_in_pit: Vec<u32>,
+    parent_cell: Vec<usize>,
+    trace_seen: Vec<u32>,
+    pf_gen: u32,
+    trace_gen: u32,
+    heap: BinaryHeap<HeapCell>,
+}
+
+impl OutletSearchScratch {
+    fn new(n: usize) -> Self {
+        Self {
+            in_source: vec![false; n],
+            visited_pf: vec![0u32; n],
+            drains_to_source: vec![0u32; n],
+            trapped_in_pit: vec![0u32; n],
+            parent_cell: vec![usize::MAX; n],
+            trace_seen: vec![0u32; n],
+            pf_gen: 0,
+            trace_gen: 0,
+            heap: BinaryHeap::new(),
+        }
+    }
 }
 
 /// Discovers the lowest topographic overland spill outlet for a single depression `dep`
@@ -242,8 +277,8 @@ fn find_topographic_outlet(
     children_map: &HashMap<u32, Vec<u32>>,
     parent_map: &HashMap<u32, u32>,
     pixels_by_id: &HashMap<u32, Vec<usize>>,
+    scratch: &mut OutletSearchScratch,
 ) -> Option<TopographicOutlet> {
-    let n = w * h;
     let mut desc_ids: HashSet<u32> = HashSet::new();
     let mut stack = vec![dep.id];
     while let Some(cur_id) = stack.pop() {
@@ -270,18 +305,20 @@ fn find_topographic_outlet(
         return None;
     }
 
-    let mut in_source = vec![false; n];
-    let mut visited_pf = vec![false; n];
-    let mut drains_to_source = vec![0u32; n];
-    let mut trapped_in_pit = vec![0u32; n];
-    let mut parent_cell = vec![usize::MAX; n];
-    let mut trace_seen = vec![0u32; n];
-    let mut trace_gen = 0u32;
-    let mut heap: BinaryHeap<HeapCell> = BinaryHeap::new();
+    scratch.pf_gen = scratch.pf_gen.wrapping_add(1);
+    if scratch.pf_gen == 0 {
+        scratch.visited_pf.fill(0);
+        scratch.drains_to_source.fill(0);
+        scratch.trapped_in_pit.fill(0);
+        scratch.pf_gen = 1;
+    }
+    let pf_gen = scratch.pf_gen;
+    scratch.heap.clear();
 
     for &idx in &source_cells {
-        in_source[idx] = true;
-        visited_pf[idx] = true;
+        scratch.in_source[idx] = true;
+        scratch.visited_pf[idx] = pf_gen;
+        scratch.parent_cell[idx] = usize::MAX;
     }
 
     // Seed min-heap with perimeter cells of source footprint.
@@ -295,7 +332,7 @@ fn find_topographic_outlet(
                 let nc = c as isize + D8X[d] as isize;
                 if nr >= 0 && nc >= 0 && nr < h as isize && nc < w as isize {
                     let nidx = (nr as usize) * w + (nc as usize);
-                    if !in_source[nidx] {
+                    if !scratch.in_source[nidx] {
                         on_perimeter = true;
                         break;
                     }
@@ -305,23 +342,24 @@ fn find_topographic_outlet(
         if on_perimeter {
             let z = zdata[idx];
             if z.is_finite() && !z.rd_eq(z_nd) {
-                heap.push(HeapCell { elev: z, idx });
+                scratch.heap.push(HeapCell { elev: z, idx });
             }
         }
     }
 
     let mut spill_elev = f64::NEG_INFINITY;
-    while let Some(HeapCell { elev, idx: cur }) = heap.pop() {
+    let mut found: Option<TopographicOutlet> = None;
+    while let Some(HeapCell { elev, idx: cur }) = scratch.heap.pop() {
         if elev > spill_elev {
             spill_elev = elev;
         }
         let r = cur / w;
         let c = cur % w;
-        if !in_source[cur] {
-            trace_gen = trace_gen.wrapping_add(1);
-            if trace_gen == 0 {
-                trace_seen.fill(0);
-                trace_gen = 1;
+        if !scratch.in_source[cur] {
+            scratch.trace_gen = scratch.trace_gen.wrapping_add(1);
+            if scratch.trace_gen == 0 {
+                scratch.trace_seen.fill(0);
+                scratch.trace_gen = 1;
             }
             if let Some((down_trace, target_dep)) = trace_downstream_away_from_source(
                 cur,
@@ -329,23 +367,23 @@ fn find_topographic_outlet(
                 h,
                 fdata,
                 dep_ids,
-                &in_source,
+                &scratch.in_source,
                 &desc_ids,
                 &ancestor_ids,
-                &mut drains_to_source,
-                &mut trapped_in_pit,
-                1,
-                &mut trace_seen,
-                trace_gen,
+                &mut scratch.drains_to_source,
+                &mut scratch.trapped_in_pit,
+                pf_gen,
+                &mut scratch.trace_seen,
+                scratch.trace_gen,
             ) {
                 let mut up_path = Vec::new();
                 let mut p = cur;
                 while p != usize::MAX {
                     up_path.push(p);
-                    if in_source[p] {
+                    if scratch.in_source[p] {
                         break;
                     }
-                    p = parent_cell[p];
+                    p = scratch.parent_cell[p];
                 }
                 up_path.reverse();
                 if down_trace.len() > 1 {
@@ -353,19 +391,21 @@ fn find_topographic_outlet(
                 }
                 let cells: Vec<(usize, usize)> =
                     up_path.into_iter().map(|idx| (idx % w, idx / w)).collect();
-                return Some(TopographicOutlet {
+                found = Some(TopographicOutlet {
                     to_dep_id: target_dep,
                     spill_elev,
                     cells,
                 });
+                break;
             }
         } else if r == 0 || r + 1 == h || c == 0 || c + 1 == w {
             // Source basin directly touches the DEM boundary.
-            return Some(TopographicOutlet {
+            found = Some(TopographicOutlet {
                 to_dep_id: 0,
                 spill_elev,
                 cells: vec![(c, r)],
             });
+            break;
         }
 
         for d in 1..=8 {
@@ -375,23 +415,27 @@ fn find_topographic_outlet(
                 continue;
             }
             let nidx = (nr as usize) * w + (nc as usize);
-            if visited_pf[nidx] {
+            if scratch.visited_pf[nidx] == pf_gen {
                 continue;
             }
             let nz = zdata[nidx];
             if !nz.is_finite() || nz.rd_eq(z_nd) {
                 continue;
             }
-            visited_pf[nidx] = true;
-            parent_cell[nidx] = cur;
-            heap.push(HeapCell {
+            scratch.visited_pf[nidx] = pf_gen;
+            scratch.parent_cell[nidx] = cur;
+            scratch.heap.push(HeapCell {
                 elev: nz,
                 idx: nidx,
             });
         }
     }
 
-    None
+    for &idx in &source_cells {
+        scratch.in_source[idx] = false;
+    }
+
+    found
 }
 
 /// Resolves the lowest-elevation leaf descendant of `dep_id` in the nesting tree.
@@ -424,17 +468,35 @@ fn lowest_leaf_descendant(
     best_leaf
 }
 
-/// Returns the active (non-Merged) representative of `id` by walking up `parent_id`.
-fn active_rep(basins: &[BasinNode], id_to_idx: &[usize], mut id: u32) -> u32 {
+/// Resolves the live receiving basin (`Active` or `FullSpilling`) for a spill targeting `id`.
+///
+/// - `Merged` targets walk upward to their active ancestor.
+/// - `Waiting` compound parents route downward to their lowest-elevation `Active` descendant
+///   (so spillover entering a compound rim fills from the bottom up without dropping mass).
+/// - Returns `0` (DEM boundary) if no eligible live basin exists or if it would self-loop.
+fn resolve_spill_target(
+    basins: &[BasinNode],
+    id_to_idx: &[usize],
+    src_id: u32,
+    mut id: u32,
+) -> u32 {
     while id != 0 {
         let idx = id_to_idx[id as usize];
         if idx == usize::MAX {
             return 0;
         }
-        if basins[idx].state != BasinState::Merged {
-            return id;
+        match basins[idx].state {
+            BasinState::Merged => {
+                id = basins[idx].parent_id;
+            }
+            BasinState::Active | BasinState::FullSpilling => {
+                return if id == src_id { 0 } else { id };
+            }
+            BasinState::Waiting => {
+                return lowest_active_descendant(id, |x| x == src_id, basins, id_to_idx)
+                    .unwrap_or(0);
+            }
         }
-        id = basins[idx].parent_id;
     }
     0
 }
@@ -471,10 +533,11 @@ fn find_lca(nodes: &[u32], basins: &[BasinNode], id_to_idx: &[usize]) -> Option<
     common.first().copied()
 }
 
-/// Returns the lowest-elevation `Active` descendant of `root_id` (excluding `excluded`), if any.
+/// Returns the lowest-elevation `Active` descendant of `root_id` (excluding IDs matched by
+/// `is_excluded`), if any.
 fn lowest_active_descendant(
     root_id: u32,
-    excluded: &HashSet<u32>,
+    is_excluded: impl Fn(u32) -> bool,
     basins: &[BasinNode],
     id_to_idx: &[usize],
 ) -> Option<u32> {
@@ -486,7 +549,7 @@ fn lowest_active_descendant(
             continue;
         }
         let b = &basins[idx];
-        if b.state == BasinState::Active && !excluded.contains(&b.id) {
+        if b.state == BasinState::Active && !is_excluded(b.id) {
             let cand = (b.min_elev, b.id);
             if best.is_none_or(|prev| {
                 cand.0 < prev.0 || ((cand.0 - prev.0).abs() <= 1e-12 && cand.1 < prev.1)
@@ -499,6 +562,94 @@ fn lowest_active_descendant(
         }
     }
     best.map(|(_, id)| id)
+}
+
+/// Evaluates topological spill inflows (`q_in`), routed contributing areas (`routed_cat`),
+/// downstream target indices (`target_idx_buf`), and total boundary spill discharge.
+///
+/// When `allow_drain_revert` is true and a `FullSpilling` basin loses more to vertical
+/// infiltration than it receives, it reverts to `Active` and the routing DAG is recomputed.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_topological_routing(
+    basins: &mut [BasinNode],
+    id_to_idx: &[usize],
+    rain_m_h: f64,
+    allow_drain_revert: bool,
+    q_in: &mut [f64],
+    routed_cat: &mut [f64],
+    indegree: &mut [usize],
+    target_idx_buf: &mut [usize],
+) -> f64 {
+    let m = basins.len();
+    loop {
+        q_in.fill(0.0);
+        routed_cat.fill(0.0);
+        indegree.fill(0);
+        target_idx_buf.fill(usize::MAX);
+        let mut q_boundary_spill = 0.0;
+
+        for i in 0..m {
+            match basins[i].state {
+                BasinState::Active | BasinState::FullSpilling => {
+                    q_in[i] = basins[i].local_eff_cat_area_m2 * rain_m_h;
+                    routed_cat[i] = basins[i].local_cat_area_m2;
+                }
+                BasinState::Waiting | BasinState::Merged => {}
+            }
+        }
+
+        for i in 0..m {
+            if basins[i].state != BasinState::FullSpilling {
+                continue;
+            }
+            let raw_dst = basins[i]
+                .spill_override
+                .or_else(|| basins[i].outlet.as_ref().map(|o| o.to_dep_id))
+                .unwrap_or(0);
+            let rep = resolve_spill_target(basins, id_to_idx, basins[i].id, raw_dst);
+            if rep != 0 {
+                let dst_idx = id_to_idx[rep as usize];
+                if dst_idx != usize::MAX && dst_idx != i {
+                    target_idx_buf[i] = dst_idx;
+                    indegree[dst_idx] += 1;
+                }
+            }
+        }
+
+        let mut queue: VecDeque<usize> = VecDeque::new();
+        for i in 0..m {
+            if basins[i].state == BasinState::FullSpilling && indegree[i] == 0 {
+                queue.push_back(i);
+            }
+        }
+
+        let mut drained_any = false;
+        while let Some(u) = queue.pop_front() {
+            let net_spill = q_in[u] - basins[u].loss_rate_m3_h;
+            if allow_drain_revert && net_spill < -1e-15 {
+                // Infiltration exceeds inflow on this full basin; un-spill and drain.
+                basins[u].state = BasinState::Active;
+                drained_any = true;
+                break;
+            }
+            let q_out = net_spill.max(0.0);
+            let dst = target_idx_buf[u];
+            if dst != usize::MAX {
+                q_in[dst] += q_out;
+                routed_cat[dst] += routed_cat[u];
+                indegree[dst] = indegree[dst].saturating_sub(1);
+                if basins[dst].state == BasinState::FullSpilling && indegree[dst] == 0 {
+                    queue.push_back(dst);
+                }
+            } else {
+                q_boundary_spill += q_out;
+            }
+        }
+
+        if !drained_any {
+            return q_boundary_spill;
+        }
+    }
 }
 
 /// Advances the hypsometric cursor on `basin`, recording exact continuous `fill_time` for all
@@ -588,20 +739,8 @@ pub fn simulate_fill_spill_merge_in_memory(
     let w = dem_refined.width();
     let h = dem_refined.height();
     let n = w * h;
-    if sink.width() != w || sink.height() != h {
-        return Err(Error::DimensionMismatch(format!(
-            "sink ({}x{}) does not match dem_refined ({w}x{h})",
-            sink.width(),
-            sink.height()
-        )));
-    }
-    if depressions.depression_id.width() != w || depressions.depression_id.height() != h {
-        return Err(Error::DimensionMismatch(format!(
-            "depression_id ({}x{}) does not match dem_refined ({w}x{h})",
-            depressions.depression_id.width(),
-            depressions.depression_id.height()
-        )));
-    }
+    validate_grid_alignment(dem_refined, sink, "sink")?;
+    validate_grid_alignment(dem_refined, &depressions.depression_id, "depression_id")?;
     validate_forcing_grids(sink, forcing)?;
 
     let (_, _, cell_area) = affine_metrics(&dem_refined.geotransform);
@@ -714,7 +853,6 @@ pub fn simulate_fill_spill_merge_in_memory(
     let mut leaf_memo: HashMap<u32, u32> = HashMap::new();
     let mut local_cat_area = vec![0.0f64; max_id + 1];
     let mut local_eff_cat_area = vec![0.0f64; max_id + 1];
-    let mut boundary_cat_area = 0.0f64;
     let mut boundary_eff_cat_area = 0.0f64;
 
     const UNVISITED: u32 = u32::MAX;
@@ -805,55 +943,66 @@ pub fn simulate_fill_spill_merge_in_memory(
             local_cat_area[target as usize] += cell_area;
             local_eff_cat_area[target as usize] += cell_area * c_val;
         } else {
-            boundary_cat_area += cell_area;
             boundary_eff_cat_area += cell_area * c_val;
         }
     }
-    let _ = boundary_cat_area;
 
-    // 4. Discover topographic spill outlets for every depression (parallel when enabled).
+    // 4. Discover topographic spill outlets for every depression (parallel when enabled),
+    // reusing one `OutletSearchScratch` per worker thread.
     #[cfg(feature = "parallel")]
     let outlets: Vec<Option<TopographicOutlet>> = depressions
         .depressions
         .par_iter()
-        .map(|d| {
-            find_topographic_outlet(
-                d,
-                w,
-                h,
-                zdata,
-                z_nd,
-                fdata,
-                dep_ids,
-                &children_map,
-                &parent_map,
-                &pixels_by_id,
-            )
-        })
+        .map_init(
+            || OutletSearchScratch::new(n),
+            |scratch, d| {
+                find_topographic_outlet(
+                    d,
+                    w,
+                    h,
+                    zdata,
+                    z_nd,
+                    fdata,
+                    dep_ids,
+                    &children_map,
+                    &parent_map,
+                    &pixels_by_id,
+                    scratch,
+                )
+            },
+        )
         .collect();
     #[cfg(not(feature = "parallel"))]
-    let outlets: Vec<Option<TopographicOutlet>> = depressions
-        .depressions
-        .iter()
-        .map(|d| {
-            find_topographic_outlet(
-                d,
-                w,
-                h,
-                zdata,
-                z_nd,
-                fdata,
-                dep_ids,
-                &children_map,
-                &parent_map,
-                &pixels_by_id,
-            )
-        })
-        .collect();
+    let outlets: Vec<Option<TopographicOutlet>> = {
+        let mut scratch = OutletSearchScratch::new(n);
+        depressions
+            .depressions
+            .iter()
+            .map(|d| {
+                find_topographic_outlet(
+                    d,
+                    w,
+                    h,
+                    zdata,
+                    z_nd,
+                    fdata,
+                    dep_ids,
+                    &children_map,
+                    &parent_map,
+                    &pixels_by_id,
+                    &mut scratch,
+                )
+            })
+            .collect()
+    };
 
     // 5. Build exact hypsometric storage curves, infiltration rates, and antecedent volumes.
-    let mut basins: Vec<BasinNode> = Vec::with_capacity(depressions.depressions.len());
-    let mut total_antecedent_m3 = 0.0f64;
+    // Collect sorted footprint cells and initial rim elevations first, incorporating each
+    // basin's discovered saddle elevation (`outlet.spill_elev`), then propagate rim elevations
+    // bottom-up so every parent's `z_rim >= max(z_rim(children))` and `V_cap(P) >= sum(V_cap(c))`.
+    let mut all_cells_by_dep: Vec<Vec<(f64, usize)>> =
+        Vec::with_capacity(depressions.depressions.len());
+    let mut z_rims: Vec<f64> = Vec::with_capacity(depressions.depressions.len());
 
     for (dep_idx, d) in depressions.depressions.iter().enumerate() {
         let mut all_cells: Vec<(f64, usize)> = Vec::new();
@@ -882,9 +1031,42 @@ pub fn simulate_fill_spill_merge_in_memory(
         }
         all_cells.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
-        let z_rim = d
+        let mut z_rim = d
             .max_elev
             .max(all_cells.last().map_or(d.max_elev, |&(z, _)| z));
+        if let Some(outlet) = &outlets[dep_idx]
+            && outlet.spill_elev.is_finite()
+        {
+            z_rim = z_rim.max(outlet.spill_elev);
+        }
+        all_cells_by_dep.push(all_cells);
+        z_rims.push(z_rim);
+    }
+
+    let mut level_order: Vec<usize> = (0..depressions.depressions.len()).collect();
+    level_order.sort_by_key(|&idx| {
+        (
+            depressions.depressions[idx].level,
+            depressions.depressions[idx].id,
+        )
+    });
+    for &dep_idx in &level_order {
+        let d = &depressions.depressions[dep_idx];
+        let pid = parent_map.get(&d.id).copied().unwrap_or(d.parent_id);
+        if pid > 0 && (pid as usize) <= max_id {
+            let pidx = id_to_idx[pid as usize];
+            if pidx != usize::MAX && z_rims[dep_idx] > z_rims[pidx] {
+                z_rims[pidx] = z_rims[dep_idx];
+            }
+        }
+    }
+
+    let mut basins: Vec<BasinNode> = Vec::with_capacity(depressions.depressions.len());
+    let mut total_antecedent_m3 = 0.0f64;
+
+    for (dep_idx, d) in depressions.depressions.iter().enumerate() {
+        let all_cells = &all_cells_by_dep[dep_idx];
+        let z_rim = z_rims[dep_idx];
 
         let mut hypso_cells: Vec<HypsoCell> = Vec::with_capacity(all_cells.len());
         let mut prefix_sum = 0.0f64;
@@ -909,7 +1091,7 @@ pub fn simulate_fill_spill_merge_in_memory(
         let loss_rate_m3_h = if let Some(inf) = forcing.infiltration_cm_h {
             let inf_nd = inf.no_data();
             let mut sum_m_h = 0.0f64;
-            for &(_, gi) in &all_cells {
+            for &(_, gi) in all_cells {
                 let v = inf.get_i(gi);
                 if v.is_finite() && !v.rd_eq(inf_nd) && v > 0.0 {
                     sum_m_h += (v / 100.0) * cell_area;
@@ -981,6 +1163,7 @@ pub fn simulate_fill_spill_merge_in_memory(
             peak_spill_rate_m3_h: 0.0,
             infiltrated_vol_storm_m3: 0.0,
             storm_end_vol_m3: owned_ant_vol,
+            storm_end_merged: false,
             storm_end_routed_cat_m2: local_cat_area[d.id as usize],
         };
 
@@ -1126,7 +1309,8 @@ pub fn simulate_fill_spill_merge_in_memory(
                             .spill_override
                             .or_else(|| basins[cur_idx].outlet.as_ref().map(|o| o.to_dep_id))
                             .unwrap_or(0);
-                        let rep = active_rep(basins, id_to_idx, raw_dst);
+                        let rep =
+                            resolve_spill_target(basins, id_to_idx, basins[cur_idx].id, raw_dst);
                         if rep == 0 {
                             break;
                         }
@@ -1165,7 +1349,14 @@ pub fn simulate_fill_spill_merge_in_memory(
                         .unwrap();
 
                     let new_target = find_lca(&cyc, basins, id_to_idx)
-                        .and_then(|lca| lowest_active_descendant(lca, &cyc_set, basins, id_to_idx))
+                        .and_then(|lca| {
+                            lowest_active_descendant(
+                                lca,
+                                |x| cyc_set.contains(&x),
+                                basins,
+                                id_to_idx,
+                            )
+                        })
                         .unwrap_or(0);
                     basins[id_to_idx[break_id as usize]].spill_override = Some(new_target);
                     changed = true;
@@ -1185,6 +1376,7 @@ pub fn simulate_fill_spill_merge_in_memory(
     let mut total_boundary_outflow_storm_m3 = 0.0f64;
     let mut num_merge_events = 0usize;
     let mut snapshot_taken = false;
+    let mut last_rain_m_h = 0.0f64;
 
     let mut q_in = vec![0.0f64; m];
     let mut routed_cat = vec![0.0f64; m];
@@ -1192,6 +1384,7 @@ pub fn simulate_fill_spill_merge_in_memory(
     let mut target_idx_buf = vec![usize::MAX; m];
 
     for (seg_dt, rain_m_h, in_storm_window) in segments {
+        last_rain_m_h = rain_m_h;
         let t_seg_end = if seg_dt.is_finite() {
             t_cur + seg_dt
         } else {
@@ -1199,6 +1392,7 @@ pub fn simulate_fill_spill_merge_in_memory(
         };
         let mut iter_guard = 0usize;
         let max_iters = (m + 1) * 16;
+        let mut segment_done_early = false;
 
         while t_cur < t_seg_end - 1e-12 && iter_guard < max_iters {
             iter_guard += 1;
@@ -1214,76 +1408,16 @@ pub fn simulate_fill_spill_merge_in_memory(
             // Evaluate topological spill inflows; if a FullSpilling basin loses more to
             // infiltration than it receives during a dry/low-rain step, revert it to Active
             // so it drains cleanly rather than spilling negative water.
-            let mut q_boundary_spill;
-            loop {
-                q_in.fill(0.0);
-                routed_cat.fill(0.0);
-                indegree.fill(0);
-                target_idx_buf.fill(usize::MAX);
-                q_boundary_spill = 0.0;
-
-                for i in 0..m {
-                    match basins[i].state {
-                        BasinState::Active | BasinState::FullSpilling => {
-                            q_in[i] = basins[i].local_eff_cat_area_m2 * rain_m_h;
-                            routed_cat[i] = basins[i].local_cat_area_m2;
-                        }
-                        BasinState::Waiting | BasinState::Merged => {}
-                    }
-                }
-
-                for i in 0..m {
-                    if basins[i].state != BasinState::FullSpilling {
-                        continue;
-                    }
-                    let raw_dst = basins[i]
-                        .spill_override
-                        .or_else(|| basins[i].outlet.as_ref().map(|o| o.to_dep_id))
-                        .unwrap_or(0);
-                    let rep = active_rep(&basins, &id_to_idx, raw_dst);
-                    if rep != 0 {
-                        let dst_idx = id_to_idx[rep as usize];
-                        if dst_idx != usize::MAX && dst_idx != i {
-                            target_idx_buf[i] = dst_idx;
-                            indegree[dst_idx] += 1;
-                        }
-                    }
-                }
-
-                let mut queue: VecDeque<usize> = VecDeque::new();
-                for i in 0..m {
-                    if basins[i].state == BasinState::FullSpilling && indegree[i] == 0 {
-                        queue.push_back(i);
-                    }
-                }
-
-                let mut drained_any = false;
-                while let Some(u) = queue.pop_front() {
-                    let net_spill = q_in[u] - basins[u].loss_rate_m3_h;
-                    if net_spill < -1e-15 {
-                        // Infiltration exceeds inflow on this full basin; un-spill and drain.
-                        basins[u].state = BasinState::Active;
-                        drained_any = true;
-                        break;
-                    }
-                    let q_out = net_spill.max(0.0);
-                    let dst = target_idx_buf[u];
-                    if dst != usize::MAX {
-                        q_in[dst] += q_out;
-                        routed_cat[dst] += routed_cat[u];
-                        indegree[dst] = indegree[dst].saturating_sub(1);
-                        if basins[dst].state == BasinState::FullSpilling && indegree[dst] == 0 {
-                            queue.push_back(dst);
-                        }
-                    } else {
-                        q_boundary_spill += q_out;
-                    }
-                }
-
-                if !drained_any {
-                    break;
-                }
-            }
+            let q_boundary_spill = evaluate_topological_routing(
+                &mut basins,
+                &id_to_idx,
+                rain_m_h,
+                true,
+                &mut q_in,
+                &mut routed_cat,
+                &mut indegree,
+                &mut target_idx_buf,
+            );
 
             // Record realized spill targets and start times for newly spilling basins.
             for i in 0..m {
@@ -1325,9 +1459,11 @@ pub fn simulate_fill_spill_merge_in_memory(
 
             if !dt_next.is_finite() {
                 // Unbounded post-storm tail segment with no remaining filling basins.
+                segment_done_early = true;
                 break;
             }
             if !any_filling && !t_seg_end.is_finite() {
+                segment_done_early = true;
                 break;
             }
 
@@ -1397,6 +1533,12 @@ pub fn simulate_fill_spill_merge_in_memory(
             t_cur = t_end;
         }
 
+        if !segment_done_early && t_cur < t_seg_end - 1e-12 && iter_guard >= max_iters {
+            return Err(Error::Algorithm(format!(
+                "FSM routing exceeded iteration guard ({max_iters}) at t={t_cur:.6} h before segment end {t_seg_end:.6} h"
+            )));
+        }
+
         // Snapshot storm-end volumes and routed contributing areas right when the storm window ends.
         if in_storm_window && t_cur >= storm_duration_h - 1e-9 && !snapshot_taken {
             resolve_merges_and_cycles(
@@ -1406,8 +1548,19 @@ pub fn simulate_fill_spill_merge_in_memory(
                 &mut num_merge_events,
                 &mut fill_time_data,
             );
+            let _ = evaluate_topological_routing(
+                &mut basins,
+                &id_to_idx,
+                rain_m_h,
+                false,
+                &mut q_in,
+                &mut routed_cat,
+                &mut indegree,
+                &mut target_idx_buf,
+            );
             for i in 0..m {
                 basins[i].storm_end_vol_m3 = basins[i].stored_vol_m3;
+                basins[i].storm_end_merged = basins[i].state == BasinState::Merged;
                 basins[i].storm_end_routed_cat_m2 = if routed_cat[i] > 0.0 {
                     routed_cat[i]
                 } else {
@@ -1419,8 +1572,26 @@ pub fn simulate_fill_spill_merge_in_memory(
     }
 
     if !snapshot_taken {
+        resolve_merges_and_cycles(
+            &mut basins,
+            &id_to_idx,
+            t_cur,
+            &mut num_merge_events,
+            &mut fill_time_data,
+        );
+        let _ = evaluate_topological_routing(
+            &mut basins,
+            &id_to_idx,
+            last_rain_m_h,
+            false,
+            &mut q_in,
+            &mut routed_cat,
+            &mut indegree,
+            &mut target_idx_buf,
+        );
         for i in 0..m {
             basins[i].storm_end_vol_m3 = basins[i].stored_vol_m3;
+            basins[i].storm_end_merged = basins[i].state == BasinState::Merged;
             basins[i].storm_end_routed_cat_m2 = if routed_cat[i] > 0.0 {
                 routed_cat[i]
             } else {
@@ -1430,14 +1601,11 @@ pub fn simulate_fill_spill_merge_in_memory(
     }
 
     // 8. Compute exact watershed-scale mass balance at `t = storm_duration_h`.
-    // Sum stored volumes over all basins that were NOT merged before `storm_duration_h`
+    // Sum stored volumes over all basins that had NOT merged at the storm-end snapshot
     // (including any `Waiting` parent holding owned rim antecedent water).
     let mut total_stored_storm_m3 = 0.0f64;
     for b in &basins {
-        let merged_before_end = b
-            .merge_time_h
-            .is_some_and(|mt| mt <= storm_duration_h + 1e-9);
-        if !merged_before_end {
+        if !b.storm_end_merged {
             total_stored_storm_m3 += b.storm_end_vol_m3;
         }
     }
@@ -1455,6 +1623,19 @@ pub fn simulate_fill_spill_merge_in_memory(
     };
 
     // 9. Build dynamically realized `SpillFlowPath` list and per-basin summaries.
+    let is_ancestor = |anc_id: u32, mut cur_id: u32| -> bool {
+        if anc_id == 0 || cur_id == 0 {
+            return false;
+        }
+        while let Some(&pid) = parent_map.get(&cur_id) {
+            if pid == anc_id {
+                return true;
+            }
+            cur_id = pid;
+        }
+        false
+    };
+
     let mut spill_paths: Vec<SpillFlowPath> = Vec::new();
     let mut num_spill_events = 0usize;
     let mut summaries: Vec<FsmBasinSummary> = Vec::with_capacity(m);
@@ -1464,14 +1645,21 @@ pub fn simulate_fill_spill_merge_in_memory(
             num_spill_events += 1;
         }
         if let (Some(spill_t), Some(outlet)) = (b.first_spill_time_h, b.outlet.as_ref()) {
+            let realized_to = b.realized_spill_to.unwrap_or(outlet.to_dep_id);
+            let geometry_matches = realized_to == outlet.to_dep_id
+                || is_ancestor(realized_to, outlet.to_dep_id)
+                || is_ancestor(outlet.to_dep_id, realized_to);
             let valid_duration = b.merge_time_h.is_none_or(|mt| mt > spill_t + 1e-6);
             let show_boundary = b.parent_id > 0 || depressions.num_regions > 1;
-            if valid_duration && outlet.cells.len() >= 2 && (outlet.to_dep_id != 0 || show_boundary)
+            if geometry_matches
+                && valid_duration
+                && outlet.cells.len() >= 2
+                && (realized_to != 0 || show_boundary)
             {
                 spill_paths.push(SpillFlowPath {
                     from_dep_id: b.id,
                     from_level: b.level,
-                    to_dep_id: outlet.to_dep_id,
+                    to_dep_id: realized_to,
                     spill_time_h: spill_t,
                     merge_time_h: b.merge_time_h,
                     spill_elev: outlet.spill_elev,
@@ -1692,8 +1880,8 @@ mod tests {
     fn fsm_exact_analytical_hand_calculation_two_basins() {
         // Synthetic exact test: 10x6 DEM with an outer 1-cell border (z=20, dep_id=0) draining
         // inward into an 8x4 compound depression P (id=1, level=2) with two flat-bottomed bowls:
-        //   - Basin A (id=2, level=1): 2x2 floor at z=10, max_elev=12 -> V_cap(A) = 4 * 2 = 8 m^3
-        //   - Basin B (id=3, level=1): 2x2 floor at z=6, max_elev=12 -> V_cap(B) = 4 * 6 = 24 m^3
+        //   - Basin A (id=2, level=1): 2x2 floor at z=10, saddle at z=12.5 -> V_cap(A) = 4 * 2.5 = 10 m^3
+        //   - Basin B (id=3, level=1): 2x2 floor at z=6, saddle at z=12.5 -> V_cap(B) = 4 * 6.5 = 26 m^3
         //   - West half slopes strictly into A, east half slopes strictly into B.
         // With rain = 100 cm/h = 1.0 m/h:
         //   - A fills FIRST at t_a = V_A / Q_A
@@ -1819,8 +2007,9 @@ mod tests {
         let a = res.basins.iter().find(|b| b.dep_id == 2).unwrap();
         let b = res.basins.iter().find(|b| b.dep_id == 3).unwrap();
 
-        assert_eq!(a.capacity_m3, 8.0);
-        assert_eq!(b.capacity_m3, 24.0);
+        assert_eq!(a.capacity_m3, 10.0);
+        assert_eq!(b.capacity_m3, 26.0);
+        assert!(p.capacity_m3 >= a.capacity_m3 + b.capacity_m3);
         assert_eq!(a.spill_to_dep_id, Some(3));
 
         let t_a = a.fill_time_h.unwrap();
@@ -2019,14 +2208,13 @@ mod tests {
                 z[r * w + c] = 10.0 + d;
             }
         }
-        // Create a sharp rim around the inner 3x3 bowl (depth ~2m) and upland sloping inward from 20m to 13m.
+        // Flatten the inner 3x3 bowl to z = 10.0; the surrounding 72 upland cells slope
+        // inward from z = 10.0 + d (12.0 to ~15.7) into the explicitly delineated 3x3 depression.
         for r in 3..=5 {
             for c in 3..=5 {
                 z[r * w + c] = 10.0;
             }
         }
-        // Raise outer perimeter to 20.0 so the whole 9x9 interior is a sink? No: make outer ring 15.0
-        // and keep the depression explicitly in `deps` at 3..=5 so 72 cells are upland!
         let mut dem = Array2D::from_vec(w, h, z.clone()).unwrap();
         dem.set_no_data(-9999.0);
         dem.geotransform = [0.0, 1.0, 0.0, h as f64, 0.0, -1.0];
@@ -2138,5 +2326,355 @@ mod tests {
             t_high < t_low * 0.5,
             "higher upland runoff_coeff must dramatically speed up filling (t_high={t_high}, t_low={t_low})"
         );
+    }
+
+    #[test]
+    fn fsm_rejects_shifted_sink_or_depression_id_grid() {
+        let (dem_refined, mut sink, mut deps) = build_two_sibling_compound_dem();
+        let opts = SimulateInundationOptions {
+            min_size: 10,
+            min_depth: 0.3,
+            interval: 0.3,
+            rain_intensity_cm_h: 5.0,
+            rain_duration_h: 10.0,
+            time_step_h: 1.0,
+            compress: false,
+        };
+
+        // Shift sink geotransform origin -> must be rejected.
+        sink.geotransform[0] += 5.0;
+        let err = simulate_fill_spill_merge_in_memory(
+            &dem_refined,
+            &sink,
+            &deps,
+            &opts,
+            &InundationForcing::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::DimensionMismatch(_)),
+            "expected DimensionMismatch for shifted sink, got {err:?}"
+        );
+
+        // Restore sink, shift depression_id geotransform origin -> must be rejected.
+        sink.geotransform = dem_refined.geotransform;
+        deps.depression_id.geotransform[3] += 5.0;
+        let err = simulate_fill_spill_merge_in_memory(
+            &dem_refined,
+            &sink,
+            &deps,
+            &opts,
+            &InundationForcing::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::DimensionMismatch(_)),
+            "expected DimensionMismatch for shifted depression_id, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn fsm_spill_into_waiting_compound_parent_routes_to_active_descendant_and_conserves_mass() {
+        // Upstream leaf U (id=1) sits on a high west terrace and spills over a saddle directly
+        // onto a cell labeled with Waiting compound parent P (id=2, children C1=3, C2=4).
+        // Spillover entering P's rim must route down into P's lowest Active child C1 (id=3)
+        // rather than being dropped while P is Waiting, conserving mass to machine precision.
+        let (w, h) = (13usize, 7usize);
+        let mut z = vec![30.0f64; w * h];
+        let mut dep_id = vec![0i32; w * h];
+        let mut dep_lvl = vec![0i32; w * h];
+
+        // West upland terrace around U (cols 1..=3, rows 2..=4)
+        for r in 1..h - 1 {
+            for c in 1..=4 {
+                z[r * w + c] = 22.0 + ((r as f64 - 3.0).abs() + (c as f64 - 2.0).abs()) * 0.5;
+            }
+        }
+        // Upstream shallow leaf U (id=1): 1x1 bowl at (2, 3), floor 19.0
+        z[3 * w + 2] = 19.0;
+        dep_id[3 * w + 2] = 1;
+        dep_lvl[3 * w + 2] = 1;
+        // Saddle at (3, 3) = 20.0 -> (4, 3) = 19.5 -> enters P rim at (5, 3) = 17.0
+        z[3 * w + 3] = 20.0;
+        z[3 * w + 4] = 19.5;
+
+        // Compound parent P (id=2, level=2) covers cols 5..=11, rows 1..=5
+        for r in 1..h - 1 {
+            for c in 5..=11 {
+                dep_id[r * w + c] = 2;
+                dep_lvl[r * w + c] = 2;
+                z[r * w + c] = 16.0 + ((r as f64 - 3.0).abs() + (c as f64 - 8.0).abs()) * 0.4;
+            }
+        }
+        // Child C1 (id=3, deeper floor 5.0) at (7, 3) and Child C2 (id=4, floor 8.0) at (10, 3)
+        z[3 * w + 7] = 5.0;
+        dep_id[3 * w + 7] = 3;
+        dep_lvl[3 * w + 7] = 1;
+        z[3 * w + 10] = 8.0;
+        dep_id[3 * w + 10] = 4;
+        dep_lvl[3 * w + 10] = 1;
+        // Ensure (5, 3) flows downhill into (6, 3) -> C1 (7, 3)
+        z[3 * w + 5] = 15.0;
+        z[3 * w + 6] = 12.0;
+
+        let mut dem = Array2D::from_vec(w, h, z.clone()).unwrap();
+        dem.set_no_data(-9999.0);
+        dem.geotransform = [0.0, 1.0, 0.0, h as f64, 0.0, -1.0];
+
+        let mut sink_data = vec![0.0f64; w * h];
+        for i in 0..w * h {
+            if dep_id[i] > 0 {
+                sink_data[i] = z[i];
+            }
+        }
+        let mut sink = Array2D::from_vec(w, h, sink_data).unwrap();
+        sink.set_no_data(0.0);
+        sink.geotransform = dem.geotransform;
+
+        let mut id_arr = Array2D::from_vec(w, h, dep_id).unwrap();
+        id_arr.set_no_data(0);
+        id_arr.geotransform = dem.geotransform;
+        let mut lvl_arr = Array2D::from_vec(w, h, dep_lvl).unwrap();
+        lvl_arr.set_no_data(0);
+        lvl_arr.geotransform = dem.geotransform;
+
+        let make_dep = |id: u32,
+                        level: u32,
+                        parent_id: u32,
+                        children_ids: Vec<u32>,
+                        region_id: u32,
+                        min_elev: f64,
+                        max_elev: f64,
+                        count: usize| NestedDepression {
+            id,
+            level,
+            count,
+            area: count as f64,
+            volume: (max_elev - min_elev) * count as f64,
+            avg_depth: max_elev - min_elev,
+            max_depth: max_elev - min_elev,
+            min_elev,
+            max_elev,
+            children_ids,
+            region_id,
+            perimeter: 4.0,
+            major_axis: 1.0,
+            minor_axis: 1.0,
+            elongatedness: 1.0,
+            eccentricity: 0.0,
+            orientation: 0.0,
+            area_bbox_ratio: 1.0,
+            parent_id,
+            circularity: 1.0,
+            depth_diam_ratio: 0.5,
+            hypsometric_integral: 1.0,
+            rim_slope_deg: 45.0,
+            artifact_flag: false,
+        };
+
+        let deps = InMemoryDepressions {
+            depression_id: id_arr,
+            depression_level: lvl_arr,
+            depressions: vec![
+                make_dep(1, 1, 0, vec![], 1, 19.0, 20.0, 1),
+                make_dep(2, 2, 0, vec![3, 4], 2, 5.0, 18.0, 35),
+                make_dep(3, 1, 2, vec![], 2, 5.0, 15.0, 1),
+                make_dep(4, 1, 2, vec![], 2, 8.0, 15.0, 1),
+            ],
+            max_level: 2,
+            num_regions: 2,
+        };
+
+        let opts = SimulateInundationOptions {
+            min_size: 1,
+            min_depth: 0.1,
+            interval: 0.5,
+            rain_intensity_cm_h: 100.0, // 1.0 m/h
+            rain_duration_h: 2.0,       // U fills & spills well before P merges
+            time_step_h: 0.5,
+            compress: false,
+        };
+
+        let res = simulate_fill_spill_merge_in_memory(
+            &dem,
+            &sink,
+            &deps,
+            &opts,
+            &InundationForcing::default(),
+        )
+        .unwrap();
+
+        let u = res.basins.iter().find(|b| b.dep_id == 1).unwrap();
+        let c1 = res.basins.iter().find(|b| b.dep_id == 3).unwrap();
+        assert!(u.spilled_volume_m3 > 0.0, "U must spill during storm");
+        assert_eq!(
+            u.spill_to_dep_id,
+            Some(3),
+            "spill targeting Waiting parent P must route to its lowest Active child C1"
+        );
+        let t_c1 = c1.fill_time_h.expect("C1 should fill");
+        let static_t_c1 = c1.capacity_m3 / c1.local_cat_area_m2;
+        assert!(
+            t_c1 < static_t_c1 - 1e-6,
+            "C1 ({t_c1:.4} h) must be accelerated by U's spillover (static {static_t_c1:.4} h)"
+        );
+        assert!(
+            res.mass_balance.mass_balance_error_m3.abs() < 1e-9,
+            "mass balance must be exact when spilling into Waiting compound parent: {:?}",
+            res.mass_balance
+        );
+    }
+
+    #[test]
+    fn fsm_storm_end_routed_cat_reflects_events_at_storm_end() {
+        // Use the two-basin analytical DEM and stop the storm right at the exact fill time of A
+        // (`t_a`), so A becomes FullSpilling on the final step of the storm window.
+        // At `t = storm_duration_h = t_a`, B's `final_routed_cat_area_m2` must already reflect
+        // A's routed contributing area rather than the stale pre-event value.
+        let (w, h) = (10usize, 6usize);
+        let mut z = vec![20.0f64; w * h];
+        let mut dep_id = vec![0i32; w * h];
+        let mut dep_lvl = vec![0i32; w * h];
+
+        for r in 1..h - 1 {
+            for c in 1..w - 1 {
+                dep_id[r * w + c] = 1;
+                dep_lvl[r * w + c] = 2;
+                if (2..=3).contains(&r) && (2..=3).contains(&c) {
+                    z[r * w + c] = 10.0;
+                    dep_id[r * w + c] = 2;
+                    dep_lvl[r * w + c] = 1;
+                } else if (2..=3).contains(&r) && (6..=7).contains(&c) {
+                    z[r * w + c] = 6.0;
+                    dep_id[r * w + c] = 3;
+                    dep_lvl[r * w + c] = 1;
+                } else if c < 5 {
+                    let dist = ((c as f64 - 2.5).powi(2) + (r as f64 - 2.5).powi(2)).sqrt();
+                    z[r * w + c] = 12.6 + 0.2 * dist;
+                } else {
+                    let dist = ((c as f64 - 6.5).powi(2) + (r as f64 - 2.5).powi(2)).sqrt();
+                    z[r * w + c] = 12.6 + 0.2 * dist;
+                }
+            }
+        }
+        z[2 * w + 4] = 12.5;
+        z[2 * w + 5] = 12.4;
+
+        let mut dem = Array2D::from_vec(w, h, z.clone()).unwrap();
+        dem.set_no_data(-9999.0);
+        dem.geotransform = [0.0, 1.0, 0.0, h as f64, 0.0, -1.0];
+
+        let mut sink_data = vec![0.0f64; w * h];
+        for i in 0..w * h {
+            if dep_id[i] > 0 {
+                sink_data[i] = z[i];
+            }
+        }
+        let mut sink = Array2D::from_vec(w, h, sink_data).unwrap();
+        sink.set_no_data(0.0);
+        sink.geotransform = dem.geotransform;
+
+        let mut id_arr = Array2D::from_vec(w, h, dep_id).unwrap();
+        id_arr.set_no_data(0);
+        id_arr.geotransform = dem.geotransform;
+        let mut lvl_arr = Array2D::from_vec(w, h, dep_lvl).unwrap();
+        lvl_arr.set_no_data(0);
+        lvl_arr.geotransform = dem.geotransform;
+
+        let make_dep = |id: u32,
+                        level: u32,
+                        parent_id: u32,
+                        children_ids: Vec<u32>,
+                        min_elev: f64,
+                        max_elev: f64,
+                        count: usize| NestedDepression {
+            id,
+            level,
+            count,
+            area: count as f64,
+            volume: (max_elev - min_elev) * count as f64,
+            avg_depth: max_elev - min_elev,
+            max_depth: max_elev - min_elev,
+            min_elev,
+            max_elev,
+            children_ids,
+            region_id: 1,
+            perimeter: 8.0,
+            major_axis: 2.0,
+            minor_axis: 2.0,
+            elongatedness: 1.0,
+            eccentricity: 0.0,
+            orientation: 0.0,
+            area_bbox_ratio: 1.0,
+            parent_id,
+            circularity: 1.0,
+            depth_diam_ratio: 0.5,
+            hypsometric_integral: 1.0,
+            rim_slope_deg: 45.0,
+            artifact_flag: false,
+        };
+
+        let deps = InMemoryDepressions {
+            depression_id: id_arr,
+            depression_level: lvl_arr,
+            depressions: vec![
+                make_dep(1, 2, 0, vec![2, 3], 6.0, 14.0, 32),
+                make_dep(2, 1, 1, vec![], 10.0, 12.0, 4),
+                make_dep(3, 1, 1, vec![], 6.0, 12.0, 4),
+            ],
+            max_level: 2,
+            num_regions: 1,
+        };
+
+        // First find exact t_a under rain = 100 cm/h.
+        let probe_opts = SimulateInundationOptions {
+            min_size: 2,
+            min_depth: 0.1,
+            interval: 0.5,
+            rain_intensity_cm_h: 100.0,
+            rain_duration_h: 5.0,
+            time_step_h: 0.5,
+            compress: false,
+        };
+        let probe = simulate_fill_spill_merge_in_memory(
+            &dem,
+            &sink,
+            &deps,
+            &probe_opts,
+            &InundationForcing::default(),
+        )
+        .unwrap();
+        let t_a = probe
+            .basins
+            .iter()
+            .find(|b| b.dep_id == 2)
+            .unwrap()
+            .fill_time_h
+            .unwrap();
+
+        // Now run with rain_duration_h == t_a exactly.
+        let exact_opts = SimulateInundationOptions {
+            rain_duration_h: t_a,
+            time_step_h: t_a,
+            ..probe_opts
+        };
+        let res = simulate_fill_spill_merge_in_memory(
+            &dem,
+            &sink,
+            &deps,
+            &exact_opts,
+            &InundationForcing::default(),
+        )
+        .unwrap();
+        let a = res.basins.iter().find(|b| b.dep_id == 2).unwrap();
+        let b = res.basins.iter().find(|b| b.dep_id == 3).unwrap();
+        assert!(
+            (b.final_routed_cat_area_m2 - (a.local_cat_area_m2 + b.local_cat_area_m2)).abs() < 1e-9,
+            "expected B's storm-end routed_cat ({}) to include A's area ({} + {})",
+            b.final_routed_cat_area_m2,
+            a.local_cat_area_m2,
+            b.local_cat_area_m2
+        );
+        assert!(res.mass_balance.mass_balance_error_m3.abs() < 1e-9);
     }
 }
