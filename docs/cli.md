@@ -49,6 +49,7 @@ lidar pipeline dem.tif out_storm \
 | `--breach-max-length <N>` | `40` | Max breach path length in cells when `--breach-max-depth` is set |
 | `--culverts <PATH>` | off | Vector file (`.gpkg`, `.geojson`, `.shp`) burned before sink extraction |
 | `--scs-type2-mm <MM>` | off | Enables an NRCS SCS Type II design storm (`--duration` defaults to `24.0` h when omitted) |
+| `--routing <MODE>` | `static` | Inundation routing mode: `static` (independent level-set) or `fsm` (dynamic Fill-Spill-Merge cascade mass-balance) |
 | `--runoff-coeff <TIF>` | off | Spatially variable runoff coefficient raster (`0..=1`) |
 | `--infiltration <TIF>` | off | Spatially variable vertical infiltration loss raster (`cm/h`) |
 | `--antecedent-depth <TIF>` | off | Antecedent ponded water depth raster (`m`) |

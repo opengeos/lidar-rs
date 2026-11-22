@@ -124,6 +124,7 @@ Non-finite and NoData CN cells propagate as NoData (`-9999.0`) in the output ras
                     time_step_h: 0.5,
                     compress: false,
                 },
+                routing: lidar::RoutingMode::FillSpillMerge,
                 forcing: InundationForcing {
                     runoff_coeff: Some(&rc),
                     hyetograph: Some(&hyeto),
@@ -134,6 +135,80 @@ Non-finite and NoData CN cells propagate as NoData (`-9999.0`) in the output ras
             },
         )?;
         println!("{}", &pipe.inundation_curve_csv[..pipe.inundation_curve_csv.len().min(300)]);
+        Ok(())
+    }
+    ```
+
+## Dynamic Fill-Spill-Merge Cascade Routing (`routing="fsm"`)
+
+By default (`RoutingMode::Static`), each depression fills independently using its static pre-spill catchment area. Enabling **Fill-Spill-Merge (FSM)** cascade mass-balance routing (`--routing fsm` on the CLI, `routing="fsm"` in Python/WASM, or `RoutingMode::FillSpillMerge` in Rust) models coupled multi-basin fill, spillover, and hierarchical merging:
+
+1. **Catchment-weighted runoff attribution (`O(N)`):** Every valid cell traces its D8 flow path once to its initial receiving depression (or watershed boundary), crediting both geometric area (`cell_area`) and effective runoff area (`cell_area * runoff_coeff`) with zero double-counting between nested levels.
+2. **Dynamic spill cascades:** Once an upstream depression fills to its rim capacity at `t_spill`, its net excess discharge `(Q_in - loss).max(0)` routes over its lowest topographic saddle into the downstream receiving depression (or the DEM boundary), accelerating downstream fill times.
+3. **Hierarchical parent merging:** When all direct children of a compound parent depression reach full capacity, they merge into the parent at `t_merge`, transferring stored volume and contributing catchments to the parent as water continues rising smoothly to the enclosing rim.
+4. **Continuous hypsometric timing & mass conservation:** Per-cell `fill_time` is interpolated continuously from each basin's exact sorted-elevation stage-storage curve, and every run tracks watershed-scale numerical volume accounting (detecting any routing leaks across storage, infiltration, and boundary outflow):
+
+```text
+total_antecedent_m3 + total_runoff_m3
+  == total_stored_m3 + total_infiltration_m3 + total_boundary_outflow_m3
+```
+
+=== "CLI"
+
+    ```sh
+    lidar pipeline dem.tif out_fsm \
+      --routing fsm \
+      --min-size 1000 --min-depth 0.3 --interval 0.3 \
+      --rain-intensity 5 --duration 50 --time-step 1 \
+      --compress --json
+    ```
+
+=== "Python"
+
+    ```python
+    import lidar_rs as lidar
+
+    pipe = lidar.run_pipeline(
+        "dem.tif",
+        "out_fsm",
+        min_size=1000,
+        min_depth=0.3,
+        interval=0.3,
+        rain_intensity_cm_h=5.0,
+        rain_duration_h=50.0,
+        time_step_h=1.0,
+        routing="fsm",
+    )
+    print(pipe["fsm_mass_balance"])
+    print("Per-basin CSV:", pipe["fsm_basins_csv"])
+    ```
+
+=== "Rust"
+
+    ```rust,no_run
+    use lidar::{RoutingMode, RunPipelineOptions, SimulateInundationOptions, run_pipeline};
+
+    fn main() -> lidar::Result<()> {
+        let res = run_pipeline(
+            "dem.tif",
+            "out_fsm",
+            &RunPipelineOptions {
+                routing: RoutingMode::FillSpillMerge,
+                simulation: SimulateInundationOptions {
+                    min_size: 1000,
+                    min_depth: 0.3,
+                    interval: 0.3,
+                    rain_intensity_cm_h: 5.0,
+                    rain_duration_h: 50.0,
+                    time_step_h: 1.0,
+                    compress: true,
+                },
+                ..Default::default()
+            },
+        )?;
+        if let Some(mb) = res.fsm_mass_balance {
+            println!("Mass balance residual: {:.2e} m3", mb.mass_balance_error_m3);
+        }
         Ok(())
     }
     ```

@@ -43,6 +43,7 @@ pub mod conditioning;
 pub mod error;
 pub mod filling;
 pub mod filtering;
+pub mod fsm;
 pub mod graph;
 pub mod inundation;
 pub mod mounts;
@@ -80,6 +81,10 @@ pub use filling::{
 pub use filtering::{
     gaussian_filter, gaussian_filter_file, mean_filter, mean_filter_file, median_filter,
     median_filter_file,
+};
+pub use fsm::{
+    FsmBasinSummary, FsmMassBalance, FsmSimulationResult, RoutingMode, fsm_basins_to_csv_string,
+    simulate_fill_spill_merge_in_memory, write_fsm_basins_csv,
 };
 #[cfg(feature = "serde")]
 pub use graph::write_connectivity_graph_json;

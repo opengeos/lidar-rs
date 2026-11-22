@@ -150,6 +150,38 @@ const simAdv = lidar.simulateInundationAdvanced(
 );
 assert.equal(simAdv.runoffCoeff, 0.75);
 assert.equal(simAdv.numSteps, 5);
+assert.equal(JSON.parse(simAdv.fsmMassBalanceJson()), null);
 simAdv.free();
+
+// 7. Dynamic Fill-Spill-Merge cascade mass-balance routing in WASM
+const simFsm = lidar.simulateInundationAdvanced(
+  demBytes,
+  "dem.tif",
+  3,
+  1000,
+  0.3,
+  0.3,
+  5.0,
+  50.0,
+  2.0,
+  undefined,
+  1.0,
+  undefined,
+  "fsm",
+);
+const fsmMb = JSON.parse(simFsm.fsmMassBalanceJson());
+assert.ok(fsmMb && fsmMb.total_runoff_m3 > 0, "expected positive FSM total runoff");
+assert.ok(
+  Math.abs(fsmMb.mass_balance_error_m3) < 1e-6 * fsmMb.total_runoff_m3,
+  `FSM mass balance error too large: ${fsmMb.mass_balance_error_m3}`,
+);
+const fsmBasins = JSON.parse(simFsm.fsmBasinsJson());
+assert.ok(fsmBasins.length >= 2, "expected multiple FSM basins");
+assert.ok(
+  fsmBasins.some((b) => b.spilled_volume_m3 > 0),
+  "expected spilling FSM basins",
+);
+assert.ok(simFsm.fsmBasinsCsv().startsWith("dep_id,parent_id,level,"));
+simFsm.free();
 
 console.log("ALL lidar-js WASM TESTS PASSED!");

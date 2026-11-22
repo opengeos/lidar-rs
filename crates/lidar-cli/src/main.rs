@@ -13,7 +13,7 @@ use lidar::pointcloud::{
 use lidar::{
     AnimateInundationOptions, BreachMode, BreachOptions, BurnCulvertsOptions,
     CatchmentHierarchyOptions, DelineateCatchmentsOptions, DelineateFlowPathsOptions,
-    DelineateOptions, ExtractSinksOptions, HillshadeOptions, RunPipelineOptions,
+    DelineateOptions, ExtractSinksOptions, HillshadeOptions, RoutingMode, RunPipelineOptions,
     SimulateInundationOptions, TiledDelineationOptions, Topology, add_crs, animate_inundation,
     breach_depressions_file, burn_culverts_file, clip_image, csv_points_to_vector,
     delineate_catchment_hierarchy, delineate_catchments, delineate_depressions,
@@ -64,6 +64,21 @@ impl From<CliBreachMode> for BreachMode {
             CliBreachMode::Complete => BreachMode::Complete,
             CliBreachMode::Selective => BreachMode::Selective,
             CliBreachMode::Constrained => BreachMode::Constrained,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CliRoutingMode {
+    Static,
+    Fsm,
+}
+
+impl From<CliRoutingMode> for RoutingMode {
+    fn from(m: CliRoutingMode) -> Self {
+        match m {
+            CliRoutingMode::Static => RoutingMode::Static,
+            CliRoutingMode::Fsm => RoutingMode::FillSpillMerge,
         }
     }
 }
@@ -518,6 +533,9 @@ enum Commands {
         /// Optional SCS Type II design storm total precipitation in mm (overrides constant rainfall)
         #[arg(long)]
         scs_type2_mm: Option<f64>,
+        /// Hydrologic routing mode (static = independent level-set timing, fsm = dynamic Fill-Spill-Merge cascade mass-balance)
+        #[arg(long, value_enum, default_value_t = CliRoutingMode::Static)]
+        routing: CliRoutingMode,
         /// Optional stream network vector (.gpkg, .geojson, .shp) for distance-to-stream graph metrics
         #[arg(long)]
         streams: Option<PathBuf>,
@@ -1119,6 +1137,7 @@ fn run() -> lidar::Result<()> {
             infiltration,
             antecedent_depth,
             scs_type2_mm,
+            routing,
             streams,
             use_f32,
             no_rasters,
@@ -1150,6 +1169,7 @@ fn run() -> lidar::Result<()> {
                     time_step_h: time_step,
                     compress,
                 },
+                routing: routing.into(),
                 runoff_coeff_path: runoff_coeff,
                 infiltration_path: infiltration,
                 antecedent_depth_path: antecedent_depth,
@@ -1190,6 +1210,20 @@ fn run() -> lidar::Result<()> {
                     println!("  graph GraphML:    {}", p.display());
                 }
                 println!("  inundation curve: {}", res.inundation_csv.display());
+                if let Some(ref p) = res.fsm_basins_csv {
+                    println!("  FSM basins CSV:   {}", p.display());
+                }
+                if let Some(ref mb) = res.fsm_mass_balance {
+                    println!(
+                        "  FSM mass balance ({:.2} h): runoff={:.2} m³, stored={:.2} m³, infil={:.2} m³, outflow={:.2} m³, err={:.2e} m³",
+                        mb.duration_h,
+                        mb.total_runoff_m3,
+                        mb.total_stored_m3,
+                        mb.total_infiltration_m3,
+                        mb.total_boundary_outflow_m3,
+                        mb.mass_balance_error_m3,
+                    );
+                }
                 println!("  summary JSON:     {}", res.summary_json.display());
             }
         }

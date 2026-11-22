@@ -131,12 +131,12 @@ try {
 | `delineateMounts` | `(dsmBytes, filename, minSize, minHeight, interval)` | `DepressionsOutput` (same fields as `delineateDepressions`) |
 | `delineateCatchments` | `(demBytes, sinkOrRegionBytes, demFilename, sinkFilename)` | `CatchmentsOutput` (`recordsJson()`, `watershedTif()`, `geojson()`) |
 | `simulateInundation` | `(demBytes, filename, kernelSize, minSize, minDepth, interval, rainIntensityCmH, rainDurationH, timeStepH)` | `InundationOutput` |
-| `simulateInundationAdvanced` | `(demBytes, filename, kernelSize, minSize, minDepth, interval, rainIntensityCmH, rainDurationH, timeStepH, breachMaxDepth?, runoffCoeff, scsType2Mm?)` | `InundationOutput` with optional selective breaching, runoff coefficient `C`, and SCS Type II storm hyetograph |
+| `simulateInundationAdvanced` | `(demBytes, filename, kernelSize, minSize, minDepth, interval, rainIntensityCmH, rainDurationH, timeStepH, breachMaxDepth?, runoffCoeff, scsType2Mm?, routing?)` | `InundationOutput` with optional selective breaching, runoff coefficient `C`, SCS Type II storm hyetograph, and routing mode (`"static"` or `"fsm"`) |
 
 **`InundationOutput` methods:**
 
 - **Metadata & telemetry:** `width`, `height`, `projection`, `maxLevel`, `numRegions`, `numSteps`, `runoffCoeff`
-- **Tabular & graph exports:** `depressionsJson()`, `catchmentHierarchyJson()`, `stepsJson()`, `inundationCurveCsv()`, `spillPathsJson()`, `spillPathsGeojson()`, `ratingCurvesJson()`, `ratingCurvesCsv()`, `connectivityGraphJson()`, `connectivityGraphml()`
+- **Tabular & graph exports:** `depressionsJson()`, `catchmentHierarchyJson()`, `stepsJson()`, `inundationCurveCsv()`, `spillPathsJson()`, `spillPathsGeojson()`, `ratingCurvesJson()`, `ratingCurvesCsv()`, `connectivityGraphJson()`, `connectivityGraphml()`, `fsmMassBalanceJson()`, `fsmBasinsJson()`, `fsmBasinsCsv()`
 - **Raster & vector buffers:** `depressionsGeojson()`, `fillTimeTif()`, `catchmentHirTif()`, `sinkTif()`, `levelTif()`, `depressionIdValues()`, `fillTimeValues()`
 - **Canvas & publication rendering:** `hillshadeRgba()`, `depthRgba()`, `levelRgba()`, `fillTimeRgba()`, `renderFramePng(stepIndex, showScaleBar, showLegend, showSpillPaths?)`, `encodeGif(frameDelayMs, pingPong, maxDim, showSpillPaths?)`
 

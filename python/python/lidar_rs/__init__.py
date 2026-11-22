@@ -754,8 +754,12 @@ def simulate_inundation_array(
     breach_max_depth: float | None = None,
     no_data: float | None = None,
     cell_size: float = 1.0,
+    routing: str = "static",
 ) -> dict[str, Any]:
-    """Run the complete hydrology and inundation pipeline in memory on a 2D NumPy DEM array."""
+    """Run the complete hydrology and inundation pipeline in memory on a 2D NumPy DEM array.
+
+    Set `routing="fsm"` for dynamic Fill-Spill-Merge cascade mass-balance routing.
+    """
     arr = np.ascontiguousarray(dem_arr, dtype=np.float64)
     rc = np.ascontiguousarray(runoff_coeff_arr, dtype=np.float64) if runoff_coeff_arr is not None else None
     inf = np.ascontiguousarray(infiltration_arr, dtype=np.float64) if infiltration_arr is not None else None
@@ -780,6 +784,7 @@ def simulate_inundation_array(
         breach_max_depth,
         no_data,
         float(cell_size),
+        routing,
     )
 
 
@@ -806,8 +811,12 @@ def run_pipeline(
     export_vectors: bool = True,
     export_graph: bool = True,
     compress: bool = False,
+    routing: str = "static",
 ) -> dict[str, Any]:
-    """Run the all-in-one in-memory hydrology pipeline from a raw DEM file to GeoPackage, CSV, GraphML, and rasters."""
+    """Run the all-in-one in-memory hydrology pipeline from a raw DEM file to GeoPackage, CSV, GraphML, and rasters.
+
+    Set `routing="fsm"` for dynamic Fill-Spill-Merge cascade mass-balance routing.
+    """
     return _lidar_rs.run_pipeline(
         _as_path_str(in_dem),
         _as_path_str(out_dir),
@@ -831,6 +840,7 @@ def run_pipeline(
         bool(export_vectors),
         bool(export_graph),
         bool(compress),
+        routing,
     )
 
 

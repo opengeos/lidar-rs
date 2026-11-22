@@ -947,6 +947,7 @@
     if (!loadedFile) return;
     const token = ++runToken;
     const mode = $("lp-mode").value;
+    const routingMode = $("lp-routing") ? $("lp-routing").value : "static";
     const kernelSize = Math.max(1, parseInt($("lp-kernel").value, 10) || 1);
     const breachVal = Math.max(0, parseFloat($("lp-breach")?.value) || 0);
     const breachMaxDepth = breachVal > 0 ? breachVal : undefined;
@@ -988,6 +989,7 @@
                 breachMaxDepth,
                 runoffCoeff,
                 undefined,
+                routingMode,
               )
             : wasm.simulateInundation(
                 loadedFile.bytes,
@@ -1059,8 +1061,13 @@
         drawRgba($("lp-c-level"), w, h, level, hill);
         drawRgba($("lp-c-fill"), w, h, fill, hill);
 
-        renderSummary([
+        const fsmMassBalance =
+          typeof sim.fsmMassBalanceJson === "function"
+            ? JSON.parse(sim.fsmMassBalanceJson())
+            : null;
+        const summaryCards = [
           ["Raster Size", `${w} × ${h}`],
+          ["Routing", fsmMassBalance !== null ? "Fill-Spill-Merge" : "Static"],
           ["Sink Regions", String(sim.numRegions)],
           ["Nested Depressions", String(depressions.length)],
           ["Max Level", String(sim.maxLevel)],
@@ -1068,7 +1075,22 @@
           ["Spill Paths", String(spillPaths.length)],
           ["Final Inundated", lastStep ? `${(lastStep.inundated_fraction * 100).toFixed(1)}%` : "0%"],
           ["WASM Runtime", `${elapsed.toFixed(0)} ms`],
-        ]);
+        ];
+        if (fsmMassBalance) {
+          summaryCards.push([
+            "FSM Stored / Runoff",
+            `${(fsmMassBalance.total_stored_m3 / 1000).toFixed(1)}k / ${(fsmMassBalance.total_runoff_m3 / 1000).toFixed(1)}k m³`,
+          ]);
+          summaryCards.push([
+            "FSM Boundary Outflow",
+            `${(fsmMassBalance.total_boundary_outflow_m3 / 1000).toFixed(1)}k m³`,
+          ]);
+          summaryCards.push([
+            "Mass Balance Err",
+            `${fsmMassBalance.mass_balance_error_m3.toExponential(1)} m³`,
+          ]);
+        }
+        renderSummary(summaryCards);
 
         const downloadItems = [
           {
@@ -1092,6 +1114,20 @@
           { label: "Catchment Hierarchy GeoTIFF", filename: `${stem}_catchment_hir.tif`, data: sim.catchmentHirTif(), mime: "image/tiff" },
           { label: "Sink GeoTIFF", filename: `${stem}_sink.tif`, data: sim.sinkTif(), mime: "image/tiff" },
         ];
+        if (fsmMassBalance && typeof sim.fsmBasinsCsv === "function") {
+          const fsmItem = {
+            label: "FSM Basins CSV",
+            filename: `${stem}_fsm_basins.csv`,
+            getData: () => sim.fsmBasinsCsv(),
+            mime: "text/csv",
+          };
+          const curveIdx = downloadItems.findIndex((item) => item.label === "Inundation Curve CSV");
+          if (curveIdx >= 0) {
+            downloadItems.splice(curveIdx + 1, 0, fsmItem);
+          } else {
+            downloadItems.push(fsmItem);
+          }
+        }
         renderDownloads(downloadItems, true);
 
         renderTable(depressions);

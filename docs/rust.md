@@ -33,6 +33,7 @@ lidar = { version = "0.4", default-features = false, features = ["serde"] }
 | `mounts` | `flip_dem`, `delineate_mounts`, `delineate_mounts_in_memory` |
 | `catchment` | `delineate_catchments`, `delineate_flow_paths`, `delineate_catchment_hierarchy`, `delineate_catchment_hierarchy_in_memory` (compressed D8 + DSU) |
 | `inundation` | `run_pipeline`, `run_full_pipeline_in_memory`, `simulate_inundation`, `simulate_inundation_with_forcing_in_memory`, `InundationForcing`, `scs_curve_number_runoff`, `scs_type2_hyetograph`, `cumulative_runoff_mm` |
+| `fsm` | `RoutingMode`, `simulate_fill_spill_merge_in_memory`, `FsmSimulationResult`, `FsmBasinSummary`, `FsmMassBalance`, `fsm_basins_to_csv_string`, `write_fsm_basins_csv` |
 | `graph` | `compute_rating_curves`, `write_rating_curves_csv`, `build_connectivity_graph`, `write_connectivity_graph_json`, `write_connectivity_graphml`, `write_spill_paths_vector` |
 | `tiling` | `delineate_depressions_tiled`, `TiledDelineationOptions`, `load_dem_f32` |
 | `animation` | `animate_inundation`, `animate_inundation_to_bytes_with_spill_paths`, `export_inundation_frames_png`, `render_inundation_frame_png_bytes`, `AnimateInundationOptions` |
@@ -108,6 +109,7 @@ fn main() -> lidar::Result<()> {
                 time_step_h: 1.0,
                 compress: false,
             },
+            routing: lidar::RoutingMode::FillSpillMerge,
             forcing: InundationForcing {
                 runoff_coeff: Some(&rc),
                 ..Default::default()

@@ -23,6 +23,13 @@ Run **`lidar-rs`** directly in your browser via WebAssembly: DEM smoothing, sele
       </select>
     </div>
     <div class="lp-field lp-inundation-only">
+      <label for="lp-routing">Routing mode</label>
+      <select id="lp-routing">
+        <option value="static">Static (Level-Set)</option>
+        <option value="fsm">Fill-Spill-Merge (Cascade)</option>
+      </select>
+    </div>
+    <div class="lp-field lp-inundation-only">
       <label for="lp-kernel">Median filter (px)</label>
       <input type="number" id="lp-kernel" value="3" min="1" max="15" step="2">
     </div>
