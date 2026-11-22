@@ -1106,6 +1106,12 @@ pub fn delineate_catchment_hierarchy_in_memory(
     const EXITS: u32 = u32::MAX - 1;
     const VISITING: u32 = u32::MAX - 2;
 
+    if max_level as usize > n {
+        return Err(Error::InvalidArgument(format!(
+            "depression_level contains invalid level {max_level} exceeding grid cell count {n}"
+        )));
+    }
+
     let mut grid_to_dep = vec![NONE; n];
     let mut dep_to_grid: Vec<usize> = Vec::new();
     let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); max_level as usize + 1];

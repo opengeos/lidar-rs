@@ -265,19 +265,9 @@ pub fn breach_dem(
     fill_remaining: bool,
 ) -> Result<Vec<u8>, JsValue> {
     let dem = read_array2d_f64(bytes, filename)?;
-    let breach_mode = match mode.to_ascii_lowercase().as_str() {
-        "complete" => BreachMode::Complete,
-        "selective" => BreachMode::Selective,
-        "constrained" => BreachMode::Constrained,
-        other => return Err(to_js_err(format!("Unknown breach mode: {other}"))),
-    };
-    let opts = BreachOptions {
-        mode: breach_mode,
-        max_depth,
-        max_length,
-        fill_remaining,
-        ..Default::default()
-    };
+    let breach_mode: BreachMode = mode.parse().map_err(to_js_err)?;
+    let mut opts = BreachOptions::for_mode(breach_mode, max_depth, max_length);
+    opts.fill_remaining = fill_remaining;
     let out = core_breach_depressions(&dem, &opts).map_err(to_js_err)?;
     write_array2d_tif(&out, "dem_breached.tif")
 }

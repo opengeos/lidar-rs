@@ -1810,6 +1810,37 @@ pub struct InMemoryFullPipeline {
     pub inundation_curve_csv: String,
 }
 
+fn effective_runoff_scale(
+    sink: &Array2D<f64>,
+    runoff_coeff: Option<&Array2D<f64>>,
+    scalar_fallback: f64,
+) -> f64 {
+    let fallback = if scalar_fallback.is_finite() {
+        scalar_fallback.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let Some(rc) = runoff_coeff else {
+        return fallback;
+    };
+    let s_nd = sink.no_data();
+    let rc_nd = rc.no_data();
+    let mut sum = 0.0f64;
+    let mut cnt = 0usize;
+    for (&sv, &cv) in sink.data().iter().zip(rc.data().iter()) {
+        if sv.is_finite() && !sv.rd_eq(s_nd) {
+            let eff = if cv.is_finite() && !cv.rd_eq(rc_nd) {
+                cv.clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            sum += eff;
+            cnt += 1;
+        }
+    }
+    if cnt > 0 { sum / cnt as f64 } else { fallback }
+}
+
 /// Runs the complete in-memory hydrology pipeline (optional median filter -> optional breaching ->
 /// sink extraction -> nested depression hierarchy -> catchment hierarchy -> forced inundation ->
 /// spill flow paths -> rating curves -> connectivity graph) without touching the filesystem.
@@ -1856,13 +1887,13 @@ pub fn run_full_pipeline_in_memory(
         delineate_spill_flow_paths_in_memory(&sinks.dem_refined, &depressions, &fill_time)?;
     let rating_curves = compute_rating_curves(&sinks.sink, &depressions, sim_opts.interval.abs())?;
 
-    // Scale hyetograph / constant rainfall intensity by scalar_runoff_coeff only when no
-    // spatially variable runoff_coeff raster is supplied.
-    let runoff_scale = if options.forcing.runoff_coeff.is_none() {
-        options.scalar_runoff_coeff
-    } else {
-        1.0
-    };
+    // Scale reported cumulative runoff depth using the mean effective runoff coefficient across
+    // sink cells when a runoff_coeff raster is supplied, or scalar_runoff_coeff otherwise.
+    let runoff_scale = effective_runoff_scale(
+        &sinks.sink,
+        options.forcing.runoff_coeff,
+        options.scalar_runoff_coeff,
+    );
     let eff_rain = sim_opts.rain_intensity_cm_h * runoff_scale;
     let scaled_hyeto: Option<Vec<(f64, f64)>> = options.forcing.hyetograph.map(|h| {
         h.iter()
@@ -2132,15 +2163,19 @@ pub fn run_pipeline(
         .map(|&v| v * cell_area)
         .sum();
 
+    let runoff_scale = effective_runoff_scale(&sinks.sink, rc_arr.as_ref(), 1.0);
+    let eff_rain = sim_opts.rain_intensity_cm_h * runoff_scale;
+    let scaled_hyeto: Option<Vec<(f64, f64)>> = options.hyetograph.as_ref().map(|h| {
+        h.iter()
+            .map(|&(dt, cm_h)| (dt, cm_h * runoff_scale))
+            .collect()
+    });
+
     write_depressions_csv(&depressions.depressions, &depressions_csv)?;
     write_catchment_hierarchy_csv(&catchment_records, &catchments_csv)?;
     std::fs::write(
         &inundation_csv,
-        format_inundation_curve_csv(
-            &steps,
-            sim_opts.rain_intensity_cm_h,
-            options.hyetograph.as_deref(),
-        ),
+        format_inundation_curve_csv(&steps, eff_rain, scaled_hyeto.as_deref()),
     )?;
 
     if options.save_rasters {
@@ -2175,8 +2210,8 @@ pub fn run_pipeline(
             &spill_paths,
             &dem.geotransform,
             &dem.projection,
-            sim_opts.rain_intensity_cm_h,
-            options.hyetograph.as_deref(),
+            eff_rain,
+            scaled_hyeto.as_deref(),
             &sg,
         )?;
         (Some(dg), Some(sg))
@@ -2195,8 +2230,8 @@ pub fn run_pipeline(
             &catchment_records,
             &fill_time,
             &spill_paths,
-            sim_opts.rain_intensity_cm_h,
-            options.hyetograph.as_deref(),
+            eff_rain,
+            scaled_hyeto.as_deref(),
             options.stream_vector.as_deref(),
         )?;
         let gml_path = out_dir.join("connectivity_graph.graphml");

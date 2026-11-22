@@ -1068,28 +1068,16 @@ fn run() -> lidar::Result<()> {
             fill_remaining,
             compress,
         } => {
-            let defaults = BreachOptions::default();
             let breach_mode: BreachMode = mode.into();
-            let resolved_depth = match max_depth {
-                Some(0.0) => None,
-                Some(v) => Some(v),
-                None if breach_mode == BreachMode::Complete => None,
-                None => defaults.max_depth,
-            };
-            let resolved_length = match max_length {
-                Some(0) => None,
-                Some(v) => Some(v),
-                None if breach_mode == BreachMode::Complete => None,
-                None => defaults.max_length,
-            };
-            let opts = BreachOptions {
-                mode: breach_mode,
-                max_depth: resolved_depth,
-                max_length: resolved_length,
-                fill_remaining,
-                compress,
-                ..defaults
-            };
+            let mut opts = BreachOptions::for_mode(breach_mode, max_depth, max_length);
+            if max_depth == Some(0.0) {
+                opts.max_depth = None;
+            }
+            if max_length == Some(0) {
+                opts.max_length = None;
+            }
+            opts.fill_remaining = fill_remaining;
+            opts.compress = compress;
             breach_depressions_file(&input, &output, &opts)?;
             println!("Saved breached DEM to {}", output.display());
         }
