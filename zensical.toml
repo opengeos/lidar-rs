@@ -1,6 +1,6 @@
 [project]
 site_name = "lidar-rs"
-site_description = "High-performance nested depression delineation and fill-and-spill inundation simulation in pure Rust, powered by terrio and richdem"
+site_description = "High-performance nested depression delineation, hydro-conditioning, LiDAR point-cloud gridding, and fill-and-spill inundation simulation in pure Rust"
 site_author = "opengeos"
 site_url = "https://lidar-rs.opengeos.org"
 repo_url = "https://github.com/opengeos/lidar-rs"
@@ -13,10 +13,21 @@ nav = [
   { "Home" = "index.md" },
   { "Playground" = "playground.md" },
   { "Installation" = "installation.md" },
+  { "User Guides" = [
+      { "Overview & Architecture" = "guides/index.md" },
+      { "All-in-One Pipeline & GeoPackage" = "guides/pipeline.md" },
+      { "Hydro-Conditioning" = "guides/hydro-conditioning.md" },
+      { "Inundation Physics & Storm Forcing" = "guides/inundation-physics.md" },
+      { "Rating Curves & Connectivity Graphs" = "guides/connectivity-graphs.md" },
+      { "LiDAR Point Clouds (DSM, DTM, CHM)" = "guides/point-clouds.md" },
+      { "Tiled Regional Delineation" = "guides/tiling.md" },
+      { "Animation & Publication Frames" = "guides/visualization.md" },
+  ] },
   { "CLI Reference" = "cli.md" },
   { "Rust Library" = "rust.md" },
   { "Python API" = "python.md" },
   { "JavaScript / WASM" = "javascript.md" },
+  { "Sample Datasets" = "datasets.md" },
   { "Report Issues" = "https://github.com/opengeos/lidar-rs/issues" },
 ]
 

@@ -8,19 +8,24 @@
 [![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.24411444-blue.svg)](https://doi.org/10.5281/zenodo.24411444)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-High-performance nested depression delineation and fill-and-spill inundation simulation from Digital Elevation Models (DEMs) in **pure Rust**, ported from [`opengeos/lidar`](https://github.com/opengeos/lidar) and powered by [`terrio`](https://github.com/opengeos/terrio) and [`richdem`](https://github.com/opengeos/richdem-rs) with **zero GDAL or C/C++ dependencies**.
+High-performance nested surface depression delineation, hydro-conditioning, LiDAR point-cloud gridding, and fill-and-spill inundation simulation in **pure Rust**, ported from [`opengeos/lidar`](https://github.com/opengeos/lidar) and powered by [`terrio`](https://github.com/opengeos/terrio) and [`richdem`](https://github.com/opengeos/richdem-rs) with **zero GDAL or C/C++ dependencies**.
 
 [![Interactive inundation simulation and inundation curve in the lidar-rs WebAssembly Playground](https://files.opengeos.org/inundation_demo.gif)](https://lidar-rs.opengeos.org/playground/)
 
+**Documentation:** [User Guides](https://lidar-rs.opengeos.org/guides/) | [Sample Datasets](https://lidar-rs.opengeos.org/datasets/) | [CLI](https://lidar-rs.opengeos.org/cli/) | [Rust](https://lidar-rs.opengeos.org/rust/) | [Python](https://lidar-rs.opengeos.org/python/) | [JavaScript / WASM](https://lidar-rs.opengeos.org/javascript/) | [Live Playground](https://lidar-rs.opengeos.org/playground/)
+
 ## Highlights
 
-- **DEM smoothing filters:** Mean (`mean_filter`), median (`median_filter`), and Gaussian (`gaussian_filter`) filters with symmetric boundary reflection, NoData preservation, and optional `rayon` row parallelism.
-- **Sink extraction & DEM refinement (`extract_sinks`):** Priority-Flood depression filling via `richdem`, 4-connected region grouping, small artifact removal, refined DEM generation, geometric/topographic depression attributes (`regions_info.csv`), and polygonized Shapefile + attribute-joined GeoPackage export via `terrio`.
-- **Nested depression hierarchy (`delineate_depressions`):** Wu et al. (2019) level-set algorithm delineating nested depressions across sink regions in parallel, computing all 18 geometric and topological attributes (`id`, `level`, `count`, `area`, `volume`, `avg_depth`, `max_depth`, `min_elev`, `max_elev`, `children_id`, `region_id`, `perimeter`, `major_axis`, `minor_axis`, `elongatedness`, `eccentricity`, `orientation`, `area_bbox_ratio`), and exporting per-level shapefiles (`shp-level/Single_level_*.shp`).
-- **Nested mount hierarchy (`delineate_mounts` & `flip_dem`):** DEM/DSM inversion and elevated feature hierarchy delineation.
-- **Catchment hierarchy, flow paths & inundation simulation (`catchment`, `inundation`, `animation`):** Pure-Rust ports of `opengeos/lidar`'s ArcGIS Hydrology Analyst toolbox (`delineate_catchments`, `delineate_flow_paths`, `delineate_catchment_hierarchy`, single-pass parallel `simulate_inundation`, and shaded-relief animated GIF export via `animate_inundation`).
-- **Pure-Rust geospatial utilities:** `polygonize`, `mosaic`, `reproject_image`, `resample`, `clip_image`, `image_to_cog`, `add_crs`, `join_csv_to_vector`, `csv_points_to_vector`, and LiDAR point cloud I/O, conversion, and DSM gridding (`read_lidar`, `write_lidar`, `convert_lidar`, `lidar_to_dsm`) via `terrio`.
-- **Rust crate (`lidar`), standalone CLI (`lidar-cli`), Python bindings (`lidar-rs` via PyO3 + maturin), and WebAssembly (`lidar-js` via `wasm-bindgen`) with a live browser [Playground](https://lidar-rs.opengeos.org/playground/).**
+- **All-in-one in-memory pipeline (`run_pipeline` / `lidar pipeline`):** Run DEM smoothing, optional hydro-conditioning, Priority-Flood sink extraction, nested depression hierarchy, single-pass D8 catchment hierarchy, inundation simulation, rating curves, connectivity graph export, and unified multi-layer GeoPackage (`results.gpkg`) output in a single command.
+- **Compressed D8 catchment engine:** Single-pass upland D8 forest compression plus per-level Union-Find (`O(N + L*D)`). In an illustrative 98M-cell, 43-level 1-m USGS 3DEP karst run it completed in ~65 seconds (see the [User Guides](https://lidar-rs.opengeos.org/guides/)).
+- **Hydro-conditioning (`breach_depressions`, `burn_culverts`):** Pure-Rust Lindsay (2016) least-cost depression breaching (`complete`, `selective`, `constrained`) and vector-guided culvert burning across road embankments.
+- **Inundation physics & storm forcing:** Spatially variable runoff coefficients, NRCS TR-55 SCS Curve Number conversion (`cn_to_runoff_coeff`), SCS Type II design storm hyetographs, vertical infiltration losses, and antecedent ponded water depths.
+- **Rating curves & connectivity graphs:** Exact stage-storage-area rating curves (`rating_curves.csv`), directed fill-and-spill / merge networks (JSON + GraphML), georeferenced spill-path vectors (`spill_paths.gpkg`), and NHD stream-proximity metrics.
+- **DEM smoothing, sink extraction & nested hierarchies:** Mean, median, and Gaussian filters; Priority-Flood sink extraction (`extract_sinks`); Wu et al. (2019) nested depression hierarchy (`delineate_depressions`, 18+ morphometric and topological attributes); and nested mount / canopy hierarchy (`delineate_mounts`, `flip_dem`).
+- **LiDAR point clouds (`DSM`, `DTM`, `CHM`):** Native LAS/LAZ/COPC/PLY/E57 reading and conversion, ASPRS class and return filtering, pure-Rust CSF/PMF ground classification (`classify_ground`), bare-earth DTM (`lidar_to_dtm`), and Canopy Height Models (`lidar_to_chm`).
+- **Tiled regional delineation & `f32` storage (`delineate_depressions_tiled` / `tiled-depressions`):** Parallel overlapping tile windows with core-owned seam deduplication and optional `f32` DEM grids that halve source raster memory.
+- **Publication PNG & GIF rendering (`export_frames`, `animate_inundation`):** Shaded-relief inundation animations and individual PNG frames with overland spill arrows, metric scale bars, legends, and timestamp HUDs.
+- **Four interfaces, one pure-Rust core:** Rust crate (`lidar`), standalone CLI (`lidar-cli`, 31 subcommands + JSON output), Python package (`lidar-rs`, PyO3 + zero-copy NumPy arrays, Python 3.11+), and WebAssembly (`lidar-js`) powering the interactive browser [Playground](https://lidar-rs.opengeos.org/playground/) with Depression Inspector and live Stage-Volume Rating Curves.
 
 ## Workspace Layout
 
@@ -44,44 +49,30 @@ lidar = "0.4"
 ```
 
 ```rust,no_run
-use std::path::Path;
-use lidar::{
-    DelineateOptions, ExtractSinksOptions,
-    delineate_depressions, extract_sinks, median_filter_file,
-};
+use lidar::{RunPipelineOptions, SimulateInundationOptions, run_pipeline};
 
 fn main() -> lidar::Result<()> {
-    let out_dir = Path::new("output");
-    let med_path = out_dir.join("median.tif");
-
-    median_filter_file("dem.tif", 3, Some(&med_path))?;
-
-    let sinks = extract_sinks(
-        &med_path,
-        out_dir,
-        &ExtractSinksOptions {
-            min_size: 1000,
-            ..Default::default()
-        },
-    )?;
-
-    let deps = delineate_depressions(
-        sinks.sink_path.as_ref().unwrap(),
-        out_dir,
-        &DelineateOptions {
-            min_size: 1000,
-            min_depth: 0.3,
-            interval: 0.3,
-            bool_level_shp: true,
+    let res = run_pipeline(
+        "dem.tif",
+        "out_pipe",
+        &RunPipelineOptions {
+            kernel_size: 3,
+            simulation: SimulateInundationOptions {
+                min_size: 1000,
+                min_depth: 0.3,
+                interval: 0.3,
+                rain_intensity_cm_h: 5.0,
+                rain_duration_h: 50.0,
+                time_step_h: 1.0,
+                compress: true,
+            },
             ..Default::default()
         },
     )?;
 
     println!(
-        "Delineated {} nested depressions across {} regions (max level = {})",
-        deps.depressions.len(),
-        deps.num_regions,
-        deps.max_level,
+        "Delineated {} nested depressions and {} spill paths",
+        res.num_depressions, res.num_spill_paths,
     );
     Ok(())
 }
@@ -105,14 +96,25 @@ cargo install lidar-cli
 Example commands:
 
 ```sh
-lidar median-filter dem.tif out/median.tif -k 3
-lidar extract-sinks out/median.tif out --min-size 1000
-lidar delineate-depressions out/sink.tif out --min-size 1000 --min-depth 0.3 --interval 0.3 --level-shp
-lidar catchment-hierarchy out/dem.tif out/shp-level out/catchment_hir.tif
-lidar simulate-inundation out/sink.tif out/catchment_hir.tif out/simulation --rain-intensity 5 --duration 50 --time-step 1
-lidar animate-inundation out/dem.tif out/simulation out/inundation.gif --rain-intensity 5
-lidar delineate-mounts dsm.tif out_mounts --min-size 1000 --min-height 0.3 --interval 0.3
+# End-to-end pipeline (GeoPackage, CSV, rating curves, connectivity graphs, rasters)
+lidar pipeline dem.tif out_pipe --min-size 1000 --min-depth 0.3 --interval 0.3 \
+  --rain-intensity 5 --duration 50 --time-step 1 --compress
+
+# Hydro-conditioning (Lindsay 2016 breaching + culvert burning)
+lidar breach-depressions dem.tif out/breached.tif --mode selective --max-depth 0.5
+lidar burn-culverts dem.tif culverts.gpkg out/burned.tif --half-width 1 --depth-offset 0.1
+
+# Publication PNG frames & shaded-relief animated GIF
+lidar export-frames dem.tif out_pipe/fill_time.tif out_pipe/frames --num-steps 10 --time-step 5 --rain-intensity 5 --scale-bar --legend
+lidar animate-inundation dem.tif out/simulation out/inundation.gif --rain-intensity 5 --scale-bar --legend
+
+# LiDAR point clouds (CSF/PMF ground classification, DSM, bare-earth DTM, CHM)
 lidar lidar-to-dsm cloud.laz dsm.tif --resolution 1.0
+lidar lidar-to-dtm cloud.laz dtm.tif --resolution 1.0 --ground-method csf
+lidar lidar-to-chm cloud.laz chm.tif --resolution 1.0 --ground-method csf
+
+# Parallel tiled regional delineation
+lidar tiled-depressions regional_dem.tif out_tiled --tile-size 2048 --overlap 128 --min-size 1000
 ```
 
 ## Python Usage
@@ -126,6 +128,21 @@ Or try it interactively in [Google Colab](https://colab.research.google.com/gith
 ```python
 import lidar_rs as lidar
 
+# End-to-end pipeline (GeoPackage, CSV, rating curves, GraphML/JSON, rasters)
+pipe = lidar.run_pipeline(
+    "dem.tif",
+    "out_pipe",
+    min_size=1000,
+    min_depth=0.3,
+    interval=0.3,
+    rain_intensity_cm_h=5.0,
+    rain_duration_h=50.0,
+    time_step_h=1.0,
+    compress=True,
+)
+print(pipe["num_depressions"], pipe["num_spill_paths"])
+
+# Classic opengeos/lidar drop-in workflow
 med = lidar.MedianFilter("dem.tif", kernel_size=3, out_file="out/median.tif")
 sink = lidar.ExtractSinks(med, min_size=1000, out_dir="out")
 dep_id, dep_level = lidar.DelineateDepressions(
