@@ -30,6 +30,7 @@ pipe = lidar.run_pipeline(
     breach_max_depth=None,        # set e.g. 1.5 to enable selective breaching
     culverts_vector=None,         # optional .gpkg/.geojson/.shp culvert layer
     stream_vector="sample_streams.gpkg",
+    routing="fsm",                # "static" (default) or "fsm" (dynamic Fill-Spill-Merge cascade)
     use_f32=False,
     compress=True,
 )
@@ -37,6 +38,7 @@ print(f"Depressions: {pipe['num_depressions']}, Spill paths: {pipe['num_spill_pa
 print("GeoPackage:", pipe["depressions_gpkg"])
 print("Rating curves:", pipe["rating_curves_csv"])
 print("GraphML:", pipe["connectivity_graphml"])
+print("FSM mass balance:", pipe["fsm_mass_balance"])
 ```
 
 ### 2. Zero-Temp-File NumPy Array API
