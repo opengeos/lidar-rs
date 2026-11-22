@@ -1030,3 +1030,112 @@ fn test_pointcloud_filtering_dtm_and_chm() {
         "expected ~15 m CHM peak, got {max_chm}"
     );
 }
+
+#[test]
+fn test_fill_spill_merge_end_to_end_on_sample_dem() {
+    use lidar::{
+        InMemoryFullPipelineOptions, InundationForcing, RoutingMode, RunPipelineOptions,
+        SimulateInundationOptions, run_full_pipeline_in_memory, run_pipeline,
+    };
+
+    let dem_path = test_data_dir().join("dem.tif");
+    let dem = load_raster::<f64>(&dem_path, None).unwrap();
+
+    let sim_opts = SimulateInundationOptions {
+        min_size: 1000,
+        min_depth: 0.3,
+        interval: 0.3,
+        rain_intensity_cm_h: 5.0,
+        rain_duration_h: 50.0,
+        time_step_h: 2.0,
+        compress: false,
+    };
+
+    let pipe_fsm = run_full_pipeline_in_memory(
+        &dem,
+        &InMemoryFullPipelineOptions {
+            kernel_size: 3,
+            breach: None,
+            simulation: sim_opts.clone(),
+            routing: RoutingMode::FillSpillMerge,
+            forcing: InundationForcing::default(),
+            scalar_runoff_coeff: 1.0,
+            stream_vector: None,
+        },
+    )
+    .unwrap();
+
+    let mb = pipe_fsm
+        .fsm_mass_balance
+        .as_ref()
+        .expect("FSM mass balance must be populated");
+    assert!(mb.total_runoff_m3 > 0.0);
+    assert!(
+        mb.mass_balance_error_m3.abs() < 1e-6 * mb.total_runoff_m3.max(1.0),
+        "sample DEM FSM mass balance error too large: {mb:?}"
+    );
+
+    let basins = pipe_fsm
+        .fsm_basins
+        .as_ref()
+        .expect("FSM basin summaries must be populated");
+    assert_eq!(basins.len(), pipe_fsm.depressions.depressions.len());
+    assert!(
+        basins.iter().any(|b| b.spilled_volume_m3 > 0.0),
+        "expected at least one spilling depression on sample DEM"
+    );
+    assert!(
+        basins.iter().any(|b| b.merge_time_h.is_some()),
+        "expected hierarchical merges on nested sample DEM"
+    );
+
+    // Verify monotonic inundation curve and consistent spill paths.
+    assert_eq!(pipe_fsm.steps.len(), 25);
+    for pair in pipe_fsm.steps.windows(2) {
+        assert!(pair[1].inundated_cells >= pair[0].inundated_cells);
+    }
+    assert!(pipe_fsm.steps.last().unwrap().inundated_cells > 0);
+    assert!(
+        !pipe_fsm.spill_paths.is_empty(),
+        "expected dynamically realized spill paths on sample DEM"
+    );
+    for sp in &pipe_fsm.spill_paths {
+        assert!(sp.cells.len() >= 2);
+        assert!(sp.spill_time_h.is_finite() && sp.spill_time_h >= 0.0);
+        if let Some(mt) = sp.merge_time_h {
+            assert!(
+                mt > sp.spill_time_h,
+                "merge_time ({mt}) must strictly exceed spill_time ({})",
+                sp.spill_time_h
+            );
+        }
+    }
+
+    // Verify end-to-end file pipeline with RoutingMode::FillSpillMerge writes all artifacts.
+    let tmp = tempfile::tempdir().unwrap();
+    let res = run_pipeline(
+        &dem_path,
+        tmp.path(),
+        &RunPipelineOptions {
+            kernel_size: 3,
+            simulation: sim_opts,
+            routing: RoutingMode::FillSpillMerge,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(res.routing, RoutingMode::FillSpillMerge);
+    let fsm_csv = res
+        .fsm_basins_csv
+        .as_ref()
+        .expect("fsm_basins.csv must be written");
+    assert!(fsm_csv.exists());
+    let csv_text = std::fs::read_to_string(fsm_csv).unwrap();
+    let csv_lines: Vec<&str> = csv_text.lines().collect();
+    assert!(csv_lines[0].starts_with("dep_id,parent_id,level,capacity_m3,"));
+    assert_eq!(csv_lines.len(), res.num_depressions + 1);
+    assert!(res.fsm_mass_balance.is_some());
+    assert!(res.depressions_gpkg.as_ref().unwrap().exists());
+    assert!(res.spill_paths_gpkg.as_ref().unwrap().exists());
+    assert!(tmp.path().join("fill_time.tif").exists());
+}

@@ -257,3 +257,50 @@ def test_numpy_in_memory_and_pipeline(tmp_path: Path):
     # Selective default (max_depth=1.5) leaves the 10 m wall intact; complete carves through it.
     assert breached_selective[:, 1:4].min() == pytest.approx(20.0)
     assert breached_complete[:, 1:4].min() < 12.0
+
+
+def test_fill_spill_merge_routing(tmp_path: Path):
+    dem_path = TEST_DATA / "dem.tif"
+    dem_arr = lidar_rs.MedianFilter(dem_path, kernel_size=3)
+
+    # In-memory FSM routing on NumPy array
+    sim_fsm = lidar_rs.simulate_inundation_array(
+        dem_arr,
+        kernel_size=1,
+        min_size=1000,
+        min_depth=0.3,
+        interval=0.3,
+        rain_intensity_cm_h=5.0,
+        rain_duration_h=50.0,
+        time_step_h=2.0,
+        routing="fsm",
+    )
+    mb = sim_fsm["fsm_mass_balance"]
+    assert mb is not None
+    assert mb["total_runoff_m3"] > 0.0
+    assert abs(mb["mass_balance_error_m3"]) < 1e-6 * mb["total_runoff_m3"]
+    assert sim_fsm["fsm_basins"] is not None
+    assert len(sim_fsm["fsm_basins"]) == len(sim_fsm["depressions"])
+    assert any(b["spilled_volume_m3"] > 0.0 for b in sim_fsm["fsm_basins"])
+    assert any(b["merge_time_h"] is not None for b in sim_fsm["fsm_basins"])
+
+    # File-based pipeline with FSM routing
+    pipe_dir = tmp_path / "pipe_fsm"
+    pipe = lidar_rs.run_pipeline(
+        dem_path,
+        pipe_dir,
+        kernel_size=3,
+        min_size=1000,
+        min_depth=0.3,
+        interval=0.3,
+        rain_intensity_cm_h=5.0,
+        rain_duration_h=50.0,
+        time_step_h=2.0,
+        routing="fsm",
+    )
+    assert pipe["routing"] == "fsm"
+    assert Path(pipe["fsm_basins_csv"]).exists()
+    assert abs(pipe["fsm_mass_balance"]["mass_balance_error_m3"]) < 1e-6 * pipe["fsm_mass_balance"]["total_runoff_m3"]
+
+    with pytest.raises(ValueError, match="unknown routing mode"):
+        lidar_rs.simulate_inundation_array(dem_arr, routing="invalid_mode")

@@ -14,14 +14,15 @@ use wasm_bindgen::prelude::*;
 
 use lidar::{
     ANIMATION_BANNER_HEIGHT, AnimateInundationOptions, BreachMode, BreachOptions, HillshadeOptions,
-    InMemoryFullPipelineOptions, InundationForcing, SimulateInundationOptions, SpillFlowPath,
-    animate_inundation_to_bytes_with_spill_paths, breach_depressions as core_breach_depressions,
-    compute_hillshade_rgb, connectivity_graph_to_graphml_string, delineate_catchments_in_memory,
+    InMemoryFullPipelineOptions, InundationForcing, RoutingMode, SimulateInundationOptions,
+    SpillFlowPath, animate_inundation_to_bytes_with_spill_paths,
+    breach_depressions as core_breach_depressions, compute_hillshade_rgb,
+    connectivity_graph_to_graphml_string, delineate_catchments_in_memory,
     delineate_depressions_in_memory, delineate_mounts_in_memory, extract_sink_labels_from_raster,
-    extract_sinks_in_memory, flip_dem as core_flip_dem, gaussian_filter as core_gaussian_filter,
-    mean_filter as core_mean_filter, median_filter as core_median_filter,
-    rating_curves_to_csv_string, render_inundation_frame_png_bytes, run_full_pipeline_in_memory,
-    scs_type2_hyetograph,
+    extract_sinks_in_memory, flip_dem as core_flip_dem, fsm_basins_to_csv_string,
+    gaussian_filter as core_gaussian_filter, mean_filter as core_mean_filter,
+    median_filter as core_median_filter, rating_curves_to_csv_string,
+    render_inundation_frame_png_bytes, run_full_pipeline_in_memory, scs_type2_hyetograph,
 };
 
 /// Upper bound on total pixels (`frames * width * height`) encoded in a single synchronous
@@ -680,6 +681,9 @@ pub struct InundationOutput {
     fill_time_rgba: Vec<u8>,
     fill_time_values: Vec<f64>,
     depression_id_values: Vec<i32>,
+    fsm_mass_balance_json: String,
+    fsm_basins_json: String,
+    fsm_basins_csv: String,
 }
 
 #[wasm_bindgen]
@@ -809,6 +813,21 @@ impl InundationOutput {
     #[wasm_bindgen(js_name = inundationCurveCsv)]
     pub fn inundation_curve_csv(&self) -> String {
         self.inundation_curve_csv.clone()
+    }
+    /// Dynamic Fill-Spill-Merge watershed mass balance as JSON (`"null"` in static mode).
+    #[wasm_bindgen(js_name = fsmMassBalanceJson)]
+    pub fn fsm_mass_balance_json(&self) -> String {
+        self.fsm_mass_balance_json.clone()
+    }
+    /// Dynamic Fill-Spill-Merge per-basin summaries as JSON (`"[]"` in static mode).
+    #[wasm_bindgen(js_name = fsmBasinsJson)]
+    pub fn fsm_basins_json(&self) -> String {
+        self.fsm_basins_json.clone()
+    }
+    /// Dynamic Fill-Spill-Merge per-basin summaries formatted as CSV (empty string in static mode).
+    #[wasm_bindgen(js_name = fsmBasinsCsv)]
+    pub fn fsm_basins_csv(&self) -> String {
+        self.fsm_basins_csv.clone()
     }
     /// Renders a single inundation time step (`0`-based, or `0` = dry, `1..=numSteps`) as PNG bytes
     /// with optional scale bar, legend, and active spill flow paths.
@@ -960,12 +979,14 @@ pub fn simulate_inundation(
         None,
         1.0,
         None,
+        None,
     )
 }
 
 /// Runs the full in-memory hydrology & inundation pipeline with optional selective breaching
-/// (`breach_max_depth`), effective runoff coefficient (`runoff_coeff` in `(0, 1]`), and
-/// optional SCS Type II design storm depth (`scs_type2_mm`).
+/// (`breach_max_depth`), effective runoff coefficient (`runoff_coeff` in `(0, 1]`), optional
+/// SCS Type II design storm depth (`scs_type2_mm`), and optional routing mode
+/// (`"static"` default, or `"fsm"` for dynamic Fill-Spill-Merge cascade mass-balance routing).
 #[wasm_bindgen(js_name = simulateInundationAdvanced)]
 #[allow(clippy::too_many_arguments)]
 pub fn simulate_inundation_advanced(
@@ -981,12 +1002,17 @@ pub fn simulate_inundation_advanced(
     breach_max_depth: Option<f64>,
     runoff_coeff: f64,
     scs_type2_mm: Option<f64>,
+    routing: Option<String>,
 ) -> Result<InundationOutput, JsValue> {
     if !runoff_coeff.is_finite() || runoff_coeff <= 0.0 || runoff_coeff > 1.0 {
         return Err(to_js_err(format!(
             "runoff_coeff must be in (0, 1], got {runoff_coeff}"
         )));
     }
+    let routing_mode: RoutingMode = match routing.as_deref() {
+        Some(r) if !r.trim().is_empty() => r.parse().map_err(to_js_err)?,
+        _ => RoutingMode::Static,
+    };
     let raw_dem = read_array2d_f64(dem_bytes, filename)?;
     let breach = breach_max_depth
         .filter(|&md| md > 0.0)
@@ -1031,6 +1057,7 @@ pub fn simulate_inundation_advanced(
             time_step_h,
             compress: false,
         },
+        routing: routing_mode,
         forcing: InundationForcing {
             runoff_coeff: rc_arr.as_ref(),
             infiltration_cm_h: None,
@@ -1048,6 +1075,16 @@ pub fn simulate_inundation_advanced(
         serde_json::to_string(&pipe.connectivity_graph).map_err(to_js_err)?;
     let connectivity_graphml = connectivity_graph_to_graphml_string(&pipe.connectivity_graph);
     let inundation_curve_csv = pipe.inundation_curve_csv;
+    let fsm_mass_balance_json = serde_json::to_string(&pipe.fsm_mass_balance).map_err(to_js_err)?;
+    let fsm_basins_json = match pipe.fsm_basins.as_ref() {
+        Some(b) => serde_json::to_string(b).map_err(to_js_err)?,
+        None => "[]".to_string(),
+    };
+    let fsm_basins_csv = pipe
+        .fsm_basins
+        .as_deref()
+        .map(fsm_basins_to_csv_string)
+        .unwrap_or_default();
 
     let hillshade_rgb =
         compute_hillshade_rgb(&pipe.sinks.dem_refined, &HillshadeOptions::default());
@@ -1117,5 +1154,8 @@ pub fn simulate_inundation_advanced(
         fill_time_rgba,
         fill_time_values,
         depression_id_values,
+        fsm_mass_balance_json,
+        fsm_basins_json,
+        fsm_basins_csv,
     })
 }

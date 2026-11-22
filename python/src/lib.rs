@@ -14,9 +14,9 @@ use lidar::pointcloud::{
 use lidar::{
     AnimateInundationOptions, Array2D, BreachMode, BreachOptions, BurnCulvertsOptions,
     CatchmentHierarchyOptions, DelineateCatchmentsOptions, DelineateFlowPathsOptions,
-    DelineateOptions, ExtractSinksOptions, HillshadeOptions, InundationForcing, NestedDepression,
-    RunPipelineOptions, SimulateInundationOptions, SinkDepression, TiledDelineationOptions,
-    Topology,
+    DelineateOptions, ExtractSinksOptions, FsmBasinSummary, FsmMassBalance, HillshadeOptions,
+    InundationForcing, NestedDepression, RoutingMode, RunPipelineOptions,
+    SimulateInundationOptions, SinkDepression, TiledDelineationOptions, Topology,
 };
 
 fn to_py_err(e: lidar::Error) -> PyErr {
@@ -86,6 +86,45 @@ fn from_py_array2_with_cell(
 
 fn parse_breach_mode(mode: &str) -> PyResult<BreachMode> {
     mode.parse::<BreachMode>().map_err(to_py_err)
+}
+
+fn parse_routing_mode(mode: &str) -> PyResult<RoutingMode> {
+    mode.parse::<RoutingMode>().map_err(to_py_err)
+}
+
+fn fsm_mass_balance_to_dict<'py>(
+    py: Python<'py>,
+    mb: &FsmMassBalance,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("duration_h", mb.duration_h)?;
+    dict.set_item("total_antecedent_m3", mb.total_antecedent_m3)?;
+    dict.set_item("total_runoff_m3", mb.total_runoff_m3)?;
+    dict.set_item("total_stored_m3", mb.total_stored_m3)?;
+    dict.set_item("total_infiltration_m3", mb.total_infiltration_m3)?;
+    dict.set_item("total_boundary_outflow_m3", mb.total_boundary_outflow_m3)?;
+    dict.set_item("mass_balance_error_m3", mb.mass_balance_error_m3)?;
+    Ok(dict)
+}
+
+fn fsm_basin_to_dict<'py>(py: Python<'py>, b: &FsmBasinSummary) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("dep_id", b.dep_id)?;
+    dict.set_item("parent_id", b.parent_id)?;
+    dict.set_item("level", b.level)?;
+    dict.set_item("capacity_m3", b.capacity_m3)?;
+    dict.set_item("local_cat_area_m2", b.local_cat_area_m2)?;
+    dict.set_item("local_eff_cat_area_m2", b.local_eff_cat_area_m2)?;
+    dict.set_item("final_routed_cat_area_m2", b.final_routed_cat_area_m2)?;
+    dict.set_item("initial_volume_m3", b.initial_volume_m3)?;
+    dict.set_item("final_volume_m3", b.final_volume_m3)?;
+    dict.set_item("fill_time_h", b.fill_time_h)?;
+    dict.set_item("spill_to_dep_id", b.spill_to_dep_id)?;
+    dict.set_item("merge_time_h", b.merge_time_h)?;
+    dict.set_item("spilled_volume_m3", b.spilled_volume_m3)?;
+    dict.set_item("peak_spill_rate_m3_h", b.peak_spill_rate_m3_h)?;
+    dict.set_item("infiltrated_volume_m3", b.infiltrated_volume_m3)?;
+    Ok(dict)
 }
 
 fn parse_ground_method(method: &str) -> PyResult<GroundFilterMethod> {
@@ -1233,7 +1272,7 @@ fn delineate_depressions_array<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (dem_arr, kernel_size=3, min_size=1000, min_depth=0.3, interval=0.3, rain_intensity_cm_h=5.0, rain_duration_h=50.0, time_step_h=1.0, runoff_coeff_arr=None, infiltration_arr=None, antecedent_depth_arr=None, hyetograph=None, breach_max_depth=None, no_data=None, cell_size=1.0))]
+#[pyo3(signature = (dem_arr, kernel_size=3, min_size=1000, min_depth=0.3, interval=0.3, rain_intensity_cm_h=5.0, rain_duration_h=50.0, time_step_h=1.0, runoff_coeff_arr=None, infiltration_arr=None, antecedent_depth_arr=None, hyetograph=None, breach_max_depth=None, no_data=None, cell_size=1.0, routing="static"))]
 #[allow(clippy::too_many_arguments)]
 fn simulate_inundation_array<'py>(
     py: Python<'py>,
@@ -1252,7 +1291,9 @@ fn simulate_inundation_array<'py>(
     breach_max_depth: Option<f64>,
     no_data: Option<f64>,
     cell_size: f64,
+    routing: &str,
 ) -> PyResult<Bound<'py, PyDict>> {
+    let routing_mode = parse_routing_mode(routing)?;
     let raw_dem = from_py_array2_with_cell(dem_arr, no_data, cell_size)?;
     let rc = runoff_coeff_arr
         .map(|a| from_py_array2_with_cell(a, None, cell_size))
@@ -1285,6 +1326,7 @@ fn simulate_inundation_array<'py>(
                 kernel_size,
                 breach,
                 simulation: sim_opts,
+                routing: routing_mode,
                 forcing: InundationForcing {
                     runoff_coeff: rc.as_ref(),
                     infiltration_cm_h: inf.as_ref(),
@@ -1360,11 +1402,25 @@ fn simulate_inundation_array<'py>(
     dict.set_item("rating_curves", py_rc)?;
     dict.set_item("graph_node_count", pipe.connectivity_graph.nodes.len())?;
     dict.set_item("graph_edge_count", pipe.connectivity_graph.edges.len())?;
+    if let Some(ref mb) = pipe.fsm_mass_balance {
+        dict.set_item("fsm_mass_balance", fsm_mass_balance_to_dict(py, mb)?)?;
+    } else {
+        dict.set_item("fsm_mass_balance", py.None())?;
+    }
+    if let Some(ref basins) = pipe.fsm_basins {
+        let py_basins = PyList::empty(py);
+        for b in basins {
+            py_basins.append(fsm_basin_to_dict(py, b)?)?;
+        }
+        dict.set_item("fsm_basins", py_basins)?;
+    } else {
+        dict.set_item("fsm_basins", py.None())?;
+    }
     Ok(dict)
 }
 
 #[pyfunction]
-#[pyo3(signature = (in_dem, out_dir, kernel_size=3, min_size=1000, min_depth=0.3, interval=0.3, rain_intensity_cm_h=5.0, rain_duration_h=50.0, time_step_h=1.0, breach_max_depth=None, breach_max_length=40, culverts_vector=None, runoff_coeff_path=None, infiltration_path=None, antecedent_depth_path=None, hyetograph=None, stream_vector=None, use_f32=false, save_rasters=true, export_vectors=true, export_graph=true, compress=false))]
+#[pyo3(signature = (in_dem, out_dir, kernel_size=3, min_size=1000, min_depth=0.3, interval=0.3, rain_intensity_cm_h=5.0, rain_duration_h=50.0, time_step_h=1.0, breach_max_depth=None, breach_max_length=40, culverts_vector=None, runoff_coeff_path=None, infiltration_path=None, antecedent_depth_path=None, hyetograph=None, stream_vector=None, use_f32=false, save_rasters=true, export_vectors=true, export_graph=true, compress=false, routing="static"))]
 #[allow(clippy::too_many_arguments)]
 fn run_pipeline<'py>(
     py: Python<'py>,
@@ -1390,7 +1446,9 @@ fn run_pipeline<'py>(
     export_vectors: bool,
     export_graph: bool,
     compress: bool,
+    routing: &str,
 ) -> PyResult<Bound<'py, PyDict>> {
+    let routing_mode = parse_routing_mode(routing)?;
     let in_dem = in_dem.to_string();
     let out_dir = out_dir.to_string();
     let breach = breach_max_depth.map(|md| BreachOptions {
@@ -1412,6 +1470,7 @@ fn run_pipeline<'py>(
             time_step_h,
             compress,
         },
+        routing: routing_mode,
         runoff_coeff_path: runoff_coeff_path.map(PathBuf::from),
         infiltration_path: infiltration_path.map(PathBuf::from),
         antecedent_depth_path: antecedent_depth_path.map(PathBuf::from),
@@ -1469,6 +1528,19 @@ fn run_pipeline<'py>(
         "connectivity_graphml",
         opt_path_to_py(res.connectivity_graphml.as_ref()),
     )?;
+    dict.set_item(
+        "routing",
+        match res.routing {
+            RoutingMode::Static => "static",
+            RoutingMode::FillSpillMerge => "fsm",
+        },
+    )?;
+    dict.set_item("fsm_basins_csv", opt_path_to_py(res.fsm_basins_csv.as_ref()))?;
+    if let Some(ref mb) = res.fsm_mass_balance {
+        dict.set_item("fsm_mass_balance", fsm_mass_balance_to_dict(py, mb)?)?;
+    } else {
+        dict.set_item("fsm_mass_balance", py.None())?;
+    }
     Ok(dict)
 }
 

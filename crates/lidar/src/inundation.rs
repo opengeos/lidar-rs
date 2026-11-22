@@ -31,6 +31,10 @@ use crate::conditioning::{BreachOptions, BurnCulvertsOptions, breach_depressions
 use crate::error::{Error, Result};
 use crate::filling::{InMemorySinks, extract_sinks_in_memory};
 use crate::filtering::median_filter;
+use crate::fsm::{
+    FsmBasinSummary, FsmMassBalance, RoutingMode, simulate_fill_spill_merge_in_memory,
+    write_fsm_basins_csv,
+};
 #[cfg(feature = "serde")]
 use crate::graph::write_connectivity_graph_json;
 use crate::graph::{
@@ -121,7 +125,7 @@ fn validate_options(opts: &SimulateInundationOptions) -> Result<usize> {
     validate_options_with_hyetograph(opts, false)
 }
 
-fn validate_options_with_hyetograph(
+pub(crate) fn validate_options_with_hyetograph(
     opts: &SimulateInundationOptions,
     has_hyetograph: bool,
 ) -> Result<usize> {
@@ -168,7 +172,7 @@ fn validate_options_with_hyetograph(
     Ok(n_steps_f as usize)
 }
 
-fn affine_metrics(gt: &[f64; 6]) -> (f64, f64, f64) {
+pub(crate) fn affine_metrics(gt: &[f64; 6]) -> (f64, f64, f64) {
     let res_x = gt[1].hypot(gt[4]);
     let res_y = gt[2].hypot(gt[5]);
     let det = (gt[1] * gt[5] - gt[2] * gt[4]).abs();
@@ -526,9 +530,9 @@ pub struct InMemoryInundationPipeline {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct HeapCell {
-    elev: f64,
-    idx: usize,
+pub(crate) struct HeapCell {
+    pub(crate) elev: f64,
+    pub(crate) idx: usize,
 }
 
 impl PartialEq for HeapCell {
@@ -570,7 +574,7 @@ impl Ord for HeapCell {
 /// (memoized in `trapped_in_pit`), so the outward Priority-Flood search steps across
 /// sub-threshold micro-pits until it locates a valid overland outlet.
 #[allow(clippy::too_many_arguments)]
-fn trace_downstream_away_from_source(
+pub(crate) fn trace_downstream_away_from_source(
     start_idx: usize,
     w: usize,
     h: usize,
@@ -1565,6 +1569,68 @@ fn region_fill_times_forced(
     Ok(fill_time)
 }
 
+pub(crate) fn validate_grid_alignment(
+    reference: &Array2D<f64>,
+    candidate: &Array2D<f64>,
+    name: &str,
+) -> Result<()> {
+    let w = reference.width();
+    let h = reference.height();
+    let ref_gt = reference.geotransform;
+    let cell_x = ref_gt[1].hypot(ref_gt[2]).max(1e-9);
+    let cell_y = ref_gt[4].hypot(ref_gt[5]).max(1e-9);
+    if candidate.width() != w || candidate.height() != h {
+        return Err(Error::DimensionMismatch(format!(
+            "{name} ({}x{}) does not match sink ({w}x{h})",
+            candidate.width(),
+            candidate.height()
+        )));
+    }
+    for (k, (&a, &b)) in candidate.geotransform.iter().zip(ref_gt.iter()).enumerate() {
+        let tol = match k {
+            0 => 1e-3 * cell_x,
+            3 => 1e-3 * cell_y,
+            _ => 1e-6 * a.abs().max(b.abs()).max(1e-12),
+        };
+        if (a - b).abs() > tol {
+            return Err(Error::DimensionMismatch(format!(
+                "{name} geotransform[{k}] ({a}) does not match sink ({b})"
+            )));
+        }
+    }
+    if !reference.projection.is_empty()
+        && !candidate.projection.is_empty()
+        && let Ok(s_srs) = terrio::crs::SpatialRef::parse(&reference.projection)
+        && !s_srs.is_unknown()
+        && let Ok(a_srs) = terrio::crs::SpatialRef::parse(&candidate.projection)
+        && !a_srs.is_unknown()
+        && !s_srs.same_as(&a_srs)
+    {
+        return Err(Error::InvalidArgument(format!(
+            "{name} CRS ({}) does not match sink CRS ({})",
+            a_srs.label(),
+            s_srs.label()
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_forcing_grids(
+    sink: &Array2D<f64>,
+    forcing: &InundationForcing<'_>,
+) -> Result<()> {
+    if let Some(rc) = forcing.runoff_coeff {
+        validate_grid_alignment(sink, rc, "runoff_coeff")?;
+    }
+    if let Some(inf) = forcing.infiltration_cm_h {
+        validate_grid_alignment(sink, inf, "infiltration_cm_h")?;
+    }
+    if let Some(ant) = forcing.antecedent_depth {
+        validate_grid_alignment(sink, ant, "antecedent_depth")?;
+    }
+    Ok(())
+}
+
 /// Computes per-pixel inundation times in memory with optional spatially variable runoff
 /// coefficients, vertical infiltration losses, antecedent ponded water depths, and a
 /// time-varying storm hyetograph.
@@ -1598,60 +1664,8 @@ pub fn simulate_inundation_with_forcing_in_memory(
     }
     let w = sink.width();
     let h = sink.height();
-    let sink_gt = sink.geotransform;
-    let cell_x = sink_gt[1].hypot(sink_gt[2]).max(1e-9);
-    let cell_y = sink_gt[4].hypot(sink_gt[5]).max(1e-9);
-    let sink_srs = if sink.projection.is_empty() {
-        None
-    } else {
-        terrio::crs::SpatialRef::parse(&sink.projection)
-            .ok()
-            .filter(|s| !s.is_unknown())
-    };
-    let check_grid = |arr: &Array2D<f64>, name: &str| -> Result<()> {
-        if arr.width() != w || arr.height() != h {
-            return Err(Error::DimensionMismatch(format!(
-                "{name} ({}x{}) does not match sink ({w}x{h})",
-                arr.width(),
-                arr.height()
-            )));
-        }
-        for (k, (&a, &b)) in arr.geotransform.iter().zip(sink_gt.iter()).enumerate() {
-            let tol = match k {
-                0 => 1e-3 * cell_x,
-                3 => 1e-3 * cell_y,
-                _ => 1e-6 * a.abs().max(b.abs()).max(1e-12),
-            };
-            if (a - b).abs() > tol {
-                return Err(Error::DimensionMismatch(format!(
-                    "{name} geotransform[{k}] ({a}) does not match sink ({b})"
-                )));
-            }
-        }
-        if let Some(ref s_srs) = sink_srs
-            && !arr.projection.is_empty()
-            && let Ok(a_srs) = terrio::crs::SpatialRef::parse(&arr.projection)
-            && !a_srs.is_unknown()
-            && !s_srs.same_as(&a_srs)
-        {
-            return Err(Error::InvalidArgument(format!(
-                "{name} CRS ({}) does not match sink CRS ({})",
-                a_srs.label(),
-                s_srs.label()
-            )));
-        }
-        Ok(())
-    };
-    check_grid(catchment_area, "catchment raster")?;
-    if let Some(rc) = forcing.runoff_coeff {
-        check_grid(rc, "runoff_coeff")?;
-    }
-    if let Some(inf) = forcing.infiltration_cm_h {
-        check_grid(inf, "infiltration_cm_h")?;
-    }
-    if let Some(ant) = forcing.antecedent_depth {
-        check_grid(ant, "antecedent_depth")?;
-    }
+    validate_grid_alignment(sink, catchment_area, "catchment raster")?;
+    validate_forcing_grids(sink, forcing)?;
 
     let metrics = affine_metrics(&sink.geotransform);
     let nd = sink.no_data();
@@ -1786,6 +1800,8 @@ pub struct InMemoryFullPipelineOptions<'a> {
     pub breach: Option<BreachOptions>,
     /// Level-set and inundation simulation parameters.
     pub simulation: SimulateInundationOptions,
+    /// Hydrologic routing strategy (`RoutingMode::Static` or `RoutingMode::FillSpillMerge`).
+    pub routing: RoutingMode,
     /// Hydrologic forcing (runoff coefficient raster, infiltration raster, antecedent depth, hyetograph).
     pub forcing: InundationForcing<'a>,
     /// Effective scalar runoff multiplier used for reporting cumulative runoff (mm) when no spatially
@@ -1808,6 +1824,10 @@ pub struct InMemoryFullPipeline {
     pub rating_curves: Vec<crate::graph::RatingCurvePoint>,
     pub connectivity_graph: crate::graph::ConnectivityGraph,
     pub inundation_curve_csv: String,
+    /// Dynamic Fill-Spill-Merge per-basin summaries (populated when `routing == RoutingMode::FillSpillMerge`).
+    pub fsm_basins: Option<Vec<FsmBasinSummary>>,
+    /// Dynamic Fill-Spill-Merge watershed mass balance (populated when `routing == RoutingMode::FillSpillMerge`).
+    pub fsm_mass_balance: Option<FsmMassBalance>,
 }
 
 fn effective_runoff_scale(
@@ -1875,16 +1895,37 @@ pub fn run_full_pipeline_in_memory(
         sim_opts.min_size,
     )?;
 
-    let (fill_time, num_regions) = simulate_inundation_with_forcing_in_memory(
-        &sinks.sink,
-        &catchment_hierarchy,
-        sim_opts,
-        &options.forcing,
-    )?;
+    let (fill_time, num_regions, spill_paths, fsm_basins, fsm_mass_balance) = match options.routing
+    {
+        RoutingMode::Static => {
+            let (ft, nr) = simulate_inundation_with_forcing_in_memory(
+                &sinks.sink,
+                &catchment_hierarchy,
+                sim_opts,
+                &options.forcing,
+            )?;
+            let sp = delineate_spill_flow_paths_in_memory(&sinks.dem_refined, &depressions, &ft)?;
+            (ft, nr, sp, None, None)
+        }
+        RoutingMode::FillSpillMerge => {
+            let fsm = simulate_fill_spill_merge_in_memory(
+                &sinks.dem_refined,
+                &sinks.sink,
+                &depressions,
+                sim_opts,
+                &options.forcing,
+            )?;
+            (
+                fsm.fill_time,
+                fsm.num_regions,
+                fsm.spill_paths,
+                Some(fsm.basins),
+                Some(fsm.mass_balance),
+            )
+        }
+    };
     let steps =
         compute_inundation_step_summaries(&sinks.sink, &fill_time, num_steps, sim_opts.time_step_h);
-    let spill_paths =
-        delineate_spill_flow_paths_in_memory(&sinks.dem_refined, &depressions, &fill_time)?;
     let rating_curves = compute_rating_curves(&sinks.sink, &depressions, sim_opts.interval.abs())?;
 
     // Scale reported cumulative runoff depth using the mean effective runoff coefficient across
@@ -1924,6 +1965,8 @@ pub fn run_full_pipeline_in_memory(
         rating_curves,
         connectivity_graph,
         inundation_curve_csv,
+        fsm_basins,
+        fsm_mass_balance,
     })
 }
 
@@ -1941,6 +1984,9 @@ pub struct RunPipelineOptions {
     pub burn_culverts: BurnCulvertsOptions,
     /// Level-set and inundation simulation parameters.
     pub simulation: SimulateInundationOptions,
+    /// Hydrologic routing strategy (`RoutingMode::Static` by default, or `RoutingMode::FillSpillMerge`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub routing: RoutingMode,
     /// Optional spatially variable runoff-coefficient raster path (`0.0..=1.0`).
     pub runoff_coeff_path: Option<PathBuf>,
     /// Optional spatially variable infiltration loss raster path (`cm/h`).
@@ -1972,6 +2018,7 @@ impl Default for RunPipelineOptions {
             culverts_vector: None,
             burn_culverts: BurnCulvertsOptions::default(),
             simulation: SimulateInundationOptions::default(),
+            routing: RoutingMode::Static,
             runoff_coeff_path: None,
             infiltration_path: None,
             antecedent_depth_path: None,
@@ -2006,6 +2053,15 @@ pub struct RunPipelineResult {
     pub rating_curves_csv: Option<PathBuf>,
     pub connectivity_graph_json: Option<PathBuf>,
     pub connectivity_graphml: Option<PathBuf>,
+    /// Routing strategy executed (`Static` or `FillSpillMerge`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub routing: RoutingMode,
+    /// Path to `fsm_basins.csv` when `routing == RoutingMode::FillSpillMerge`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub fsm_basins_csv: Option<PathBuf>,
+    /// Watershed-scale mass balance summary when `routing == RoutingMode::FillSpillMerge`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub fsm_mass_balance: Option<FsmMassBalance>,
 }
 
 /// Runs the complete `lidar-rs` workflow end to end in memory from a single DEM file
@@ -2055,6 +2111,9 @@ pub fn run_pipeline(
         candidate_outputs.push(out_dir.join("connectivity_graph.graphml"));
         #[cfg(feature = "serde")]
         candidate_outputs.push(out_dir.join("connectivity_graph.json"));
+    }
+    if options.routing == RoutingMode::FillSpillMerge {
+        candidate_outputs.push(out_dir.join("fsm_basins.csv"));
     }
     let candidate_refs: Vec<&Path> = candidate_outputs.iter().map(PathBuf::as_path).collect();
     crate::raster_ops::ensure_no_path_collision(in_dem, &candidate_refs)?;
@@ -2142,16 +2201,37 @@ pub fn run_pipeline(
         antecedent_depth: ant_arr.as_ref(),
         hyetograph: options.hyetograph.as_deref(),
     };
-    let (fill_time, _num_sim_regions) = simulate_inundation_with_forcing_in_memory(
-        &sinks.sink,
-        &catchment_hierarchy,
-        sim_opts,
-        &forcing,
-    )?;
+    let (fill_time, spill_paths, fsm_basins_csv, fsm_mass_balance) = match options.routing {
+        RoutingMode::Static => {
+            let (ft, _num_sim_regions) = simulate_inundation_with_forcing_in_memory(
+                &sinks.sink,
+                &catchment_hierarchy,
+                sim_opts,
+                &forcing,
+            )?;
+            let sp = delineate_spill_flow_paths_in_memory(&sinks.dem_refined, &depressions, &ft)?;
+            (ft, sp, None, None)
+        }
+        RoutingMode::FillSpillMerge => {
+            let fsm = simulate_fill_spill_merge_in_memory(
+                &sinks.dem_refined,
+                &sinks.sink,
+                &depressions,
+                sim_opts,
+                &forcing,
+            )?;
+            let basins_csv = out_dir.join("fsm_basins.csv");
+            write_fsm_basins_csv(&fsm.basins, &basins_csv)?;
+            (
+                fsm.fill_time,
+                fsm.spill_paths,
+                Some(basins_csv),
+                Some(fsm.mass_balance),
+            )
+        }
+    };
     let steps =
         compute_inundation_step_summaries(&sinks.sink, &fill_time, num_steps, sim_opts.time_step_h);
-    let spill_paths =
-        delineate_spill_flow_paths_in_memory(&sinks.dem_refined, &depressions, &fill_time)?;
 
     let (_, _, cell_area) = affine_metrics(&dem.geotransform);
     let d_nd = sinks.depth.no_data();
@@ -2269,6 +2349,9 @@ pub fn run_pipeline(
         rating_curves_csv,
         connectivity_graph_json,
         connectivity_graphml,
+        routing: options.routing,
+        fsm_basins_csv,
+        fsm_mass_balance,
     };
 
     #[cfg(feature = "serde")]
