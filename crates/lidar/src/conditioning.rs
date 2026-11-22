@@ -77,6 +77,27 @@ pub struct BreachOptions {
     pub compress: bool,
 }
 
+impl BreachOptions {
+    /// Builds `BreachOptions` resolving mode-appropriate defaults when `max_depth` or
+    /// `max_length` is omitted: `Complete` leaves omitted bounds unconstrained (`None`),
+    /// whereas `Selective` and `Constrained` default omitted bounds to `1.5` and `50`.
+    pub fn for_mode(mode: BreachMode, max_depth: Option<f64>, max_length: Option<u32>) -> Self {
+        let def = Self::default();
+        let (eff_depth, eff_len) = match mode {
+            BreachMode::Complete => (max_depth, max_length),
+            BreachMode::Selective | BreachMode::Constrained => {
+                (max_depth.or(def.max_depth), max_length.or(def.max_length))
+            }
+        };
+        Self {
+            mode,
+            max_depth: eff_depth,
+            max_length: eff_len,
+            ..def
+        }
+    }
+}
+
 impl Default for BreachOptions {
     fn default() -> Self {
         Self {
@@ -204,9 +225,10 @@ fn bresenham_segment(
         return Vec::new();
     }
     // Liang-Barsky parametric clip to [-0.5, max_x + 0.5] x [-0.5, max_y + 0.5] so huge
-    // off-grid segments never iterate millions of off-grid cells.
-    let dx_f = (c1 - c0) as f64;
-    let dy_f = (r1 - r0) as f64;
+    // off-grid segments never iterate millions of off-grid cells. Subtract in `f64` to avoid
+    // signed integer overflow on extreme coordinates.
+    let dx_f = c1 as f64 - c0 as f64;
+    let dy_f = r1 as f64 - r0 as f64;
     let mut t0 = 0.0f64;
     let mut t1 = 1.0f64;
     let clip = |p: f64, q: f64, t0: &mut f64, t1: &mut f64| -> bool {
@@ -671,8 +693,8 @@ mod tests {
 
         let err = burn_culverts(&dem, &culvert_path, &BurnCulvertsOptions::default());
         assert!(
-            err.is_err(),
-            "mismatched culvert vector CRS must be rejected"
+            matches!(err, Err(Error::InvalidArgument(ref msg)) if msg.contains("CRS")),
+            "expected InvalidArgument mentioning CRS mismatch, got: {err:?}"
         );
     }
 }

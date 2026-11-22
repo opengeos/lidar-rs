@@ -1071,7 +1071,7 @@ fn export_inundation_frames_png(
 }
 
 #[pyfunction]
-#[pyo3(signature = (arr, mode="selective", max_depth=Some(1.5), max_length=Some(50), fill_remaining=false, no_data=None))]
+#[pyo3(signature = (arr, mode="selective", max_depth=None, max_length=None, fill_remaining=false, no_data=None))]
 fn breach_depressions_array<'py>(
     py: Python<'py>,
     arr: PyReadonlyArray2<'_, f64>,
@@ -1082,13 +1082,8 @@ fn breach_depressions_array<'py>(
     no_data: Option<f64>,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
     let dem = from_py_array2(arr, no_data)?;
-    let opts = BreachOptions {
-        mode: parse_breach_mode(mode)?,
-        max_depth,
-        max_length,
-        fill_remaining,
-        ..Default::default()
-    };
+    let mut opts = BreachOptions::for_mode(parse_breach_mode(mode)?, max_depth, max_length);
+    opts.fill_remaining = fill_remaining;
     let out = py
         .detach(move || lidar::breach_depressions(&dem, &opts))
         .map_err(to_py_err)?;
@@ -1096,7 +1091,7 @@ fn breach_depressions_array<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (in_dem, out_dem, mode="selective", max_depth=Some(1.5), max_length=Some(50), fill_remaining=false, compress=false))]
+#[pyo3(signature = (in_dem, out_dem, mode="selective", max_depth=None, max_length=None, fill_remaining=false, compress=false))]
 #[allow(clippy::too_many_arguments)]
 fn breach_depressions(
     py: Python<'_>,
@@ -1110,14 +1105,9 @@ fn breach_depressions(
 ) -> PyResult<String> {
     let in_dem = in_dem.to_string();
     let out_dem_s = out_dem.to_string();
-    let opts = BreachOptions {
-        mode: parse_breach_mode(mode)?,
-        max_depth,
-        max_length,
-        fill_remaining,
-        compress,
-        ..Default::default()
-    };
+    let mut opts = BreachOptions::for_mode(parse_breach_mode(mode)?, max_depth, max_length);
+    opts.fill_remaining = fill_remaining;
+    opts.compress = compress;
     let out_ret = out_dem_s.clone();
     py.detach(move || lidar::breach_depressions_file(&in_dem, &out_dem_s, &opts))
         .map_err(to_py_err)?;

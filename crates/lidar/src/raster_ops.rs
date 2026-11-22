@@ -109,18 +109,25 @@ fn resolve_path_for_compare(path: &Path) -> Option<PathBuf> {
 
 /// Returns an error if `input` resolves to the same path as any entry in `outputs`.
 pub(crate) fn ensure_no_path_collision(input: &Path, outputs: &[&Path]) -> Result<()> {
-    let Some(in_canon) = resolve_path_for_compare(input) else {
-        return Ok(());
-    };
-    for out in outputs {
-        if let Some(out_canon) = resolve_path_for_compare(out)
-            && in_canon == out_canon
-        {
-            return Err(Error::InvalidArgument(format!(
-                "output path '{}' would overwrite input file '{}'",
-                out.display(),
-                input.display()
-            )));
+    let in_canon = resolve_path_for_compare(input);
+    let mut seen_outputs: Vec<(PathBuf, &Path)> = Vec::with_capacity(outputs.len());
+    for &out in outputs {
+        if let Some(out_canon) = resolve_path_for_compare(out) {
+            if in_canon.as_ref() == Some(&out_canon) {
+                return Err(Error::InvalidArgument(format!(
+                    "output path '{}' would overwrite input file '{}'",
+                    out.display(),
+                    input.display()
+                )));
+            }
+            if let Some((_, prev)) = seen_outputs.iter().find(|(p, _)| *p == out_canon) {
+                return Err(Error::InvalidArgument(format!(
+                    "output paths '{}' and '{}' resolve to the same destination",
+                    prev.display(),
+                    out.display()
+                )));
+            }
+            seen_outputs.push((out_canon, out));
         }
     }
     Ok(())

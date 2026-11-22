@@ -700,7 +700,8 @@ where
 
         if options.show_scale_bar && !is_geographic_crs(&dem.projection, dem.geotransform) {
             let cell_m = dem.geotransform[1].hypot(dem.geotransform[4]).max(1e-6);
-            draw_scale_bar(body, dw, dh, sw, cell_m, &dem.projection);
+            let reserve_right = if options.show_legend { 96 } else { 0 };
+            draw_scale_bar(body, dw, dh, sw, cell_m, &dem.projection, reserve_right);
         }
         if options.show_legend {
             draw_legend_box(body, dw, dh, options.water_rgb, !spill_paths.is_empty());
@@ -943,8 +944,10 @@ fn draw_scale_bar(
     sw: usize,
     cell_units: f64,
     projection: &str,
+    reserve_right: usize,
 ) {
-    if dw < 90 || dh < 36 || !cell_units.is_finite() || cell_units <= 0.0 {
+    let avail_w = dw.saturating_sub(reserve_right + 16);
+    if dw < 90 || dh < 36 || avail_w < 36 || !cell_units.is_finite() || cell_units <= 0.0 {
         return;
     }
     let p_lower = projection.to_ascii_lowercase();
@@ -956,7 +959,10 @@ fn draw_scale_bar(
         cell_units
     };
     let total_m = sw as f64 * cell_m;
-    let max_bar_px = (dw as f64 * 0.35).max(24.0);
+    let max_bar_px = (dw as f64 * 0.35).min(avail_w.saturating_sub(12) as f64);
+    if max_bar_px < 16.0 {
+        return;
+    }
     let max_bar_m = (max_bar_px / dw as f64) * total_m;
     let target_m = total_m * 0.22;
     let nice_vals = [
@@ -987,6 +993,9 @@ fn draw_scale_bar(
     let pad = 4usize;
     let label_px = label.len() * 6;
     let box_w = (bar_px.max(label_px) + 2 * pad).min(dw.saturating_sub(bx0));
+    if reserve_right > 0 && bx0 + box_w + 6 > dw.saturating_sub(reserve_right) {
+        return;
+    }
     let box_h = 20usize.min(dh.saturating_sub(by0));
     for y in by0..(by0 + box_h) {
         for x in bx0..(bx0 + box_w) {
@@ -1176,7 +1185,8 @@ pub fn render_inundation_frame_png_bytes(
         draw_active_spill_paths(body, dw, dh, sw, sh, &wet, t_hours, spill_paths);
     }
     if options.show_scale_bar && !is_geographic_crs(&dem.projection, dem.geotransform) {
-        draw_scale_bar(body, dw, dh, sw, cell_m, &dem.projection);
+        let reserve_right = if options.show_legend { 96 } else { 0 };
+        draw_scale_bar(body, dw, dh, sw, cell_m, &dem.projection, reserve_right);
     }
     if options.show_legend {
         draw_legend_box(body, dw, dh, options.water_rgb, !spill_paths.is_empty());
@@ -1285,7 +1295,8 @@ pub fn export_inundation_frames_png(
             draw_active_spill_paths(body, dw, dh, sw, sh, &wet, t_hours, spill_paths);
         }
         if draw_scale {
-            draw_scale_bar(body, dw, dh, sw, cell_m, &dem.projection);
+            let reserve_right = if options.show_legend { 96 } else { 0 };
+            draw_scale_bar(body, dw, dh, sw, cell_m, &dem.projection, reserve_right);
         }
         if options.show_legend {
             draw_legend_box(body, dw, dh, options.water_rgb, !spill_paths.is_empty());

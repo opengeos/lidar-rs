@@ -249,6 +249,7 @@ fn point_to_segment_dist(px: f64, py: f64, ax: f64, ay: f64, bx: f64, by: f64) -
     (px - proj_x).hypot(py - proj_y)
 }
 
+#[derive(Debug)]
 struct StreamSegmentIndex {
     segs: Vec<([f64; 2], [f64; 2])>,
     min_x: f64,
@@ -1049,6 +1050,9 @@ mod tests {
 
         let err = load_stream_segments(&tmp, "EPSG:26916");
         let _ = std::fs::remove_file(&tmp);
-        assert!(err.is_err(), "mismatched stream CRS must be rejected");
+        assert!(
+            matches!(err, Err(Error::InvalidArgument(ref msg)) if msg.contains("CRS")),
+            "expected InvalidArgument mentioning stream CRS mismatch, got: {err:?}"
+        );
     }
 }

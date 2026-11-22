@@ -129,6 +129,8 @@ struct TileRegionOutput {
     min_cell: (usize, usize),
     /// Total pixel count of this sink region inside the tile (larger = less truncated).
     total_cells: usize,
+    /// Whether this tile copy's centroid falls inside the tile's non-overlapping core.
+    core_owned: bool,
     /// Complete nested depression hierarchy for this sink region.
     depressions: Vec<NestedDepression>,
 }
@@ -210,35 +212,34 @@ fn process_one_tile(
         }
     }
 
-    let mut kept_meta: HashMap<u32, ((usize, usize), usize)> = HashMap::new();
+    let mut reg_meta: HashMap<u32, ((usize, usize), usize, bool)> = HashMap::new();
     for (rid, acc) in reg_acc {
         if acc.count == 0 {
             continue;
         }
         let gr = acc.sum_r / acc.count as f64;
         let gc = acc.sum_c / acc.count as f64;
-        if gr >= win.core_r0 as f64
+        let core_owned = gr >= win.core_r0 as f64
             && gr < win.core_r1 as f64
             && gc >= win.core_c0 as f64
-            && gc < win.core_c1 as f64
-        {
-            kept_meta.insert(rid, (acc.min_cell, acc.count));
-        }
+            && gc < win.core_c1 as f64;
+        reg_meta.insert(rid, (acc.min_cell, acc.count, core_owned));
     }
 
     let mut by_reg: HashMap<u32, Vec<NestedDepression>> = HashMap::new();
     for d in deps.depressions {
-        if kept_meta.contains_key(&d.region_id) {
+        if reg_meta.contains_key(&d.region_id) {
             by_reg.entry(d.region_id).or_default().push(d);
         }
     }
 
     let mut out = Vec::with_capacity(by_reg.len());
     for (rid, reg_deps) in by_reg {
-        let (min_cell, total_cells) = kept_meta[&rid];
+        let (min_cell, total_cells, core_owned) = reg_meta[&rid];
         out.push(TileRegionOutput {
             min_cell,
             total_cells,
+            core_owned,
             depressions: reg_deps,
         });
     }
@@ -296,24 +297,29 @@ fn run_tiled_generic<T: DemNum>(
         .collect::<Result<Vec<_>>>()?;
 
     // Global deduplication across tile seams keyed by each sink region's lowest pixel within
-    // the padded tile: when two neighbouring tiles observe the same lowest cell, keep the copy
-    // with the largest pixel count (least clipped). Exact for depressions fitting within `overlap`.
-    let mut best_by_min_cell: HashMap<(usize, usize), TileRegionOutput> = HashMap::new();
+    // the padded tile: require at least one core-owned observation to emit a group, while
+    // selecting the largest (least-clipped) copy observed across all overlapping tiles.
+    let mut best_by_min_cell: HashMap<(usize, usize), (bool, TileRegionOutput)> = HashMap::new();
     for tile_regions in per_tile {
         for reg in tile_regions {
             match best_by_min_cell.entry(reg.min_cell) {
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(reg);
+                    e.insert((reg.core_owned, reg));
                 }
                 std::collections::hash_map::Entry::Occupied(mut e) => {
-                    if reg.total_cells > e.get().total_cells {
-                        e.insert(reg);
+                    let (any_core, best) = e.get_mut();
+                    *any_core |= reg.core_owned;
+                    if reg.total_cells > best.total_cells {
+                        *best = reg;
                     }
                 }
             }
         }
     }
-    let mut dedup_regions: Vec<TileRegionOutput> = best_by_min_cell.into_values().collect();
+    let mut dedup_regions: Vec<TileRegionOutput> = best_by_min_cell
+        .into_values()
+        .filter_map(|(any_core, reg)| any_core.then_some(reg))
+        .collect();
     dedup_regions.sort_by_key(|r| r.min_cell);
 
     // Reassign globally unique sequential IDs, parent_ids, children_ids, and region_ids.

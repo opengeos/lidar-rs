@@ -245,3 +245,15 @@ def test_numpy_in_memory_and_pipeline(tmp_path: Path):
     )
     assert tiled["num_tiles"] == 4
     assert len(tiled["depressions"]) >= 1
+
+    # Verify mode="complete" breaches a deep (>1.5 m) wall to a lower outlet without hitting selective caps
+    rr, cc = np.indices((15, 15))
+    deep = np.full((15, 15), 20.0, dtype=np.float64)
+    deep[:, 0] = 5.0  # lower outlet along west boundary
+    dist = np.hypot(rr - 7, cc - 7)
+    deep[dist <= 3.5] = 9.0 + dist[dist <= 3.5]
+    breached_selective = lidar_rs.breach_depressions(deep, mode="selective")
+    breached_complete = lidar_rs.breach_depressions(deep, mode="complete")
+    # Selective default (max_depth=1.5) leaves the 10 m wall intact; complete carves through it.
+    assert breached_selective[:, 1:4].min() == pytest.approx(20.0)
+    assert breached_complete[:, 1:4].min() < 12.0

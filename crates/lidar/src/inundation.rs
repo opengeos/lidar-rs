@@ -118,6 +118,13 @@ pub struct SimulateInundationResult {
 }
 
 fn validate_options(opts: &SimulateInundationOptions) -> Result<usize> {
+    validate_options_with_hyetograph(opts, false)
+}
+
+fn validate_options_with_hyetograph(
+    opts: &SimulateInundationOptions,
+    has_hyetograph: bool,
+) -> Result<usize> {
     if !opts.min_depth.is_finite() || opts.min_depth < 0.0 {
         return Err(Error::InvalidArgument(format!(
             "min_depth must be finite and >= 0, got {}",
@@ -130,9 +137,13 @@ fn validate_options(opts: &SimulateInundationOptions) -> Result<usize> {
             opts.interval
         )));
     }
-    if !opts.rain_intensity_cm_h.is_finite() || opts.rain_intensity_cm_h <= 0.0 {
+    if !opts.rain_intensity_cm_h.is_finite()
+        || (!has_hyetograph && opts.rain_intensity_cm_h <= 0.0)
+        || (has_hyetograph && opts.rain_intensity_cm_h < 0.0)
+    {
         return Err(Error::InvalidArgument(format!(
-            "rain_intensity_cm_h must be finite and > 0, got {}",
+            "rain_intensity_cm_h must be finite and {}, got {}",
+            if has_hyetograph { ">= 0" } else { "> 0" },
             opts.rain_intensity_cm_h
         )));
     }
@@ -1338,8 +1349,13 @@ pub fn format_inundation_curve_csv(
 /// Maps a required cumulative effective runoff depth (meters) onto elapsed time (hours)
 /// along a piecewise-constant hyetograph `[(dt_h, intensity_cm_h)]`, deducting optional
 /// continuous vertical loss rate `loss_m_h`.
+///
+/// `req_volume_m3` is the initial remaining deficit (`full_capacity_m3 - initial_storage`),
+/// while `full_capacity_m3` is the empty-basin capacity so infiltration during dry/low-rain
+/// steps can drain pre-existing antecedent water down to zero storage (`rem_vol <= full_capacity_m3`).
 fn invert_hyetograph_time(
     req_volume_m3: f64,
+    full_capacity_m3: f64,
     eff_cat_area_m2: f64,
     dep_area_m2: f64,
     loss_m_h: f64,
@@ -1348,6 +1364,7 @@ fn invert_hyetograph_time(
     if req_volume_m3 <= 0.0 {
         return 0.0;
     }
+    let max_deficit = full_capacity_m3.max(req_volume_m3);
     let mut rem_vol = req_volume_m3;
     let mut elapsed_h = 0.0f64;
     for &(dt, rain_cm_h) in hyetograph {
@@ -1362,9 +1379,9 @@ fn invert_hyetograph_time(
             }
             rem_vol -= step_vol;
         } else if inflow_m3_h < 0.0 {
-            // Vertical infiltration exceeds rainfall: previously accumulated water drains
-            // (capped at empty basin `req_volume_m3`).
-            rem_vol = (rem_vol - inflow_m3_h * dt).min(req_volume_m3);
+            // Vertical infiltration exceeds rainfall: stored water drains down to zero storage
+            // (deficit capped at full slice capacity `max_deficit`).
+            rem_vol = (rem_vol - inflow_m3_h * dt).min(max_deficit);
         }
         elapsed_h += dt;
     }
@@ -1522,7 +1539,7 @@ fn region_fill_times_forced(
             let t_fill = if rem_vol <= 0.0 {
                 0.0
             } else if let Some(hyeto) = hyetograph {
-                invert_hyetograph_time(rem_vol, eff_cat, obj.area, mean_inf_m_h, hyeto)
+                invert_hyetograph_time(rem_vol, obj.volume, eff_cat, obj.area, mean_inf_m_h, hyeto)
             } else {
                 let net_q = eff_cat * rain_m_h - obj.area * mean_inf_m_h;
                 if net_q <= 0.0 {
@@ -1564,7 +1581,7 @@ pub fn simulate_inundation_with_forcing_in_memory(
     {
         return simulate_inundation_in_memory(sink, catchment_area, options);
     }
-    let _ = validate_options(options)?;
+    let _ = validate_options_with_hyetograph(options, forcing.hyetograph.is_some())?;
     if let Some(hyeto) = forcing.hyetograph {
         if hyeto.is_empty() {
             return Err(Error::InvalidArgument(
@@ -1765,7 +1782,7 @@ pub fn simulate_inundation_with_forcing_in_memory(
 pub struct InMemoryFullPipelineOptions<'a> {
     /// Median filter kernel size (`<= 1` skips smoothing).
     pub kernel_size: usize,
-    /// Optional selective/constrained depression breaching applied prior to smoothing and sink extraction.
+    /// Optional selective/constrained depression breaching applied after optional smoothing and prior to sink extraction.
     pub breach: Option<BreachOptions>,
     /// Level-set and inundation simulation parameters.
     pub simulation: SimulateInundationOptions,
@@ -1793,25 +1810,28 @@ pub struct InMemoryFullPipeline {
     pub inundation_curve_csv: String,
 }
 
-/// Runs the complete in-memory hydrology pipeline (optional breaching -> optional median filter ->
+/// Runs the complete in-memory hydrology pipeline (optional median filter -> optional breaching ->
 /// sink extraction -> nested depression hierarchy -> catchment hierarchy -> forced inundation ->
 /// spill flow paths -> rating curves -> connectivity graph) without touching the filesystem.
 pub fn run_full_pipeline_in_memory(
     raw_dem: &Array2D<f64>,
     options: &InMemoryFullPipelineOptions<'_>,
 ) -> Result<InMemoryFullPipeline> {
-    let num_steps = validate_options(&options.simulation)?;
+    let num_steps = validate_options_with_hyetograph(
+        &options.simulation,
+        options.forcing.hyetograph.is_some(),
+    )?;
     let sim_opts = &options.simulation;
 
-    let mut dem = raw_dem.clone();
+    let mut dem = std::borrow::Cow::Borrowed(raw_dem);
     if options.kernel_size > 1 {
-        dem = median_filter(&dem, options.kernel_size)?;
+        dem = std::borrow::Cow::Owned(median_filter(dem.as_ref(), options.kernel_size)?);
     }
     if let Some(ref breach_opts) = options.breach {
-        dem = breach_depressions(&dem, breach_opts)?;
+        dem = std::borrow::Cow::Owned(breach_depressions(dem.as_ref(), breach_opts)?);
     }
 
-    let sinks = extract_sinks_in_memory(&dem, sim_opts.min_size, Topology::D8)?;
+    let sinks = extract_sinks_in_memory(dem.as_ref(), sim_opts.min_size, Topology::D8)?;
     let depressions = delineate_depressions_in_memory(
         &sinks.sink,
         sim_opts.min_size,
@@ -1836,11 +1856,17 @@ pub fn run_full_pipeline_in_memory(
         delineate_spill_flow_paths_in_memory(&sinks.dem_refined, &depressions, &fill_time)?;
     let rating_curves = compute_rating_curves(&sinks.sink, &depressions, sim_opts.interval.abs())?;
 
-    // Scale hyetograph / constant rainfall intensity by scalar_runoff_coeff for reported runoff depth.
-    let eff_rain = sim_opts.rain_intensity_cm_h * options.scalar_runoff_coeff;
+    // Scale hyetograph / constant rainfall intensity by scalar_runoff_coeff only when no
+    // spatially variable runoff_coeff raster is supplied.
+    let runoff_scale = if options.forcing.runoff_coeff.is_none() {
+        options.scalar_runoff_coeff
+    } else {
+        1.0
+    };
+    let eff_rain = sim_opts.rain_intensity_cm_h * runoff_scale;
     let scaled_hyeto: Option<Vec<(f64, f64)>> = options.forcing.hyetograph.map(|h| {
         h.iter()
-            .map(|&(dt, cm_h)| (dt, cm_h * options.scalar_runoff_coeff))
+            .map(|&(dt, cm_h)| (dt, cm_h * runoff_scale))
             .collect()
     });
     let connectivity_graph = build_connectivity_graph(
@@ -1963,7 +1989,8 @@ pub fn run_pipeline(
     let out_dir = out_dir.as_ref();
     std::fs::create_dir_all(out_dir)?;
 
-    let num_steps = validate_options(&options.simulation)?;
+    let num_steps =
+        validate_options_with_hyetograph(&options.simulation, options.hyetograph.is_some())?;
     let sim_opts = &options.simulation;
 
     // Guard against output paths resolving to the input DEM before writing anything.
@@ -1995,6 +2022,7 @@ pub fn run_pipeline(
     if options.export_graph {
         candidate_outputs.push(out_dir.join("rating_curves.csv"));
         candidate_outputs.push(out_dir.join("connectivity_graph.graphml"));
+        #[cfg(feature = "serde")]
         candidate_outputs.push(out_dir.join("connectivity_graph.json"));
     }
     let candidate_refs: Vec<&Path> = candidate_outputs.iter().map(PathBuf::as_path).collect();
@@ -2781,6 +2809,24 @@ mod tests {
         assert_eq!(coeff.data()[1], 0.0);
         assert!((coeff.data()[2] - 1.0).abs() < 1e-12);
         assert_eq!(coeff.data()[3], coeff.no_data());
+    }
+
+    #[test]
+    fn invert_hyetograph_drains_antecedent_water_up_to_full_capacity() {
+        // 10 m^3 slice with 6 m^3 antecedent storage -> initial deficit = 4 m^3.
+        // Hour 1: rain=0, loss=4 m^3/h -> drains 4 m^3 (deficit rises from 4 to 8 m^3, NOT capped at 4).
+        // Hour 2: inflow=4 m^3/h -> adds 4 m^3 (deficit drops from 8 to 4 m^3 -> NOT filled yet).
+        // Hour 3: inflow=4 m^3/h -> adds 4 m^3 (fills exactly at t = 3.0 h).
+        let hyeto = [(1.0, 0.0), (1.0, 800.0), (1.0, 800.0)];
+        // eff_cat=1 m^2, dep_area=1 m^2, loss=4 m/h:
+        //   step 1: 1*(0) - 4 = -4 m^3/h
+        //   step 2: 1*(8) - 4 = +4 m^3/h
+        //   step 3: 1*(8) - 4 = +4 m^3/h
+        let t = invert_hyetograph_time(4.0, 10.0, 1.0, 1.0, 4.0, &hyeto);
+        assert!(
+            (t - 3.0).abs() < 1e-12,
+            "expected fill at t=3.0 h after antecedent drainage, got {t}"
+        );
     }
 
     #[test]
