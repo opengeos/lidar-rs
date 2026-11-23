@@ -2,8 +2,8 @@ cff-version: 1.2.0
 message: "If you use lidar-rs in your work, please cite this software and the related papers below."
 title: "lidar-rs: High-performance nested depression delineation and fill-and-spill inundation simulation"
 type: software
-version: "0.4.0"
-date-released: "2026-11-21"
+version: "0.5.0"
+date-released: "2026-11-23"
 doi: "10.5281/zenodo.24411444"
 license: MIT
 repository-code: "https://github.com/opengeos/lidar-rs"

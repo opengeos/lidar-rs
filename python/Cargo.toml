@@ -2,7 +2,7 @@
 name = "lidar-py"
 description = "Python bindings for lidar-rs (pure-Rust port of opengeos/lidar with terrio and richdem)"
 publish = false
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.90"
