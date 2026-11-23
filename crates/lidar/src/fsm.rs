@@ -112,7 +112,8 @@ pub struct FsmBasinSummary {
     /// storm duration (`None` if it never filled during the storm). Every basin that is full at
     /// storm end has a value; with variable rainfall or infiltration a basin can also fill and
     /// then drain below its rim, so a value does not guarantee `final_volume_m3 == capacity_m3`.
-    /// `fill_time.tif` keeps extrapolated sustained-rainfall timing for basins that never filled.
+    /// With constant rainfall, `fill_time.tif` keeps extrapolated sustained-rainfall timing for
+    /// basins that never filled.
     pub fill_time_h: Option<f64>,
     /// Downstream depression ID receiving spillover (`Some(0)` for DEM boundary, `None` if it did
     /// not spill within the simulated storm duration).
