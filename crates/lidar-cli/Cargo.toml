@@ -11,6 +11,10 @@ rust-version.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[lib]
+name = "lidar_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "lidar"
 path = "src/main.rs"
@@ -26,3 +30,4 @@ richdem = { workspace = true, features = ["parallel"] }
 terrio = { workspace = true, features = ["pointcloud"] }
 clap.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true

@@ -24,6 +24,7 @@ nav = [
       { "Animation & Publication Frames" = "guides/visualization.md" },
   ] },
   { "CLI Reference" = "cli.md" },
+  { "AI Agents (MCP)" = "mcp.md" },
   { "Rust Library" = "rust.md" },
   { "Python API" = "python.md" },
   { "JavaScript / WASM" = "javascript.md" },

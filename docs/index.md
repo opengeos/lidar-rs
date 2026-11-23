@@ -25,7 +25,8 @@ Run it right now in your browser with zero installation via the live [WebAssembl
 | **Rating Curves & Connectivity Graphs** | Exact stage-storage-area rating curves (`rating_curves.csv`), directed fill-and-spill / merge networks (JSON + GraphML), georeferenced spill-path vectors, and NHD stream-proximity metrics. | [Connectivity Graphs](guides/connectivity-graphs.md) |
 | **LiDAR Point Clouds (DSM, DTM, CHM)** | Native LAS/LAZ/COPC/PLY/E57 reading and conversion, ASPRS class & return filtering, pure-Rust CSF/PMF ground classification, bare-earth DTM, and Canopy Height Models. | [LiDAR Point Clouds](guides/point-clouds.md) |
 | **Tiled Regional Delineation & `f32`** | Parallel overlapping tile windows with core-owned seam deduplication and optional `f32` storage (halving source DEM memory). | [Tiled Delineation](guides/tiling.md) |
-| **Publication PNG & GIF Rendering** | Pure-Rust shaded-relief inundation animations and individual PNG frames with overland spill arrows, metric scale bars, legends, and timestamp HUDs. | [Animation & Frames](guides/visualization.md) |
+| **Publication PNG & GIF Rendering** | Pure-Rust shaded-relief inundation animations, individual PNG frames, and inline MCP `preview` renders with overland spill arrows, metric scale bars, legends, and timestamp HUDs. | [Animation & Frames](guides/visualization.md) |
+| **AI Agents (MCP Server)** | Pure-Rust Model Context Protocol server (`lidar mcp` or `uvx --from lidar-rs lidar mcp`) for Claude Code, Claude Desktop, Cursor, and VS Code with every CLI tool, inline `preview` PNG images, `info --json --stats`, and guided workflow prompts. | [AI Agents (MCP)](mcp.md) |
 
 ## Quick Example
 

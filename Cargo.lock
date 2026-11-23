@@ -925,6 +925,7 @@ dependencies = [
  "lidar",
  "richdem",
  "serde_json",
+ "tempfile",
  "terrio",
 ]
 

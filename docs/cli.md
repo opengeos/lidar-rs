@@ -14,7 +14,8 @@ All sample files used below can be downloaded from [Sample Datasets](datasets.md
 | **DEM Smoothing & Sinks** | `mean-filter`, `median-filter`, `gaussian-filter`, `extract-sinks` |
 | **Nested Hierarchies** | `delineate-depressions`, `delineate-mounts`, `flip-dem` |
 | **Catchments & Inundation** | `delineate-catchments`, `delineate-flow-paths`, `catchment-hierarchy`, `simulate-inundation` |
-| **Animation & Visualization** | `animate-inundation`, `export-frames` |
+| **Animation & Visualization** | `animate-inundation`, `export-frames`, `preview` |
+| **AI Agents (MCP)** | `mcp` (plus `--json-usage` global catalog flag) |
 | **LiDAR Point Clouds** | `convert-lidar`, `lidar-to-dsm`, `lidar-to-dtm`, `lidar-to-chm` |
 | **Raster & Vector Utilities** | `polygonize`, `mosaic`, `reproject`, `resample`, `clip`, `to-cog`, `add-crs`, `join-tables`, `csv-to-vector`, `info` |
 
@@ -152,7 +153,10 @@ lidar lidar-to-chm sample_forest.laz out/chm.tif --resolution 1.0 --ground-metho
 ## Geospatial Raster & Vector Utilities
 
 ```sh
-lidar info dem.tif
+lidar info dem.tif --json --stats
+lidar preview dem.tif -o preview.png --scale-bar
+lidar preview dem.tif -o flood.png --fill-time out_pipe/fill_time.tif --hour 10 --scale-bar --legend
+lidar --json-usage   # dump machine-readable JSON command catalog
 lidar polygonize out/region.tif out/regions.geojson --field-name id
 lidar mosaic tile1.tif tile2.tif -o mosaic.tif
 lidar reproject dem.tif dem_4326.tif --crs EPSG:4326 -r bilinear
@@ -162,4 +166,12 @@ lidar to-cog dem.tif dem_cog.tif --compression DEFLATE
 lidar add-crs dem.tif EPSG:26915 -o dem_crs.tif
 lidar join-tables out/regions.shp out/regions_info.csv out/joined.gpkg
 lidar csv-to-vector points.csv points.shp --latitude latitude --longitude longitude
+```
+
+## AI Agents (MCP Server)
+
+`lidar mcp` runs a foreground JSON-RPC 2.0 server over stdin/stdout (normally launched by an MCP client such as Claude Code, Claude Desktop, Cursor, or VS Code; see [AI Agents (MCP)](mcp.md)):
+
+```sh
+claude mcp add lidar -- lidar mcp
 ```

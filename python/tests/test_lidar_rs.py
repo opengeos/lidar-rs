@@ -365,3 +365,92 @@ def test_synthesize_culverts_and_federal_validation(tmp_path: Path):
         lidar_rs.download_federal_data(
             tmp_path / "bad_ds", bbox=(-99.3, 47.0, -99.2, 47.1), datasets="nonexistent"
         )
+
+
+def test_python_cli_and_mcp_server():
+    import json
+    import queue
+    import subprocess
+    import sys
+    import threading
+
+    dem = str(TEST_DATA / "dem.tif")
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "lidar_rs", "mcp"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    assert proc.stdin is not None and proc.stdout is not None
+    out_q: queue.Queue[str | None] = queue.Queue()
+
+    def _reader() -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            out_q.put(line)
+        out_q.put(None)
+
+    reader_thread = threading.Thread(target=_reader, daemon=True)
+    reader_thread.start()
+
+    replies = {}
+    try:
+        msgs = [
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "pytest", "version": "0"},
+                },
+            },
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "info", "arguments": {"args": [dem, "--json"]}},
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {"name": "preview", "arguments": {"args": [dem, "--max-dim", "64"]}},
+            },
+        ]
+        for m in msgs:
+            proc.stdin.write(json.dumps(m) + "\n")
+        proc.stdin.flush()
+
+        for _ in range(4):
+            line = out_q.get(timeout=30.0)
+            assert line is not None, "unexpected EOF from lidar mcp"
+            obj = json.loads(line)
+            replies[obj["id"]] = obj
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            exit_code = proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+            raise
+        reader_thread.join(timeout=5)
+    assert exit_code == 0
+
+    assert replies[1]["result"]["serverInfo"]["name"] == "lidar-rs"
+    tool_names = [t["name"] for t in replies[2]["result"]["tools"]]
+    assert "download" in tool_names and "pipeline" in tool_names and "preview" in tool_names
+    assert replies[3]["result"]["isError"] is False
+    assert isinstance(json.loads(replies[3]["result"]["content"][0]["text"]), dict)
+    assert replies[4]["result"]["isError"] is False
+    imgs = [c for c in replies[4]["result"]["content"] if c["type"] == "image"]
+    assert len(imgs) == 1 and imgs[0]["mimeType"] == "image/png"
+    assert imgs[0]["data"].startswith("iVBORw0KGgo")
