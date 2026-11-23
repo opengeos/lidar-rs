@@ -39,14 +39,21 @@ def test_file_filters_and_pipeline(tmp_path: Path):
     assert Path(out).exists()
 
     with pytest.raises(ValueError, match="keep_files"):
-        lidar_rs.ExtractSinks(med_path, min_size=1000, out_dir=tmp_path, keep_files=False)
+        lidar_rs.ExtractSinks(
+            med_path, min_size=1000, out_dir=tmp_path, keep_files=False
+        )
 
     sink_path = lidar_rs.ExtractSinks(med_path, min_size=1000, out_dir=tmp_path)
     assert Path(sink_path).exists()
     assert (tmp_path / "median.gpkg").exists()
 
     dep_id, dep_level = lidar_rs.DelineateDepressions(
-        sink_path, min_size=1000, min_depth=0.3, interval=0.3, out_dir=tmp_path, bool_level_shp=True
+        sink_path,
+        min_size=1000,
+        min_depth=0.3,
+        interval=0.3,
+        out_dir=tmp_path,
+        bool_level_shp=True,
     )
     assert Path(dep_id).exists()
     assert Path(dep_level).exists()
@@ -58,7 +65,12 @@ def test_file_filters_and_pipeline(tmp_path: Path):
 def test_delineate_mounts(tmp_path: Path):
     dsm = TEST_DATA / "dsm.tif"
     mount_id, mount_level = lidar_rs.DelineateMounts(
-        dsm, min_size=1000, min_height=0.3, interval=0.3, out_dir=tmp_path, bool_shp=False
+        dsm,
+        min_size=1000,
+        min_height=0.3,
+        interval=0.3,
+        out_dir=tmp_path,
+        bool_shp=False,
     )
     assert Path(mount_id).exists()
     assert Path(mount_level).exists()
@@ -92,23 +104,36 @@ def test_inundation_hydrology_pipeline(tmp_path: Path):
     region_tif = sinks["region_path"]
     sink_tif = sinks["sink_path"]
 
-    cats = lidar_rs.delineate_catchments(refined_dem, region_tif, tmp_path / "catchments")
+    cats = lidar_rs.delineate_catchments(
+        refined_dem, region_tif, tmp_path / "catchments"
+    )
     assert len(cats["records"]) >= 1
     assert Path(cats["watershed_path"]).exists()
     assert Path(cats["vector_path"]).exists()
 
     fp = lidar_rs.delineate_flow_paths(
-        filled_dem, region_tif, tmp_path / "flowpath.shp", rain_intensity_cm_h=5.0, refined_dem=refined_dem
+        filled_dem,
+        region_tif,
+        tmp_path / "flowpath.shp",
+        rain_intensity_cm_h=5.0,
+        refined_dem=refined_dem,
     )
     assert Path(fp["flowpath_vector_path"]).exists()
 
     deps = lidar_rs.delineate_depressions(
-        sink_tif, min_size=1000, min_depth=0.3, interval=0.3, out_dir=tmp_path, bool_level_shp=True
+        sink_tif,
+        min_size=1000,
+        min_depth=0.3,
+        interval=0.3,
+        out_dir=tmp_path,
+        bool_level_shp=True,
     )
     assert deps["max_level"] >= 2
 
     hir_tif = tmp_path / "hir" / "catchment_hir.tif"
-    hir = lidar_rs.delineate_catchment_hierarchy(refined_dem, tmp_path / "shp-level", hir_tif)
+    hir = lidar_rs.delineate_catchment_hierarchy(
+        refined_dem, tmp_path / "shp-level", hir_tif
+    )
     assert Path(hir["catchment_raster_path"]).exists()
     assert len(hir["records"]) >= 1
 
@@ -195,7 +220,9 @@ def test_numpy_in_memory_and_pipeline(tmp_path: Path):
     assert sim_mem["graph_node_count"] >= 1
 
     # Selective breaching on array & file
-    breached_arr = lidar_rs.breach_depressions(dem_arr, mode="selective", max_depth=0.5, max_length=15)
+    breached_arr = lidar_rs.breach_depressions(
+        dem_arr, mode="selective", max_depth=0.5, max_length=15
+    )
     assert isinstance(breached_arr, np.ndarray)
     assert breached_arr.shape == (400, 400)
 
@@ -300,7 +327,10 @@ def test_fill_spill_merge_routing(tmp_path: Path):
     )
     assert pipe["routing"] == "fsm"
     assert Path(pipe["fsm_basins_csv"]).exists()
-    assert abs(pipe["fsm_mass_balance"]["mass_balance_error_m3"]) < 1e-6 * pipe["fsm_mass_balance"]["total_runoff_m3"]
+    assert (
+        abs(pipe["fsm_mass_balance"]["mass_balance_error_m3"])
+        < 1e-6 * pipe["fsm_mass_balance"]["total_runoff_m3"]
+    )
 
     with pytest.raises(ValueError, match="unknown routing mode"):
         lidar_rs.simulate_inundation_array(dem_arr, routing="invalid_mode")
@@ -360,7 +390,9 @@ def test_synthesize_culverts_and_federal_validation(tmp_path: Path):
     with pytest.raises(ValueError, match="invalid HUC"):
         lidar_rs.query_3dep_products(huc="12345")
     with pytest.raises(ValueError, match="invalid longitude"):
-        lidar_rs.download_federal_data(tmp_path / "bad", bbox=(-99.0, 47.0, -99.5, 47.5))
+        lidar_rs.download_federal_data(
+            tmp_path / "bad", bbox=(-99.0, 47.0, -99.5, 47.5)
+        )
     with pytest.raises(ValueError, match="unknown federal dataset"):
         lidar_rs.download_federal_data(
             tmp_path / "bad_ds", bbox=(-99.3, 47.0, -99.2, 47.1), datasets="nonexistent"
@@ -419,7 +451,10 @@ def test_python_cli_and_mcp_server():
                 "jsonrpc": "2.0",
                 "id": 4,
                 "method": "tools/call",
-                "params": {"name": "preview", "arguments": {"args": [dem, "--max-dim", "64"]}},
+                "params": {
+                    "name": "preview",
+                    "arguments": {"args": [dem, "--max-dim", "64"]},
+                },
             },
         ]
         for m in msgs:
@@ -447,7 +482,11 @@ def test_python_cli_and_mcp_server():
 
     assert replies[1]["result"]["serverInfo"]["name"] == "lidar-rs"
     tool_names = [t["name"] for t in replies[2]["result"]["tools"]]
-    assert "download" in tool_names and "pipeline" in tool_names and "preview" in tool_names
+    assert (
+        "download" in tool_names
+        and "pipeline" in tool_names
+        and "preview" in tool_names
+    )
     assert replies[3]["result"]["isError"] is False
     assert isinstance(json.loads(replies[3]["result"]["content"][0]["text"]), dict)
     assert replies[4]["result"]["isError"] is False

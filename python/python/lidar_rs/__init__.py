@@ -32,7 +32,9 @@ def MeanFilter(
         arr = np.ascontiguousarray(in_dem, dtype=np.float64)
         return _lidar_rs.mean_filter_array(arr, kernel_size, no_data)
     out_str = _as_path_str(out_file) if out_file is not None else None
-    res = _lidar_rs.mean_filter_file(_as_path_str(in_dem), kernel_size, out_str, no_data)
+    res = _lidar_rs.mean_filter_file(
+        _as_path_str(in_dem), kernel_size, out_str, no_data
+    )
     return out_str if out_str is not None else res
 
 
@@ -51,7 +53,9 @@ def MedianFilter(
         arr = np.ascontiguousarray(in_dem, dtype=np.float64)
         return _lidar_rs.median_filter_array(arr, kernel_size, no_data)
     out_str = _as_path_str(out_file) if out_file is not None else None
-    res = _lidar_rs.median_filter_file(_as_path_str(in_dem), kernel_size, out_str, no_data)
+    res = _lidar_rs.median_filter_file(
+        _as_path_str(in_dem), kernel_size, out_str, no_data
+    )
     return out_str if out_str is not None else res
 
 
@@ -70,7 +74,9 @@ def GaussianFilter(
         arr = np.ascontiguousarray(in_dem, dtype=np.float64)
         return _lidar_rs.gaussian_filter_array(arr, float(sigma), no_data)
     out_str = _as_path_str(out_file) if out_file is not None else None
-    res = _lidar_rs.gaussian_filter_file(_as_path_str(in_dem), float(sigma), out_str, no_data)
+    res = _lidar_rs.gaussian_filter_file(
+        _as_path_str(in_dem), float(sigma), out_str, no_data
+    )
     return out_str if out_str is not None else res
 
 
@@ -215,7 +221,11 @@ def polygonize(
     field_name: str = "id",
 ) -> int:
     """Polygonize a raster band into a vector file (Shapefile, GeoPackage, GeoJSON, etc.)."""
-    return int(_lidar_rs.polygonize(_as_path_str(in_raster), _as_path_str(out_vector), field_name))
+    return int(
+        _lidar_rs.polygonize(
+            _as_path_str(in_raster), _as_path_str(out_vector), field_name
+        )
+    )
 
 
 def mosaic(
@@ -267,7 +277,9 @@ def resample(
     resampling: str = "bilinear",
 ) -> None:
     """Resample a raster to a target pixel resolution."""
-    _lidar_rs.resample(_as_path_str(src), _as_path_str(dst), float(resolution), resampling)
+    _lidar_rs.resample(
+        _as_path_str(src), _as_path_str(dst), float(resolution), resampling
+    )
 
 
 def clip_image(
@@ -286,7 +298,9 @@ def image_to_cog(
 ) -> str:
     """Convert a raster to a Cloud Optimized GeoTIFF (COG)."""
     src = Path(source)
-    dst = Path(dst_path) if dst_path is not None else src.with_name(f"{src.stem}_cog.tif")
+    dst = (
+        Path(dst_path) if dst_path is not None else src.with_name(f"{src.stem}_cog.tif")
+    )
     _lidar_rs.image_to_cog(str(src), str(dst), compression)
     return str(dst)
 
@@ -312,7 +326,11 @@ def join_tables(
     """Join a CSV attribute table onto a vector file."""
     return int(
         _lidar_rs.join_tables(
-            _as_path_str(in_shp), _as_path_str(in_csv), _as_path_str(out_shp), vec_col, csv_col
+            _as_path_str(in_shp),
+            _as_path_str(in_csv),
+            _as_path_str(out_shp),
+            vec_col,
+            csv_col,
         )
     )
 
@@ -325,7 +343,9 @@ def csv_to_shp(
 ) -> int:
     """Convert a CSV file with latitude/longitude columns into a WGS 84 point vector file."""
     return int(
-        _lidar_rs.csv_to_vector(_as_path_str(in_csv), _as_path_str(out_shp), latitude, longitude)
+        _lidar_rs.csv_to_vector(
+            _as_path_str(in_csv), _as_path_str(out_shp), latitude, longitude
+        )
     )
 
 
@@ -341,7 +361,10 @@ def convert_lidar(
     """Convert a LiDAR point cloud between formats (LAS, LAZ, COPC, PLY, E57)."""
     return int(
         _lidar_rs.convert_lidar(
-            _as_path_str(source), _as_path_str(destination), point_format_id, minor_version
+            _as_path_str(source),
+            _as_path_str(destination),
+            point_format_id,
+            minor_version,
         )
     )
 
@@ -720,7 +743,9 @@ def extract_sinks_array(
 ) -> dict[str, Any]:
     """Extract surface sinks completely in memory from a 2D NumPy DEM array."""
     arr = np.ascontiguousarray(dem_arr, dtype=np.float64)
-    return _lidar_rs.extract_sinks_array(arr, int(min_size), topology, no_data, float(cell_size))
+    return _lidar_rs.extract_sinks_array(
+        arr, int(min_size), topology, no_data, float(cell_size)
+    )
 
 
 def delineate_depressions_array(
@@ -761,8 +786,16 @@ def simulate_inundation_array(
     Set `routing="fsm"` for dynamic Fill-Spill-Merge cascade mass-balance routing.
     """
     arr = np.ascontiguousarray(dem_arr, dtype=np.float64)
-    rc = np.ascontiguousarray(runoff_coeff_arr, dtype=np.float64) if runoff_coeff_arr is not None else None
-    inf = np.ascontiguousarray(infiltration_arr, dtype=np.float64) if infiltration_arr is not None else None
+    rc = (
+        np.ascontiguousarray(runoff_coeff_arr, dtype=np.float64)
+        if runoff_coeff_arr is not None
+        else None
+    )
+    inf = (
+        np.ascontiguousarray(infiltration_arr, dtype=np.float64)
+        if infiltration_arr is not None
+        else None
+    )
     ant = (
         np.ascontiguousarray(antecedent_depth_arr, dtype=np.float64)
         if antecedent_depth_arr is not None
@@ -832,7 +865,9 @@ def run_pipeline(
         _as_path_str(culverts_vector) if culverts_vector is not None else None,
         _as_path_str(runoff_coeff_path) if runoff_coeff_path is not None else None,
         _as_path_str(infiltration_path) if infiltration_path is not None else None,
-        _as_path_str(antecedent_depth_path) if antecedent_depth_path is not None else None,
+        _as_path_str(antecedent_depth_path)
+        if antecedent_depth_path is not None
+        else None,
         hyetograph,
         _as_path_str(stream_vector) if stream_vector is not None else None,
         bool(use_f32),
@@ -923,7 +958,9 @@ def _normalize_bbox(
     if bbox is None:
         return None
     if len(bbox) != 4:
-        raise ValueError(f"bbox must have 4 elements (min_lon, min_lat, max_lon, max_lat); got {len(bbox)}")
+        raise ValueError(
+            f"bbox must have 4 elements (min_lon, min_lat, max_lon, max_lat); got {len(bbox)}"
+        )
     return (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
 
 
@@ -1095,7 +1132,9 @@ def download_federal_data(
     overwrite: bool = False,
 ) -> dict[str, Any]:
     """Download a bundle of open U.S. federal datasets (WBD, 3DEP DEM, NHD, NWI, roads, culverts, NOAA Atlas 14) for a region."""
-    ds_spec = ",".join(datasets) if isinstance(datasets, (list, tuple)) else str(datasets)
+    ds_spec = (
+        ",".join(datasets) if isinstance(datasets, (list, tuple)) else str(datasets)
+    )
     return dict(
         _lidar_rs.download_federal_data(
             _as_path_str(out_dir),
