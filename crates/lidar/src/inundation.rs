@@ -1978,9 +1978,15 @@ pub fn run_full_pipeline_in_memory(
 
 /// Updates hierarchical `"merge"` edge timestamps on a [`crate::graph::ConnectivityGraph`] to use
 /// the exact child-to-parent merge event times simulated by Fill-Spill-Merge routing.
+///
+/// Uses the sustained-rainfall merge times so `merge` edges share the timing convention of the
+/// graph's raster-derived node fill times and spill edges, rather than the storm-bounded
+/// `merge_time_h` reported in `fsm_basins.csv`.
 fn apply_fsm_merge_times(graph: &mut crate::graph::ConnectivityGraph, basins: &[FsmBasinSummary]) {
-    let merge_by_id: HashMap<u32, Option<f64>> =
-        basins.iter().map(|b| (b.dep_id, b.merge_time_h)).collect();
+    let merge_by_id: HashMap<u32, Option<f64>> = basins
+        .iter()
+        .map(|b| (b.dep_id, b.sustained_merge_time_h))
+        .collect();
     for edge in &mut graph.edges {
         if edge.edge_type == "merge"
             && let Some(&mt) = merge_by_id.get(&edge.from_id)

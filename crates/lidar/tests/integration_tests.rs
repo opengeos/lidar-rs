@@ -1107,6 +1107,22 @@ fn test_fill_spill_merge_end_to_end_on_sample_dem() {
         // A basin still filling at storm end cannot have spilled during the storm.
         assert_eq!(b.spill_to_dep_id, None, "{b:?}");
     }
+    for b in basins {
+        if let Some(t) = b.merge_time_h {
+            assert!(t <= sim_opts.rain_duration_h + 1e-9, "{b:?}");
+            assert_eq!(b.sustained_merge_time_h, Some(t), "{b:?}");
+        }
+    }
+    // Graph `merge` edges keep the sustained-rainfall merge times, matching its spill edges.
+    for e in pipe_fsm
+        .connectivity_graph
+        .edges
+        .iter()
+        .filter(|e| e.edge_type == "merge")
+    {
+        let b = basins.iter().find(|b| b.dep_id == e.from_id).unwrap();
+        assert_eq!(e.merge_time_h, b.sustained_merge_time_h, "{e:?}");
+    }
     assert!(
         basins.iter().any(|b| b.fill_time_h.is_none()),
         "expected the top-level sample basin to still be filling at storm end"

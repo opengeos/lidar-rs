@@ -120,6 +120,11 @@ pub struct FsmBasinSummary {
     /// Time in hours when this depression merged into its parent (`None` if it had not merged by
     /// the end of the simulated storm duration).
     pub merge_time_h: Option<f64>,
+    /// Merge time under the sustained-rainfall extension past the storm, the timing convention
+    /// shared by `fill_time.tif`, the spill flow paths, and the connectivity graph's `merge` edges.
+    /// Equals `merge_time_h` for merges within the storm; not written to `fsm_basins.csv`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub sustained_merge_time_h: Option<f64>,
     /// Cumulative excess volume spilled downstream over the simulated storm duration (cubic map units).
     pub spilled_volume_m3: f64,
     /// Peak spill discharge rate during the simulated storm duration (cubic map units per hour).
@@ -1714,11 +1719,14 @@ pub fn simulate_fill_spill_merge_in_memory(
             // post-storm tail segment exists only to give `fill_time.tif` sustained-rainfall
             // timing for deep basins. `realized_spill_to` is always set together with
             // `first_spill_time_h`, so gating on the latter bounds the spill target too.
+            // `sustained_merge_time_h` keeps the unbounded merge time for the connectivity graph.
             fill_time_h: b.first_fill_time_h.filter(|&t| t <= storm_end),
             spill_to_dep_id: b
-                .realized_spill_to
-                .filter(|_| b.first_spill_time_h.is_some_and(|t| t <= storm_end)),
+                .first_spill_time_h
+                .filter(|&t| t <= storm_end)
+                .and(b.realized_spill_to),
             merge_time_h: b.merge_time_h.filter(|&t| t <= storm_end),
+            sustained_merge_time_h: b.merge_time_h,
             spilled_volume_m3: b.spilled_vol_storm_m3,
             peak_spill_rate_m3_h: b.peak_spill_rate_m3_h,
             infiltrated_volume_m3: b.infiltrated_vol_storm_m3,
