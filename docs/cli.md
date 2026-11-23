@@ -14,7 +14,8 @@ All sample files used below can be downloaded from [Sample Datasets](datasets.md
 | **DEM Smoothing & Sinks** | `mean-filter`, `median-filter`, `gaussian-filter`, `extract-sinks` |
 | **Nested Hierarchies** | `delineate-depressions`, `delineate-mounts`, `flip-dem` |
 | **Catchments & Inundation** | `delineate-catchments`, `delineate-flow-paths`, `catchment-hierarchy`, `simulate-inundation` |
-| **Animation & Visualization** | `animate-inundation`, `export-frames` |
+| **Animation & Visualization** | `animate-inundation`, `export-frames`, `preview` |
+| **AI Agents (MCP)** | `mcp` (plus `--json-usage` global catalog flag) |
 | **LiDAR Point Clouds** | `convert-lidar`, `lidar-to-dsm`, `lidar-to-dtm`, `lidar-to-chm` |
 | **Raster & Vector Utilities** | `polygonize`, `mosaic`, `reproject`, `resample`, `clip`, `to-cog`, `add-crs`, `join-tables`, `csv-to-vector`, `info` |
 
@@ -152,7 +153,11 @@ lidar lidar-to-chm sample_forest.laz out/chm.tif --resolution 1.0 --ground-metho
 ## Geospatial Raster & Vector Utilities
 
 ```sh
-lidar info dem.tif
+lidar info dem.tif --json --stats
+lidar preview dem.tif -o preview.png --scale-bar
+lidar preview dem.tif -o flood.png --fill-time out_pipe/fill_time.tif --hour 10 --scale-bar --legend
+lidar mcp   # start stdio Model Context Protocol server for AI agents
+lidar --json-usage   # dump machine-readable JSON command catalog
 lidar polygonize out/region.tif out/regions.geojson --field-name id
 lidar mosaic tile1.tif tile2.tif -o mosaic.tif
 lidar reproject dem.tif dem_4326.tif --crs EPSG:4326 -r bilinear

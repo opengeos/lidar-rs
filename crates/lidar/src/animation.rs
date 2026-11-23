@@ -1194,6 +1194,59 @@ pub fn render_inundation_frame_png_bytes(
     encode_rgb_to_png_bytes(&frame_rgb, dw, total_h)
 }
 
+/// Renders a shaded-relief PNG preview of `dem` with an optional positive-depth overlay
+/// (e.g., `depth.tif` or `sink.tif`), optional scale bar, and optional legend.
+pub fn render_dem_preview_png_bytes(
+    dem: &Array2D<f64>,
+    depth_overlay: Option<&Array2D<f64>>,
+    options: &AnimateInundationOptions,
+) -> Result<Vec<u8>> {
+    let sw = dem.width();
+    let sh = dem.height();
+    if let Some(ov) = depth_overlay
+        && (ov.width() != sw || ov.height() != sh)
+    {
+        return Err(Error::DimensionMismatch(format!(
+            "depth overlay ({}x{}) does not match DEM ({sw}x{sh})",
+            ov.width(),
+            ov.height()
+        )));
+    }
+    let (dw, dh, _) = compute_gif_dimensions(sw, sh, options)?;
+    let full_bg = compute_hillshade_rgb(dem, &options.hillshade);
+    let mut rgb = downscale_rgb(&full_bg, sw, sh, dw, dh);
+    let cell_m = dem.geotransform[1].hypot(dem.geotransform[4]).max(1e-6);
+
+    if let Some(ov) = depth_overlay {
+        let alpha = options.water_alpha.clamp(0.0, 1.0);
+        let inv_alpha = 1.0 - alpha;
+        let [wr, wg, wb] = options.water_rgb;
+        let ov_data = ov.data();
+        let ov_nd = ov.no_data();
+        for dr in 0..dh {
+            let sr = dr * sh / dh;
+            for dc in 0..dw {
+                let sc = dc * sw / dw;
+                let v = ov_data[sr * sw + sc];
+                if v.is_finite() && !v.rd_eq(ov_nd) && v > 0.0 {
+                    let p = (dr * dw + dc) * 3;
+                    rgb[p] = (rgb[p] as f32 * inv_alpha + wr as f32 * alpha).round() as u8;
+                    rgb[p + 1] = (rgb[p + 1] as f32 * inv_alpha + wg as f32 * alpha).round() as u8;
+                    rgb[p + 2] = (rgb[p + 2] as f32 * inv_alpha + wb as f32 * alpha).round() as u8;
+                }
+            }
+        }
+    }
+    if options.show_scale_bar && !is_geographic_crs(&dem.projection, dem.geotransform) {
+        let reserve_right = if options.show_legend { 96 } else { 0 };
+        draw_scale_bar(&mut rgb, dw, dh, sw, cell_m, &dem.projection, reserve_right);
+    }
+    if options.show_legend && depth_overlay.is_some() {
+        draw_legend_box(&mut rgb, dw, dh, options.water_rgb, false);
+    }
+    encode_rgb_to_png_bytes(&rgb, dw, dh)
+}
+
 /// Exports individual time-series inundation frames as numbered PNG files (`frame_001.png`, ...)
 /// with optional banner, scale bar, legend, spill paths, and vector overlays.
 pub fn export_inundation_frames_png(

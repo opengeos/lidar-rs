@@ -12,7 +12,7 @@ High-performance nested surface depression delineation, hydro-conditioning, LiDA
 
 [![Interactive inundation simulation and inundation curve in the lidar-rs WebAssembly Playground](https://files.opengeos.org/inundation_demo.gif)](https://lidar-rs.opengeos.org/playground/)
 
-**Documentation:** [User Guides](https://lidar-rs.opengeos.org/guides/) | [Sample Datasets](https://lidar-rs.opengeos.org/datasets/) | [CLI](https://lidar-rs.opengeos.org/cli/) | [Rust](https://lidar-rs.opengeos.org/rust/) | [Python](https://lidar-rs.opengeos.org/python/) | [JavaScript / WASM](https://lidar-rs.opengeos.org/javascript/) | [Live Playground](https://lidar-rs.opengeos.org/playground/)
+**Documentation:** [User Guides](https://lidar-rs.opengeos.org/guides/) | [Sample Datasets](https://lidar-rs.opengeos.org/datasets/) | [CLI](https://lidar-rs.opengeos.org/cli/) | [AI Agents (MCP)](https://lidar-rs.opengeos.org/mcp/) | [Rust](https://lidar-rs.opengeos.org/rust/) | [Python](https://lidar-rs.opengeos.org/python/) | [JavaScript / WASM](https://lidar-rs.opengeos.org/javascript/) | [Live Playground](https://lidar-rs.opengeos.org/playground/)
 
 ## Highlights
 
@@ -26,7 +26,8 @@ High-performance nested surface depression delineation, hydro-conditioning, LiDA
 - **Tiled regional delineation & `f32` storage (`delineate_depressions_tiled` / `tiled-depressions`):** Parallel overlapping tile windows with core-owned seam deduplication and optional `f32` DEM grids that halve source raster memory.
 - **Publication PNG & GIF rendering (`export_frames`, `animate_inundation`):** Shaded-relief inundation animations and individual PNG frames with overland spill arrows, metric scale bars, legends, and timestamp HUDs.
 - **Federal geospatial data download (`download_federal_data` / `lidar download`):** Pure-Rust download utilities for authoritative open U.S. federal datasets within a WGS 84 bounding box, USGS HUC code (HUC-2 through HUC-12), or local polygon file: USGS 3DEP DEMs (1-m, 10-m, 30-m) and LiDAR Point Clouds (with newest-vintage tile deduplication, caching, mosaicking, and clipping), USGS WBD watershed boundaries, USGS NHD flowlines, USFWS NWI wetlands, USGS National Transportation roads and railways, deterministic road-stream culvert synthesis (`synthesize_culverts`), and NOAA Atlas 14 precipitation depth frequency tables.
-- **Four interfaces, one pure-Rust core:** Rust crate (`lidar`), standalone CLI (`lidar-cli`, 33 subcommands + JSON output), Python package (`lidar-rs`, PyO3 + zero-copy NumPy arrays, Python 3.11+), and WebAssembly (`lidar-js`) powering the interactive browser [Playground](https://lidar-rs.opengeos.org/playground/) with Depression Inspector and live Stage-Volume Rating Curves.
+- **AI Agents & MCP server (`lidar mcp`):** Pure-Rust Model Context Protocol (MCP) server over stdio for Claude Code, Claude Desktop, Cursor, and VS Code (`claude mcp add lidar -- lidar mcp` or zero-install via `uvx --from lidar-rs lidar mcp`), exposing every CLI subcommand, inline PNG terrain/inundation `preview` images, structured `info --json --stats`, `--json-usage`, and guided hydrology workflow prompts.
+- **Four interfaces, one pure-Rust core:** Rust crate (`lidar`), standalone CLI & MCP server (`lidar-cli`, 35 subcommands + JSON output), Python package (`lidar-rs`, PyO3 + zero-copy NumPy arrays + bundled `lidar` CLI, Python 3.11+), and WebAssembly (`lidar-js`) powering the interactive browser [Playground](https://lidar-rs.opengeos.org/playground/) with Depression Inspector and live Stage-Volume Rating Curves.
 
 ## Workspace Layout
 

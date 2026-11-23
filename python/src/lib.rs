@@ -1954,9 +1954,20 @@ fn download_federal_data<'py>(
     Ok(d)
 }
 
+#[pyfunction]
+#[pyo3(signature = (args, lidar_cmd=None))]
+fn cli_main(
+    py: Python<'_>,
+    args: Vec<std::ffi::OsString>,
+    lidar_cmd: Option<Vec<std::ffi::OsString>>,
+) -> i32 {
+    py.detach(move || lidar_cli::run_as(args, lidar_cmd))
+}
+
 #[pymodule]
 fn _lidar_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", lidar::VERSION)?;
+    m.add_function(wrap_pyfunction!(cli_main, m)?)?;
     m.add_function(wrap_pyfunction!(mean_filter_array, m)?)?;
     m.add_function(wrap_pyfunction!(median_filter_array, m)?)?;
     m.add_function(wrap_pyfunction!(gaussian_filter_array, m)?)?;

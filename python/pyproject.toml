@@ -28,6 +28,9 @@ dependencies = ["numpy>=1.24"]
 [project.optional-dependencies]
 test = ["pytest>=7"]
 
+[project.scripts]
+lidar = "lidar_rs.__main__:main"
+
 [project.urls]
 Homepage = "https://github.com/opengeos/lidar-rs"
 Repository = "https://github.com/opengeos/lidar-rs"
