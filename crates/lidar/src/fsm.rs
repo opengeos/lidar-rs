@@ -120,11 +120,11 @@ pub struct FsmBasinSummary {
     /// Time in hours when this depression merged into its parent (`None` if it had not merged by
     /// the end of the simulated storm duration).
     pub merge_time_h: Option<f64>,
-    /// Merge time under the sustained-rainfall extension past the storm, the timing convention
-    /// shared by `fill_time.tif`, the spill flow paths, and the connectivity graph's `merge` edges.
-    /// Equals `merge_time_h` for merges within the storm; not written to `fsm_basins.csv`.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub sustained_merge_time_h: Option<f64>,
+    /// Merge time including the constant-rainfall extension past the storm, the timing convention
+    /// shared by `fill_time.tif`, the spill flow paths, and the connectivity graph's edges. Equals
+    /// `merge_time_h` for merges within the storm. Internal: used only to time graph `merge` edges.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) sustained_merge_time_h: Option<f64>,
     /// Cumulative excess volume spilled downstream over the simulated storm duration (cubic map units).
     pub spilled_volume_m3: f64,
     /// Peak spill discharge rate during the simulated storm duration (cubic map units per hour).
@@ -161,8 +161,11 @@ pub struct FsmMassBalance {
 pub struct FsmSimulationResult {
     /// Per-cell continuous time to inundation in hours (`-1.0` = dry / NoData).
     ///
-    /// Rainfall is extended past the storm duration, so cells in basins that are still filling at
-    /// storm end get sustained-rainfall timing that can exceed `duration_h`.
+    /// With constant rainfall, rainfall is extended past the storm duration, so cells in basins
+    /// that are still filling at storm end get sustained-rainfall timing that can exceed
+    /// `duration_h`. With a hyetograph, routing stops at the end of the hyetograph, and cells not
+    /// yet inundated by then stay NoData (`-1.0`). Values are first-inundation times: a cell keeps
+    /// its time even if its basin later drains.
     pub fill_time: Array2D<f64>,
     /// Dynamically realized overland spill flow paths with exact cascade `spill_time_h`
     /// and `merge_time_h`.
@@ -173,9 +176,11 @@ pub struct FsmSimulationResult {
     pub mass_balance: FsmMassBalance,
     /// Number of top-level sink regions.
     pub num_regions: usize,
-    /// Number of depressions that filled and initiated overland spilling.
+    /// Number of depressions that filled and initiated overland spilling. Like `spill_paths` and
+    /// `fill_time`, this includes events in the constant-rainfall extension past the storm.
     pub num_spill_events: usize,
-    /// Number of compound parent depressions formed by merging filled children.
+    /// Number of compound parent depressions formed by merging filled children. Includes events in
+    /// the constant-rainfall extension past the storm, like `num_spill_events`.
     pub num_merge_events: usize,
 }
 

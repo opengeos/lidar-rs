@@ -1110,19 +1110,25 @@ fn test_fill_spill_merge_end_to_end_on_sample_dem() {
     for b in basins {
         if let Some(t) = b.merge_time_h {
             assert!(t <= sim_opts.rain_duration_h + 1e-9, "{b:?}");
-            assert_eq!(b.sustained_merge_time_h, Some(t), "{b:?}");
         }
     }
-    // Graph `merge` edges keep the sustained-rainfall merge times, matching its spill edges.
-    for e in pipe_fsm
-        .connectivity_graph
-        .edges
-        .iter()
-        .filter(|e| e.edge_type == "merge")
-    {
-        let b = basins.iter().find(|b| b.dep_id == e.from_id).unwrap();
-        assert_eq!(e.merge_time_h, b.sustained_merge_time_h, "{e:?}");
+    // Graph `merge` and `spill` edges from the same basin report the same merge state.
+    let edges = &pipe_fsm.connectivity_graph.edges;
+    let mut checked = 0;
+    for m in edges.iter().filter(|e| e.edge_type == "merge") {
+        let b = basins.iter().find(|b| b.dep_id == m.from_id).unwrap();
+        if let Some(t) = b.merge_time_h {
+            assert_eq!(m.merge_time_h, Some(t), "{m:?}");
+        }
+        for s in edges
+            .iter()
+            .filter(|e| e.edge_type == "spill" && e.from_id == m.from_id)
+        {
+            assert_eq!(s.merge_time_h, m.merge_time_h, "{s:?} vs {m:?}");
+            checked += 1;
+        }
     }
+    assert!(checked > 0, "expected spill edges from merged basins");
     assert!(
         basins.iter().any(|b| b.fill_time_h.is_none()),
         "expected the top-level sample basin to still be filling at storm end"
