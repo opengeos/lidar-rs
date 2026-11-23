@@ -25,7 +25,8 @@ High-performance nested surface depression delineation, hydro-conditioning, LiDA
 - **LiDAR point clouds (`DSM`, `DTM`, `CHM`):** Native LAS/LAZ/COPC/PLY/E57 reading and conversion, ASPRS class and return filtering, pure-Rust CSF/PMF ground classification (`classify_ground`), bare-earth DTM (`lidar_to_dtm`), and Canopy Height Models (`lidar_to_chm`).
 - **Tiled regional delineation & `f32` storage (`delineate_depressions_tiled` / `tiled-depressions`):** Parallel overlapping tile windows with core-owned seam deduplication and optional `f32` DEM grids that halve source raster memory.
 - **Publication PNG & GIF rendering (`export_frames`, `animate_inundation`):** Shaded-relief inundation animations and individual PNG frames with overland spill arrows, metric scale bars, legends, and timestamp HUDs.
-- **Four interfaces, one pure-Rust core:** Rust crate (`lidar`), standalone CLI (`lidar-cli`, 31 subcommands + JSON output), Python package (`lidar-rs`, PyO3 + zero-copy NumPy arrays, Python 3.11+), and WebAssembly (`lidar-js`) powering the interactive browser [Playground](https://lidar-rs.opengeos.org/playground/) with Depression Inspector and live Stage-Volume Rating Curves.
+- **Federal geospatial data download (`download_federal_data` / `lidar download`):** Pure-Rust download utilities for authoritative open U.S. federal datasets within a WGS 84 bounding box, USGS HUC code (HUC-2 through HUC-12), or local polygon file: USGS 3DEP DEMs (1-m, 10-m, 30-m) and LiDAR Point Clouds (with newest-vintage tile deduplication, caching, mosaicking, and clipping), USGS WBD watershed boundaries, USGS NHD flowlines, USFWS NWI wetlands, USGS National Transportation roads and railways, deterministic road-stream culvert synthesis (`synthesize_culverts`), and NOAA Atlas 14 precipitation depth frequency tables.
+- **Four interfaces, one pure-Rust core:** Rust crate (`lidar`), standalone CLI (`lidar-cli`, 33 subcommands + JSON output), Python package (`lidar-rs`, PyO3 + zero-copy NumPy arrays, Python 3.11+), and WebAssembly (`lidar-js`) powering the interactive browser [Playground](https://lidar-rs.opengeos.org/playground/) with Depression Inspector and live Stage-Volume Rating Curves.
 
 ## Workspace Layout
 
@@ -36,7 +37,7 @@ High-performance nested surface depression delineation, hydro-conditioning, LiDA
 | `python` | Python bindings (`lidar-rs`, PyO3 + NumPy) with drop-in `opengeos/lidar` API |
 | `js` | WebAssembly (`wasm-bindgen`) bindings (`lidar-js`) for browsers and Node.js |
 | `test_data` | Sample DEM/DSM/sink GeoTIFF datasets from `opengeos/lidar` |
-| `examples` | Interactive Google Colab demo notebooks (`lidar_rs_demo.ipynb`, `inundation_demo.ipynb`) |
+| `examples` | Interactive Google Colab demo notebooks (`lidar_rs_demo.ipynb`, `inundation_demo.ipynb`, `federal_data_download.ipynb`) |
 | `docs` | Zensical documentation site, interactive WASM Playground, and CLI installer scripts (`install.sh`, `install.ps1`) |
 
 ## Rust Usage

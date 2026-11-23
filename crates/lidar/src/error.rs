@@ -32,6 +32,10 @@ pub enum Error {
     /// Algorithm execution failure.
     #[error("algorithm error: {0}")]
     Algorithm(String),
+
+    /// Network or remote web-service request failure.
+    #[error("HTTP error: {0}")]
+    Http(String),
 }
 
 /// Convenience `Result` alias for `lidar-rs`.

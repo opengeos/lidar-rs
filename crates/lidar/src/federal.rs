@@ -1,0 +1,2172 @@
+//! Pure-Rust utilities for downloading authoritative open U.S. federal geospatial
+//! datasets within a user-specified region of interest.
+//!
+//! Supported federal web services (zero API keys, zero GDAL/C dependencies):
+//! - **USGS WBD** (Watershed Boundary Dataset, HUC-2 through HUC-12):
+//!   [`download_wbd`]
+//! - **USGS 3DEP** (1-m, 1/3 arc-sec, and 1 arc-sec DEMs, plus Lidar Point Cloud):
+//!   [`query_3dep_products`], [`download_3dep_dem`]
+//! - **USGS NHD** (National Hydrography Dataset flowlines):
+//!   [`download_nhd`]
+//! - **USFWS NWI** (National Wetlands Inventory polygons):
+//!   [`download_nwi`]
+//! - **USGS National Transportation** (road and railway centerlines):
+//!   [`download_roads`]
+//! - **NOAA Atlas 14** (partial-duration-series precipitation depth frequency tables):
+//!   [`fetch_noaa_atlas14`]
+//! - **End-to-end bundle** (downloads all selected federal datasets, optionally mosaics/clips
+//!   the 3DEP DEM and synthesizes road-stream culverts): [`download_federal_data`]
+
+use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::time::Duration;
+
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use terrio::crs::{SpatialRef, Transformer};
+use terrio::ops::topology::make_valid as terrio_make_valid;
+use terrio::ops::vector_clip::{ClipRegion, ClipTemplateOptions, clip as terrio_vector_clip};
+use terrio::{VectorOpenOptions, VectorWriteOptions};
+
+use crate::conditioning::{SynthesizeCulvertsOptions, synthesize_culverts};
+use crate::error::{Error, Result};
+use crate::raster_ops::{clip_image, mosaic};
+
+/// USGS Watershed Boundary Dataset (WBD) MapServer base URL.
+pub const USGS_WBD_BASE_URL: &str =
+    "https://hydro.nationalmap.gov/arcgis/rest/services/wbd/MapServer";
+/// USGS National Hydrography Dataset (NHD) flowlines (Layer 6) query endpoint.
+pub const USGS_NHD_FLOWLINE_URL: &str =
+    "https://hydro.nationalmap.gov/arcgis/rest/services/nhd/MapServer/6/query";
+/// USFWS National Wetlands Inventory (NWI) MapServer (Layer 0) query endpoint.
+pub const USFWS_NWI_URL: &str = "https://fwspublicservices.wim.usgs.gov/wetlandsmapservice/rest/services/Wetlands/MapServer/0/query";
+/// USGS The National Map (TNM) Access products API endpoint.
+pub const USGS_TNM_PRODUCTS_URL: &str = "https://tnmaccess.nationalmap.gov/api/v1/products";
+/// USGS National Transportation MapServer base URL.
+pub const USGS_TRANSPORTATION_BASE_URL: &str =
+    "https://carto.nationalmap.gov/arcgis/rest/services/transportation/MapServer";
+/// Default USGS National Transportation layer IDs (controlled-access, secondary, local,
+/// ramp roadways: 29..=33; railways: 38).
+pub const DEFAULT_TRANSPORTATION_LAYERS: &[u32] = &[29, 30, 31, 32, 33, 38];
+/// NOAA Atlas 14 precipitation frequency query CGI endpoint.
+pub const NOAA_ATLAS14_URL: &str = "https://hdsc.nws.noaa.gov/cgi-bin/hdsc/new/cgi_readH5.py";
+
+const NOAA_DURATIONS: &[&str] = &[
+    "5-min", "10-min", "15-min", "30-min", "60-min", "2-hr", "3-hr", "6-hr", "12-hr", "24-hr",
+    "2-day", "3-day", "4-day", "7-day", "10-day", "20-day", "30-day", "45-day", "60-day",
+];
+const NOAA_ARIS: &[u32] = &[1, 2, 5, 10, 25, 50, 100, 200, 500, 1000];
+
+/// Axis-aligned geographic bounding box in WGS 84 (`EPSG:4326`) decimal degrees.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Bbox {
+    /// Western longitude bound in degrees (`-180.0..=180.0`).
+    pub min_lon: f64,
+    /// Southern latitude bound in degrees (`-90.0..=90.0`).
+    pub min_lat: f64,
+    /// Eastern longitude bound in degrees (`-180.0..=180.0`).
+    pub max_lon: f64,
+    /// Northern latitude bound in degrees (`-90.0..=90.0`).
+    pub max_lat: f64,
+}
+
+impl Bbox {
+    /// Creates and validates a WGS 84 bounding box.
+    pub fn new(min_lon: f64, min_lat: f64, max_lon: f64, max_lat: f64) -> Result<Self> {
+        let bbox = Self {
+            min_lon,
+            min_lat,
+            max_lon,
+            max_lat,
+        };
+        bbox.validate()?;
+        Ok(bbox)
+    }
+
+    /// Validates coordinate finiteness, geographic ranges, and ordering (`min < max`).
+    pub fn validate(&self) -> Result<()> {
+        if !self.min_lon.is_finite()
+            || !self.min_lat.is_finite()
+            || !self.max_lon.is_finite()
+            || !self.max_lat.is_finite()
+        {
+            return Err(Error::InvalidArgument(
+                "bounding box coordinates must be finite".into(),
+            ));
+        }
+        if self.min_lon < -180.0 || self.max_lon > 180.0 || self.min_lon >= self.max_lon {
+            return Err(Error::InvalidArgument(format!(
+                "invalid longitude bounds [{}, {}]; expected -180 <= min_lon < max_lon <= 180",
+                self.min_lon, self.max_lon
+            )));
+        }
+        if self.min_lat < -90.0 || self.max_lat > 90.0 || self.min_lat >= self.max_lat {
+            return Err(Error::InvalidArgument(format!(
+                "invalid latitude bounds [{}, {}]; expected -90 <= min_lat < max_lat <= 90",
+                self.min_lat, self.max_lat
+            )));
+        }
+        Ok(())
+    }
+
+    /// Returns `(centroid_lon, centroid_lat)`.
+    pub fn centroid(&self) -> (f64, f64) {
+        (
+            0.5 * (self.min_lon + self.max_lon),
+            0.5 * (self.min_lat + self.max_lat),
+        )
+    }
+
+    /// Returns `true` if `self` intersects `other` (including touching edges).
+    pub fn intersects(&self, other: &Self) -> bool {
+        self.min_lon <= other.max_lon
+            && self.max_lon >= other.min_lon
+            && self.min_lat <= other.max_lat
+            && self.max_lat >= other.min_lat
+    }
+
+    /// Formats as `"min_lon,min_lat,max_lon,max_lat"` for ArcGIS and USGS TNM APIs.
+    pub fn to_csv_string(&self) -> String {
+        format!(
+            "{},{},{},{}",
+            self.min_lon, self.min_lat, self.max_lon, self.max_lat
+        )
+    }
+}
+
+impl FromStr for Bbox {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let parts: Vec<&str> = s.split(',').map(str::trim).collect();
+        if parts.len() != 4 {
+            return Err(Error::InvalidArgument(format!(
+                "expected 4 comma-separated WGS 84 bounds 'min_lon,min_lat,max_lon,max_lat', got '{s}'"
+            )));
+        }
+        let nums: Vec<f64> = parts
+            .iter()
+            .map(|p| {
+                p.parse::<f64>()
+                    .map_err(|_| Error::InvalidArgument(format!("invalid bbox coordinate '{p}'")))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Self::new(nums[0], nums[1], nums[2], nums[3])
+    }
+}
+
+/// Region of interest specification for federal data downloads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Region {
+    /// Explicit WGS 84 bounding box (`min_lon, min_lat, max_lon, max_lat`).
+    Bbox(Bbox),
+    /// USGS Watershed Boundary Dataset Hydrologic Unit Code (2, 4, 6, 8, 10, or 12 digits,
+    /// e.g. `"10160002"` for a HUC-8 subbasin or `"101600020502"` for a single HUC-12).
+    Huc(String),
+    /// Local polygon vector file (`.geojson`, `.gpkg`, `.shp`) in any CRS supported by `terrio`.
+    VectorFile(PathBuf),
+}
+
+impl Region {
+    /// Validates a HUC code string (2, 4, 6, 8, 10, or 12 ASCII digits).
+    pub fn validate_huc(huc: &str) -> Result<String> {
+        let trimmed = huc.trim();
+        let valid_len = matches!(trimmed.len(), 2 | 4 | 6 | 8 | 10 | 12);
+        if !valid_len || !trimmed.chars().all(|c| c.is_ascii_digit()) {
+            return Err(Error::InvalidArgument(format!(
+                "invalid HUC code '{huc}'; expected 2, 4, 6, 8, 10, or 12 digits (e.g. '10160002')"
+            )));
+        }
+        Ok(trimmed.to_string())
+    }
+}
+
+/// USGS Watershed Boundary Dataset (WBD) hierarchy level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum WbdLevel {
+    /// HUC-2 Region (MapServer Layer 1).
+    Huc2,
+    /// HUC-4 Subregion (MapServer Layer 2).
+    Huc4,
+    /// HUC-6 Basin (MapServer Layer 3).
+    Huc6,
+    /// HUC-8 Subbasin (MapServer Layer 4).
+    Huc8,
+    /// HUC-10 Watershed (MapServer Layer 5).
+    Huc10,
+    /// HUC-12 Subwatershed (MapServer Layer 6).
+    #[default]
+    Huc12,
+}
+
+impl WbdLevel {
+    /// USGS WBD MapServer layer index.
+    pub fn layer_id(self) -> u32 {
+        match self {
+            Self::Huc2 => 1,
+            Self::Huc4 => 2,
+            Self::Huc6 => 3,
+            Self::Huc8 => 4,
+            Self::Huc10 => 5,
+            Self::Huc12 => 6,
+        }
+    }
+
+    /// Primary HUC attribute field name on USGS WBD MapServer.
+    pub fn field_name(self) -> &'static str {
+        match self {
+            Self::Huc2 => "huc2",
+            Self::Huc4 => "huc4",
+            Self::Huc6 => "huc6",
+            Self::Huc8 => "huc8",
+            Self::Huc10 => "huc10",
+            Self::Huc12 => "huc12",
+        }
+    }
+
+    /// Digit length associated with this WBD level.
+    pub fn digits(self) -> usize {
+        match self {
+            Self::Huc2 => 2,
+            Self::Huc4 => 4,
+            Self::Huc6 => 6,
+            Self::Huc8 => 8,
+            Self::Huc10 => 10,
+            Self::Huc12 => 12,
+        }
+    }
+
+    /// Parses numeric digits (`2`, `4`, `6`, `8`, `10`, `12`) into a [`WbdLevel`].
+    pub fn from_digits(digits: usize) -> Result<Self> {
+        match digits {
+            2 => Ok(Self::Huc2),
+            4 => Ok(Self::Huc4),
+            6 => Ok(Self::Huc6),
+            8 => Ok(Self::Huc8),
+            10 => Ok(Self::Huc10),
+            12 => Ok(Self::Huc12),
+            other => Err(Error::InvalidArgument(format!(
+                "invalid WBD HUC level {other}; expected 2, 4, 6, 8, 10, or 12"
+            ))),
+        }
+    }
+
+    /// Full ArcGIS REST query endpoint URL for this WBD level.
+    pub fn query_url(self) -> String {
+        format!("{USGS_WBD_BASE_URL}/{}/query", self.layer_id())
+    }
+}
+
+impl FromStr for WbdLevel {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let norm = s.trim().to_ascii_lowercase();
+        let digits = norm
+            .strip_prefix("huc")
+            .unwrap_or(&norm)
+            .trim_start_matches('-')
+            .trim_start_matches('_');
+        let n = digits.parse::<usize>().map_err(|_| {
+            Error::InvalidArgument(format!(
+                "invalid WBD level '{s}'; expected 2, 4, 6, 8, 10, or 12"
+            ))
+        })?;
+        Self::from_digits(n)
+    }
+}
+
+/// USGS 3D Elevation Program (3DEP) product selector for The National Map API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum DemProduct {
+    /// 1-meter bare-earth GeoTIFF DEM (`Digital Elevation Model (DEM) 1 meter`).
+    #[default]
+    Meter1,
+    /// 1/3 arc-second (~10-m) GeoTIFF DEM (`National Elevation Dataset (NED) 1/3 arc-second`).
+    ThirdArcSec,
+    /// 1 arc-second (~30-m) GeoTIFF DEM (`National Elevation Dataset (NED) 1 arc-second`).
+    OneArcSec,
+    /// Raw airborne LiDAR Point Cloud (`Lidar Point Cloud (LPC)` in LAZ/LAS).
+    LidarPointCloud,
+}
+
+impl DemProduct {
+    /// Dataset name accepted by the USGS TNM Access `datasets` query parameter.
+    pub fn tnm_dataset_name(self) -> &'static str {
+        match self {
+            Self::Meter1 => "Digital Elevation Model (DEM) 1 meter",
+            Self::ThirdArcSec => "National Elevation Dataset (NED) 1/3 arc-second",
+            Self::OneArcSec => "National Elevation Dataset (NED) 1 arc-second",
+            Self::LidarPointCloud => "Lidar Point Cloud (LPC)",
+        }
+    }
+
+    /// Optional `prodFormats` filter for USGS TNM Access API.
+    pub fn prod_formats(self) -> Option<&'static str> {
+        match self {
+            Self::Meter1 | Self::ThirdArcSec | Self::OneArcSec => Some("GeoTIFF"),
+            Self::LidarPointCloud => Some("LAZ,LAS"),
+        }
+    }
+
+    /// Returns `true` for raster DEM products (eligible for mosaicking and clipping).
+    pub fn is_raster(self) -> bool {
+        !matches!(self, Self::LidarPointCloud)
+    }
+}
+
+impl FromStr for DemProduct {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "1m" | "meter1" | "1-m" | "1_m" => Ok(Self::Meter1),
+            "10m" | "1/3" | "third_arc_sec" | "third-arc-sec" | "1_3_arc_sec" | "ned13" => {
+                Ok(Self::ThirdArcSec)
+            }
+            "30m" | "1arcsec" | "one_arc_sec" | "one-arc-sec" | "ned1" => Ok(Self::OneArcSec),
+            "lpc" | "lidar" | "pointcloud" | "laz" => Ok(Self::LidarPointCloud),
+            other => Err(Error::InvalidArgument(format!(
+                "unknown 3DEP product '{other}'; expected 1m, 10m, 30m, or lpc"
+            ))),
+        }
+    }
+}
+
+/// Individual federal datasets available in [`download_federal_data`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FederalDataset {
+    /// USGS Watershed Boundary Dataset polygons.
+    Wbd,
+    /// USGS 3DEP DEM (or LPC) tiles plus optional mosaic/clip.
+    Dem,
+    /// USGS NHD flowlines.
+    Nhd,
+    /// USFWS NWI wetland polygons.
+    Nwi,
+    /// USGS National Transportation roads and railways.
+    Roads,
+    /// Deterministic road-stream culverts synthesized from NHD x Roads.
+    Culverts,
+    /// NOAA Atlas 14 PDS precipitation depth frequency table at region centroid.
+    NoaaAtlas14,
+}
+
+impl FederalDataset {
+    /// Returns all seven datasets in dependency order.
+    pub fn all() -> Vec<Self> {
+        vec![
+            Self::Wbd,
+            Self::Dem,
+            Self::Nhd,
+            Self::Nwi,
+            Self::Roads,
+            Self::Culverts,
+            Self::NoaaAtlas14,
+        ]
+    }
+}
+
+impl FromStr for FederalDataset {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "wbd" | "huc" => Ok(Self::Wbd),
+            "dem" | "3dep" | "elevation" => Ok(Self::Dem),
+            "nhd" | "streams" | "flowlines" => Ok(Self::Nhd),
+            "nwi" | "wetlands" => Ok(Self::Nwi),
+            "roads" | "transportation" | "trans" => Ok(Self::Roads),
+            "culverts" => Ok(Self::Culverts),
+            "noaa" | "atlas14" | "noaa_atlas14" | "precip" => Ok(Self::NoaaAtlas14),
+            other => Err(Error::InvalidArgument(format!(
+                "unknown federal dataset '{other}'; expected wbd, dem, nhd, nwi, roads, culverts, or noaa"
+            ))),
+        }
+    }
+}
+
+/// Parses a comma-separated list of dataset names (or `"all"`).
+pub fn parse_dataset_list(spec: &str) -> Result<Vec<FederalDataset>> {
+    let trimmed = spec.trim();
+    if trimmed.eq_ignore_ascii_case("all") {
+        return Ok(FederalDataset::all());
+    }
+    let mut out = Vec::new();
+    for part in trimmed.split(',') {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        let ds = p.parse::<FederalDataset>()?;
+        if !out.contains(&ds) {
+            out.push(ds);
+        }
+    }
+    if out.is_empty() {
+        return Err(Error::InvalidArgument(
+            "dataset list must contain at least one dataset or 'all'".into(),
+        ));
+    }
+    Ok(out)
+}
+
+/// Configuration for federal web-service queries, retries, caching, and post-processing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadOptions {
+    /// Per-request HTTP timeout in seconds (default `120`).
+    pub timeout_secs: u64,
+    /// Maximum retry attempts for transient network or 5xx errors (default `4`).
+    pub max_retries: usize,
+    /// ArcGIS ObjectID chunk size for paginated vector downloads (default `250`).
+    pub oid_chunk_size: usize,
+    /// Re-download files even if they already exist locally with matching size (default `false`).
+    pub overwrite: bool,
+    /// Optional shared cache directory for 3DEP tiles so tiles can be reused across regions.
+    pub tile_cache_dir: Option<PathBuf>,
+    /// USGS 3DEP product to query and download (default [`DemProduct::Meter1`]).
+    pub dem_product: DemProduct,
+    /// USGS WBD HUC hierarchy level to download (default [`WbdLevel::Huc12`]).
+    pub wbd_level: WbdLevel,
+    /// Deduplicate overlapping 3DEP grid tiles (`x\d+y\d+`) to newest `publicationDate` (default `true`).
+    pub deduplicate_tiles: bool,
+    /// Mosaic downloaded raster DEM tiles into a single `dem.tif` (default `true`).
+    pub mosaic_dem: bool,
+    /// Clip downloaded DEM mosaic and vector layers to the region boundary polygon when the
+    /// region is specified via `Region::Huc` or `Region::VectorFile` (default `true`).
+    pub clip_to_region: bool,
+    /// Maximum TNM product records to scan across paginated pages (default `1000`).
+    pub max_products: usize,
+    /// Culvert synthesis half-length in meters on each side of crossing (default `25.0`).
+    pub culvert_half_length_m: f64,
+    /// Culvert synthesis deduplication snap distance in meters (default `15.0`).
+    pub culvert_snap_distance_m: f64,
+    /// USGS National Transportation MapServer layer IDs to query (default `[29, 30, 31, 32, 33, 38]`).
+    pub transportation_layers: Vec<u32>,
+}
+
+impl Default for DownloadOptions {
+    fn default() -> Self {
+        Self {
+            timeout_secs: 120,
+            max_retries: 4,
+            oid_chunk_size: 250,
+            overwrite: false,
+            tile_cache_dir: None,
+            dem_product: DemProduct::Meter1,
+            wbd_level: WbdLevel::Huc12,
+            deduplicate_tiles: true,
+            mosaic_dem: true,
+            clip_to_region: true,
+            max_products: 1000,
+            culvert_half_length_m: 25.0,
+            culvert_snap_distance_m: 15.0,
+            transportation_layers: DEFAULT_TRANSPORTATION_LAYERS.to_vec(),
+        }
+    }
+}
+
+/// Options for [`download_federal_data`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FederalBundleOptions {
+    /// Federal datasets to download (defaults to all seven datasets).
+    pub datasets: Vec<FederalDataset>,
+    /// Shared download, caching, and processing options.
+    pub download: DownloadOptions,
+}
+
+impl Default for FederalBundleOptions {
+    fn default() -> Self {
+        Self {
+            datasets: FederalDataset::all(),
+            download: DownloadOptions::default(),
+        }
+    }
+}
+
+/// Metadata for a single USGS The National Map (3DEP) product tile.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TnmProductItem {
+    /// Deduplication grid key (e.g. `"x47y523"` when present in title, else title).
+    pub grid_key: String,
+    /// Product title reported by USGS TNM.
+    pub title: String,
+    /// Publication date string (ISO `YYYY-MM-DD`, empty if unavailable).
+    pub publication_date: String,
+    /// Direct download URL.
+    pub download_url: String,
+    /// Expected file size in bytes if reported by USGS TNM.
+    pub size_bytes: Option<u64>,
+    /// File format string (e.g. `"GeoTIFF"`, `"LAZ"`).
+    pub format: String,
+    /// Product WGS 84 bounding box.
+    pub bbox: Bbox,
+}
+
+/// Output summary from [`download_3dep_dem`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DemDownloadResult {
+    /// Resolved WGS 84 bounding box queried.
+    pub bbox: Bbox,
+    /// Product metadata items selected for download.
+    pub products: Vec<TnmProductItem>,
+    /// Paths to downloaded (or cached) tile files on disk.
+    pub tile_paths: Vec<PathBuf>,
+    /// Path to the mosaicked (and optionally clipped) GeoTIFF when `mosaic_dem` is enabled.
+    pub mosaic_path: Option<PathBuf>,
+}
+
+/// Structured NOAA Atlas 14 Partial Duration Series (PDS) precipitation depth table (mm).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NoaaAtlas14Table {
+    /// Query latitude in decimal degrees (WGS 84).
+    pub lat: f64,
+    /// Query longitude in decimal degrees (WGS 84).
+    pub lon: f64,
+    /// Depth units (`"mm"`).
+    pub units: String,
+    /// Mapping `duration_label -> (ari_yr -> depth_mm)`.
+    pub depths_mm: BTreeMap<String, BTreeMap<u32, f64>>,
+}
+
+impl NoaaAtlas14Table {
+    /// Looks up the design storm precipitation depth in millimeters for a given duration
+    /// (e.g. `"24-hr"`, `"60-min"`) and average recurrence interval in years (e.g. `2`, `10`, `25`, `100`).
+    pub fn depth_mm(&self, duration: &str, ari_yr: u32) -> Option<f64> {
+        self.depths_mm
+            .get(duration)
+            .and_then(|row| row.get(&ari_yr))
+            .copied()
+    }
+}
+
+/// Resolved region geometry and geographic extent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedRegion {
+    /// WGS 84 bounding box of the region.
+    pub bbox: Bbox,
+    /// Optional local vector file representing the exact polygon boundary (present for
+    /// `Region::VectorFile` or fetched `Region::Huc`).
+    pub boundary_path: Option<PathBuf>,
+    /// Number of boundary polygons fetched (for `Region::Huc`).
+    pub boundary_feature_count: usize,
+}
+
+/// Complete manifest returned by [`download_federal_data`] and written to `manifest.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FederalBundleResult {
+    /// Resolved WGS 84 bounding box of the region.
+    pub region_bbox: Bbox,
+    /// Path to downloaded WBD vector file, if requested.
+    pub wbd_path: Option<PathBuf>,
+    /// Number of WBD polygon features downloaded.
+    pub wbd_count: usize,
+    /// Downloaded 3DEP tile paths.
+    pub dem_tiles: Vec<PathBuf>,
+    /// Path to mosaicked (and optionally clipped) 3DEP DEM GeoTIFF, if produced.
+    pub dem_mosaic_path: Option<PathBuf>,
+    /// Path to downloaded NHD flowlines vector file, if requested.
+    pub nhd_path: Option<PathBuf>,
+    /// Number of NHD flowlines downloaded.
+    pub nhd_count: usize,
+    /// Path to downloaded NWI wetland polygons vector file, if requested.
+    pub nwi_path: Option<PathBuf>,
+    /// Number of NWI polygons downloaded.
+    pub nwi_count: usize,
+    /// Path to downloaded USGS Transportation roads/railways vector file, if requested.
+    pub roads_path: Option<PathBuf>,
+    /// Number of road/railway segments downloaded.
+    pub roads_count: usize,
+    /// Path to synthesized culverts vector file, if requested.
+    pub culverts_path: Option<PathBuf>,
+    /// Number of synthesized culvert breach segments.
+    pub culverts_count: usize,
+    /// Path to saved NOAA Atlas 14 JSON file, if requested.
+    pub noaa_atlas14_path: Option<PathBuf>,
+    /// Parsed NOAA Atlas 14 precipitation frequency table, if requested.
+    pub noaa_atlas14: Option<NoaaAtlas14Table>,
+    /// Path to the written `manifest.json`.
+    pub manifest_path: PathBuf,
+}
+
+fn make_agent(timeout_secs: u64) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(timeout_secs.max(5))))
+        .user_agent(format!("lidar-rs/{}", crate::VERSION))
+        .build();
+    ureq::Agent::new_with_config(config)
+}
+
+fn ensure_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+fn url_encode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+    }
+    out
+}
+
+fn build_query_url(base: &str, params: &[(&str, String)]) -> String {
+    if params.is_empty() {
+        return base.to_string();
+    }
+    let qs: Vec<String> = params
+        .iter()
+        .map(|(k, v)| format!("{}={}", url_encode_component(k), url_encode_component(v)))
+        .collect();
+    if base.contains('?') {
+        format!("{base}&{}", qs.join("&"))
+    } else {
+        format!("{base}?{}", qs.join("&"))
+    }
+}
+
+/// Maximum response size accepted for JSON/GeoJSON/text federal API responses (256 MiB).
+const MAX_TEXT_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
+
+fn http_get_text(
+    agent: &ureq::Agent,
+    url: &str,
+    params: &[(&str, String)],
+    max_retries: usize,
+) -> Result<String> {
+    let full_url = build_query_url(url, params);
+    let mut last_err = String::new();
+    for attempt in 0..=max_retries {
+        match agent.get(&full_url).call() {
+            Ok(mut resp) => {
+                return resp
+                    .body_mut()
+                    .with_config()
+                    .limit(MAX_TEXT_RESPONSE_BYTES)
+                    .read_to_string()
+                    .map_err(|e| {
+                        Error::Http(format!("failed reading response body from {url}: {e}"))
+                    });
+            }
+            Err(e) => {
+                last_err = format!("{e}");
+                if attempt < max_retries {
+                    std::thread::sleep(Duration::from_millis(1200 * (attempt as u64 + 1)));
+                }
+            }
+        }
+    }
+    Err(Error::Http(format!(
+        "GET {url} failed after {} attempts: {last_err}",
+        max_retries + 1
+    )))
+}
+
+fn http_post_form_text(
+    agent: &ureq::Agent,
+    url: &str,
+    form: &[(&str, String)],
+    max_retries: usize,
+) -> Result<String> {
+    let body = form
+        .iter()
+        .map(|(k, v)| format!("{}={}", url_encode_component(k), url_encode_component(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let mut last_err = String::new();
+    for attempt in 0..=max_retries {
+        match agent
+            .post(url)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .send(body.as_bytes())
+        {
+            Ok(mut resp) => {
+                return resp
+                    .body_mut()
+                    .with_config()
+                    .limit(MAX_TEXT_RESPONSE_BYTES)
+                    .read_to_string()
+                    .map_err(|e| {
+                        Error::Http(format!("failed reading POST response from {url}: {e}"))
+                    });
+            }
+            Err(e) => {
+                last_err = format!("{e}");
+                if attempt < max_retries {
+                    std::thread::sleep(Duration::from_millis(1500 * (attempt as u64 + 1)));
+                }
+            }
+        }
+    }
+    Err(Error::Http(format!(
+        "POST {url} failed after {} attempts: {last_err}",
+        max_retries + 1
+    )))
+}
+
+fn http_download_file(
+    agent: &ureq::Agent,
+    url: &str,
+    dest: &Path,
+    expected_bytes: Option<u64>,
+    overwrite: bool,
+    max_retries: usize,
+) -> Result<PathBuf> {
+    if !overwrite
+        && dest.exists()
+        && let Ok(meta) = std::fs::metadata(dest)
+        && meta.len() > 0
+        && expected_bytes.is_none_or(|exp| meta.len() == exp)
+    {
+        return Ok(dest.to_path_buf());
+    }
+    ensure_parent_dir(dest)?;
+    let part = dest.with_file_name(format!(
+        ".{}.part_{}",
+        dest.file_name().and_then(|n| n.to_str()).unwrap_or("tile"),
+        std::process::id()
+    ));
+
+    let mut last_err = String::new();
+    for attempt in 0..=max_retries {
+        let res = (|| -> Result<()> {
+            let mut resp = agent
+                .get(url)
+                .call()
+                .map_err(|e| Error::Http(format!("GET {url}: {e}")))?;
+            let mut reader = resp.body_mut().as_reader();
+            let mut file = File::create(&part)?;
+            let mut buf = vec![0u8; 256 * 1024];
+            loop {
+                let n = reader.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                file.write_all(&buf[..n])?;
+            }
+            file.flush()?;
+            Ok(())
+        })();
+        match res {
+            Ok(()) => {
+                std::fs::rename(&part, dest)?;
+                return Ok(dest.to_path_buf());
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&part);
+                last_err = e.to_string();
+                if attempt < max_retries {
+                    std::thread::sleep(Duration::from_millis(2000 * (attempt as u64 + 1)));
+                }
+            }
+        }
+    }
+    Err(Error::Http(format!(
+        "download {url} failed after {} attempts: {last_err}",
+        max_retries + 1
+    )))
+}
+
+/// Computes the WGS 84 bounding box of a local vector file via `terrio`.
+pub fn vector_file_bbox_wgs84(path: impl AsRef<Path>) -> Result<Bbox> {
+    let p = path.as_ref();
+    let p_str = p
+        .to_str()
+        .ok_or_else(|| Error::InvalidArgument(format!("non-UTF-8 path: {}", p.display())))?;
+    let ds = terrio::open_vector(p_str, &VectorOpenOptions::default())?;
+    let wgs84 = SpatialRef::from_epsg(4326)?;
+
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+
+    for layer in &ds.layers {
+        let src_srs = SpatialRef::from_layer(layer);
+        let mut lmin_x = f64::INFINITY;
+        let mut lmin_y = f64::INFINITY;
+        let mut lmax_x = f64::NEG_INFINITY;
+        let mut lmax_y = f64::NEG_INFINITY;
+        for feat in &layer.features {
+            if let Some(ref g) = feat.geometry
+                && let Some((gx0, gy0, gx1, gy1)) = geometry_bounds(g)
+            {
+                lmin_x = lmin_x.min(gx0);
+                lmin_y = lmin_y.min(gy0);
+                lmax_x = lmax_x.max(gx1);
+                lmax_y = lmax_y.max(gy1);
+            }
+        }
+        if !lmin_x.is_finite() {
+            continue;
+        }
+        let (bx0, by0, bx1, by1) = if !src_srs.is_unknown() && !src_srs.same_as(&wgs84) {
+            let tx = Transformer::new(&src_srs, &wgs84)?;
+            tx.transform_bounds_densified((lmin_x, lmin_y, lmax_x, lmax_y), 21)?
+        } else {
+            (lmin_x, lmin_y, lmax_x, lmax_y)
+        };
+        min_x = min_x.min(bx0);
+        min_y = min_y.min(by0);
+        max_x = max_x.max(bx1);
+        max_y = max_y.max(by1);
+    }
+
+    if !min_x.is_finite() {
+        return Err(Error::InvalidArgument(format!(
+            "vector file '{}' contains no valid geometries",
+            p.display()
+        )));
+    }
+    Bbox::new(min_x, min_y, max_x, max_y)
+}
+
+fn geometry_bounds(geom: &terrio::Geometry) -> Option<(f64, f64, f64, f64)> {
+    let mut b = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    fn push_coord(b: &mut (f64, f64, f64, f64), c: &terrio::vector::Coord) {
+        if c.x.is_finite() && c.y.is_finite() {
+            b.0 = b.0.min(c.x);
+            b.1 = b.1.min(c.y);
+            b.2 = b.2.max(c.x);
+            b.3 = b.3.max(c.y);
+        }
+    }
+    fn walk(b: &mut (f64, f64, f64, f64), g: &terrio::Geometry) {
+        match g {
+            terrio::Geometry::Point(c) => push_coord(b, c),
+            terrio::Geometry::MultiPoint(pts) | terrio::Geometry::LineString(pts) => {
+                for c in pts {
+                    push_coord(b, c);
+                }
+            }
+            terrio::Geometry::MultiLineString(lines) => {
+                for line in lines {
+                    for c in line {
+                        push_coord(b, c);
+                    }
+                }
+            }
+            terrio::Geometry::Polygon {
+                exterior,
+                interiors,
+            } => {
+                for c in exterior.coords() {
+                    push_coord(b, c);
+                }
+                for ring in interiors {
+                    for c in ring.coords() {
+                        push_coord(b, c);
+                    }
+                }
+            }
+            terrio::Geometry::MultiPolygon(polys) => {
+                for (ext, ints) in polys {
+                    for c in ext.coords() {
+                        push_coord(b, c);
+                    }
+                    for ring in ints {
+                        for c in ring.coords() {
+                            push_coord(b, c);
+                        }
+                    }
+                }
+            }
+            terrio::Geometry::GeometryCollection(geoms) => {
+                for child in geoms {
+                    walk(b, child);
+                }
+            }
+        }
+    }
+    walk(&mut b, geom);
+    if b.0.is_finite() { Some(b) } else { None }
+}
+
+fn geojson_bbox(fc: &Value) -> Result<Bbox> {
+    let mut b = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    fn walk_coords(v: &Value, b: &mut (f64, f64, f64, f64)) {
+        if let Some(arr) = v.as_array() {
+            if arr.len() >= 2 && arr[0].is_number() && arr[1].is_number() {
+                if let (Some(x), Some(y)) = (arr[0].as_f64(), arr[1].as_f64()) {
+                    b.0 = b.0.min(x);
+                    b.1 = b.1.min(y);
+                    b.2 = b.2.max(x);
+                    b.3 = b.3.max(y);
+                }
+            } else {
+                for child in arr {
+                    walk_coords(child, b);
+                }
+            }
+        }
+    }
+    if let Some(feats) = fc.get("features").and_then(Value::as_array) {
+        for feat in feats {
+            if let Some(geom) = feat.get("geometry") {
+                if let Some(coords) = geom.get("coordinates") {
+                    walk_coords(coords, &mut b);
+                }
+                if let Some(geoms) = geom.get("geometries").and_then(Value::as_array) {
+                    for g in geoms {
+                        if let Some(coords) = g.get("coordinates") {
+                            walk_coords(coords, &mut b);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !b.0.is_finite() {
+        return Err(Error::Parse(
+            "GeoJSON FeatureCollection contains no valid coordinates".into(),
+        ));
+    }
+    Bbox::new(b.0, b.1, b.2, b.3)
+}
+
+fn clip_with_lazy_repair(layer: &terrio::Layer, clip_region: &ClipRegion) -> Result<terrio::Layer> {
+    let mut out = terrio::Layer::new(layer.name.clone());
+    out.geom_type = layer.geom_type;
+    out.crs = layer.crs.clone();
+    out.schema = layer.schema.clone();
+
+    let mut single = terrio::Layer::new(layer.name.clone());
+    single.geom_type = layer.geom_type;
+    single.crs = layer.crs.clone();
+    single.schema = layer.schema.clone();
+
+    for feat in &layer.features {
+        single.features.clear();
+        single.features.push(feat.clone());
+        let clipped_feat_layer = match terrio_vector_clip(&single, clip_region) {
+            Ok(c) => c,
+            Err(_) => {
+                let repaired = terrio_make_valid(&single)?;
+                terrio_vector_clip(&repaired, clip_region)?
+            }
+        };
+        for mut f in clipped_feat_layer.features {
+            f.fid = out.features.len() as u64 + 1;
+            out.features.push(f);
+        }
+    }
+    Ok(out)
+}
+
+/// Writes a GeoJSON `FeatureCollection` `Value` to `out_path` (supports `.geojson`/`.json`
+/// directly, or converts via `terrio` for `.gpkg`, `.shp`, etc., with optional polygon clipping).
+fn write_geojson_feature_collection(
+    fc: &Value,
+    out_path: &Path,
+    layer_name: &str,
+    clip_mask: Option<&Path>,
+) -> Result<usize> {
+    ensure_parent_dir(out_path)?;
+    let ext = out_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let raw_count = fc
+        .get("features")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+
+    if clip_mask.is_none() && (ext == "geojson" || ext == "json") {
+        let serialized = serde_json::to_string(fc)
+            .map_err(|e| Error::Parse(format!("failed serializing GeoJSON: {e}")))?;
+        std::fs::write(out_path, serialized)?;
+        return Ok(raw_count);
+    }
+
+    // Use a temporary GeoJSON file to convert/clip cleanly via terrio
+    let tmp = tempfile::Builder::new()
+        .prefix("lidar_fed_")
+        .suffix(".geojson")
+        .tempfile()?;
+    let serialized = serde_json::to_string(fc)
+        .map_err(|e| Error::Parse(format!("failed serializing GeoJSON: {e}")))?;
+    std::fs::write(tmp.path(), serialized)?;
+
+    let tmp_str = tmp
+        .path()
+        .to_str()
+        .ok_or_else(|| Error::InvalidArgument("non-UTF-8 temporary path".into()))?;
+    let out_str = out_path
+        .to_str()
+        .ok_or_else(|| Error::InvalidArgument(format!("non-UTF-8 path: {}", out_path.display())))?;
+
+    let ds = terrio::open_vector(tmp_str, &VectorOpenOptions::default())?;
+    let mut layers = ds.layers;
+    if let Some(first) = layers.first_mut() {
+        first.name = layer_name.to_string();
+    }
+
+    if let Some(mask_path) = clip_mask {
+        let mask_str = mask_path.to_str().ok_or_else(|| {
+            Error::InvalidArgument(format!("non-UTF-8 mask path: {}", mask_path.display()))
+        })?;
+        let clip_region = ClipRegion::from_path(mask_str, &ClipTemplateOptions::default())?;
+        let mut clipped = Vec::with_capacity(layers.len());
+        for layer in &layers {
+            // Try clipping directly first (fast path when geometries are already valid);
+            // only fall back to per-feature geometry repair on invalid federal polygons
+            // (e.g. occasional self-intersecting rings in USFWS NWI) so huge valid
+            // polygons never pay an unnecessary MakeValid cost.
+            let mut cl = match terrio_vector_clip(layer, &clip_region) {
+                Ok(c) => c,
+                Err(_) => clip_with_lazy_repair(layer, &clip_region)?,
+            };
+            cl.name = layer.name.clone();
+            clipped.push(cl);
+        }
+        layers = clipped;
+    }
+
+    let final_count: usize = layers.iter().map(|l| l.features.len()).sum();
+    if layers.is_empty() {
+        // Fallback: write empty GeoJSON if ext is geojson, or empty layer
+        let mut empty = terrio::Layer::new(layer_name.to_string());
+        SpatialRef::from_epsg(4326)?.apply_to_layer(&mut empty);
+        terrio::write_vector(&[empty], out_str, &VectorWriteOptions::default())?;
+    } else {
+        terrio::write_vector(&layers, out_str, &VectorWriteOptions::default())?;
+    }
+    Ok(final_count)
+}
+
+/// Fetches all features matching `base_params` from an ArcGIS REST MapServer/FeatureServer
+/// query endpoint using `returnIdsOnly=true` + chunked POST requests so large regions never
+/// silently truncate at the server's maxRecordCount.
+fn fetch_arcgis_paginated(
+    agent: &ureq::Agent,
+    query_url: &str,
+    base_params: &[(&str, String)],
+    out_fields: &str,
+    opts: &DownloadOptions,
+) -> Result<Value> {
+    let mut id_params: Vec<(&str, String)> = base_params.to_vec();
+    id_params.push(("returnIdsOnly", "true".to_string()));
+    id_params.push(("f", "json".to_string()));
+
+    let id_text = http_get_text(agent, query_url, &id_params, opts.max_retries)?;
+    let id_json: Value = serde_json::from_str(&id_text)
+        .map_err(|e| Error::Parse(format!("invalid ArcGIS OID JSON from {query_url}: {e}")))?;
+
+    if let Some(err) = id_json.get("error") {
+        return Err(Error::Http(format!(
+            "ArcGIS server error from {query_url}: {err}"
+        )));
+    }
+
+    let oids: Vec<i64> = id_json
+        .get("objectIds")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_i64).collect())
+        .unwrap_or_default();
+
+    if oids.is_empty() {
+        return Ok(serde_json::json!({
+            "type": "FeatureCollection",
+            "features": []
+        }));
+    }
+
+    let chunk_size = opts.oid_chunk_size.max(1);
+    let chunks: Vec<Vec<i64>> = oids.chunks(chunk_size).map(|c| c.to_vec()).collect();
+
+    let fetch_chunk = |chunk: &[i64]| -> Result<Vec<Value>> {
+        let oid_str = chunk
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let form = vec![
+            ("objectIds", oid_str),
+            ("outFields", out_fields.to_string()),
+            ("outSR", "4326".to_string()),
+            ("f", "geojson".to_string()),
+        ];
+        let text = http_post_form_text(agent, query_url, &form, opts.max_retries)?;
+        let v: Value = serde_json::from_str(&text)
+            .map_err(|e| Error::Parse(format!("invalid GeoJSON chunk from {query_url}: {e}")))?;
+        if let Some(err) = v.get("error") {
+            return Err(Error::Http(format!(
+                "ArcGIS chunk error from {query_url}: {err}"
+            )));
+        }
+        Ok(v.get("features")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    };
+
+    #[cfg(feature = "parallel")]
+    let chunk_results: Result<Vec<Vec<Value>>> = {
+        // Limit concurrency to 6 so federal ArcGIS servers stay responsive
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(6)
+            .build()
+            .map_err(|e| Error::Algorithm(format!("failed creating download thread pool: {e}")))?;
+        pool.install(|| chunks.par_iter().map(|c| fetch_chunk(c)).collect())
+    };
+    #[cfg(not(feature = "parallel"))]
+    let chunk_results: Result<Vec<Vec<Value>>> = chunks.iter().map(|c| fetch_chunk(c)).collect();
+
+    let mut all_features = Vec::with_capacity(oids.len());
+    for batch in chunk_results? {
+        all_features.extend(batch);
+    }
+
+    Ok(serde_json::json!({
+        "type": "FeatureCollection",
+        "features": all_features
+    }))
+}
+
+/// Resolves a [`Region`] (`Bbox`, `Huc`, or `VectorFile`) into a validated WGS 84 [`Bbox`]
+/// and (when applicable) a boundary vector file path.
+///
+/// For `Region::Huc`, if `boundary_out_dir` is `Some(dir)`, the fetched WBD boundary is saved
+/// to `dir/wbd_<huc>.geojson`; otherwise it is fetched in memory to determine the exact extent.
+pub fn resolve_region(
+    region: &Region,
+    boundary_out_dir: Option<&Path>,
+    opts: &DownloadOptions,
+) -> Result<ResolvedRegion> {
+    match region {
+        Region::Bbox(bbox) => {
+            bbox.validate()?;
+            Ok(ResolvedRegion {
+                bbox: *bbox,
+                boundary_path: None,
+                boundary_feature_count: 0,
+            })
+        }
+        Region::VectorFile(path) => {
+            if !path.exists() {
+                return Err(Error::InvalidArgument(format!(
+                    "region vector file does not exist: {}",
+                    path.display()
+                )));
+            }
+            let bbox = vector_file_bbox_wgs84(path)?;
+            Ok(ResolvedRegion {
+                bbox,
+                boundary_path: Some(path.clone()),
+                boundary_feature_count: 1,
+            })
+        }
+        Region::Huc(raw_huc) => {
+            let huc = Region::validate_huc(raw_huc)?;
+            let level = WbdLevel::from_digits(huc.len())?;
+            let agent = make_agent(opts.timeout_secs);
+            let where_clause = format!("{} = '{huc}'", level.field_name());
+            let out_fields = format!("{},name,areasqkm,states", level.field_name());
+            let fc = fetch_arcgis_paginated(
+                &agent,
+                &level.query_url(),
+                &[("where", where_clause)],
+                &out_fields,
+                opts,
+            )?;
+            let count = fc
+                .get("features")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            if count == 0 {
+                return Err(Error::InvalidArgument(format!(
+                    "USGS WBD returned no watershed boundary for HUC '{huc}'"
+                )));
+            }
+            let bbox = geojson_bbox(&fc)?;
+            let boundary_path = if let Some(dir) = boundary_out_dir {
+                std::fs::create_dir_all(dir)?;
+                let p = dir.join(format!("region_huc_{huc}.geojson"));
+                write_geojson_feature_collection(&fc, &p, "region", None)?;
+                Some(p)
+            } else {
+                None
+            };
+            Ok(ResolvedRegion {
+                bbox,
+                boundary_path,
+                boundary_feature_count: count,
+            })
+        }
+    }
+}
+
+/// Downloads USGS Watershed Boundary Dataset (WBD) polygons for `region` at
+/// `opts.wbd_level` (default `Huc12`) to `out_path` (`.geojson`, `.gpkg`, or `.shp`).
+///
+/// When `region` is `Region::Huc(code)` and `code` is shorter than `opts.wbd_level`
+/// (e.g., HUC-8 code `"10160002"` with `WbdLevel::Huc12`), fetches all child subwatersheds
+/// matching `huc12 LIKE '10160002%'`.
+///
+/// Returns the number of WBD features written.
+pub fn download_wbd(
+    region: &Region,
+    out_path: impl AsRef<Path>,
+    opts: &DownloadOptions,
+) -> Result<usize> {
+    let out_path = out_path.as_ref();
+    if !opts.overwrite && out_path.exists() {
+        let ds = terrio::open_vector(
+            out_path
+                .to_str()
+                .ok_or_else(|| Error::InvalidArgument("non-UTF-8 output path".into()))?,
+            &VectorOpenOptions::default(),
+        )?;
+        return Ok(ds.layers.iter().map(|l| l.features.len()).sum());
+    }
+
+    let agent = make_agent(opts.timeout_secs);
+    let level = opts.wbd_level;
+    let out_fields = match level {
+        WbdLevel::Huc12 => "huc12,name,areasqkm,states,hutype".to_string(),
+        other => format!("{},name,areasqkm,states", other.field_name()),
+    };
+
+    let base_params: Vec<(&str, String)> = match region {
+        Region::Huc(raw_huc) => {
+            let huc = Region::validate_huc(raw_huc)?;
+            if huc.len() <= level.digits() {
+                let clause = if huc.len() == level.digits() {
+                    format!("{} = '{huc}'", level.field_name())
+                } else {
+                    format!("{} LIKE '{huc}%'", level.field_name())
+                };
+                vec![("where", clause)]
+            } else {
+                // Requested coarser level than the provided HUC; query by prefix match on parent
+                let prefix = &huc[..level.digits()];
+                vec![("where", format!("{} = '{prefix}'", level.field_name()))]
+            }
+        }
+        Region::Bbox(bbox) => {
+            bbox.validate()?;
+            envelope_query_params(bbox)
+        }
+        Region::VectorFile(path) => {
+            let bbox = vector_file_bbox_wgs84(path)?;
+            envelope_query_params(&bbox)
+        }
+    };
+
+    let fc = fetch_arcgis_paginated(&agent, &level.query_url(), &base_params, &out_fields, opts)?;
+    write_geojson_feature_collection(&fc, out_path, level.field_name(), None)
+}
+
+fn envelope_query_params(bbox: &Bbox) -> Vec<(&'static str, String)> {
+    vec![
+        ("geometry", bbox.to_csv_string()),
+        ("geometryType", "esriGeometryEnvelope".to_string()),
+        ("inSR", "4326".to_string()),
+        ("spatialRel", "esriSpatialRelIntersects".to_string()),
+    ]
+}
+
+/// Extracts a 3DEP grid tile key from a USGS product title if present:
+/// - 1-m UTM 10-km tiles: `x\d+y\d+` (e.g. `"x47y523"`)
+/// - 1/3 and 1 arc-second 1x1-degree tiles: `[ns]\d+[ew]\d+` (e.g. `"n48w100"`)
+///
+/// Falls back to the full title if neither pattern is found.
+pub(crate) fn extract_3dep_grid_key(title: &str) -> String {
+    let bytes = title.as_bytes();
+    let match_pair = |a0: u8, a1: u8, b0: u8, b1: u8| -> Option<String> {
+        for i in 0..bytes.len() {
+            if bytes[i] == a0 || bytes[i] == a1 {
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j > i + 1 && j < bytes.len() && (bytes[j] == b0 || bytes[j] == b1) {
+                    let y_start = j + 1;
+                    let mut k = y_start;
+                    while k < bytes.len() && bytes[k].is_ascii_digit() {
+                        k += 1;
+                    }
+                    if k > y_start {
+                        let prev_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+                        let next_ok = k == bytes.len() || !bytes[k].is_ascii_alphanumeric();
+                        if prev_ok && next_ok {
+                            return Some(title[i..k].to_ascii_lowercase());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    };
+
+    if let Some(k) = match_pair(b'x', b'X', b'y', b'Y') {
+        return k;
+    }
+    if let Some(k) = match_pair(b'n', b'N', b'w', b'W')
+        .or_else(|| match_pair(b'n', b'N', b'e', b'E'))
+        .or_else(|| match_pair(b's', b'S', b'w', b'W'))
+        .or_else(|| match_pair(b's', b'S', b'e', b'E'))
+    {
+        return k;
+    }
+    title.to_string()
+}
+
+/// Parses USGS TNM products JSON and optionally deduplicates overlapping grid tiles to the
+/// newest `publicationDate`.
+pub(crate) fn parse_tnm_products_json(
+    json: &Value,
+    filter_bbox: Option<&Bbox>,
+    deduplicate: bool,
+) -> Vec<TnmProductItem> {
+    let Some(items) = json.get("items").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut parsed: Vec<TnmProductItem> = Vec::new();
+    for it in items {
+        let Some(url) = it
+            .get("downloadURL")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let Some(bb) = it.get("boundingBox") else {
+            continue;
+        };
+        let (Some(min_x), Some(min_y), Some(max_x), Some(max_y)) = (
+            bb.get("minX").and_then(Value::as_f64),
+            bb.get("minY").and_then(Value::as_f64),
+            bb.get("maxX").and_then(Value::as_f64),
+            bb.get("maxY").and_then(Value::as_f64),
+        ) else {
+            continue;
+        };
+        let Ok(bbox) = Bbox::new(min_x, min_y, max_x, max_y) else {
+            continue;
+        };
+        if let Some(fb) = filter_bbox
+            && !bbox.intersects(fb)
+        {
+            continue;
+        }
+        let title = it
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let grid_key = extract_3dep_grid_key(&title);
+        let publication_date = it
+            .get("publicationDate")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let size_bytes = it.get("sizeInBytes").and_then(Value::as_u64);
+        let format = it
+            .get("format")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        parsed.push(TnmProductItem {
+            grid_key,
+            title,
+            publication_date,
+            download_url: url.to_string(),
+            size_bytes,
+            format,
+            bbox,
+        });
+    }
+
+    if !deduplicate {
+        parsed.sort_by(|a, b| a.grid_key.cmp(&b.grid_key));
+        return parsed;
+    }
+
+    let mut by_grid: HashMap<String, TnmProductItem> = HashMap::new();
+    for item in parsed {
+        match by_grid.get(&item.grid_key) {
+            Some(prev) if prev.publication_date >= item.publication_date => {}
+            _ => {
+                by_grid.insert(item.grid_key.clone(), item);
+            }
+        }
+    }
+    let mut deduped: Vec<TnmProductItem> = by_grid.into_values().collect();
+    deduped.sort_by(|a, b| a.grid_key.cmp(&b.grid_key));
+    deduped
+}
+
+/// Queries the USGS The National Map (TNM) API for 3DEP elevation or point-cloud tiles
+/// intersecting `region` without downloading tile payloads.
+pub fn query_3dep_products(region: &Region, opts: &DownloadOptions) -> Result<Vec<TnmProductItem>> {
+    let resolved = resolve_region(region, None, opts)?;
+    query_3dep_products_for_bbox(&resolved.bbox, opts)
+}
+
+fn query_3dep_products_for_bbox(
+    bbox: &Bbox,
+    opts: &DownloadOptions,
+) -> Result<Vec<TnmProductItem>> {
+    let agent = make_agent(opts.timeout_secs);
+    let page_size = 100usize.min(opts.max_products.max(1));
+    let mut offset = 0usize;
+    let mut raw_items: Vec<Value> = Vec::new();
+
+    loop {
+        let mut params = vec![
+            ("datasets", opts.dem_product.tnm_dataset_name().to_string()),
+            ("bbox", bbox.to_csv_string()),
+            ("max", page_size.to_string()),
+            ("offset", offset.to_string()),
+        ];
+        if let Some(fmt) = opts.dem_product.prod_formats() {
+            params.push(("prodFormats", fmt.to_string()));
+        }
+        let text = http_get_text(&agent, USGS_TNM_PRODUCTS_URL, &params, opts.max_retries)?;
+        let json: Value = serde_json::from_str(&text)
+            .map_err(|e| Error::Parse(format!("invalid USGS TNM JSON response: {e}")))?;
+        let batch = json
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let batch_len = batch.len();
+        raw_items.extend(batch);
+        let total = json
+            .get("total")
+            .and_then(Value::as_u64)
+            .map(|t| t as usize)
+            .unwrap_or(raw_items.len());
+        offset += batch_len;
+        if batch_len < page_size || offset >= total || raw_items.len() >= opts.max_products {
+            break;
+        }
+    }
+
+    let combined = serde_json::json!({ "items": raw_items });
+    Ok(parse_tnm_products_json(
+        &combined,
+        Some(bbox),
+        opts.deduplicate_tiles,
+    ))
+}
+
+/// Queries, downloads, and optionally mosaics and clips USGS 3DEP DEM (or LPC) tiles for `region`.
+pub fn download_3dep_dem(
+    region: &Region,
+    out_dir: impl AsRef<Path>,
+    opts: &DownloadOptions,
+) -> Result<DemDownloadResult> {
+    let out_dir = out_dir.as_ref();
+    std::fs::create_dir_all(out_dir)?;
+    let resolved = resolve_region(region, Some(out_dir), opts)?;
+    download_3dep_dem_resolved(&resolved, out_dir, opts)
+}
+
+fn download_3dep_dem_resolved(
+    resolved: &ResolvedRegion,
+    out_dir: &Path,
+    opts: &DownloadOptions,
+) -> Result<DemDownloadResult> {
+    let products = query_3dep_products_for_bbox(&resolved.bbox, opts)?;
+    if products.is_empty() {
+        return Err(Error::Http(format!(
+            "no USGS 3DEP '{}' tiles found for bbox {}",
+            opts.dem_product.tnm_dataset_name(),
+            resolved.bbox.to_csv_string()
+        )));
+    }
+
+    let tiles_dir = opts
+        .tile_cache_dir
+        .clone()
+        .unwrap_or_else(|| out_dir.join("tiles"));
+    std::fs::create_dir_all(&tiles_dir)?;
+
+    let download_one = |item: &TnmProductItem| -> Result<PathBuf> {
+        let fname = item
+            .download_url
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("tile.tif");
+        let dest = tiles_dir.join(fname);
+        let agent = make_agent(opts.timeout_secs.max(300));
+        http_download_file(
+            &agent,
+            &item.download_url,
+            &dest,
+            item.size_bytes,
+            opts.overwrite,
+            opts.max_retries,
+        )
+    };
+
+    #[cfg(feature = "parallel")]
+    let tile_paths: Vec<PathBuf> = {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .map_err(|e| Error::Algorithm(format!("failed creating download thread pool: {e}")))?;
+        pool.install(|| {
+            products
+                .par_iter()
+                .map(download_one)
+                .collect::<Result<Vec<_>>>()
+        })?
+    };
+    #[cfg(not(feature = "parallel"))]
+    let tile_paths: Vec<PathBuf> = products
+        .iter()
+        .map(download_one)
+        .collect::<Result<Vec<_>>>()?;
+
+    let mosaic_path = if opts.mosaic_dem && opts.dem_product.is_raster() && !tile_paths.is_empty() {
+        let final_dem = out_dir.join("dem.tif");
+        if opts.overwrite || !final_dem.exists() {
+            let needs_clip = opts.clip_to_region && resolved.boundary_path.is_some();
+            if needs_clip {
+                let raw_mosaic = out_dir.join(".dem_mosaic_tmp.tif");
+                if tile_paths.len() == 1 {
+                    clip_image(
+                        &tile_paths[0],
+                        resolved.boundary_path.as_ref().expect("boundary path"),
+                        &final_dem,
+                    )?;
+                } else {
+                    mosaic(&tile_paths, &raw_mosaic)?;
+                    let clip_res = clip_image(
+                        &raw_mosaic,
+                        resolved.boundary_path.as_ref().expect("boundary path"),
+                        &final_dem,
+                    );
+                    let _ = std::fs::remove_file(&raw_mosaic);
+                    clip_res?;
+                }
+            } else if tile_paths.len() == 1 {
+                std::fs::copy(&tile_paths[0], &final_dem)?;
+            } else {
+                mosaic(&tile_paths, &final_dem)?;
+            }
+        }
+        Some(final_dem)
+    } else {
+        None
+    };
+
+    Ok(DemDownloadResult {
+        bbox: resolved.bbox,
+        products,
+        tile_paths,
+        mosaic_path,
+    })
+}
+
+/// Downloads USGS National Hydrography Dataset (NHD) flowlines intersecting `region`.
+pub fn download_nhd(
+    region: &Region,
+    out_path: impl AsRef<Path>,
+    opts: &DownloadOptions,
+) -> Result<usize> {
+    let tmp_dir = tempfile::tempdir()?;
+    let resolved = resolve_region(region, Some(tmp_dir.path()), opts)?;
+    download_nhd_resolved(&resolved, out_path.as_ref(), opts)
+}
+
+fn download_nhd_resolved(
+    resolved: &ResolvedRegion,
+    out_path: &Path,
+    opts: &DownloadOptions,
+) -> Result<usize> {
+    if !opts.overwrite && out_path.exists() {
+        let ds = terrio::open_vector(
+            out_path
+                .to_str()
+                .ok_or_else(|| Error::InvalidArgument("non-UTF-8 output path".into()))?,
+            &VectorOpenOptions::default(),
+        )?;
+        return Ok(ds.layers.iter().map(|l| l.features.len()).sum());
+    }
+    let agent = make_agent(opts.timeout_secs);
+    let fc = fetch_arcgis_paginated(
+        &agent,
+        USGS_NHD_FLOWLINE_URL,
+        &envelope_query_params(&resolved.bbox),
+        "gnis_name,ftype,fcode,lengthkm",
+        opts,
+    )?;
+    let mask = if opts.clip_to_region {
+        resolved.boundary_path.as_deref()
+    } else {
+        None
+    };
+    write_geojson_feature_collection(&fc, out_path, "nhd_flowlines", mask)
+}
+
+/// Downloads USFWS National Wetlands Inventory (NWI) wetland polygons intersecting `region`.
+pub fn download_nwi(
+    region: &Region,
+    out_path: impl AsRef<Path>,
+    opts: &DownloadOptions,
+) -> Result<usize> {
+    let tmp_dir = tempfile::tempdir()?;
+    let resolved = resolve_region(region, Some(tmp_dir.path()), opts)?;
+    download_nwi_resolved(&resolved, out_path.as_ref(), opts)
+}
+
+fn download_nwi_resolved(
+    resolved: &ResolvedRegion,
+    out_path: &Path,
+    opts: &DownloadOptions,
+) -> Result<usize> {
+    if !opts.overwrite && out_path.exists() {
+        let ds = terrio::open_vector(
+            out_path
+                .to_str()
+                .ok_or_else(|| Error::InvalidArgument("non-UTF-8 output path".into()))?,
+            &VectorOpenOptions::default(),
+        )?;
+        return Ok(ds.layers.iter().map(|l| l.features.len()).sum());
+    }
+    let agent = make_agent(opts.timeout_secs);
+    let fc = fetch_arcgis_paginated(
+        &agent,
+        USFWS_NWI_URL,
+        &envelope_query_params(&resolved.bbox),
+        "ATTRIBUTE,WETLAND_TYPE,ACRES",
+        opts,
+    )?;
+    let mask = if opts.clip_to_region {
+        resolved.boundary_path.as_deref()
+    } else {
+        None
+    };
+    write_geojson_feature_collection(&fc, out_path, "nwi_wetlands", mask)
+}
+
+/// Downloads USGS National Transportation road and railway centerlines intersecting `region`.
+pub fn download_roads(
+    region: &Region,
+    out_path: impl AsRef<Path>,
+    opts: &DownloadOptions,
+) -> Result<usize> {
+    let tmp_dir = tempfile::tempdir()?;
+    let resolved = resolve_region(region, Some(tmp_dir.path()), opts)?;
+    download_roads_resolved(&resolved, out_path.as_ref(), opts)
+}
+
+fn download_roads_resolved(
+    resolved: &ResolvedRegion,
+    out_path: &Path,
+    opts: &DownloadOptions,
+) -> Result<usize> {
+    if !opts.overwrite && out_path.exists() {
+        let ds = terrio::open_vector(
+            out_path
+                .to_str()
+                .ok_or_else(|| Error::InvalidArgument("non-UTF-8 output path".into()))?,
+            &VectorOpenOptions::default(),
+        )?;
+        return Ok(ds.layers.iter().map(|l| l.features.len()).sum());
+    }
+    let agent = make_agent(opts.timeout_secs);
+    let base_params = envelope_query_params(&resolved.bbox);
+    let layers = if opts.transportation_layers.is_empty() {
+        DEFAULT_TRANSPORTATION_LAYERS
+    } else {
+        &opts.transportation_layers
+    };
+
+    let mut all_features: Vec<Value> = Vec::new();
+    for &lyr in layers {
+        let url = format!("{USGS_TRANSPORTATION_BASE_URL}/{lyr}/query");
+        let fc = fetch_arcgis_paginated(&agent, &url, &base_params, "*", opts)?;
+        if let Some(feats) = fc.get("features").and_then(Value::as_array) {
+            for feat in feats {
+                let mut f = feat.clone();
+                // Normalize to compact consistent schema across road and railway layers
+                let old_props = f
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut props = Map::new();
+                props.insert("trans_layer".to_string(), Value::from(lyr));
+                if let Some(name) = old_props.get("FULL_STREET_NAME") {
+                    props.insert("FULL_STREET_NAME".to_string(), name.clone());
+                } else {
+                    props.insert("FULL_STREET_NAME".to_string(), Value::Null);
+                }
+                if let Some(mtfcc) = old_props.get("MTFCC_CODE") {
+                    props.insert("MTFCC_CODE".to_string(), mtfcc.clone());
+                } else {
+                    props.insert("MTFCC_CODE".to_string(), Value::Null);
+                }
+                if let Some(obj) = f.as_object_mut() {
+                    obj.insert("properties".to_string(), Value::Object(props));
+                }
+                all_features.push(f);
+            }
+        }
+    }
+
+    let merged = serde_json::json!({
+        "type": "FeatureCollection",
+        "features": all_features
+    });
+    let mask = if opts.clip_to_region {
+        resolved.boundary_path.as_deref()
+    } else {
+        None
+    };
+    write_geojson_feature_collection(&merged, out_path, "usgs_roads", mask)
+}
+
+/// Parses the JavaScript-formatted `quantiles = [[...]];` response from NOAA Atlas 14 CGI.
+pub(crate) fn parse_noaa_atlas14_response(
+    lat: f64,
+    lon: f64,
+    body: &str,
+) -> Result<NoaaAtlas14Table> {
+    let key_idx = body.find("quantiles").ok_or_else(|| {
+        Error::Parse("NOAA Atlas 14 response missing 'quantiles' array (point may be outside Atlas 14 coverage)".into())
+    })?;
+    let after_key = &body[key_idx..];
+    let start = after_key
+        .find("[[")
+        .ok_or_else(|| Error::Parse("NOAA Atlas 14 quantiles opening '[[' not found".into()))?;
+    let rest = &after_key[start..];
+    let end = rest
+        .find("]];")
+        .map(|i| i + 2)
+        .or_else(|| rest.find("]]").map(|i| i + 2))
+        .ok_or_else(|| Error::Parse("NOAA Atlas 14 quantiles closing ']]' not found".into()))?;
+    let raw_matrix = rest[..end].replace('\'', "\"");
+    let matrix: Vec<Vec<Value>> = serde_json::from_str(&raw_matrix).map_err(|e| {
+        Error::Parse(format!(
+            "failed parsing NOAA Atlas 14 quantiles matrix: {e}"
+        ))
+    })?;
+
+    let mut depths_mm: BTreeMap<String, BTreeMap<u32, f64>> = BTreeMap::new();
+    for (&dur, row) in NOAA_DURATIONS.iter().zip(matrix.iter()) {
+        let mut by_ari = BTreeMap::new();
+        for (&ari, cell) in NOAA_ARIS.iter().zip(row.iter()) {
+            let val = match cell {
+                Value::Number(n) => n.as_f64(),
+                Value::String(s) => s.trim().parse::<f64>().ok(),
+                _ => None,
+            };
+            if let Some(v) = val
+                && v.is_finite()
+            {
+                by_ari.insert(ari, v);
+            }
+        }
+        depths_mm.insert(dur.to_string(), by_ari);
+    }
+
+    if depths_mm.is_empty() {
+        return Err(Error::Parse(
+            "NOAA Atlas 14 quantiles matrix contained no numeric values".into(),
+        ));
+    }
+
+    Ok(NoaaAtlas14Table {
+        lat: (lat * 10_000.0).round() / 10_000.0,
+        lon: (lon * 10_000.0).round() / 10_000.0,
+        units: "mm".to_string(),
+        depths_mm,
+    })
+}
+
+/// Fetches NOAA Atlas 14 partial-duration-series precipitation depth frequency values (mm)
+/// for a WGS 84 `(lat, lon)` point, optionally saving the parsed JSON table to `out_json`.
+pub fn fetch_noaa_atlas14(
+    lat: f64,
+    lon: f64,
+    out_json: Option<&Path>,
+    opts: &DownloadOptions,
+) -> Result<NoaaAtlas14Table> {
+    if !lat.is_finite() || !(-90.0..=90.0).contains(&lat) {
+        return Err(Error::InvalidArgument(format!("invalid latitude: {lat}")));
+    }
+    if !lon.is_finite() || !(-180.0..=180.0).contains(&lon) {
+        return Err(Error::InvalidArgument(format!("invalid longitude: {lon}")));
+    }
+    if let Some(p) = out_json
+        && !opts.overwrite
+        && p.exists()
+    {
+        let txt = std::fs::read_to_string(p)?;
+        let parsed: NoaaAtlas14Table = serde_json::from_str(&txt)
+            .map_err(|e| Error::Parse(format!("invalid cached NOAA Atlas 14 JSON: {e}")))?;
+        return Ok(parsed);
+    }
+
+    let agent = make_agent(opts.timeout_secs.min(60));
+    let params = vec![
+        ("lat", format!("{lat:.4}")),
+        ("lon", format!("{lon:.4}")),
+        ("type", "pf".to_string()),
+        ("data", "depth".to_string()),
+        ("units", "metric".to_string()),
+        ("series", "pds".to_string()),
+    ];
+    let body = http_get_text(&agent, NOAA_ATLAS14_URL, &params, opts.max_retries)?;
+    let table = parse_noaa_atlas14_response(lat, lon, &body)?;
+
+    if let Some(p) = out_json {
+        ensure_parent_dir(p)?;
+        let pretty = serde_json::to_string_pretty(&table)
+            .map_err(|e| Error::Parse(format!("failed serializing NOAA Atlas 14 JSON: {e}")))?;
+        std::fs::write(p, pretty)?;
+    }
+    Ok(table)
+}
+
+/// Downloads a complete bundle of open U.S. federal datasets for `region` into `out_dir`.
+///
+/// Downloads every dataset listed in `opts.datasets` (defaulting to WBD, 3DEP DEM, NHD,
+/// NWI, USGS Transportation roads/railways, synthesized road-stream culverts, and NOAA
+/// Atlas 14 precipitation frequencies), caches files on disk, and writes `manifest.json`.
+pub fn download_federal_data(
+    region: &Region,
+    out_dir: impl AsRef<Path>,
+    opts: &FederalBundleOptions,
+) -> Result<FederalBundleResult> {
+    let out_dir = out_dir.as_ref();
+    std::fs::create_dir_all(out_dir)?;
+
+    let resolved = resolve_region(region, Some(out_dir), &opts.download)?;
+    let has = |d: FederalDataset| opts.datasets.contains(&d);
+    let need_culverts = has(FederalDataset::Culverts);
+
+    let (wbd_path, wbd_count) = if has(FederalDataset::Wbd) {
+        let p = out_dir.join("wbd.gpkg");
+        let n = download_wbd(region, &p, &opts.download)?;
+        (Some(p), n)
+    } else {
+        (None, 0)
+    };
+
+    let (dem_tiles, dem_mosaic_path) = if has(FederalDataset::Dem) {
+        let res = download_3dep_dem_resolved(&resolved, out_dir, &opts.download)?;
+        (res.tile_paths, res.mosaic_path)
+    } else {
+        (Vec::new(), None)
+    };
+
+    let (nhd_path, nhd_count) = if has(FederalDataset::Nhd) || need_culverts {
+        let p = out_dir.join("nhd_flowlines.gpkg");
+        let n = download_nhd_resolved(&resolved, &p, &opts.download)?;
+        (Some(p), n)
+    } else {
+        (None, 0)
+    };
+
+    let (nwi_path, nwi_count) = if has(FederalDataset::Nwi) {
+        let p = out_dir.join("nwi_wetlands.gpkg");
+        let n = download_nwi_resolved(&resolved, &p, &opts.download)?;
+        (Some(p), n)
+    } else {
+        (None, 0)
+    };
+
+    let (roads_path, roads_count) = if has(FederalDataset::Roads) || need_culverts {
+        let p = out_dir.join("usgs_roads.gpkg");
+        let n = download_roads_resolved(&resolved, &p, &opts.download)?;
+        (Some(p), n)
+    } else {
+        (None, 0)
+    };
+
+    // Match DEM CRS for culverts when a DEM raster was downloaded so `burn_culverts` works directly
+    let dem_crs = dem_mosaic_path
+        .as_deref()
+        .or_else(|| dem_tiles.first().map(PathBuf::as_path))
+        .and_then(|p| p.to_str())
+        .and_then(|s| terrio::open_raster(s).ok())
+        .and_then(|ds| {
+            ds.raster
+                .crs
+                .wkt
+                .or(ds.raster.crs.epsg.map(|e| format!("EPSG:{e}")))
+        });
+
+    let (culverts_path, culverts_count) = if need_culverts {
+        if let (Some(nhd_p), Some(roads_p)) = (nhd_path.as_deref(), roads_path.as_deref()) {
+            let p = out_dir.join("culverts.gpkg");
+            let c_opts = SynthesizeCulvertsOptions {
+                half_length_m: opts.download.culvert_half_length_m,
+                snap_distance_m: opts.download.culvert_snap_distance_m,
+                target_crs: dem_crs,
+                ..Default::default()
+            };
+            let n = synthesize_culverts(nhd_p, roads_p, &p, &c_opts)?;
+            (Some(p), n)
+        } else {
+            (None, 0)
+        }
+    } else {
+        (None, 0)
+    };
+
+    let (noaa_atlas14_path, noaa_atlas14) = if has(FederalDataset::NoaaAtlas14) {
+        let (lon, lat) = resolved.bbox.centroid();
+        let p = out_dir.join("noaa_atlas14.json");
+        let table = fetch_noaa_atlas14(lat, lon, Some(&p), &opts.download)?;
+        (Some(p), Some(table))
+    } else {
+        (None, None)
+    };
+
+    let manifest_path = out_dir.join("manifest.json");
+    let result = FederalBundleResult {
+        region_bbox: resolved.bbox,
+        wbd_path,
+        wbd_count,
+        dem_tiles,
+        dem_mosaic_path,
+        nhd_path,
+        nhd_count,
+        nwi_path,
+        nwi_count,
+        roads_path,
+        roads_count,
+        culverts_path,
+        culverts_count,
+        noaa_atlas14_path,
+        noaa_atlas14,
+        manifest_path: manifest_path.clone(),
+    };
+    let manifest_json = serde_json::to_string_pretty(&result)
+        .map_err(|e| Error::Parse(format!("failed serializing manifest JSON: {e}")))?;
+    std::fs::write(&manifest_path, manifest_json)?;
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bbox_parse_validate_and_intersect() {
+        let b: Bbox = "-99.5, 47.0, -99.0, 47.5".parse().unwrap();
+        assert!((b.centroid().0 - (-99.25)).abs() < 1e-9);
+        assert!((b.centroid().1 - 47.25).abs() < 1e-9);
+        assert_eq!(b.to_csv_string(), "-99.5,47,-99,47.5");
+
+        let b2 = Bbox::new(-99.1, 47.2, -98.8, 47.6).unwrap();
+        assert!(b.intersects(&b2));
+        let b3 = Bbox::new(-98.5, 47.2, -98.0, 47.6).unwrap();
+        assert!(!b.intersects(&b3));
+
+        assert!(Bbox::new(-99.0, 47.0, -99.5, 47.5).is_err());
+        assert!(Bbox::new(-200.0, 47.0, -99.0, 47.5).is_err());
+        assert!("-99.5,47.0,-99.0".parse::<Bbox>().is_err());
+    }
+
+    #[test]
+    fn region_huc_and_enums_parse() {
+        assert_eq!(Region::validate_huc("10160002").unwrap(), "10160002");
+        assert_eq!(
+            Region::validate_huc("101600020502").unwrap(),
+            "101600020502"
+        );
+        assert!(Region::validate_huc("1016000").is_err());
+        assert!(Region::validate_huc("1016000a").is_err());
+
+        assert_eq!("12".parse::<WbdLevel>().unwrap(), WbdLevel::Huc12);
+        assert_eq!("huc8".parse::<WbdLevel>().unwrap(), WbdLevel::Huc8);
+        assert_eq!(WbdLevel::Huc12.layer_id(), 6);
+        assert_eq!(WbdLevel::Huc8.field_name(), "huc8");
+
+        assert_eq!("1m".parse::<DemProduct>().unwrap(), DemProduct::Meter1);
+        assert_eq!(
+            "10m".parse::<DemProduct>().unwrap(),
+            DemProduct::ThirdArcSec
+        );
+        assert_eq!("30m".parse::<DemProduct>().unwrap(), DemProduct::OneArcSec);
+        assert_eq!(
+            "lpc".parse::<DemProduct>().unwrap(),
+            DemProduct::LidarPointCloud
+        );
+
+        let ds = parse_dataset_list("wbd, dem, nhd, culverts").unwrap();
+        assert_eq!(
+            ds,
+            vec![
+                FederalDataset::Wbd,
+                FederalDataset::Dem,
+                FederalDataset::Nhd,
+                FederalDataset::Culverts
+            ]
+        );
+        assert_eq!(parse_dataset_list("all").unwrap().len(), 7);
+    }
+
+    #[test]
+    fn extract_grid_key_and_deduplicate_tnm_tiles() {
+        assert_eq!(
+            extract_3dep_grid_key("USGS 1 Meter 14 x47y523 ND_3DEPProcessing_D22"),
+            "x47y523"
+        );
+        assert_eq!(
+            extract_3dep_grid_key("USGS_1M_14_x48y524_ND_2022.tif"),
+            "x48y524"
+        );
+        assert_eq!(
+            extract_3dep_grid_key("USGS 1/3 Arc Second n48w100 20241024"),
+            "n48w100"
+        );
+        assert_eq!(
+            extract_3dep_grid_key("USGS 1 arc-second n48w100 1 x 1 degree"),
+            "n48w100"
+        );
+        assert_eq!(extract_3dep_grid_key("custom_title"), "custom_title");
+
+        let sample = serde_json::json!({
+            "items": [
+                {
+                    "title": "USGS 1 Meter 14 x47y523 ND_Old_2018",
+                    "publicationDate": "2018-05-01",
+                    "downloadURL": "https://example.org/old.tif",
+                    "sizeInBytes": 1000,
+                    "format": "GeoTIFF",
+                    "boundingBox": {"minX": -99.3, "minY": 47.0, "maxX": -99.1, "maxY": 47.2}
+                },
+                {
+                    "title": "USGS 1 Meter 14 x47y523 ND_3DEPProcessing_D22",
+                    "publicationDate": "2023-08-15",
+                    "downloadURL": "https://example.org/new.tif",
+                    "sizeInBytes": 2000,
+                    "format": "GeoTIFF",
+                    "boundingBox": {"minX": -99.3, "minY": 47.0, "maxX": -99.1, "maxY": 47.2}
+                },
+                {
+                    "title": "USGS 1 Meter 14 x99y999 Far_Away",
+                    "publicationDate": "2024-01-01",
+                    "downloadURL": "https://example.org/far.tif",
+                    "sizeInBytes": 3000,
+                    "format": "GeoTIFF",
+                    "boundingBox": {"minX": -80.0, "minY": 35.0, "maxX": -79.8, "maxY": 35.2}
+                }
+            ]
+        });
+
+        let region_bb = Bbox::new(-99.4, 47.05, -99.05, 47.25).unwrap();
+        let items = parse_tnm_products_json(&sample, Some(&region_bb), true);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].grid_key, "x47y523");
+        assert_eq!(items[0].publication_date, "2023-08-15");
+        assert_eq!(items[0].download_url, "https://example.org/new.tif");
+    }
+
+    #[test]
+    fn parse_noaa_atlas14_quantiles_response() {
+        let mut rows = Vec::new();
+        for i in 0..19 {
+            let base = (i + 1) as f64 * 10.0;
+            let vals: Vec<String> = (0..10)
+                .map(|j| format!("'{:.2}'", base + j as f64))
+                .collect();
+            rows.push(format!("[{}]", vals.join(",")));
+        }
+        let body = format!(
+            "result = 'ok';\nquantiles = [{}];\nupper = [];\n",
+            rows.join(",")
+        );
+        let tbl = parse_noaa_atlas14_response(47.12345, -99.23456, &body).unwrap();
+        assert_eq!(tbl.units, "mm");
+        assert!((tbl.lat - 47.1235).abs() < 1e-6);
+        assert!((tbl.lon - (-99.2346)).abs() < 1e-6);
+        // 24-hr is index 9 (base = 100.0); 100-yr is ARI index 6 (+6.0 = 106.0)
+        assert!((tbl.depth_mm("24-hr", 100).unwrap() - 106.0).abs() < 1e-6);
+        // 2-yr is ARI index 1 (+1.0 = 101.0)
+        assert!((tbl.depth_mm("24-hr", 2).unwrap() - 101.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn write_geojson_and_convert_to_gpkg_and_read_bbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fc = serde_json::json!({
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "properties": {"huc12": "101600020502", "name": "Pearl Lake"},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[
+                        [-99.2, 47.0], [-99.0, 47.0], [-99.0, 47.2], [-99.2, 47.2], [-99.2, 47.0]
+                    ]]
+                }
+            }]
+        });
+        let gpkg_path = tmp.path().join("wbd.gpkg");
+        let n = write_geojson_feature_collection(&fc, &gpkg_path, "huc12", None).unwrap();
+        assert_eq!(n, 1);
+
+        let bb = vector_file_bbox_wgs84(&gpkg_path).unwrap();
+        assert!((bb.min_lon - (-99.2)).abs() < 1e-6);
+        assert!((bb.max_lon - (-99.0)).abs() < 1e-6);
+        assert!((bb.min_lat - 47.0).abs() < 1e-6);
+        assert!((bb.max_lat - 47.2).abs() < 1e-6);
+
+        // Verify self-intersecting (bowtie) polygon is repaired cleanly before clipping
+        let bowtie_fc = serde_json::json!({
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "properties": {"ATTRIBUTE": "PEM1C"},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[
+                        [-99.18, 47.02], [-99.02, 47.18], [-99.02, 47.02],
+                        [-99.18, 47.18], [-99.18, 47.02]
+                    ]]
+                }
+            }]
+        });
+        let clipped_path = tmp.path().join("nwi_clipped.gpkg");
+        let n_clip = write_geojson_feature_collection(
+            &bowtie_fc,
+            &clipped_path,
+            "nwi_wetlands",
+            Some(&gpkg_path),
+        )
+        .unwrap();
+        assert_eq!(n_clip, 1);
+    }
+}

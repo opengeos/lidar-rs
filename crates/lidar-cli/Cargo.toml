@@ -16,7 +16,7 @@ name = "lidar"
 path = "src/main.rs"
 
 [dependencies]
-lidar = { workspace = true, features = ["parallel", "pointcloud", "serde"] }
+lidar = { workspace = true, features = ["parallel", "pointcloud", "serde", "download"] }
 richdem = { workspace = true, features = ["parallel"] }
 terrio = { workspace = true, features = ["pointcloud"] }
 clap.workspace = true

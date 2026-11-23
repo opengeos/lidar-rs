@@ -9,6 +9,7 @@ All sample files used below can be downloaded from [Sample Datasets](datasets.md
 | Category | Subcommands |
 | --- | --- |
 | **All-in-One & Tiled Pipelines** | `pipeline`, `tiled-depressions` |
+| **Federal Data Download** | `download`, `synthesize-culverts` |
 | **Hydro-Conditioning** | `breach-depressions`, `burn-culverts` |
 | **DEM Smoothing & Sinks** | `mean-filter`, `median-filter`, `gaussian-filter`, `extract-sinks` |
 | **Nested Hierarchies** | `delineate-depressions`, `delineate-mounts`, `flip-dem` |
@@ -56,6 +57,25 @@ lidar pipeline dem.tif out_storm \
 | `--streams <PATH>` | off | Stream flowline vector for computing `dist_to_stream` on spill edges |
 | `--use-f32` | `false` | Load source DEM as `f32` to halve initial memory footprint |
 | `--no-rasters`, `--no-vectors`, `--no-graph` | `false` | Skip writing raster, GeoPackage, or rating-curve/graph output groups |
+
+## Federal Data Download (`lidar download`)
+
+Download open U.S. federal datasets (USGS 3DEP DEM/LPC, USGS WBD, USGS NHD, USFWS NWI, USGS National Transportation roads/railways, synthesized culverts, and NOAA Atlas 14 precipitation frequencies) for any WGS 84 bounding box, USGS HUC code (HUC-2 through HUC-12), or local polygon file:
+
+```sh
+# Dry-run query for matching 1-m USGS 3DEP tiles in a HUC-12 watershed
+lidar download --huc 101600020503 -o out_huc12 --dry-run
+
+# Download all 7 federal layers, mosaic & clip 1-m DEM, and synthesize road-stream culverts
+lidar download --huc 101600020503 -o out_huc12 --tile-cache tiles_cache --json
+
+# Download selected layers for a WGS 84 bounding box or local polygon file
+lidar download --bbox -99.14,47.04,-99.08,47.08 -o out_bbox --datasets wbd,nhd,nwi,roads,culverts,noaa
+lidar download --region study_area.geojson -o out_poly --dem-product 10m
+
+# Synthesize culvert breach polylines offline from any stream and road vector files
+lidar synthesize-culverts nhd_flowlines.gpkg usgs_roads.gpkg culverts.gpkg --half-length 25 --snap-distance 15
+```
 
 ## Hydro-Conditioning
 

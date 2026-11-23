@@ -41,6 +41,8 @@ pub mod animation;
 pub mod catchment;
 pub mod conditioning;
 pub mod error;
+#[cfg(feature = "download")]
+pub mod federal;
 pub mod filling;
 pub mod filtering;
 pub mod fsm;
@@ -70,10 +72,18 @@ pub use catchment::{
     write_flowpaths_csv,
 };
 pub use conditioning::{
-    BreachMode, BreachOptions, BurnCulvertsOptions, breach_depressions, breach_depressions_file,
-    burn_culverts, burn_culverts_file,
+    BreachMode, BreachOptions, BurnCulvertsOptions, SynthesizeCulvertsOptions, breach_depressions,
+    breach_depressions_file, burn_culverts, burn_culverts_file, synthesize_culverts,
 };
 pub use error::{Error, Result};
+#[cfg(feature = "download")]
+pub use federal::{
+    Bbox, DemDownloadResult, DemProduct, DownloadOptions, FederalBundleOptions,
+    FederalBundleResult, FederalDataset, NoaaAtlas14Table, Region, ResolvedRegion, TnmProductItem,
+    WbdLevel, download_3dep_dem, download_federal_data, download_nhd, download_nwi, download_roads,
+    download_wbd, fetch_noaa_atlas14, parse_dataset_list, query_3dep_products, resolve_region,
+    vector_file_bbox_wgs84,
+};
 pub use filling::{
     ExtractSinksOptions, ExtractSinksResult, InMemorySinks, SinkDepression, extract_sinks,
     extract_sinks_in_memory, extract_sinks_with_filled_in_memory, write_sink_csv,

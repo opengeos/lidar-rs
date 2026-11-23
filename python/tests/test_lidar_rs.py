@@ -304,3 +304,64 @@ def test_fill_spill_merge_routing(tmp_path: Path):
 
     with pytest.raises(ValueError, match="unknown routing mode"):
         lidar_rs.simulate_inundation_array(dem_arr, routing="invalid_mode")
+
+
+def test_synthesize_culverts_and_federal_validation(tmp_path: Path):
+    import json
+
+    streams_gj = tmp_path / "streams.geojson"
+    roads_gj = tmp_path / "roads.geojson"
+    culverts_gpkg = tmp_path / "culverts.gpkg"
+
+    streams_gj.write_text(
+        json.dumps(
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {"name": "test_creek"},
+                        "geometry": {
+                            "type": "LineString",
+                            "coordinates": [[-99.205, 47.100], [-99.195, 47.100]],
+                        },
+                    }
+                ],
+            }
+        )
+    )
+    roads_gj.write_text(
+        json.dumps(
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {"name": "county_rd"},
+                        "geometry": {
+                            "type": "LineString",
+                            "coordinates": [[-99.200, 47.095], [-99.200, 47.105]],
+                        },
+                    }
+                ],
+            }
+        )
+    )
+
+    n = lidar_rs.synthesize_culverts(
+        streams_gj, roads_gj, culverts_gpkg, half_length_m=25.0, snap_distance_m=15.0
+    )
+    assert n == 1
+    assert culverts_gpkg.exists()
+
+    # Validate region argument checks without network calls
+    with pytest.raises(ValueError, match="exactly one"):
+        lidar_rs.query_3dep_products()
+    with pytest.raises(ValueError, match="invalid HUC"):
+        lidar_rs.query_3dep_products(huc="12345")
+    with pytest.raises(ValueError, match="invalid longitude"):
+        lidar_rs.download_federal_data(tmp_path / "bad", bbox=(-99.0, 47.0, -99.5, 47.5))
+    with pytest.raises(ValueError, match="unknown federal dataset"):
+        lidar_rs.download_federal_data(
+            tmp_path / "bad_ds", bbox=(-99.3, 47.0, -99.2, 47.1), datasets="nonexistent"
+        )
