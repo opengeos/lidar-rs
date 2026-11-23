@@ -500,6 +500,21 @@ fn call_preview(lidar: &[OsString], mut args: Vec<OsString>, cancel: &AtomicBool
         let content = res["content"]
             .as_array_mut()
             .expect("tool results always have content array");
+        // The child reports the server-injected temporary path, which is deleted when `_dir`
+        // drops at the end of this call; rewrite it so the reply never names a vanished file.
+        let temp_phrase = format!(" to {}", path.display());
+        let replacement = if png.is_some() {
+            " as inline image content (no file kept; pass -o FILE to save it)"
+        } else {
+            " to a temporary file that has been removed"
+        };
+        for item in content.iter_mut() {
+            if let Some(text) = item["text"].as_str()
+                && text.contains(&temp_phrase)
+            {
+                item["text"] = Value::String(text.replace(&temp_phrase, replacement));
+            }
+        }
         match png {
             Some(bytes) => {
                 content.push(json!({
