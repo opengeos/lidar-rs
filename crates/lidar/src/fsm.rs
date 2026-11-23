@@ -53,6 +53,9 @@ use crate::inundation::{
 };
 use crate::slicing::{InMemoryDepressions, NestedDepression};
 
+/// Time tolerance in hours for deciding whether an event falls within the storm duration.
+const STORM_TIME_EPS_H: f64 = 1e-9;
+
 /// Hydrologic inundation routing strategy for pipeline simulations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -105,12 +108,24 @@ pub struct FsmBasinSummary {
     /// Stored water volume at the end of the simulated storm duration (cubic map units).
     /// For basins merged into a parent before storm end, this records their capacity at merge.
     pub final_volume_m3: f64,
-    /// Time in hours when this depression first reached full spill capacity (`None` if never filled).
+    /// Time in hours when this depression first reached full spill capacity within the simulated
+    /// storm duration (`None` if it never filled during the storm). Every basin that is full at
+    /// storm end has a value; with variable rainfall or infiltration a basin can also fill and
+    /// then drain below its rim, so a value does not guarantee `final_volume_m3 == capacity_m3`.
+    /// With constant rainfall, `fill_time.tif` keeps extrapolated sustained-rainfall timing for
+    /// basins that never filled.
     pub fill_time_h: Option<f64>,
-    /// Downstream depression ID receiving spillover (`Some(0)` for DEM boundary, `None` if never spilled).
+    /// Downstream depression ID receiving spillover (`Some(0)` for DEM boundary, `None` if it did
+    /// not spill within the simulated storm duration).
     pub spill_to_dep_id: Option<u32>,
-    /// Time in hours when this depression merged into its parent (`None` if unmerged).
+    /// Time in hours when this depression merged into its parent (`None` if it had not merged by
+    /// the end of the simulated storm duration).
     pub merge_time_h: Option<f64>,
+    /// Merge time including the constant-rainfall extension past the storm, the timing convention
+    /// shared by `fill_time.tif`, the spill flow paths, and the connectivity graph's edges. Equals
+    /// `merge_time_h` for merges within the storm. Internal: used only to time graph `merge` edges.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) sustained_merge_time_h: Option<f64>,
     /// Cumulative excess volume spilled downstream over the simulated storm duration (cubic map units).
     pub spilled_volume_m3: f64,
     /// Peak spill discharge rate during the simulated storm duration (cubic map units per hour).
@@ -146,6 +161,12 @@ pub struct FsmMassBalance {
 #[derive(Debug, Clone)]
 pub struct FsmSimulationResult {
     /// Per-cell continuous time to inundation in hours (`-1.0` = dry / NoData).
+    ///
+    /// With constant rainfall, rainfall is extended past the storm duration, so cells in basins
+    /// that are still filling at storm end get sustained-rainfall timing that can exceed
+    /// `duration_h`. With a hyetograph, routing stops at the end of the hyetograph, and cells not
+    /// yet inundated by then stay NoData (`-1.0`). Values are first-inundation times: a cell keeps
+    /// its time even if its basin later drains.
     pub fill_time: Array2D<f64>,
     /// Dynamically realized overland spill flow paths with exact cascade `spill_time_h`
     /// and `merge_time_h`.
@@ -156,9 +177,11 @@ pub struct FsmSimulationResult {
     pub mass_balance: FsmMassBalance,
     /// Number of top-level sink regions.
     pub num_regions: usize,
-    /// Number of depressions that filled and initiated overland spilling.
+    /// Number of depressions that filled and initiated overland spilling. Like `spill_paths` and
+    /// `fill_time`, this includes events in the constant-rainfall extension past the storm.
     pub num_spill_events: usize,
-    /// Number of compound parent depressions formed by merging filled children.
+    /// Number of compound parent depressions formed by merging filled children. Includes events in
+    /// the constant-rainfall extension past the storm, like `num_spill_events`.
     pub num_merge_events: usize,
 }
 
@@ -1555,7 +1578,7 @@ pub fn simulate_fill_spill_merge_in_memory(
         }
 
         // Snapshot storm-end volumes and routed contributing areas right when the storm window ends.
-        if in_storm_window && t_cur >= storm_duration_h - 1e-9 && !snapshot_taken {
+        if in_storm_window && t_cur >= storm_duration_h - STORM_TIME_EPS_H && !snapshot_taken {
             resolve_merges_and_cycles(
                 &mut basins,
                 &id_to_idx,
@@ -1656,6 +1679,7 @@ pub fn simulate_fill_spill_merge_in_memory(
     let mut spill_paths: Vec<SpillFlowPath> = Vec::new();
     let mut num_spill_events = 0usize;
     let mut summaries: Vec<FsmBasinSummary> = Vec::with_capacity(m);
+    let storm_end = storm_duration_h + STORM_TIME_EPS_H;
 
     for b in &basins {
         if b.first_spill_time_h.is_some() {
@@ -1697,9 +1721,18 @@ pub fn simulate_fill_spill_merge_in_memory(
             final_routed_cat_area_m2: b.storm_end_routed_cat_m2,
             initial_volume_m3: b.initial_vol_m3,
             final_volume_m3: b.storm_end_vol_m3,
-            fill_time_h: b.first_fill_time_h,
-            spill_to_dep_id: b.realized_spill_to,
-            merge_time_h: b.merge_time_h,
+            // Report only fill/spill/merge events realized within the storm; the unbounded
+            // post-storm tail segment exists only to give `fill_time.tif` sustained-rainfall
+            // timing for deep basins. `realized_spill_to` is always set together with
+            // `first_spill_time_h`, so gating on the latter bounds the spill target too.
+            // `sustained_merge_time_h` keeps the unbounded merge time for the connectivity graph.
+            fill_time_h: b.first_fill_time_h.filter(|&t| t <= storm_end),
+            spill_to_dep_id: b
+                .first_spill_time_h
+                .filter(|&t| t <= storm_end)
+                .and(b.realized_spill_to),
+            merge_time_h: b.merge_time_h.filter(|&t| t <= storm_end),
+            sustained_merge_time_h: b.merge_time_h,
             spilled_volume_m3: b.spilled_vol_storm_m3,
             peak_spill_rate_m3_h: b.peak_spill_rate_m3_h,
             infiltrated_volume_m3: b.infiltrated_vol_storm_m3,
@@ -1821,7 +1854,8 @@ mod tests {
             min_depth: 0.3,
             interval: 0.3,
             rain_intensity_cm_h: 5.0, // 0.05 m/h
-            rain_duration_h: 25.0,
+            // Long enough for every basin to fill within the storm (`fill_time_h` is storm-bounded).
+            rain_duration_h: 500.0,
             time_step_h: 1.0,
             compress: false,
         };
@@ -2008,7 +2042,8 @@ mod tests {
             min_depth: 0.1,
             interval: 0.5,
             rain_intensity_cm_h: 100.0, // 1.0 m/h
-            rain_duration_h: 5.0,
+            // Long enough for the parent to fill within the storm (`fill_time_h` is storm-bounded).
+            rain_duration_h: 50.0,
             time_step_h: 0.5,
             compress: false,
         };

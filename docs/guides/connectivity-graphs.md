@@ -35,7 +35,7 @@ Hydrologic models (SWAT+, HEC-HMS, GSSHA, MODFLOW, and custom Python/NetworkX ro
   - **Nodes (`GraphNode`):** `id`, `parent_id`, `level`, `region_id`, `area`, `volume`, `avg_depth`, `max_depth`, `min_elev`, `max_elev`, `circularity`, `hypsometric_integral`, `cat_area`, `fill_time_h`, and `fill_runoff_mm`.
   - **Edges (`GraphEdge`):**
     - `edge_type = "spill"`: Overland pour-point cascade from a filled basin to a downstream basin (or boundary exit `0`), with `spill_time_h`, `spill_runoff_mm`, `merge_time_h`, `spill_elev`, `length_m`, `start_xy`, `end_xy`, and optional `dist_to_stream`.
-    - `edge_type = "merge"`: Hierarchical child-to-parent coalescence link (`from_id = child`, `to_id = parent`, `merge_time_h = parent fill time`).
+    - `edge_type = "merge"`: Hierarchical child-to-parent coalescence link (`from_id = child`, `to_id = parent`). In static routing `merge_time_h` is the parent's fill time; with `--routing fsm` it is the simulated child-to-parent merge time, including merges in the constant-rainfall extension past the storm, so it matches the `merge_time_h` on that child's `spill` edge.
 - **GraphML attribute subset (`connectivity_graph.graphml`):**
   - **Node attributes:** `level`, `region_id`, `parent_id`, `area`, `volume`, `max_depth`, `cat_area`, and `fill_runoff_mm` (plus a virtual sink node `n0` when any spill edge exits to the watershed boundary `to_id == 0`).
   - **Edge attributes:** `edge_type`, `spill_runoff_mm`, `length_m`, and `dist_to_stream` (when finite). Use the JSON graph when you need `spill_time_h`, `merge_time_h`, `spill_elev`, `start_xy`, or `end_xy`.

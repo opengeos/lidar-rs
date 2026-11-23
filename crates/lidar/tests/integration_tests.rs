@@ -1089,6 +1089,62 @@ fn test_fill_spill_merge_end_to_end_on_sample_dem() {
         "expected hierarchical merges on nested sample DEM"
     );
 
+    // With constant rain and no infiltration no basin drains after filling, so here
+    // `fill_time_h`/`spill_to_dep_id` are bounded by the storm and agree with the storm-end `final_volume_m3`:
+    // the top-level basin is still filling at 50 h, so it must not report the extrapolated
+    // sustained-rainfall fill time (~65 h) that `fill_time.tif` keeps for its cells.
+    for b in basins {
+        let full = b.final_volume_m3 >= b.capacity_m3 - 1e-6 * b.capacity_m3.max(1.0);
+        match b.fill_time_h {
+            Some(t) => {
+                assert!(t <= sim_opts.rain_duration_h + 1e-9, "{b:?}");
+                assert!(full, "basin reports fill_time_h but is not full: {b:?}");
+            }
+            None => assert!(!full, "full basin is missing fill_time_h: {b:?}"),
+        }
+    }
+    for b in basins.iter().filter(|b| b.fill_time_h.is_none()) {
+        // A basin still filling at storm end cannot have spilled during the storm.
+        assert_eq!(b.spill_to_dep_id, None, "{b:?}");
+    }
+    for b in basins {
+        if let Some(t) = b.merge_time_h {
+            assert!(t <= sim_opts.rain_duration_h + 1e-9, "{b:?}");
+        }
+    }
+    // Graph `merge` and `spill` edges from the same basin report the same merge state.
+    let edges = &pipe_fsm.connectivity_graph.edges;
+    let mut checked = 0;
+    for m in edges.iter().filter(|e| e.edge_type == "merge") {
+        let b = basins.iter().find(|b| b.dep_id == m.from_id).unwrap();
+        if let Some(t) = b.merge_time_h {
+            assert_eq!(m.merge_time_h, Some(t), "{m:?}");
+        }
+        for s in edges
+            .iter()
+            .filter(|e| e.edge_type == "spill" && e.from_id == m.from_id)
+        {
+            assert_eq!(s.merge_time_h, m.merge_time_h, "{s:?} vs {m:?}");
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "expected spill edges from merged basins");
+    assert!(
+        basins.iter().any(|b| b.fill_time_h.is_none()),
+        "expected the top-level sample basin to still be filling at storm end"
+    );
+    let max_ft = pipe_fsm
+        .fill_time
+        .data()
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .fold(0.0f64, f64::max);
+    assert!(
+        max_ft > sim_opts.rain_duration_h,
+        "fill_time raster should keep sustained-rainfall timing beyond the storm ({max_ft})"
+    );
+
     // Verify monotonic inundation curve and consistent spill paths.
     assert_eq!(pipe_fsm.steps.len(), 25);
     for pair in pipe_fsm.steps.windows(2) {

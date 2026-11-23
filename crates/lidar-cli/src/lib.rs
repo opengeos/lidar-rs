@@ -841,7 +841,10 @@ enum Commands {
         /// Optional fill-time raster (fill_time.tif) to overlay inundation at --hour
         #[arg(long, conflicts_with = "depth")]
         fill_time: Option<PathBuf>,
-        /// Inundation snapshot time in hours when --fill-time is set (defaults to max finite fill time)
+        /// Inundation snapshot time in hours when --fill-time is set; shows cells first inundated by
+        /// this time (defaults to max finite fill time, which can exceed the storm duration because
+        /// constant-rain fill_time.tif assumes sustained rainfall; pass the storm duration to stop
+        /// at storm end)
         #[arg(long, requires = "fill_time")]
         hour: Option<f64>,
         /// Optional depression depth raster (depth.tif or sink.tif) to overlay positive-depth basins

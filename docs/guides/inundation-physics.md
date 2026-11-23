@@ -213,6 +213,9 @@ total_antecedent_m3 + total_runoff_m3
     }
     ```
 
+!!! note "Storm-bounded summaries vs. sustained-rainfall `fill_time.tif`"
+    The mass balance and the `fsm_basins.csv` columns describe the simulated storm: `fill_time_h`, `spill_to_dep_id`, and `merge_time_h` are reported only for events that happen within the storm duration, so a basin that never fills during the storm has an empty `fill_time_h` and a `final_volume_m3` below its `capacity_m3`. (`fill_time_h` is the *first* time a basin filled; with variable rainfall or infiltration a basin can fill and later drain below its rim before the storm ends.) With constant rainfall, `fill_time.tif` (like the static mode raster), the spill flow paths, the connectivity graph, and the `num_spill_events`/`num_merge_events` counts keep sustained-rainfall timing for those basins, so their times can exceed the storm duration. With a hyetograph, routing stops when the hyetograph ends, and cells not yet inundated stay NoData. `fill_time.tif` holds first-inundation times, so `preview --hour <duration>` shows every cell inundated at some point by storm end. That equals the storm-end extent only when no basin drains, i.e. constant rain with no infiltration.
+
 ## Grid Alignment & Validation Rules
 
 `simulate_inundation_with_forcing_in_memory` strictly validates every supplied forcing raster (`runoff_coeff`, `infiltration_cm_h`, `antecedent_depth`) against the sink raster before running:
