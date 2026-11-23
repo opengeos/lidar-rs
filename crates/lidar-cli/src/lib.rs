@@ -1861,6 +1861,10 @@ pub fn run(args: Vec<OsString>) -> i32 {
 /// Runs the `lidar` CLI with `args`, using `lidar_cmd` as the command line invoked by `lidar mcp`
 /// for child tool calls (e.g., `[python, "-m", "lidar_rs"]` when run from the Python package).
 pub fn run_as(args: Vec<OsString>, lidar_cmd: Option<Vec<OsString>>) -> i32 {
+    usage::with_clap_stack(move || run_as_inner(args, lidar_cmd))
+}
+
+fn run_as_inner(args: Vec<OsString>, lidar_cmd: Option<Vec<OsString>>) -> i32 {
     if let Some(catalog) = usage::requested(&args) {
         match serde_json::to_string_pretty(&catalog) {
             Ok(json) => {
@@ -1873,7 +1877,7 @@ pub fn run_as(args: Vec<OsString>, lidar_cmd: Option<Vec<OsString>>) -> i32 {
             }
         }
     }
-    let cli = match usage::with_clap_stack(|| Cli::try_parse_from(&args)) {
+    let cli = match Cli::try_parse_from(&args) {
         Ok(c) => c,
         Err(e) => {
             let code = e.exit_code();

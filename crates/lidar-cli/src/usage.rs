@@ -8,20 +8,20 @@ use std::sync::OnceLock;
 use clap::{Arg, ArgAction, Command, CommandFactory};
 use serde_json::{Value, json};
 
-/// Stack size used when constructing the full Clap command tree (safe on Windows 1 MiB and test
-/// 2 MiB default stacks in debug builds).
-const CLAP_STACK_SIZE: usize = 8 * 1024 * 1024;
+/// Stack size used for CLI parsing and command dispatch (prevents stack overflows on Windows's
+/// 1 MiB main thread and Rust's 2 MiB test threads in debug builds).
+const WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
 
-/// Runs `f` on a scoped thread with an 8 MiB stack so building the full Clap command tree never
-/// overflows small platform or test-thread stacks in debug builds.
+/// Runs `f` on a scoped thread with a 16 MiB stack so CLI parsing and large command dispatch
+/// frames never overflow small platform or test-thread stacks.
 pub(crate) fn with_clap_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
     std::thread::scope(|scope| {
         std::thread::Builder::new()
-            .stack_size(CLAP_STACK_SIZE)
+            .stack_size(WORKER_STACK_SIZE)
             .spawn_scoped(scope, f)
-            .expect("spawn clap worker thread")
+            .expect("spawn CLI worker thread")
             .join()
-            .expect("clap worker thread panicked")
+            .expect("CLI worker thread panicked")
     })
 }
 
