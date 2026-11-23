@@ -183,6 +183,11 @@ fn preview_returns_inline_png_image_and_pipeline_runs_end_to_end() {
     assert_eq!(img["mimeType"], "image/png");
     // Base64 of PNG magic bytes `\x89PNG\r\n\x1a\n` starts with `iVBORw0KGgo`
     assert!(img["data"].as_str().unwrap().starts_with("iVBORw0KGgo"));
+    // The server-injected temporary PNG is deleted after the call, so the text reply must not
+    // point at it.
+    let text = content[0]["text"].as_str().unwrap();
+    assert!(text.contains("as inline image content"), "{text}");
+    assert!(!text.contains("lidar-preview-"), "{text}");
 
     let pipe_res = &replies[&2]["result"];
     assert_eq!(pipe_res["isError"], false, "{pipe_res}");
