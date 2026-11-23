@@ -213,6 +213,9 @@ total_antecedent_m3 + total_runoff_m3
     }
     ```
 
+!!! note "Storm-bounded summaries vs. sustained-rainfall `fill_time.tif`"
+    The mass balance and the `fsm_basins.csv` columns describe the simulated storm: `fill_time_h`, `spill_to_dep_id`, and `merge_time_h` are reported only for events that happen within the storm duration, so a basin still filling at storm end has an empty `fill_time_h` and a `final_volume_m3` below its `capacity_m3`. `fill_time.tif`, like the static mode raster, keeps sustained-rainfall timing for those basins, so its values can exceed the storm duration. Pass `preview --hour <duration>` to see the inundated extent at storm end.
+
 ## Grid Alignment & Validation Rules
 
 `simulate_inundation_with_forcing_in_memory` strictly validates every supplied forcing raster (`runoff_coeff`, `infiltration_cm_h`, `antecedent_depth`) against the sink raster before running:

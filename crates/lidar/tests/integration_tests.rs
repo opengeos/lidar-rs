@@ -1089,6 +1089,39 @@ fn test_fill_spill_merge_end_to_end_on_sample_dem() {
         "expected hierarchical merges on nested sample DEM"
     );
 
+    // `fill_time_h`/`spill_to_dep_id` are bounded by the storm and agree with the storm-end `final_volume_m3`:
+    // the top-level basin is still filling at 50 h, so it must not report the extrapolated
+    // sustained-rainfall fill time (~65 h) that `fill_time.tif` keeps for its cells.
+    for b in basins {
+        let full = b.final_volume_m3 >= b.capacity_m3 - 1e-6 * b.capacity_m3.max(1.0);
+        match b.fill_time_h {
+            Some(t) => {
+                assert!(t <= sim_opts.rain_duration_h + 1e-9, "{b:?}");
+                assert!(full, "basin reports fill_time_h but is not full: {b:?}");
+            }
+            None => assert!(!full, "full basin is missing fill_time_h: {b:?}"),
+        }
+    }
+    for b in basins.iter().filter(|b| b.fill_time_h.is_none()) {
+        // A basin still filling at storm end cannot have spilled during the storm.
+        assert_eq!(b.spill_to_dep_id, None, "{b:?}");
+    }
+    assert!(
+        basins.iter().any(|b| b.fill_time_h.is_none()),
+        "expected the top-level sample basin to still be filling at storm end"
+    );
+    let max_ft = pipe_fsm
+        .fill_time
+        .data()
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .fold(0.0f64, f64::max);
+    assert!(
+        max_ft > sim_opts.rain_duration_h,
+        "fill_time raster should keep sustained-rainfall timing beyond the storm ({max_ft})"
+    );
+
     // Verify monotonic inundation curve and consistent spill paths.
     assert_eq!(pipe_fsm.steps.len(), 25);
     for pair in pipe_fsm.steps.windows(2) {

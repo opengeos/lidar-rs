@@ -105,11 +105,15 @@ pub struct FsmBasinSummary {
     /// Stored water volume at the end of the simulated storm duration (cubic map units).
     /// For basins merged into a parent before storm end, this records their capacity at merge.
     pub final_volume_m3: f64,
-    /// Time in hours when this depression first reached full spill capacity (`None` if never filled).
+    /// Time in hours when this depression first reached full spill capacity within the simulated
+    /// storm duration (`None` if it was still filling at storm end, matching `final_volume_m3`).
+    /// `fill_time.tif` keeps extrapolated sustained-rainfall timing for such basins.
     pub fill_time_h: Option<f64>,
-    /// Downstream depression ID receiving spillover (`Some(0)` for DEM boundary, `None` if never spilled).
+    /// Downstream depression ID receiving spillover (`Some(0)` for DEM boundary, `None` if it did
+    /// not spill within the simulated storm duration).
     pub spill_to_dep_id: Option<u32>,
-    /// Time in hours when this depression merged into its parent (`None` if unmerged).
+    /// Time in hours when this depression merged into its parent (`None` if it had not merged by
+    /// the end of the simulated storm duration).
     pub merge_time_h: Option<f64>,
     /// Cumulative excess volume spilled downstream over the simulated storm duration (cubic map units).
     pub spilled_volume_m3: f64,
@@ -146,6 +150,9 @@ pub struct FsmMassBalance {
 #[derive(Debug, Clone)]
 pub struct FsmSimulationResult {
     /// Per-cell continuous time to inundation in hours (`-1.0` = dry / NoData).
+    ///
+    /// Rainfall is extended past the storm duration, so cells in basins that are still filling at
+    /// storm end get sustained-rainfall timing that can exceed `duration_h`.
     pub fill_time: Array2D<f64>,
     /// Dynamically realized overland spill flow paths with exact cascade `spill_time_h`
     /// and `merge_time_h`.
@@ -1656,6 +1663,7 @@ pub fn simulate_fill_spill_merge_in_memory(
     let mut spill_paths: Vec<SpillFlowPath> = Vec::new();
     let mut num_spill_events = 0usize;
     let mut summaries: Vec<FsmBasinSummary> = Vec::with_capacity(m);
+    let storm_end = storm_duration_h + 1e-9;
 
     for b in &basins {
         if b.first_spill_time_h.is_some() {
@@ -1697,9 +1705,14 @@ pub fn simulate_fill_spill_merge_in_memory(
             final_routed_cat_area_m2: b.storm_end_routed_cat_m2,
             initial_volume_m3: b.initial_vol_m3,
             final_volume_m3: b.storm_end_vol_m3,
-            fill_time_h: b.first_fill_time_h,
-            spill_to_dep_id: b.realized_spill_to,
-            merge_time_h: b.merge_time_h,
+            // Report only fill/spill/merge events realized within the storm so the summary stays
+            // consistent with the storm-end volumes; the unbounded post-storm tail segment exists
+            // only to give `fill_time.tif` sustained-rainfall timing for deep basins.
+            fill_time_h: b.first_fill_time_h.filter(|&t| t <= storm_end),
+            spill_to_dep_id: b
+                .realized_spill_to
+                .filter(|_| b.first_spill_time_h.is_some_and(|t| t <= storm_end)),
+            merge_time_h: b.merge_time_h.filter(|&t| t <= storm_end),
             spilled_volume_m3: b.spilled_vol_storm_m3,
             peak_spill_rate_m3_h: b.peak_spill_rate_m3_h,
             infiltrated_volume_m3: b.infiltrated_vol_storm_m3,
@@ -1821,7 +1834,8 @@ mod tests {
             min_depth: 0.3,
             interval: 0.3,
             rain_intensity_cm_h: 5.0, // 0.05 m/h
-            rain_duration_h: 25.0,
+            // Long enough for every basin to fill within the storm (`fill_time_h` is storm-bounded).
+            rain_duration_h: 500.0,
             time_step_h: 1.0,
             compress: false,
         };
@@ -2008,7 +2022,8 @@ mod tests {
             min_depth: 0.1,
             interval: 0.5,
             rain_intensity_cm_h: 100.0, // 1.0 m/h
-            rain_duration_h: 5.0,
+            // Long enough for the parent to fill within the storm (`fill_time_h` is storm-bounded).
+            rain_duration_h: 50.0,
             time_step_h: 0.5,
             compress: false,
         };

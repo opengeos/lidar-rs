@@ -112,6 +112,7 @@ pub struct SimulateInundationResult {
     /// Time-ordered paths to `flood_01.tif`, `flood_02.tif`, …
     pub frame_paths: Vec<PathBuf>,
     /// Path to `fill_time.tif` (`f64`, hours until each sink pixel inundates; `-1.0` = dry/NoData).
+    /// Timing assumes sustained rainfall, so values can exceed the storm duration.
     pub fill_time_path: PathBuf,
     /// Path to `inundation_summary.csv`.
     pub summary_csv_path: PathBuf,
