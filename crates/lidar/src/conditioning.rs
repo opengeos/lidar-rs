@@ -612,6 +612,37 @@ impl Default for SynthesizeCulvertsOptions {
     }
 }
 
+impl SynthesizeCulvertsOptions {
+    /// Validates numeric distance thresholds before running culvert synthesis or federal downloads.
+    pub fn validate(&self) -> Result<()> {
+        if !self.half_length_m.is_finite() || self.half_length_m <= 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "half_length_m must be finite and > 0, got {}",
+                self.half_length_m
+            )));
+        }
+        if !self.snap_distance_m.is_finite() || self.snap_distance_m < 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "snap_distance_m must be finite and >= 0, got {}",
+                self.snap_distance_m
+            )));
+        }
+        if !self.min_stream_length_m.is_finite() || self.min_stream_length_m < 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "min_stream_length_m must be finite and >= 0, got {}",
+                self.min_stream_length_m
+            )));
+        }
+        if !self.min_segment_length_m.is_finite() || self.min_segment_length_m < 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "min_segment_length_m must be finite and >= 0, got {}",
+                self.min_segment_length_m
+            )));
+        }
+        Ok(())
+    }
+}
+
 fn collect_polylines(geom: &Geometry, out: &mut Vec<Vec<(f64, f64)>>) {
     match geom {
         Geometry::LineString(coords) => {
@@ -875,6 +906,9 @@ fn stitch_degree2_polylines(lines: Vec<Vec<(f64, f64)>>, snap_tol: f64) -> Vec<V
 /// projected-CRS-aware vector format such as `.gpkg` or `.shp` (`.geojson`/`.json` is rejected
 /// because RFC 7946 GeoJSON requires WGS 84 coordinates).
 ///
+/// Each output feature carries attributes `culvert_id` (1-based), `stream_idx` (0-based index
+/// into the degree-2 stitched stream polyline chains), and `length_m` (exact metric length).
+///
 /// Returns the number of synthesized culvert polylines written to `out_culverts`.
 pub fn synthesize_culverts(
     streams_vector: impl AsRef<Path>,
@@ -882,30 +916,7 @@ pub fn synthesize_culverts(
     out_culverts: impl AsRef<Path>,
     options: &SynthesizeCulvertsOptions,
 ) -> Result<usize> {
-    if !options.half_length_m.is_finite() || options.half_length_m <= 0.0 {
-        return Err(Error::InvalidArgument(format!(
-            "half_length_m must be finite and > 0, got {}",
-            options.half_length_m
-        )));
-    }
-    if !options.snap_distance_m.is_finite() || options.snap_distance_m < 0.0 {
-        return Err(Error::InvalidArgument(format!(
-            "snap_distance_m must be finite and >= 0, got {}",
-            options.snap_distance_m
-        )));
-    }
-    if !options.min_stream_length_m.is_finite() || options.min_stream_length_m < 0.0 {
-        return Err(Error::InvalidArgument(format!(
-            "min_stream_length_m must be finite and >= 0, got {}",
-            options.min_stream_length_m
-        )));
-    }
-    if !options.min_segment_length_m.is_finite() || options.min_segment_length_m < 0.0 {
-        return Err(Error::InvalidArgument(format!(
-            "min_segment_length_m must be finite and >= 0, got {}",
-            options.min_segment_length_m
-        )));
-    }
+    options.validate()?;
 
     let streams_path = streams_vector.as_ref();
     let roads_path = roads_vector.as_ref();

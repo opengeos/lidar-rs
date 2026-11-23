@@ -571,6 +571,9 @@ pub struct ResolvedRegion {
 pub struct FederalBundleResult {
     /// Resolved WGS 84 bounding box of the region.
     pub region_bbox: Bbox,
+    /// Canonical region identity (`"bbox"`, `"huc:<code>"`, or `"file:<path>"`) for cache checks.
+    #[serde(default)]
+    pub region_key: String,
     /// USGS 3DEP DEM product configured for this bundle.
     #[serde(default)]
     pub dem_product: DemProduct,
@@ -583,6 +586,9 @@ pub struct FederalBundleResult {
     /// Whether DEM mosaicking was enabled for this bundle.
     #[serde(default)]
     pub mosaic_dem: bool,
+    /// Effective USGS National Transportation layer IDs queried for this bundle.
+    #[serde(default)]
+    pub transportation_layers: Vec<u32>,
     /// Path to downloaded WBD vector file, if requested.
     pub wbd_path: Option<PathBuf>,
     /// Number of WBD polygon features downloaded.
@@ -1043,7 +1049,16 @@ fn geojson_bbox(fc: &Value) -> Result<Bbox> {
 
 fn is_geometry_validity_error(err: &terrio::Error) -> bool {
     match err {
-        terrio::Error::InvalidData(_) => true,
+        terrio::Error::InvalidData(msg) => {
+            let lower = msg.to_ascii_lowercase();
+            lower.contains("polygon")
+                || lower.contains("ring")
+                || lower.contains("topology")
+                || lower.contains("clip")
+                || lower.contains("vert")
+                || lower.contains("self-intersection")
+                || lower.contains("invalid")
+        }
         terrio::Error::InvalidArgument(msg) => {
             let lower = msg.to_ascii_lowercase();
             lower.contains("make-valid")
@@ -1126,7 +1141,17 @@ fn write_geojson_feature_collection(
     if clip_mask.is_none() && (ext == "geojson" || ext == "json") {
         let serialized = serde_json::to_string(fc)
             .map_err(|e| Error::Parse(format!("failed serializing GeoJSON: {e}")))?;
-        std::fs::write(out_path, serialized)?;
+        let parent = out_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut staged = tempfile::Builder::new()
+            .prefix(".lidar_vec_")
+            .suffix(".geojson")
+            .tempfile_in(parent)?;
+        staged.as_file_mut().write_all(serialized.as_bytes())?;
+        staged.as_file_mut().flush()?;
+        staged.persist(out_path).map_err(|e| Error::Io(e.error))?;
         return Ok(raw_count);
     }
 
@@ -1178,13 +1203,35 @@ fn write_geojson_feature_collection(
     }
 
     let final_count: usize = layers.iter().map(|l| l.features.len()).sum();
-    if layers.is_empty() {
-        // Fallback: write empty GeoJSON if ext is geojson, or empty layer
+    let layers_to_write = if layers.is_empty() {
         let mut empty = terrio::Layer::new(layer_name.to_string());
         SpatialRef::from_epsg(4326)?.apply_to_layer(&mut empty);
-        terrio::write_vector(&[empty], out_str, &VectorWriteOptions::default())?;
+        vec![empty]
     } else {
-        terrio::write_vector(&layers, out_str, &VectorWriteOptions::default())?;
+        layers
+    };
+
+    // Atomically stage single-file vector formats (.gpkg/.geojson/.json) in the destination
+    // directory so interrupted writes never leave truncated files that cache checks reuse.
+    if matches!(ext.as_str(), "gpkg" | "geojson" | "json") {
+        let parent = out_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let staged = tempfile::Builder::new()
+            .prefix(".lidar_vec_")
+            .suffix(&format!(".{ext}"))
+            .tempfile_in(parent)?;
+        let staged_path = staged.into_temp_path();
+        let staged_str = staged_path
+            .to_str()
+            .ok_or_else(|| Error::InvalidArgument("non-UTF-8 temporary path".into()))?;
+        terrio::write_vector(&layers_to_write, staged_str, &VectorWriteOptions::default())?;
+        staged_path
+            .persist(out_path)
+            .map_err(|e| Error::Io(e.error))?;
+    } else {
+        terrio::write_vector(&layers_to_write, out_str, &VectorWriteOptions::default())?;
     }
     Ok(final_count)
 }
@@ -1576,7 +1623,7 @@ pub(crate) fn parse_tnm_products_json(
         let Some(url) = it
             .get("downloadURL")
             .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
+            .filter(|s| s.starts_with("https://"))
         else {
             continue;
         };
@@ -1687,21 +1734,33 @@ fn query_3dep_products_for_bbox(
             .unwrap_or_default();
         let batch_len = batch.len();
         raw_items.extend(batch);
-        let total = json
+        let total_opt = json
             .get("total")
             .and_then(Value::as_u64)
-            .map(|t| t as usize)
-            .unwrap_or(raw_items.len());
+            .map(|t| t as usize);
         offset += batch_len;
-        if offset < total && raw_items.len() >= max_products {
-            return Err(Error::InvalidArgument(format!(
-                "USGS TNM matched {total} '{}' products for bbox {}, exceeding max_products={max_products}; increase max_products or narrow the region",
-                opts.dem_product.tnm_dataset_name(),
-                bbox.to_csv_string()
-            )));
-        }
-        if batch_len == 0 || offset >= total {
-            break;
+        if let Some(total) = total_opt {
+            if offset < total && raw_items.len() >= max_products {
+                return Err(Error::InvalidArgument(format!(
+                    "USGS TNM matched {total} '{}' products for bbox {}, exceeding max_products={max_products}; increase max_products or narrow the region",
+                    opts.dem_product.tnm_dataset_name(),
+                    bbox.to_csv_string()
+                )));
+            }
+            if batch_len == 0 || offset >= total {
+                break;
+            }
+        } else {
+            if batch_len == 0 || batch_len < req_size {
+                break;
+            }
+            if raw_items.len() >= max_products {
+                return Err(Error::InvalidArgument(format!(
+                    "USGS TNM returned at least {max_products} '{}' products for bbox {} without a total count; increase max_products or narrow the region",
+                    opts.dem_product.tnm_dataset_name(),
+                    bbox.to_csv_string()
+                )));
+            }
         }
     }
 
@@ -2151,7 +2210,31 @@ pub fn fetch_noaa_atlas14(
     Ok(table)
 }
 
-fn manifest_matches_request(manifest_path: &Path, bbox: &Bbox, opts: &DownloadOptions) -> bool {
+fn region_cache_key(region: &Region) -> String {
+    match region {
+        Region::Bbox(_) => "bbox".to_string(),
+        Region::Huc(code) => format!("huc:{}", code.trim()),
+        Region::VectorFile(path) => {
+            let norm = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            format!("file:{}", norm.display())
+        }
+    }
+}
+
+fn effective_transportation_layers(opts: &DownloadOptions) -> Vec<u32> {
+    if opts.transportation_layers.is_empty() {
+        DEFAULT_TRANSPORTATION_LAYERS.to_vec()
+    } else {
+        opts.transportation_layers.clone()
+    }
+}
+
+fn manifest_matches_request(
+    manifest_path: &Path,
+    region_key: &str,
+    bbox: &Bbox,
+    opts: &DownloadOptions,
+) -> bool {
     let Ok(txt) = std::fs::read_to_string(manifest_path) else {
         return false;
     };
@@ -2164,10 +2247,12 @@ fn manifest_matches_request(manifest_path: &Path, bbox: &Bbox, opts: &DownloadOp
         && (prev.region_bbox.max_lon - bbox.max_lon).abs() <= tol
         && (prev.region_bbox.max_lat - bbox.max_lat).abs() <= tol;
     bbox_same
+        && prev.region_key == region_key
         && prev.dem_product == opts.dem_product
         && prev.wbd_level == opts.wbd_level
         && prev.clip_to_region == opts.clip_to_region
         && prev.mosaic_dem == opts.mosaic_dem
+        && prev.transportation_layers == effective_transportation_layers(opts)
 }
 
 /// Downloads a complete bundle of open U.S. federal datasets for `region` into `out_dir`.
@@ -2184,21 +2269,33 @@ pub fn download_federal_data(
     out_dir: impl AsRef<Path>,
     opts: &FederalBundleOptions,
 ) -> Result<FederalBundleResult> {
+    let has = |d: FederalDataset| opts.datasets.contains(&d);
+    let need_culverts = has(FederalDataset::Culverts);
+    if need_culverts {
+        SynthesizeCulvertsOptions {
+            half_length_m: opts.download.culvert_half_length_m,
+            snap_distance_m: opts.download.culvert_snap_distance_m,
+            ..Default::default()
+        }
+        .validate()?;
+    }
+
     let out_dir = out_dir.as_ref();
     std::fs::create_dir_all(out_dir)?;
 
     let resolved = resolve_region(region, Some(out_dir), &opts.download)?;
+    let reg_key = region_cache_key(region);
+    let trans_layers = effective_transportation_layers(&opts.download);
     let manifest_path = out_dir.join("manifest.json");
-    let cache_matches = manifest_matches_request(&manifest_path, &resolved.bbox, &opts.download);
+    let cache_matches =
+        manifest_matches_request(&manifest_path, &reg_key, &resolved.bbox, &opts.download);
     let mut bundle_dl_opts = opts.download.clone();
     if !cache_matches {
-        // Refresh per-region bundle outputs whenever out_dir was previously used for another
-        // region or different DEM/WBD/clip options (raw tile cache reuse is preserved separately).
+        // Invalidate any stale manifest before overwriting per-region outputs so an interrupted
+        // run can never leave mixed-region files matched by the old manifest.
+        let _ = std::fs::remove_file(&manifest_path);
         bundle_dl_opts.overwrite = true;
     }
-
-    let has = |d: FederalDataset| opts.datasets.contains(&d);
-    let need_culverts = has(FederalDataset::Culverts);
 
     let (wbd_path, wbd_count) = if has(FederalDataset::Wbd) {
         let p = out_dir.join("wbd.gpkg");
@@ -2295,10 +2392,12 @@ pub fn download_federal_data(
 
     let result = FederalBundleResult {
         region_bbox: resolved.bbox,
+        region_key: reg_key,
         dem_product: opts.download.dem_product,
         wbd_level: opts.download.wbd_level,
         clip_to_region: opts.download.clip_to_region,
         mosaic_dem: opts.download.mosaic_dem,
+        transportation_layers: trans_layers,
         wbd_path,
         wbd_count,
         dem_tiles,
@@ -2499,16 +2598,31 @@ mod tests {
         .unwrap();
         assert_eq!(loaded, tbl);
 
-        // Manifest cache matcher detects region and option changes
+        // Non-HTTPS downloadURL items are skipped
+        let insecure = serde_json::json!({
+            "items": [{
+                "title": "USGS 1 Meter 14 x47y523 HTTP_Only",
+                "publicationDate": "2024-01-01",
+                "downloadURL": "http://example.org/insecure.tif",
+                "sizeInBytes": 1000,
+                "format": "GeoTIFF",
+                "boundingBox": {"minX": -99.3, "minY": 47.0, "maxX": -99.1, "maxY": 47.2}
+            }]
+        });
+        assert!(parse_tnm_products_json(&insecure, None, true).is_empty());
+
+        // Manifest cache matcher detects region kind, bbox, and option changes
         let bb = Bbox::new(-99.2, 47.0, -99.0, 47.2).unwrap();
         let opts = DownloadOptions::default();
         let manifest_path = tmp.path().join("manifest.json");
         let manifest = FederalBundleResult {
             region_bbox: bb,
+            region_key: "bbox".to_string(),
             dem_product: opts.dem_product,
             wbd_level: opts.wbd_level,
             clip_to_region: opts.clip_to_region,
             mosaic_dem: opts.mosaic_dem,
+            transportation_layers: effective_transportation_layers(&opts),
             wbd_path: None,
             wbd_count: 0,
             dem_tiles: vec![],
@@ -2526,12 +2640,37 @@ mod tests {
             manifest_path: manifest_path.clone(),
         };
         std::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap()).unwrap();
-        assert!(manifest_matches_request(&manifest_path, &bb, &opts));
+        assert!(manifest_matches_request(&manifest_path, "bbox", &bb, &opts));
+        // Same bbox but different region kind (VectorFile / Huc) must NOT match
+        assert!(!manifest_matches_request(
+            &manifest_path,
+            "file:/tmp/study.geojson",
+            &bb,
+            &opts
+        ));
         let other_bb = Bbox::new(-98.2, 46.0, -98.0, 46.2).unwrap();
-        assert!(!manifest_matches_request(&manifest_path, &other_bb, &opts));
+        assert!(!manifest_matches_request(
+            &manifest_path,
+            "bbox",
+            &other_bb,
+            &opts
+        ));
         let mut other_opts = opts.clone();
         other_opts.dem_product = DemProduct::OneArcSec;
-        assert!(!manifest_matches_request(&manifest_path, &bb, &other_opts));
+        assert!(!manifest_matches_request(
+            &manifest_path,
+            "bbox",
+            &bb,
+            &other_opts
+        ));
+        let mut road_only_opts = opts.clone();
+        road_only_opts.transportation_layers = vec![29, 30, 31, 32, 33];
+        assert!(!manifest_matches_request(
+            &manifest_path,
+            "bbox",
+            &bb,
+            &road_only_opts
+        ));
     }
 
     #[test]
