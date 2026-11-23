@@ -4,7 +4,7 @@ Add `lidar` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-lidar = "0.4"
+lidar = "0.5"
 ```
 
 ## Cargo Features
@@ -20,7 +20,7 @@ For minimal WASM or embedded builds without threads or point-cloud support:
 
 ```toml
 [dependencies]
-lidar = { version = "0.4", default-features = false, features = ["serde"] }
+lidar = { version = "0.5", default-features = false, features = ["serde"] }
 ```
 
 ## Module Map

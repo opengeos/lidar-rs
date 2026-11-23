@@ -52,14 +52,14 @@ Add `lidar` to your `Cargo.toml` (requires Rust 1.90+):
 
 ```toml
 [dependencies]
-lidar = "0.4"
+lidar = "0.5"
 ```
 
 Default features enable `parallel` (Rayon), `pointcloud` (LAS/LAZ/COPC/PLY/E57 + CSF/PMF), and `serde` (JSON graph serialization). Disable unused features for lighter binaries:
 
 ```toml
 [dependencies]
-lidar = { version = "0.4", default-features = false, features = ["parallel"] }
+lidar = { version = "0.5", default-features = false, features = ["parallel"] }
 ```
 
 ## WebAssembly (`lidar-js`)
