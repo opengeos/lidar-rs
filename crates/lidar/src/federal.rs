@@ -1,7 +1,9 @@
-//! Pure-Rust utilities for downloading authoritative open U.S. federal geospatial
-//! datasets within a user-specified region of interest.
+//! Utilities for downloading authoritative open U.S. federal geospatial
+//! datasets within a user-specified region of interest (zero API keys, zero GDAL
+//! dependencies; gated behind the opt-in `download` feature using `ureq` + `rustls`
+//! for HTTPS).
 //!
-//! Supported federal web services (zero API keys, zero GDAL/C dependencies):
+//! Supported federal web services:
 //! - **USGS WBD** (Watershed Boundary Dataset, HUC-2 through HUC-12):
 //!   [`download_wbd`]
 //! - **USGS 3DEP** (1-m, 1/3 arc-sec, and 1 arc-sec DEMs, plus Lidar Point Cloud):
@@ -797,32 +799,52 @@ fn http_download_file(
             .suffix(".part")
             .tempfile_in(parent)?;
 
-        let res = (|| -> Result<u64> {
-            let mut resp = agent
-                .get(url)
-                .call()
-                .map_err(|e| Error::Http(format!("GET {url}: {e}")))?;
+        enum DownloadAttemptErr {
+            Fatal(Error),
+            Retryable(Error),
+        }
+
+        let res = (|| -> std::result::Result<u64, DownloadAttemptErr> {
+            let mut resp = agent.get(url).call().map_err(|e| {
+                let retryable = is_retryable_ureq_error(&e);
+                let err = Error::Http(format!("GET {url}: {e}"));
+                if retryable {
+                    DownloadAttemptErr::Retryable(err)
+                } else {
+                    DownloadAttemptErr::Fatal(err)
+                }
+            })?;
             let mut reader = resp.body_mut().as_reader();
             let mut buf = vec![0u8; 256 * 1024];
             let mut written: u64 = 0;
             loop {
-                let n = reader.read(&mut buf)?;
+                let n = reader
+                    .read(&mut buf)
+                    .map_err(|e| DownloadAttemptErr::Retryable(Error::Io(e)))?;
                 if n == 0 {
                     break;
                 }
-                tmp_file.as_file_mut().write_all(&buf[..n])?;
+                tmp_file
+                    .as_file_mut()
+                    .write_all(&buf[..n])
+                    .map_err(|e| DownloadAttemptErr::Fatal(Error::Io(e)))?;
                 written += n as u64;
             }
-            tmp_file.as_file_mut().flush()?;
+            tmp_file
+                .as_file_mut()
+                .flush()
+                .map_err(|e| DownloadAttemptErr::Fatal(Error::Io(e)))?;
             if written == 0 {
-                return Err(Error::Http(format!("GET {url} returned empty body")));
+                return Err(DownloadAttemptErr::Retryable(Error::Http(format!(
+                    "GET {url} returned empty body"
+                ))));
             }
             if let Some(exp) = expected_bytes
                 && written != exp
             {
-                return Err(Error::Http(format!(
+                return Err(DownloadAttemptErr::Retryable(Error::Http(format!(
                     "GET {url} short read: expected {exp} bytes, got {written}"
-                )));
+                ))));
             }
             Ok(written)
         })();
@@ -831,7 +853,11 @@ fn http_download_file(
                 tmp_file.persist(dest).map_err(|e| Error::Io(e.error))?;
                 return Ok(dest.to_path_buf());
             }
-            Err(e) => {
+            Err(DownloadAttemptErr::Fatal(e)) => {
+                drop(tmp_file);
+                return Err(e);
+            }
+            Err(DownloadAttemptErr::Retryable(e)) => {
                 drop(tmp_file);
                 last_err = e.to_string();
                 if attempt < max_retries {
@@ -1040,6 +1066,7 @@ fn clip_with_lazy_repair(layer: &terrio::Layer, clip_region: &ClipRegion) -> Res
     single.crs = layer.crs.clone();
     single.schema = layer.schema.clone();
 
+    let mut skipped: usize = 0;
     for feat in &layer.features {
         single.features.clear();
         single.features.push(feat.clone());
@@ -1048,10 +1075,16 @@ fn clip_with_lazy_repair(layer: &terrio::Layer, clip_region: &ClipRegion) -> Res
             Err(ref e) if is_geometry_validity_error(e) => match terrio_make_valid(&single) {
                 Ok(repaired) => match terrio_vector_clip(&repaired, clip_region) {
                     Ok(c) => c,
-                    Err(ref e2) if is_geometry_validity_error(e2) => continue,
+                    Err(ref e2) if is_geometry_validity_error(e2) => {
+                        skipped += 1;
+                        continue;
+                    }
                     Err(e2) => return Err(e2.into()),
                 },
-                Err(ref e2) if is_geometry_validity_error(e2) => continue,
+                Err(ref e2) if is_geometry_validity_error(e2) => {
+                    skipped += 1;
+                    continue;
+                }
                 Err(e2) => return Err(e2.into()),
             },
             Err(e) => return Err(e.into()),
@@ -1060,6 +1093,12 @@ fn clip_with_lazy_repair(layer: &terrio::Layer, clip_region: &ClipRegion) -> Res
             f.fid = out.features.len() as u64 + 1;
             out.features.push(f);
         }
+    }
+    if skipped > 0 {
+        eprintln!(
+            "warning: skipped {skipped} unrepairable geometry feature(s) while clipping layer '{}'",
+            layer.name
+        );
     }
     Ok(out)
 }
@@ -1661,7 +1700,7 @@ fn query_3dep_products_for_bbox(
                 bbox.to_csv_string()
             )));
         }
-        if batch_len == 0 || batch_len < req_size || offset >= total {
+        if batch_len == 0 || offset >= total {
             break;
         }
     }
@@ -1672,6 +1711,34 @@ fn query_3dep_products_for_bbox(
         Some(bbox),
         opts.deduplicate_tiles,
     ))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DemMosaicCacheMeta {
+    bbox: Bbox,
+    dem_product: DemProduct,
+    clip_to_region: bool,
+    boundary_path: Option<PathBuf>,
+    tile_paths: Vec<PathBuf>,
+}
+
+fn dem_mosaic_cache_matches(meta_path: &Path, expected: &DemMosaicCacheMeta) -> bool {
+    let Ok(txt) = std::fs::read_to_string(meta_path) else {
+        return false;
+    };
+    let Ok(prev) = serde_json::from_str::<DemMosaicCacheMeta>(&txt) else {
+        return false;
+    };
+    let tol = 1e-6;
+    let bbox_same = (prev.bbox.min_lon - expected.bbox.min_lon).abs() <= tol
+        && (prev.bbox.min_lat - expected.bbox.min_lat).abs() <= tol
+        && (prev.bbox.max_lon - expected.bbox.max_lon).abs() <= tol
+        && (prev.bbox.max_lat - expected.bbox.max_lat).abs() <= tol;
+    bbox_same
+        && prev.dem_product == expected.dem_product
+        && prev.clip_to_region == expected.clip_to_region
+        && prev.boundary_path == expected.boundary_path
+        && prev.tile_paths == expected.tile_paths
 }
 
 /// Queries, downloads, and optionally mosaics and clips USGS 3DEP DEM (or LPC) tiles for `region`.
@@ -1742,30 +1809,65 @@ fn download_3dep_dem_resolved(
 
     let mosaic_path = if opts.mosaic_dem && opts.dem_product.is_raster() && !tile_paths.is_empty() {
         let final_dem = out_dir.join("dem.tif");
-        if overwrite_mosaic || !final_dem.exists() {
-            let needs_clip = opts.clip_to_region && resolved.boundary_path.is_some();
-            if needs_clip {
-                let raw_mosaic = out_dir.join(".dem_mosaic_tmp.tif");
-                if tile_paths.len() == 1 {
-                    clip_image(
-                        &tile_paths[0],
-                        resolved.boundary_path.as_ref().expect("boundary path"),
-                        &final_dem,
-                    )?;
+        let meta_path = out_dir.join(".dem.meta.json");
+        let expected_meta = DemMosaicCacheMeta {
+            bbox: resolved.bbox,
+            dem_product: opts.dem_product,
+            clip_to_region: opts.clip_to_region,
+            boundary_path: resolved.boundary_path.clone(),
+            tile_paths: tile_paths.clone(),
+        };
+        let cache_valid = !overwrite_mosaic
+            && final_dem.is_file()
+            && std::fs::metadata(&final_dem).is_ok_and(|m| m.len() > 0)
+            && dem_mosaic_cache_matches(&meta_path, &expected_meta);
+
+        if !cache_valid {
+            // Stage the final mosaic/clip into a unique temp file in out_dir and rename atomically
+            // so an interrupted run never leaves a truncated dem.tif behind.
+            let staged_tmp = tempfile::Builder::new()
+                .prefix(".dem_stage_")
+                .suffix(".tif")
+                .tempfile_in(out_dir)?;
+            let staged_path = staged_tmp.into_temp_path();
+            let staged_pb = staged_path.to_path_buf();
+
+            let build_res = (|| -> Result<()> {
+                let needs_clip = opts.clip_to_region && resolved.boundary_path.is_some();
+                if needs_clip {
+                    if tile_paths.len() == 1 {
+                        clip_image(
+                            &tile_paths[0],
+                            resolved.boundary_path.as_ref().expect("boundary path"),
+                            &staged_pb,
+                        )?;
+                    } else {
+                        let raw_tmp = tempfile::Builder::new()
+                            .prefix(".dem_mosaic_")
+                            .suffix(".tif")
+                            .tempfile_in(out_dir)?;
+                        let raw_path = raw_tmp.into_temp_path();
+                        let raw_pb = raw_path.to_path_buf();
+                        mosaic(&tile_paths, &raw_pb)?;
+                        clip_image(
+                            &raw_pb,
+                            resolved.boundary_path.as_ref().expect("boundary path"),
+                            &staged_pb,
+                        )?;
+                    }
+                } else if tile_paths.len() == 1 {
+                    std::fs::copy(&tile_paths[0], &staged_pb)?;
                 } else {
-                    mosaic(&tile_paths, &raw_mosaic)?;
-                    let clip_res = clip_image(
-                        &raw_mosaic,
-                        resolved.boundary_path.as_ref().expect("boundary path"),
-                        &final_dem,
-                    );
-                    let _ = std::fs::remove_file(&raw_mosaic);
-                    clip_res?;
+                    mosaic(&tile_paths, &staged_pb)?;
                 }
-            } else if tile_paths.len() == 1 {
-                std::fs::copy(&tile_paths[0], &final_dem)?;
-            } else {
-                mosaic(&tile_paths, &final_dem)?;
+                Ok(())
+            })();
+            build_res?;
+            staged_path
+                .persist(&final_dem)
+                .map_err(|e| Error::Io(e.error))?;
+            if let Ok(meta_json) = serde_json::to_string(&expected_meta) {
+                let _ = std::fs::write(&meta_path, meta_json);
             }
         }
         Some(final_dem)
