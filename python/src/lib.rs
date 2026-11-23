@@ -12,11 +12,13 @@ use lidar::pointcloud::{
     GridMethod, GridStat, GroundFilterMethod, LidarToDsmOptions, LidarToDtmOptions, ReturnKind,
 };
 use lidar::{
-    AnimateInundationOptions, Array2D, BreachMode, BreachOptions, BurnCulvertsOptions,
+    AnimateInundationOptions, Array2D, Bbox, BreachMode, BreachOptions, BurnCulvertsOptions,
     CatchmentHierarchyOptions, DelineateCatchmentsOptions, DelineateFlowPathsOptions,
-    DelineateOptions, ExtractSinksOptions, FsmBasinSummary, FsmMassBalance, HillshadeOptions,
-    InundationForcing, NestedDepression, RoutingMode, RunPipelineOptions,
-    SimulateInundationOptions, SinkDepression, TiledDelineationOptions, Topology,
+    DelineateOptions, DemProduct, DownloadOptions, ExtractSinksOptions, FederalBundleOptions,
+    FsmBasinSummary, FsmMassBalance, HillshadeOptions, InundationForcing, NestedDepression,
+    NoaaAtlas14Table, Region, RoutingMode, RunPipelineOptions, SimulateInundationOptions,
+    SinkDepression, SynthesizeCulvertsOptions, TiledDelineationOptions, TnmProductItem, Topology,
+    WbdLevel,
 };
 
 fn to_py_err(e: lidar::Error) -> PyErr {
@@ -1587,6 +1589,371 @@ fn delineate_depressions_tiled<'py>(
     Ok(dict)
 }
 
+fn parse_py_region(
+    bbox: Option<(f64, f64, f64, f64)>,
+    huc: Option<String>,
+    region: Option<String>,
+) -> PyResult<Region> {
+    match (bbox, huc, region) {
+        (Some((x0, y0, x1, y1)), None, None) => {
+            Ok(Region::Bbox(Bbox::new(x0, y0, x1, y1).map_err(to_py_err)?))
+        }
+        (None, Some(code), None) => Ok(Region::Huc(
+            Region::validate_huc(&code).map_err(to_py_err)?,
+        )),
+        (None, None, Some(path)) => Ok(Region::VectorFile(PathBuf::from(path))),
+        _ => Err(PyValueError::new_err(
+            "specify exactly one of bbox, huc, or region",
+        )),
+    }
+}
+
+fn tnm_item_to_dict<'py>(
+    py: Python<'py>,
+    it: &TnmProductItem,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("grid_key", &it.grid_key)?;
+    d.set_item("title", &it.title)?;
+    d.set_item("publication_date", &it.publication_date)?;
+    d.set_item("download_url", &it.download_url)?;
+    d.set_item("size_bytes", it.size_bytes)?;
+    d.set_item("format", &it.format)?;
+    d.set_item(
+        "bbox",
+        (it.bbox.min_lon, it.bbox.min_lat, it.bbox.max_lon, it.bbox.max_lat),
+    )?;
+    Ok(d)
+}
+
+fn noaa_table_to_dict<'py>(
+    py: Python<'py>,
+    tbl: &NoaaAtlas14Table,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("lat", tbl.lat)?;
+    d.set_item("lon", tbl.lon)?;
+    d.set_item("units", &tbl.units)?;
+    let depths = PyDict::new(py);
+    for (dur, row) in &tbl.depths_mm {
+        let row_d = PyDict::new(py);
+        for (&ari, &val) in row {
+            row_d.set_item(ari, val)?;
+        }
+        depths.set_item(dur, row_d)?;
+    }
+    d.set_item("depths_mm", depths)?;
+    Ok(d)
+}
+
+#[pyfunction]
+#[pyo3(signature = (streams_vector, roads_vector, out_culverts, half_length_m=25.0, snap_distance_m=15.0, target_crs=None))]
+fn synthesize_culverts(
+    py: Python<'_>,
+    streams_vector: &str,
+    roads_vector: &str,
+    out_culverts: &str,
+    half_length_m: f64,
+    snap_distance_m: f64,
+    target_crs: Option<String>,
+) -> PyResult<usize> {
+    let streams = streams_vector.to_string();
+    let roads = roads_vector.to_string();
+    let out = out_culverts.to_string();
+    let opts = SynthesizeCulvertsOptions {
+        half_length_m,
+        snap_distance_m,
+        target_crs,
+        ..Default::default()
+    };
+    py.detach(move || lidar::synthesize_culverts(&streams, &roads, &out, &opts))
+        .map_err(to_py_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (bbox=None, huc=None, region=None, dem_product="1m", deduplicate=true))]
+fn query_3dep_products<'py>(
+    py: Python<'py>,
+    bbox: Option<(f64, f64, f64, f64)>,
+    huc: Option<String>,
+    region: Option<String>,
+    dem_product: &str,
+    deduplicate: bool,
+) -> PyResult<Bound<'py, PyList>> {
+    let reg = parse_py_region(bbox, huc, region)?;
+    let opts = DownloadOptions {
+        dem_product: dem_product.parse::<DemProduct>().map_err(to_py_err)?,
+        deduplicate_tiles: deduplicate,
+        ..Default::default()
+    };
+    let items = py
+        .detach(move || lidar::query_3dep_products(&reg, &opts))
+        .map_err(to_py_err)?;
+    let list = PyList::empty(py);
+    for it in &items {
+        list.append(tnm_item_to_dict(py, it)?)?;
+    }
+    Ok(list)
+}
+
+#[pyfunction]
+#[pyo3(signature = (out_dir, bbox=None, huc=None, region=None, dem_product="1m", mosaic_dem=true, clip_to_region=true, tile_cache_dir=None, overwrite=false))]
+#[allow(clippy::too_many_arguments)]
+fn download_3dep_dem<'py>(
+    py: Python<'py>,
+    out_dir: &str,
+    bbox: Option<(f64, f64, f64, f64)>,
+    huc: Option<String>,
+    region: Option<String>,
+    dem_product: &str,
+    mosaic_dem: bool,
+    clip_to_region: bool,
+    tile_cache_dir: Option<String>,
+    overwrite: bool,
+) -> PyResult<Bound<'py, PyDict>> {
+    let reg = parse_py_region(bbox, huc, region)?;
+    let out = out_dir.to_string();
+    let opts = DownloadOptions {
+        dem_product: dem_product.parse::<DemProduct>().map_err(to_py_err)?,
+        mosaic_dem,
+        clip_to_region,
+        tile_cache_dir: tile_cache_dir.map(PathBuf::from),
+        overwrite,
+        ..Default::default()
+    };
+    let res = py
+        .detach(move || lidar::download_3dep_dem(&reg, &out, &opts))
+        .map_err(to_py_err)?;
+    let d = PyDict::new(py);
+    d.set_item(
+        "bbox",
+        (res.bbox.min_lon, res.bbox.min_lat, res.bbox.max_lon, res.bbox.max_lat),
+    )?;
+    let prods = PyList::empty(py);
+    for it in &res.products {
+        prods.append(tnm_item_to_dict(py, it)?)?;
+    }
+    d.set_item("products", prods)?;
+    let tiles: Vec<String> = res
+        .tile_paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    d.set_item("tile_paths", tiles)?;
+    d.set_item(
+        "mosaic_path",
+        res.mosaic_path.map(|p| p.to_string_lossy().into_owned()),
+    )?;
+    Ok(d)
+}
+
+#[pyfunction]
+#[pyo3(signature = (out_path, bbox=None, huc=None, region=None, level=12, overwrite=false))]
+fn download_wbd(
+    py: Python<'_>,
+    out_path: &str,
+    bbox: Option<(f64, f64, f64, f64)>,
+    huc: Option<String>,
+    region: Option<String>,
+    level: usize,
+    overwrite: bool,
+) -> PyResult<usize> {
+    let reg = parse_py_region(bbox, huc, region)?;
+    let out = out_path.to_string();
+    let opts = DownloadOptions {
+        wbd_level: WbdLevel::from_digits(level).map_err(to_py_err)?,
+        overwrite,
+        ..Default::default()
+    };
+    py.detach(move || lidar::download_wbd(&reg, &out, &opts))
+        .map_err(to_py_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (out_path, bbox=None, huc=None, region=None, clip_to_region=true, overwrite=false))]
+fn download_nhd(
+    py: Python<'_>,
+    out_path: &str,
+    bbox: Option<(f64, f64, f64, f64)>,
+    huc: Option<String>,
+    region: Option<String>,
+    clip_to_region: bool,
+    overwrite: bool,
+) -> PyResult<usize> {
+    let reg = parse_py_region(bbox, huc, region)?;
+    let out = out_path.to_string();
+    let opts = DownloadOptions {
+        clip_to_region,
+        overwrite,
+        ..Default::default()
+    };
+    py.detach(move || lidar::download_nhd(&reg, &out, &opts))
+        .map_err(to_py_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (out_path, bbox=None, huc=None, region=None, clip_to_region=true, overwrite=false))]
+fn download_nwi(
+    py: Python<'_>,
+    out_path: &str,
+    bbox: Option<(f64, f64, f64, f64)>,
+    huc: Option<String>,
+    region: Option<String>,
+    clip_to_region: bool,
+    overwrite: bool,
+) -> PyResult<usize> {
+    let reg = parse_py_region(bbox, huc, region)?;
+    let out = out_path.to_string();
+    let opts = DownloadOptions {
+        clip_to_region,
+        overwrite,
+        ..Default::default()
+    };
+    py.detach(move || lidar::download_nwi(&reg, &out, &opts))
+        .map_err(to_py_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (out_path, bbox=None, huc=None, region=None, clip_to_region=true, overwrite=false))]
+fn download_roads(
+    py: Python<'_>,
+    out_path: &str,
+    bbox: Option<(f64, f64, f64, f64)>,
+    huc: Option<String>,
+    region: Option<String>,
+    clip_to_region: bool,
+    overwrite: bool,
+) -> PyResult<usize> {
+    let reg = parse_py_region(bbox, huc, region)?;
+    let out = out_path.to_string();
+    let opts = DownloadOptions {
+        clip_to_region,
+        overwrite,
+        ..Default::default()
+    };
+    py.detach(move || lidar::download_roads(&reg, &out, &opts))
+        .map_err(to_py_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (lat, lon, out_json=None, overwrite=false))]
+fn fetch_noaa_atlas14<'py>(
+    py: Python<'py>,
+    lat: f64,
+    lon: f64,
+    out_json: Option<String>,
+    overwrite: bool,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out_p = out_json.map(PathBuf::from);
+    let opts = DownloadOptions {
+        overwrite,
+        ..Default::default()
+    };
+    let tbl = py
+        .detach(move || lidar::fetch_noaa_atlas14(lat, lon, out_p.as_deref(), &opts))
+        .map_err(to_py_err)?;
+    noaa_table_to_dict(py, &tbl)
+}
+
+#[pyfunction]
+#[pyo3(signature = (out_dir, bbox=None, huc=None, region=None, datasets="all", dem_product="1m", wbd_level=12, mosaic_dem=true, clip_to_region=true, tile_cache_dir=None, overwrite=false))]
+#[allow(clippy::too_many_arguments)]
+fn download_federal_data<'py>(
+    py: Python<'py>,
+    out_dir: &str,
+    bbox: Option<(f64, f64, f64, f64)>,
+    huc: Option<String>,
+    region: Option<String>,
+    datasets: &str,
+    dem_product: &str,
+    wbd_level: usize,
+    mosaic_dem: bool,
+    clip_to_region: bool,
+    tile_cache_dir: Option<String>,
+    overwrite: bool,
+) -> PyResult<Bound<'py, PyDict>> {
+    let reg = parse_py_region(bbox, huc, region)?;
+    let ds_list = lidar::parse_dataset_list(datasets).map_err(to_py_err)?;
+    let out = out_dir.to_string();
+    let opts = FederalBundleOptions {
+        datasets: ds_list,
+        download: DownloadOptions {
+            dem_product: dem_product.parse::<DemProduct>().map_err(to_py_err)?,
+            wbd_level: WbdLevel::from_digits(wbd_level).map_err(to_py_err)?,
+            mosaic_dem,
+            clip_to_region,
+            tile_cache_dir: tile_cache_dir.map(PathBuf::from),
+            overwrite,
+            ..Default::default()
+        },
+    };
+    let res = py
+        .detach(move || lidar::download_federal_data(&reg, &out, &opts))
+        .map_err(to_py_err)?;
+
+    let d = PyDict::new(py);
+    d.set_item(
+        "region_bbox",
+        (
+            res.region_bbox.min_lon,
+            res.region_bbox.min_lat,
+            res.region_bbox.max_lon,
+            res.region_bbox.max_lat,
+        ),
+    )?;
+    d.set_item(
+        "wbd_path",
+        res.wbd_path.map(|p| p.to_string_lossy().into_owned()),
+    )?;
+    d.set_item("wbd_count", res.wbd_count)?;
+    d.set_item(
+        "dem_tiles",
+        res.dem_tiles
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+    )?;
+    d.set_item(
+        "dem_mosaic_path",
+        res.dem_mosaic_path.map(|p| p.to_string_lossy().into_owned()),
+    )?;
+    d.set_item(
+        "nhd_path",
+        res.nhd_path.map(|p| p.to_string_lossy().into_owned()),
+    )?;
+    d.set_item("nhd_count", res.nhd_count)?;
+    d.set_item(
+        "nwi_path",
+        res.nwi_path.map(|p| p.to_string_lossy().into_owned()),
+    )?;
+    d.set_item("nwi_count", res.nwi_count)?;
+    d.set_item(
+        "roads_path",
+        res.roads_path.map(|p| p.to_string_lossy().into_owned()),
+    )?;
+    d.set_item("roads_count", res.roads_count)?;
+    d.set_item(
+        "culverts_path",
+        res.culverts_path.map(|p| p.to_string_lossy().into_owned()),
+    )?;
+    d.set_item("culverts_count", res.culverts_count)?;
+    d.set_item(
+        "noaa_atlas14_path",
+        res.noaa_atlas14_path
+            .map(|p| p.to_string_lossy().into_owned()),
+    )?;
+    if let Some(ref tbl) = res.noaa_atlas14 {
+        d.set_item("noaa_atlas14", noaa_table_to_dict(py, tbl)?)?;
+    } else {
+        d.set_item("noaa_atlas14", py.None())?;
+    }
+    d.set_item(
+        "manifest_path",
+        res.manifest_path.to_string_lossy().as_ref(),
+    )?;
+    Ok(d)
+}
+
 #[pymodule]
 fn _lidar_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", lidar::VERSION)?;
@@ -1613,6 +1980,15 @@ fn _lidar_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(breach_depressions, m)?)?;
     m.add_function(wrap_pyfunction!(breach_depressions_array, m)?)?;
     m.add_function(wrap_pyfunction!(burn_culverts, m)?)?;
+    m.add_function(wrap_pyfunction!(synthesize_culverts, m)?)?;
+    m.add_function(wrap_pyfunction!(query_3dep_products, m)?)?;
+    m.add_function(wrap_pyfunction!(download_3dep_dem, m)?)?;
+    m.add_function(wrap_pyfunction!(download_wbd, m)?)?;
+    m.add_function(wrap_pyfunction!(download_nhd, m)?)?;
+    m.add_function(wrap_pyfunction!(download_nwi, m)?)?;
+    m.add_function(wrap_pyfunction!(download_roads, m)?)?;
+    m.add_function(wrap_pyfunction!(fetch_noaa_atlas14, m)?)?;
+    m.add_function(wrap_pyfunction!(download_federal_data, m)?)?;
     m.add_function(wrap_pyfunction!(scs_curve_number_runoff, m)?)?;
     m.add_function(wrap_pyfunction!(scs_type2_hyetograph, m)?)?;
     m.add_function(wrap_pyfunction!(animate_inundation, m)?)?;

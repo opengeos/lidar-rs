@@ -19,6 +19,8 @@ parallel = ["dep:rayon", "richdem/parallel"]
 pointcloud = ["terrio/pointcloud"]
 ## Serialization of depression and result structs via `serde`
 serde = ["dep:serde", "dep:serde_json", "richdem/serde"]
+## Opt-in U.S. federal data download utilities (USGS 3DEP, WBD, NHD, Transportation, USFWS NWI, NOAA Atlas 14; non-WASM only, pulls `ureq` with `rustls`/`ring`)
+download = ["dep:ureq", "dep:serde", "dep:serde_json", "dep:tempfile"]
 
 [dependencies]
 gif.workspace = true
@@ -29,6 +31,10 @@ thiserror.workspace = true
 rayon = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tempfile = { workspace = true, optional = true }
+ureq = { workspace = true, optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }

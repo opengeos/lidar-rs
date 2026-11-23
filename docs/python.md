@@ -112,6 +112,38 @@ frames = lidar.export_inundation_frames_png(
 )
 ```
 
+### 4. Federal Geospatial Data Download (U.S. Open Federal Services)
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/opengeos/lidar-rs/blob/main/examples/federal_data_download.ipynb)
+
+Download authoritative open U.S. federal data within a WGS 84 bounding box, USGS HUC code (HUC-2 through HUC-12), or local polygon vector file with zero GDAL or API keys:
+
+```python
+import lidar_rs as lidar
+
+# Inspect matching 1-m USGS 3DEP tiles without downloading
+tiles = lidar.query_3dep_products(huc="101600020503", dem_product="1m")
+
+# Download WBD, 1-m 3DEP DEM (mosaicked & clipped), NHD, NWI, roads, culverts, and NOAA Atlas 14
+bundle = lidar.download_federal_data(
+    "out_huc12",
+    huc="101600020503",
+    datasets="all",
+    dem_product="1m",
+    tile_cache_dir="tiles_cache",
+)
+print("DEM:", bundle["dem_mosaic_path"], "Culverts:", bundle["culverts_count"])
+
+# Individual layer helpers and offline culvert synthesis
+lidar.download_wbd("wbd.gpkg", bbox=(-99.14, 47.04, -99.08, 47.08), level=12)
+lidar.download_nhd("nhd.gpkg", region="study_area.geojson")
+lidar.download_nwi("nwi.gpkg", region="study_area.geojson")
+lidar.download_roads("roads.gpkg", region="study_area.geojson")
+lidar.synthesize_culverts("nhd.gpkg", "roads.gpkg", "culverts.gpkg", half_length_m=25.0)
+noaa = lidar.fetch_noaa_atlas14(47.06, -99.11, out_json="noaa_atlas14.json")
+print("24-hr 100-yr rainfall (mm):", noaa["depths_mm"]["24-hr"][100])
+```
+
 ## Drop-In `opengeos/lidar` Compatibility
 
 Existing Python scripts written for `opengeos/lidar` work directly with `import lidar_rs as lidar`:

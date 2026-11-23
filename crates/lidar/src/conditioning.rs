@@ -13,8 +13,12 @@ use richdem::{
 };
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-use terrio::crs::SpatialRef;
-use terrio::{Geometry, VectorOpenOptions};
+use terrio::crs::{SpatialRef, Transformer};
+use terrio::vector::Coord;
+use terrio::{
+    Feature, FieldDef, FieldType, FieldValue, Geometry, GeometryType, Layer, VectorOpenOptions,
+    VectorWriteOptions,
+};
 
 use crate::error::{Error, Result};
 use crate::raster_ops::ensure_no_path_collision;
@@ -577,6 +581,758 @@ pub fn burn_culverts_file(
     Ok((out, carved))
 }
 
+/// Options controlling [`synthesize_culverts`].
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct SynthesizeCulvertsOptions {
+    /// Half-length (in meters) extracted along each stream polyline on both sides of a
+    /// road crossing (total target breach segment length is `2 * half_length_m`; default `25.0`).
+    pub half_length_m: f64,
+    /// Minimum Euclidean distance (in meters) between distinct synthesized culvert crossings;
+    /// clustered intersections closer than this threshold are deduplicated (default `15.0`).
+    pub snap_distance_m: f64,
+    /// Minimum stream polyline length (in meters) eligible for crossing synthesis (default `5.0`).
+    pub min_stream_length_m: f64,
+    /// Minimum extracted culvert breach segment length (in meters) kept in output (default `6.0`).
+    pub min_segment_length_m: f64,
+    /// Optional target projected CRS (e.g. `"EPSG:26914"`). When `None`, uses the stream layer's
+    /// projected CRS or automatically selects the local WGS 84 UTM zone if inputs are geographic.
+    pub target_crs: Option<String>,
+}
+
+impl Default for SynthesizeCulvertsOptions {
+    fn default() -> Self {
+        Self {
+            half_length_m: 25.0,
+            snap_distance_m: 15.0,
+            min_stream_length_m: 5.0,
+            min_segment_length_m: 6.0,
+            target_crs: None,
+        }
+    }
+}
+
+impl SynthesizeCulvertsOptions {
+    /// Validates numeric distance thresholds before running culvert synthesis or federal downloads.
+    pub fn validate(&self) -> Result<()> {
+        if !self.half_length_m.is_finite() || self.half_length_m <= 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "half_length_m must be finite and > 0, got {}",
+                self.half_length_m
+            )));
+        }
+        if !self.snap_distance_m.is_finite() || self.snap_distance_m < 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "snap_distance_m must be finite and >= 0, got {}",
+                self.snap_distance_m
+            )));
+        }
+        if !self.min_stream_length_m.is_finite() || self.min_stream_length_m < 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "min_stream_length_m must be finite and >= 0, got {}",
+                self.min_stream_length_m
+            )));
+        }
+        if !self.min_segment_length_m.is_finite() || self.min_segment_length_m < 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "min_segment_length_m must be finite and >= 0, got {}",
+                self.min_segment_length_m
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn collect_polylines(geom: &Geometry, out: &mut Vec<Vec<(f64, f64)>>) {
+    match geom {
+        Geometry::LineString(coords) => {
+            if coords.len() >= 2 {
+                out.push(coords.iter().map(|c| (c.x, c.y)).collect());
+            }
+        }
+        Geometry::MultiLineString(lines) => {
+            for line in lines {
+                if line.len() >= 2 {
+                    out.push(line.iter().map(|c| (c.x, c.y)).collect());
+                }
+            }
+        }
+        Geometry::GeometryCollection(geoms) => {
+            for g in geoms {
+                collect_polylines(g, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn transform_polylines(
+    lines: &mut [Vec<(f64, f64)>],
+    src: &SpatialRef,
+    dst: &SpatialRef,
+) -> Result<()> {
+    if lines.is_empty() {
+        return Ok(());
+    }
+    if src.is_unknown() {
+        return Err(Error::InvalidArgument(
+            "input vector layer has an unknown CRS; assign a known CRS before synthesizing culverts"
+                .into(),
+        ));
+    }
+    if dst.is_unknown() {
+        return Err(Error::InvalidArgument(
+            "target CRS is unknown; specify a valid projected CRS".into(),
+        ));
+    }
+    if src.same_as(dst) {
+        return Ok(());
+    }
+    let tx = Transformer::new(src, dst)?;
+    for line in lines.iter_mut() {
+        tx.transform_slice(line)?;
+    }
+    Ok(())
+}
+
+/// Computes the exact 2D intersection point between closed line segments `ab` and `cd`.
+fn segment_intersection(
+    a: (f64, f64),
+    b: (f64, f64),
+    c: (f64, f64),
+    d: (f64, f64),
+) -> Option<(f64, f64, f64)> {
+    let r = (b.0 - a.0, b.1 - a.1);
+    let s = (d.0 - c.0, d.1 - c.1);
+    let denom = r.0 * s.1 - r.1 * s.0;
+    if denom.abs() < 1e-12 {
+        return None;
+    }
+    let qmp = (c.0 - a.0, c.1 - a.1);
+    let t = (qmp.0 * s.1 - qmp.1 * s.0) / denom;
+    let u = (qmp.0 * r.1 - qmp.1 * r.0) / denom;
+    if (-1e-9..=1.0 + 1e-9).contains(&t) && (-1e-9..=1.0 + 1e-9).contains(&u) {
+        let tc = t.clamp(0.0, 1.0);
+        Some((a.0 + tc * r.0, a.1 + tc * r.1, tc))
+    } else {
+        None
+    }
+}
+
+fn polyline_cumulative_lengths(pts: &[(f64, f64)]) -> Vec<f64> {
+    let mut cum = Vec::with_capacity(pts.len());
+    cum.push(0.0);
+    let mut acc = 0.0;
+    for w in pts.windows(2) {
+        acc += (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1);
+        cum.push(acc);
+    }
+    cum
+}
+
+fn interpolate_along_polyline(pts: &[(f64, f64)], cum: &[f64], dist: f64) -> (f64, f64) {
+    if dist <= 0.0 {
+        return pts[0];
+    }
+    let total = *cum.last().unwrap_or(&0.0);
+    if dist >= total {
+        return *pts.last().unwrap_or(&pts[0]);
+    }
+    let idx = cum.partition_point(|&d| d < dist).saturating_sub(1);
+    let d0 = cum[idx];
+    let d1 = cum[idx + 1];
+    let seg_len = d1 - d0;
+    let t = if seg_len > 1e-12 {
+        ((dist - d0) / seg_len).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let p0 = pts[idx];
+    let p1 = pts[idx + 1];
+    (p0.0 + t * (p1.0 - p0.0), p0.1 + t * (p1.1 - p0.1))
+}
+
+fn extract_polyline_substring(
+    pts: &[(f64, f64)],
+    cum: &[f64],
+    s0: f64,
+    s1: f64,
+) -> Vec<(f64, f64)> {
+    let start_idx = cum.partition_point(|&d| d <= s0 + 1e-9);
+    let end_idx = cum.partition_point(|&d| d < s1 - 1e-9);
+    let mut out = Vec::with_capacity(end_idx.saturating_sub(start_idx) + 2);
+    out.push(interpolate_along_polyline(pts, cum, s0));
+    if start_idx < end_idx {
+        out.extend_from_slice(&pts[start_idx..end_idx]);
+    }
+    out.push(interpolate_along_polyline(pts, cum, s1));
+    out
+}
+
+fn utm_epsg_from_lon_lat(lon: f64, lat: f64) -> u32 {
+    let wrapped = (lon + 180.0).rem_euclid(360.0);
+    let zone = ((wrapped / 6.0).floor() as u32).min(59) + 1;
+    if lat >= 0.0 {
+        32600 + zone
+    } else {
+        32700 + zone
+    }
+}
+
+/// Computes an antimeridian-safe circular mean longitude and arithmetic mean latitude.
+fn circular_mean_lon_lat(pts: impl IntoIterator<Item = (f64, f64)>) -> Option<(f64, f64)> {
+    let (mut sum_sin, mut sum_cos, mut sum_lat, mut cnt) = (0.0f64, 0.0f64, 0.0f64, 0usize);
+    for (lon, lat) in pts {
+        if lon.is_finite() && lat.is_finite() {
+            let rad = lon.to_radians();
+            sum_sin += rad.sin();
+            sum_cos += rad.cos();
+            sum_lat += lat;
+            cnt += 1;
+        }
+    }
+    if cnt == 0 {
+        return None;
+    }
+    let mean_lon = sum_sin.atan2(sum_cos).to_degrees();
+    let mean_lat = sum_lat / cnt as f64;
+    Some((mean_lon, mean_lat))
+}
+
+/// Stitches stream polylines that meet at degree-2 shared endpoints (e.g., NHD reaches split
+/// right at a road crossing) so culvert extraction can span both sides of the embankment.
+fn stitch_degree2_polylines(lines: Vec<Vec<(f64, f64)>>, snap_tol: f64) -> Vec<Vec<(f64, f64)>> {
+    if lines.len() < 2 || snap_tol <= 0.0 {
+        return lines;
+    }
+    let inv = 1.0 / snap_tol;
+    let key_of =
+        |p: (f64, f64)| -> (i64, i64) { ((p.0 * inv).round() as i64, (p.1 * inv).round() as i64) };
+
+    // Map quantized endpoint -> list of (line_idx, is_end)
+    let mut node_map: std::collections::HashMap<(i64, i64), Vec<(usize, bool)>> =
+        std::collections::HashMap::new();
+    for (i, line) in lines.iter().enumerate() {
+        if line.len() < 2 {
+            continue;
+        }
+        let p0 = line[0];
+        let p1 = *line.last().expect("len >= 2");
+        if !(p0.0.is_finite() && p0.1.is_finite() && p1.0.is_finite() && p1.1.is_finite()) {
+            continue;
+        }
+        node_map.entry(key_of(p0)).or_default().push((i, false));
+        node_map.entry(key_of(p1)).or_default().push((i, true));
+    }
+
+    // Build degree-2 adjacency: for each line endpoint (line_idx, is_end) -> Option<(other_idx, other_is_end)>
+    let mut adj: Vec<[Option<(usize, bool)>; 2]> = vec![[None, None]; lines.len()];
+    for incidents in node_map.values() {
+        if incidents.len() == 2 && incidents[0].0 != incidents[1].0 {
+            let (i0, e0) = incidents[0];
+            let (i1, e1) = incidents[1];
+            adj[i0][usize::from(e0)] = Some((i1, e1));
+            adj[i1][usize::from(e1)] = Some((i0, e0));
+        }
+    }
+
+    let mut used = vec![false; lines.len()];
+    let mut merged: Vec<Vec<(f64, f64)>> = Vec::with_capacity(lines.len());
+
+    // First walk open chains starting from any endpoint without a degree-2 neighbor, then closed rings
+    for pass in 0..2 {
+        for start in 0..lines.len() {
+            if used[start] || lines[start].len() < 2 {
+                continue;
+            }
+            let start_dir = if pass == 0 {
+                if adj[start][0].is_none() {
+                    Some(true) // start at end 0, walk forward to end 1
+                } else if adj[start][1].is_none() {
+                    Some(false) // start at end 1, walk backward to end 0
+                } else {
+                    None
+                }
+            } else {
+                Some(true)
+            };
+            let Some(mut forward) = start_dir else {
+                continue;
+            };
+            let mut chain: Vec<(f64, f64)> = Vec::new();
+            let mut cur = start;
+            loop {
+                used[cur] = true;
+                let pts = &lines[cur];
+                if chain.is_empty() {
+                    if forward {
+                        chain.extend_from_slice(pts);
+                    } else {
+                        chain.extend(pts.iter().rev().copied());
+                    }
+                } else if forward {
+                    chain.extend_from_slice(&pts[1..]);
+                } else {
+                    chain.extend(pts[..pts.len() - 1].iter().rev().copied());
+                }
+                let exit_end = usize::from(forward);
+                let Some((next_idx, next_enter_end)) = adj[cur][exit_end] else {
+                    break;
+                };
+                if used[next_idx] {
+                    break;
+                }
+                cur = next_idx;
+                forward = !next_enter_end;
+            }
+            merged.push(chain);
+        }
+    }
+    merged
+}
+
+/// Synthesizes deterministic road- and rail-stream culvert breach polylines by intersecting
+/// stream flowlines (e.g., USGS NHD) with road/railway centerlines (e.g., USGS National
+/// Transportation).
+///
+/// Clustered intersections within [`SynthesizeCulvertsOptions::snap_distance_m`] are deduplicated,
+/// and for each crossing a two-sided breach polyline of length `±half_length_m` is extracted along
+/// the local stream direction so it can be passed directly into [`burn_culverts`].
+///
+/// All input layers with features must carry a known CRS. When input layers are geographic (e.g.,
+/// `EPSG:4326`) and `target_crs` is `None`, synthesis automatically selects the local WGS 84 UTM
+/// zone so distances are exact meters. Non-meter projected CRSs (e.g., US survey feet) are
+/// automatically converted using the CRS linear unit factor. Output should be written to a
+/// projected-CRS-aware vector format such as `.gpkg` or `.shp` (`.geojson`/`.json` is rejected
+/// because RFC 7946 GeoJSON requires WGS 84 coordinates).
+///
+/// Each output feature carries attributes `culvert_id` (1-based), `stream_idx` (0-based index
+/// into the degree-2 stitched stream polyline chains), and `length_m` (exact metric length).
+///
+/// Returns the number of synthesized culvert polylines written to `out_culverts`.
+pub fn synthesize_culverts(
+    streams_vector: impl AsRef<Path>,
+    roads_vector: impl AsRef<Path>,
+    out_culverts: impl AsRef<Path>,
+    options: &SynthesizeCulvertsOptions,
+) -> Result<usize> {
+    options.validate()?;
+
+    let streams_path = streams_vector.as_ref();
+    let roads_path = roads_vector.as_ref();
+    let out_path = out_culverts.as_ref();
+    let out_ext = out_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    if out_ext == "geojson" || out_ext == "json" {
+        return Err(Error::InvalidArgument(
+            "projected culvert outputs cannot be written as RFC 7946 GeoJSON (.geojson/.json); write to .gpkg or .shp instead"
+                .into(),
+        ));
+    }
+    ensure_no_path_collision(streams_path, &[out_path])?;
+    ensure_no_path_collision(roads_path, &[out_path])?;
+    if let Some(parent) = out_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let streams_str = streams_path.to_str().ok_or_else(|| {
+        Error::InvalidArgument(format!("non-UTF-8 path: {}", streams_path.display()))
+    })?;
+    let roads_str = roads_path.to_str().ok_or_else(|| {
+        Error::InvalidArgument(format!("non-UTF-8 path: {}", roads_path.display()))
+    })?;
+    let out_str = out_path
+        .to_str()
+        .ok_or_else(|| Error::InvalidArgument(format!("non-UTF-8 path: {}", out_path.display())))?;
+
+    let streams_ds = terrio::open_vector(streams_str, &VectorOpenOptions::default())?;
+    let roads_ds = terrio::open_vector(roads_str, &VectorOpenOptions::default())?;
+
+    // Collect polylines per layer so multi-layer GeoPackages retain each layer's own CRS.
+    type PolylineLayer = (SpatialRef, Vec<Vec<(f64, f64)>>);
+    let mut stream_layers: Vec<PolylineLayer> = Vec::new();
+    for layer in &streams_ds.layers {
+        let mut lines = Vec::new();
+        for feat in &layer.features {
+            if let Some(ref g) = feat.geometry {
+                collect_polylines(g, &mut lines);
+            }
+        }
+        if !lines.is_empty() {
+            let srs = SpatialRef::from_layer(layer);
+            if srs.is_unknown() {
+                return Err(Error::InvalidArgument(format!(
+                    "stream layer '{}' has an unknown CRS; assign a known CRS before synthesizing culverts",
+                    layer.name
+                )));
+            }
+            stream_layers.push((srs, lines));
+        }
+    }
+
+    let mut road_layers: Vec<PolylineLayer> = Vec::new();
+    for layer in &roads_ds.layers {
+        let mut lines = Vec::new();
+        for feat in &layer.features {
+            if let Some(ref g) = feat.geometry {
+                collect_polylines(g, &mut lines);
+            }
+        }
+        if !lines.is_empty() {
+            let srs = SpatialRef::from_layer(layer);
+            if srs.is_unknown() {
+                return Err(Error::InvalidArgument(format!(
+                    "road layer '{}' has an unknown CRS; assign a known CRS before synthesizing culverts",
+                    layer.name
+                )));
+            }
+            road_layers.push((srs, lines));
+        }
+    }
+
+    let first_stream_srs = stream_layers.first().map(|(s, _)| s.clone()).or_else(|| {
+        streams_ds
+            .layers
+            .first()
+            .map(SpatialRef::from_layer)
+            .filter(|s| !s.is_unknown())
+    });
+
+    // Determine working projected CRS (always projected so linear distances are well-defined).
+    let work_srs = if let Some(ref crs_str) = options.target_crs {
+        let parsed = SpatialRef::parse(crs_str)?;
+        if parsed.is_unknown() || parsed.is_geographic() {
+            return Err(Error::InvalidArgument(format!(
+                "target_crs '{crs_str}' must be a known projected CRS (geographic/unknown CRSs cannot measure metric culvert lengths)"
+            )));
+        }
+        parsed
+    } else if let Some(ref srs) = first_stream_srs
+        && !srs.is_geographic()
+    {
+        srs.clone()
+    } else {
+        // Compute antimeridian-safe circular mean lon/lat in WGS 84 across stream vertices
+        let wgs84 = SpatialRef::from_epsg(4326)?;
+        let mut geo_pts: Vec<(f64, f64)> = Vec::new();
+        for (srs, lines) in &stream_layers {
+            if srs.same_as(&wgs84) || srs.is_geographic() {
+                for line in lines {
+                    geo_pts.extend(line.iter().copied());
+                }
+            } else {
+                let tx = Transformer::new(srs, &wgs84)?;
+                for line in lines {
+                    let mut tmp = line.clone();
+                    tx.transform_slice(&mut tmp)?;
+                    geo_pts.extend(tmp);
+                }
+            }
+        }
+        if let Some((mean_lon, mean_lat)) = circular_mean_lon_lat(geo_pts) {
+            SpatialRef::from_epsg(utm_epsg_from_lon_lat(mean_lon, mean_lat))?
+        } else if let Some(ref srs) = first_stream_srs
+            && !srs.is_geographic()
+        {
+            srs.clone()
+        } else {
+            SpatialRef::from_epsg(3857)?
+        }
+    };
+
+    let mut stream_lines: Vec<Vec<(f64, f64)>> = Vec::new();
+    for (srs, mut lines) in stream_layers {
+        transform_polylines(&mut lines, &srs, &work_srs)?;
+        stream_lines.extend(lines);
+    }
+    let mut road_lines: Vec<Vec<(f64, f64)>> = Vec::new();
+    for (srs, mut lines) in road_layers {
+        transform_polylines(&mut lines, &srs, &work_srs)?;
+        road_lines.extend(lines);
+    }
+
+    // Scale meter parameters into the working projected CRS linear units (e.g., meters = 1.0,
+    // US survey feet ~= 0.3048006096 m/ft).
+    let unit_to_meter = work_srs
+        .projection_params()
+        .map(|p| p.to_meter)
+        .filter(|&v| v.is_finite() && v > 0.0)
+        .unwrap_or(1.0);
+    let half_length = options.half_length_m / unit_to_meter;
+    let snap_distance = options.snap_distance_m / unit_to_meter;
+    let min_stream_length = options.min_stream_length_m / unit_to_meter;
+    let min_segment_length = options.min_segment_length_m / unit_to_meter;
+    let min_side_clearance = (min_segment_length * 0.25).min(1.0 / unit_to_meter);
+
+    // Stitch degree-2 stream endpoints (e.g., NHD reaches split at a road crossing) so culverts
+    // cleanly extend onto both sides of the embankment.
+    stream_lines = stitch_degree2_polylines(stream_lines, 0.5 / unit_to_meter);
+
+    // Build a uniform spatial grid index over road segments for O(1) crossing lookup, plus an
+    // oversized fallback list so long segments never silently drop crossings.
+    const MAX_SEG_GRID_CELLS: i64 = 10_000;
+    #[derive(Clone, Copy)]
+    struct RoadSeg {
+        a: (f64, f64),
+        b: (f64, f64),
+        min_x: f64,
+        min_y: f64,
+        max_x: f64,
+        max_y: f64,
+    }
+    let mut road_segs: Vec<RoadSeg> = Vec::new();
+    for line in &road_lines {
+        for w in line.windows(2) {
+            if !(w[0].0.is_finite()
+                && w[0].1.is_finite()
+                && w[1].0.is_finite()
+                && w[1].1.is_finite())
+            {
+                continue;
+            }
+            road_segs.push(RoadSeg {
+                a: w[0],
+                b: w[1],
+                min_x: w[0].0.min(w[1].0),
+                min_y: w[0].1.min(w[1].1),
+                max_x: w[0].0.max(w[1].0),
+                max_y: w[0].1.max(w[1].1),
+            });
+        }
+    }
+
+    let cell_size = (half_length * 10.0).max(250.0 / unit_to_meter);
+    let mut grid: std::collections::HashMap<(i64, i64), Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut oversized_road_segs: Vec<usize> = Vec::new();
+    for (idx, seg) in road_segs.iter().enumerate() {
+        let gx0 = (seg.min_x / cell_size).floor() as i64;
+        let gx1 = (seg.max_x / cell_size).floor() as i64;
+        let gy0 = (seg.min_y / cell_size).floor() as i64;
+        let gy1 = (seg.max_y / cell_size).floor() as i64;
+        let span_x = gx1.saturating_sub(gx0).saturating_add(1);
+        let span_y = gy1.saturating_sub(gy0).saturating_add(1);
+        if span_x <= 0 || span_y <= 0 || span_x.saturating_mul(span_y) > MAX_SEG_GRID_CELLS {
+            oversized_road_segs.push(idx);
+            continue;
+        }
+        for gx in gx0..=gx1 {
+            for gy in gy0..=gy1 {
+                grid.entry((gx, gy)).or_default().push(idx);
+            }
+        }
+    }
+
+    struct SynthesizedSegment {
+        stream_idx: usize,
+        length_m: f64,
+        pts: Vec<(f64, f64)>,
+    }
+    let snap_sq = snap_distance * snap_distance;
+    let snap_cell = snap_distance.max(1.0 / unit_to_meter);
+    let mut seen_grid: std::collections::HashMap<(i64, i64), Vec<(f64, f64)>> =
+        std::collections::HashMap::new();
+    let mut culvert_geoms: Vec<SynthesizedSegment> = Vec::new();
+    let mut visited_seg_stamp: Vec<u32> = vec![0; road_segs.len()];
+    let mut stamp: u32 = 0;
+
+    let mut consider_road_seg = |ridx: usize,
+                                 stream_idx: usize,
+                                 sline: &[(f64, f64)],
+                                 cum: &[f64],
+                                 total_len: f64,
+                                 si: usize,
+                                 a: (f64, f64),
+                                 b: (f64, f64),
+                                 seg_len: f64,
+                                 smin_x: f64,
+                                 smax_x: f64,
+                                 smin_y: f64,
+                                 smax_y: f64,
+                                 visited_seg_stamp: &mut [u32],
+                                 stamp: u32| {
+        if visited_seg_stamp[ridx] == stamp {
+            return;
+        }
+        visited_seg_stamp[ridx] = stamp;
+        let rseg = road_segs[ridx];
+        if rseg.max_x < smin_x || rseg.min_x > smax_x || rseg.max_y < smin_y || rseg.min_y > smax_y
+        {
+            return;
+        }
+        let Some((ix, iy, t)) = segment_intersection(a, b, rseg.a, rseg.b) else {
+            return;
+        };
+        let dist_along = cum[si] + t * seg_len;
+        // Require the stream to extend on both sides of the crossing so one-sided stubs neither
+        // emit ineffective single-sided breaches nor block valid crossings via snap deduplication.
+        if dist_along < min_side_clearance || (total_len - dist_along) < min_side_clearance {
+            return;
+        }
+        let s0 = (dist_along - half_length).max(0.0);
+        let s1 = (dist_along + half_length).min(total_len);
+        if s1 - s0 < min_segment_length {
+            return;
+        }
+        let cx = (ix / snap_cell).floor() as i64;
+        let cy = (iy / snap_cell).floor() as i64;
+        if snap_sq > 0.0 {
+            for nx in (cx - 1)..=(cx + 1) {
+                for ny in (cy - 1)..=(cy + 1) {
+                    if let Some(pts) = seen_grid.get(&(nx, ny))
+                        && pts
+                            .iter()
+                            .any(|&(px, py)| (px - ix).powi(2) + (py - iy).powi(2) < snap_sq)
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+        seen_grid.entry((cx, cy)).or_default().push((ix, iy));
+        let sub = extract_polyline_substring(sline, cum, s0, s1);
+        culvert_geoms.push(SynthesizedSegment {
+            stream_idx,
+            length_m: (s1 - s0) * unit_to_meter,
+            pts: sub,
+        });
+    };
+
+    for (stream_idx, sline) in stream_lines.iter().enumerate() {
+        let cum = polyline_cumulative_lengths(sline);
+        let total_len = *cum.last().unwrap_or(&0.0);
+        if total_len < min_stream_length {
+            continue;
+        }
+        for (si, w) in sline.windows(2).enumerate() {
+            let a = w[0];
+            let b = w[1];
+            if !(a.0.is_finite() && a.1.is_finite() && b.0.is_finite() && b.1.is_finite()) {
+                continue;
+            }
+            let seg_len = cum[si + 1] - cum[si];
+            let smin_x = a.0.min(b.0);
+            let smax_x = a.0.max(b.0);
+            let smin_y = a.1.min(b.1);
+            let smax_y = a.1.max(b.1);
+            let gx0 = (smin_x / cell_size).floor() as i64;
+            let gx1 = (smax_x / cell_size).floor() as i64;
+            let gy0 = (smin_y / cell_size).floor() as i64;
+            let gy1 = (smax_y / cell_size).floor() as i64;
+            let span_x = gx1.saturating_sub(gx0).saturating_add(1);
+            let span_y = gy1.saturating_sub(gy0).saturating_add(1);
+            stamp = stamp.wrapping_add(1);
+            if stamp == 0 {
+                visited_seg_stamp.fill(0);
+                stamp = 1;
+            }
+            if span_x <= 0 || span_y <= 0 || span_x.saturating_mul(span_y) > MAX_SEG_GRID_CELLS {
+                // Direct AABB-filtered scan for unusually long stream segments
+                for ridx in 0..road_segs.len() {
+                    consider_road_seg(
+                        ridx,
+                        stream_idx,
+                        sline,
+                        &cum,
+                        total_len,
+                        si,
+                        a,
+                        b,
+                        seg_len,
+                        smin_x,
+                        smax_x,
+                        smin_y,
+                        smax_y,
+                        &mut visited_seg_stamp,
+                        stamp,
+                    );
+                }
+            } else {
+                for gx in gx0..=gx1 {
+                    for gy in gy0..=gy1 {
+                        if let Some(bucket) = grid.get(&(gx, gy)) {
+                            for &ridx in bucket {
+                                consider_road_seg(
+                                    ridx,
+                                    stream_idx,
+                                    sline,
+                                    &cum,
+                                    total_len,
+                                    si,
+                                    a,
+                                    b,
+                                    seg_len,
+                                    smin_x,
+                                    smax_x,
+                                    smin_y,
+                                    smax_y,
+                                    &mut visited_seg_stamp,
+                                    stamp,
+                                );
+                            }
+                        }
+                    }
+                }
+                for &ridx in &oversized_road_segs {
+                    consider_road_seg(
+                        ridx,
+                        stream_idx,
+                        sline,
+                        &cum,
+                        total_len,
+                        si,
+                        a,
+                        b,
+                        seg_len,
+                        smin_x,
+                        smax_x,
+                        smin_y,
+                        smax_y,
+                        &mut visited_seg_stamp,
+                        stamp,
+                    );
+                }
+            }
+        }
+    }
+
+    let mut out_layer = Layer::new("culverts".to_string()).with_geom_type(GeometryType::LineString);
+    if !work_srs.is_unknown() {
+        work_srs.apply_to_layer(&mut out_layer);
+    }
+    out_layer
+        .schema
+        .add_field(FieldDef::new("culvert_id".to_string(), FieldType::Integer));
+    out_layer
+        .schema
+        .add_field(FieldDef::new("stream_idx".to_string(), FieldType::Integer));
+    out_layer
+        .schema
+        .add_field(FieldDef::new("length_m".to_string(), FieldType::Float));
+    for (idx, seg) in culvert_geoms.iter().enumerate() {
+        let fid = (idx + 1) as u64;
+        out_layer.features.push(Feature {
+            fid,
+            geometry: Some(Geometry::LineString(
+                seg.pts.iter().map(|&(x, y)| Coord::xy(x, y)).collect(),
+            )),
+            attributes: vec![
+                FieldValue::Integer(fid as i64),
+                FieldValue::Integer(seg.stream_idx as i64),
+                FieldValue::Float(seg.length_m),
+            ],
+        });
+    }
+    let count = out_layer.features.len();
+    terrio::write_vector(&[out_layer], out_str, &VectorWriteOptions::default())?;
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -695,6 +1451,315 @@ mod tests {
         assert!(
             matches!(err, Err(Error::InvalidArgument(ref msg)) if msg.contains("CRS")),
             "expected InvalidArgument mentioning CRS mismatch, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn synthesize_culverts_intersects_snaps_and_burns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let streams_path = tmp.path().join("streams.gpkg");
+        let roads_path = tmp.path().join("roads.gpkg");
+        let culverts_path = tmp.path().join("culverts.gpkg");
+
+        let utm = SpatialRef::from_epsg(26914).unwrap();
+        let mut s_layer =
+            Layer::new("streams".to_string()).with_geom_type(GeometryType::LineString);
+        utm.apply_to_layer(&mut s_layer);
+        // East-west stream from x=500000 to x=500200 at y=5200100
+        s_layer.features.push(Feature {
+            fid: 1,
+            geometry: Some(Geometry::LineString(vec![
+                Coord::xy(500_000.0, 5_200_100.0),
+                Coord::xy(500_200.0, 5_200_100.0),
+            ])),
+            attributes: vec![],
+        });
+        terrio::write_vector(
+            &[s_layer],
+            streams_path.to_str().unwrap(),
+            &VectorWriteOptions::default(),
+        )
+        .unwrap();
+
+        let mut r_layer = Layer::new("roads".to_string()).with_geom_type(GeometryType::LineString);
+        utm.apply_to_layer(&mut r_layer);
+        // Two close parallel lanes 5 m apart at x=500080 and x=500085 (should snap to 1 culvert),
+        // plus a second crossing 60 m away at x=500145 (distinct culvert).
+        for (fid, x) in [(1, 500_080.0), (2, 500_085.0), (3, 500_145.0)] {
+            r_layer.features.push(Feature {
+                fid,
+                geometry: Some(Geometry::LineString(vec![
+                    Coord::xy(x, 5_200_050.0),
+                    Coord::xy(x, 5_200_150.0),
+                ])),
+                attributes: vec![],
+            });
+        }
+        terrio::write_vector(
+            &[r_layer],
+            roads_path.to_str().unwrap(),
+            &VectorWriteOptions::default(),
+        )
+        .unwrap();
+
+        let count = synthesize_culverts(
+            &streams_path,
+            &roads_path,
+            &culverts_path,
+            &SynthesizeCulvertsOptions {
+                half_length_m: 20.0,
+                snap_distance_m: 15.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(count, 2, "expected 2 snapped culverts, got {count}");
+
+        // Verify output CRS matches UTM, segments have ~40 m length, and burning lowers embankments
+        let ds = terrio::open_vector(
+            culverts_path.to_str().unwrap(),
+            &VectorOpenOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(ds.layers[0].features.len(), 2);
+        let out_srs = SpatialRef::from_layer(&ds.layers[0]);
+        assert!(out_srs.same_as(&utm));
+        for feat in &ds.layers[0].features {
+            match feat.attributes.get(2) {
+                Some(FieldValue::Float(len_m)) => assert!(
+                    (*len_m - 40.0).abs() < 1e-6,
+                    "expected length_m ~ 40.0, got {len_m}"
+                ),
+                other => panic!("expected Float length_m attribute, got {other:?}"),
+            }
+            let Some(Geometry::LineString(coords)) = feat.geometry.as_ref() else {
+                panic!("expected LineString culvert geometry");
+            };
+            let geom_len: f64 = coords
+                .windows(2)
+                .map(|w| (w[1].x - w[0].x).hypot(w[1].y - w[0].y))
+                .sum();
+            assert!((geom_len - 40.0).abs() < 1e-6, "got geom_len={geom_len}");
+        }
+
+        // Build a matching 200x40 1-m UTM DEM (x=500000..500200, y=5200080..5200120) with 15 m
+        // north-south road embankments at x=500080 (col 80) and x=500145 (col 145) across a 10 m valley.
+        let w = 200usize;
+        let h = 40usize;
+        let mut z = vec![10.0f64; w * h];
+        for r in 0..h {
+            z[r * w + 80] = 15.0;
+            z[r * w + 145] = 15.0;
+        }
+        let mut dem = Array2D::from_vec(w, h, z).unwrap();
+        dem.set_no_data(-9999.0);
+        dem.geotransform = [500_000.0, 1.0, 0.0, 5_200_120.0, 0.0, -1.0];
+        dem.projection = "EPSG:26914".to_string();
+
+        let (burned, carved) =
+            burn_culverts(&dem, &culverts_path, &BurnCulvertsOptions::default()).unwrap();
+        assert!(carved >= 2, "expected both road embankments carved");
+        // Stream at y=5200100 corresponds to row 20
+        assert!(burned.get(80, 20) < 10.0, "crossing 1 should be breached");
+        assert!(burned.get(145, 20) < 10.0, "crossing 2 should be breached");
+        // Embankments away from the stream remain untouched
+        assert!((burned.get(80, 2) - 15.0).abs() < 1e-6);
+        assert!((burned.get(145, 2) - 15.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn synthesize_culverts_handles_wgs84_inputs_automatically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let streams_path = tmp.path().join("streams_wgs84.geojson");
+        let roads_path = tmp.path().join("roads_wgs84.geojson");
+        let culverts_path = tmp.path().join("culverts_utm.gpkg");
+
+        let wgs = SpatialRef::from_epsg(4326).unwrap();
+        let mut s_layer =
+            Layer::new("streams".to_string()).with_geom_type(GeometryType::LineString);
+        wgs.apply_to_layer(&mut s_layer);
+        s_layer.features.push(Feature {
+            fid: 1,
+            geometry: Some(Geometry::LineString(vec![
+                Coord::xy(-99.205, 47.100),
+                Coord::xy(-99.195, 47.100),
+            ])),
+            attributes: vec![],
+        });
+        terrio::write_vector(
+            &[s_layer],
+            streams_path.to_str().unwrap(),
+            &VectorWriteOptions::default(),
+        )
+        .unwrap();
+
+        let mut r_layer = Layer::new("roads".to_string()).with_geom_type(GeometryType::LineString);
+        wgs.apply_to_layer(&mut r_layer);
+        r_layer.features.push(Feature {
+            fid: 1,
+            geometry: Some(Geometry::LineString(vec![
+                Coord::xy(-99.200, 47.095),
+                Coord::xy(-99.200, 47.105),
+            ])),
+            attributes: vec![],
+        });
+        terrio::write_vector(
+            &[r_layer],
+            roads_path.to_str().unwrap(),
+            &VectorWriteOptions::default(),
+        )
+        .unwrap();
+
+        let count = synthesize_culverts(
+            &streams_path,
+            &roads_path,
+            &culverts_path,
+            &SynthesizeCulvertsOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(count, 1);
+
+        let ds = terrio::open_vector(
+            culverts_path.to_str().unwrap(),
+            &VectorOpenOptions::default(),
+        )
+        .unwrap();
+        let out_srs = SpatialRef::from_layer(&ds.layers[0]);
+        assert_eq!(
+            out_srs.authority(),
+            Some(("EPSG", 32614)),
+            "expected WGS 84 UTM Zone 14N (EPSG:32614), got {:?}",
+            out_srs.authority()
+        );
+        match ds.layers[0].features[0].attributes.get(2) {
+            Some(FieldValue::Float(len_m)) => assert!((*len_m - 50.0).abs() < 1e-6),
+            other => panic!("expected Float length_m, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn synthesize_culverts_handles_foot_crs_long_segments_and_validation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let streams_path = tmp.path().join("streams_ft.gpkg");
+        let roads_path = tmp.path().join("roads_ft.gpkg");
+        let culverts_path = tmp.path().join("culverts_ft.gpkg");
+
+        // EPSG:2263 (NAD83 / New York Long Island ftUS) uses US survey feet (~0.3048006096 m/ft)
+        let ft_srs = SpatialRef::from_epsg(2263).unwrap();
+        let mut s_layer =
+            Layer::new("streams".to_string()).with_geom_type(GeometryType::LineString);
+        ft_srs.apply_to_layer(&mut s_layer);
+        // Two touching reaches split right at the road crossing (x = 1_000_000 ft)
+        s_layer.features.push(Feature {
+            fid: 1,
+            geometry: Some(Geometry::LineString(vec![
+                Coord::xy(999_500.0, 200_000.0),
+                Coord::xy(1_000_000.0, 200_000.0),
+            ])),
+            attributes: vec![],
+        });
+        s_layer.features.push(Feature {
+            fid: 2,
+            geometry: Some(Geometry::LineString(vec![
+                Coord::xy(1_000_000.0, 200_000.0),
+                Coord::xy(1_000_500.0, 200_000.0),
+            ])),
+            attributes: vec![],
+        });
+        terrio::write_vector(
+            &[s_layer],
+            streams_path.to_str().unwrap(),
+            &VectorWriteOptions::default(),
+        )
+        .unwrap();
+
+        let mut r_layer = Layer::new("roads".to_string()).with_geom_type(GeometryType::LineString);
+        ft_srs.apply_to_layer(&mut r_layer);
+        // Very long (>40 km) diagonal road segment crossing x=1_000_000, y=200_000
+        r_layer.features.push(Feature {
+            fid: 1,
+            geometry: Some(Geometry::LineString(vec![
+                Coord::xy(930_000.0, 130_000.0),
+                Coord::xy(1_070_000.0, 270_000.0),
+            ])),
+            attributes: vec![],
+        });
+        terrio::write_vector(
+            &[r_layer],
+            roads_path.to_str().unwrap(),
+            &VectorWriteOptions::default(),
+        )
+        .unwrap();
+
+        // Reject geographic target_crs
+        assert!(
+            synthesize_culverts(
+                &streams_path,
+                &roads_path,
+                &culverts_path,
+                &SynthesizeCulvertsOptions {
+                    target_crs: Some("EPSG:4269".into()),
+                    ..Default::default()
+                },
+            )
+            .is_err()
+        );
+
+        // Reject .geojson output for projected culverts
+        assert!(
+            synthesize_culverts(
+                &streams_path,
+                &roads_path,
+                tmp.path().join("culverts.geojson"),
+                &SynthesizeCulvertsOptions::default(),
+            )
+            .is_err()
+        );
+
+        let count = synthesize_culverts(
+            &streams_path,
+            &roads_path,
+            &culverts_path,
+            &SynthesizeCulvertsOptions {
+                half_length_m: 20.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            count, 1,
+            "long road + split stream should produce 1 culvert"
+        );
+
+        let ds = terrio::open_vector(
+            culverts_path.to_str().unwrap(),
+            &VectorOpenOptions::default(),
+        )
+        .unwrap();
+        let feat = &ds.layers[0].features[0];
+        if let Some(FieldValue::Float(len_m)) = feat.attributes.get(2) {
+            assert!((*len_m - 40.0).abs() < 1e-4, "expected 40 m, got {len_m}");
+        } else {
+            panic!("missing length_m attribute");
+        }
+        if let Some(Geometry::LineString(coords)) = feat.geometry.as_ref() {
+            let geom_ft: f64 = coords
+                .windows(2)
+                .map(|w| (w[1].x - w[0].x).hypot(w[1].y - w[0].y))
+                .sum();
+            let expected_ft = 40.0 / 0.3048006096012192;
+            assert!(
+                (geom_ft - expected_ft).abs() < 0.05,
+                "expected ~{expected_ft:.2} ft, got {geom_ft:.2} ft"
+            );
+        }
+
+        // Antimeridian circular-mean UTM zone test: +179.9 and -179.9 should pick zone 1 or 60
+        let (mean_lon, mean_lat) = circular_mean_lon_lat([(179.9, 10.0), (-179.9, 10.0)]).unwrap();
+        let epsg = utm_epsg_from_lon_lat(mean_lon, mean_lat);
+        assert!(
+            epsg == 32601 || epsg == 32660,
+            "antimeridian should select UTM zone 1 or 60, got EPSG:{epsg}"
         );
     }
 }

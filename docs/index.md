@@ -18,6 +18,7 @@ Run it right now in your browser with zero installation via the live [WebAssembl
 | Capability | Description | Guide |
 | --- | --- | --- |
 | **All-in-One In-Memory Pipeline** | Run DEM smoothing, optional hydro-conditioning, sink extraction, nested depression hierarchy, single-pass D8 catchment hierarchy, inundation simulation, rating curves, and connectivity graph export in a single command (`lidar pipeline` / `run_pipeline`). | [All-in-One Pipeline](guides/pipeline.md) |
+| **Federal Geospatial Data Download** | Pure-Rust downloaders for USGS 3DEP DEM/LPC, USGS WBD, USGS NHD, USFWS NWI, USGS National Transportation, NOAA Atlas 14, and offline culvert synthesis (`lidar download` / `download_federal_data`). | [Colab Notebook](https://colab.research.google.com/github/opengeos/lidar-rs/blob/main/examples/federal_data_download.ipynb) |
 | **Compressed D8 Catchment Engine** | Single-pass upland D8 forest compression plus per-level Union-Find (`O(N + L*D)`); completed an illustrative 98M-cell, 43-level 1-m USGS 3DEP karst run in ~65 seconds. | [Overview & Architecture](guides/index.md) |
 | **Hydro-Conditioning** | Pure-Rust Lindsay (2016) least-cost depression breaching (`complete`, `selective`, `constrained`) and vector-guided culvert burning across road embankments. | [Hydro-Conditioning](guides/hydro-conditioning.md) |
 | **Inundation Physics & Storm Forcing** | Spatially variable runoff coefficients, NRCS TR-55 SCS Curve Number conversion, SCS Type II design storm hyetographs, vertical infiltration losses, and antecedent ponded water depths. | [Inundation Physics](guides/inundation-physics.md) |
@@ -120,8 +121,8 @@ Run it right now in your browser with zero installation via the live [WebAssembl
 
 ## Four Interfaces, One Pure-Rust Core
 
-- **[Standalone CLI (`lidar-cli`)](cli.md):** Single static binary for Linux, macOS, and Windows with 31 subcommands and JSON output mode.
-- **[Rust Library (`lidar`)](rust.md):** Ergonomic in-memory (`Array2D`) and file-based APIs with optional `parallel`, `pointcloud`, and `serde` Cargo features.
+- **[Standalone CLI (`lidar-cli`)](cli.md):** Single static binary for Linux, macOS, and Windows with 33 subcommands and JSON output mode.
+- **[Rust Library (`lidar`)](rust.md):** Ergonomic in-memory (`Array2D`) and file-based APIs with optional `parallel`, `pointcloud`, `serde`, and `download` Cargo features.
 - **[Python Package (`lidar-rs`)](python.md):** Drop-in compatibility with `opengeos/lidar` plus NumPy zero-copy array workflows (`pip install lidar-rs`, Python 3.11+).
 - **[WebAssembly (`lidar-js`)](javascript.md):** Full browser and Node.js bindings powering the client-side [Playground](playground.md).
 

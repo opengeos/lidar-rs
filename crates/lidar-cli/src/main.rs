@@ -14,14 +14,19 @@ use lidar::{
     AnimateInundationOptions, BreachMode, BreachOptions, BurnCulvertsOptions,
     CatchmentHierarchyOptions, DelineateCatchmentsOptions, DelineateFlowPathsOptions,
     DelineateOptions, ExtractSinksOptions, HillshadeOptions, RoutingMode, RunPipelineOptions,
-    SimulateInundationOptions, TiledDelineationOptions, Topology, add_crs, animate_inundation,
-    breach_depressions_file, burn_culverts_file, clip_image, csv_points_to_vector,
-    delineate_catchment_hierarchy, delineate_catchments, delineate_depressions,
-    delineate_depressions_tiled, delineate_flow_paths, delineate_mounts,
+    SimulateInundationOptions, SynthesizeCulvertsOptions, TiledDelineationOptions, Topology,
+    add_crs, animate_inundation, breach_depressions_file, burn_culverts_file, clip_image,
+    csv_points_to_vector, delineate_catchment_hierarchy, delineate_catchments,
+    delineate_depressions, delineate_depressions_tiled, delineate_flow_paths, delineate_mounts,
     export_inundation_frames_png, extract_sinks, flip_dem_file, gaussian_filter_file, image_to_cog,
     join_csv_to_vector, load_raster, mean_filter_file, median_filter_file, mosaic,
     parse_resampling, polygonize, reproject_image, resample, run_pipeline, scs_type2_hyetograph,
-    simulate_inundation,
+    simulate_inundation, synthesize_culverts,
+};
+#[cfg(feature = "download")]
+use lidar::{
+    Bbox, DemProduct, DownloadOptions, FederalBundleOptions, Region, WbdLevel,
+    download_federal_data, parse_dataset_list, query_3dep_products,
 };
 
 #[derive(Parser)]
@@ -747,6 +752,76 @@ enum Commands {
         /// Draw a legend box on each frame
         #[arg(long)]
         legend: bool,
+    },
+    /// Download authoritative open U.S. federal data (USGS 3DEP DEM/LPC, WBD, NHD, Transportation, USFWS NWI, NOAA Atlas 14) for a region
+    #[cfg(feature = "download")]
+    Download {
+        /// Output directory for downloaded federal datasets and manifest.json
+        #[arg(short = 'o', long)]
+        out_dir: PathBuf,
+        /// WGS 84 bounding box as 'min_lon,min_lat,max_lon,max_lat'
+        #[arg(long, allow_hyphen_values = true, conflicts_with_all = ["huc", "region"])]
+        bbox: Option<String>,
+        /// USGS WBD Hydrologic Unit Code (2, 4, 6, 8, 10, or 12 digits, e.g. 10160002)
+        #[arg(long, conflicts_with_all = ["bbox", "region"])]
+        huc: Option<String>,
+        /// Local polygon vector file (.geojson, .gpkg, .shp) defining the region of interest
+        #[arg(long, conflicts_with_all = ["bbox", "huc"])]
+        region: Option<PathBuf>,
+        /// Comma-separated datasets to download ('all' or subset of wbd,dem,nhd,nwi,roads,culverts,noaa)
+        #[arg(long, default_value = "all")]
+        datasets: String,
+        /// USGS 3DEP product to download (1m, 10m, 30m, lpc)
+        #[arg(long, default_value = "1m")]
+        dem_product: String,
+        /// USGS WBD hierarchy level (2, 4, 6, 8, 10, or 12)
+        #[arg(long, default_value = "12")]
+        wbd_level: String,
+        /// Optional shared cache directory for 3DEP tiles
+        #[arg(long)]
+        tile_cache: Option<PathBuf>,
+        /// Keep all overlapping 3DEP tile vintages instead of deduplicating to newest publicationDate
+        #[arg(long)]
+        no_deduplicate: bool,
+        /// Skip mosaicking downloaded 3DEP GeoTIFF tiles into dem.tif
+        #[arg(long)]
+        no_mosaic: bool,
+        /// Skip clipping downloaded DEM/vectors to the HUC or vector region boundary
+        #[arg(long)]
+        no_clip: bool,
+        /// Culvert synthesis half-length along stream flowlines in meters
+        #[arg(long, default_value_t = 25.0)]
+        culvert_half_length: f64,
+        /// Culvert synthesis snapping distance in meters
+        #[arg(long, default_value_t = 15.0)]
+        culvert_snap_distance: f64,
+        /// Re-download files even if they already exist locally
+        #[arg(long)]
+        overwrite: bool,
+        /// Query matching USGS 3DEP tiles without downloading data
+        #[arg(long)]
+        dry_run: bool,
+        /// Print summary as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Synthesize deterministic road-stream culvert breach polylines by intersecting stream and road vectors
+    SynthesizeCulverts {
+        /// Stream flowline vector file (e.g. NHD .gpkg, .geojson, .shp)
+        streams: PathBuf,
+        /// Road/railway centerline vector file (e.g. USGS Transportation .gpkg, .geojson, .shp)
+        roads: PathBuf,
+        /// Output culvert breach polyline vector file (.gpkg or .shp)
+        output: PathBuf,
+        /// Half-length extracted along each stream on both sides of a crossing (meters)
+        #[arg(long, default_value_t = 25.0)]
+        half_length: f64,
+        /// Minimum distance between distinct crossings in meters
+        #[arg(long, default_value_t = 15.0)]
+        snap_distance: f64,
+        /// Optional target projected CRS (e.g. EPSG:26914); auto-selects local UTM if omitted for WGS 84 inputs
+        #[arg(long)]
+        crs: Option<String>,
     },
     /// Print metadata summary for a raster or LiDAR point cloud
     Info {
@@ -1481,6 +1556,155 @@ fn run() -> lidar::Result<()> {
                 res.width,
                 res.height,
                 res.gif_path.display(),
+            );
+        }
+        #[cfg(feature = "download")]
+        Commands::Download {
+            out_dir,
+            bbox,
+            huc,
+            region,
+            datasets,
+            dem_product,
+            wbd_level,
+            tile_cache,
+            no_deduplicate,
+            no_mosaic,
+            no_clip,
+            culvert_half_length,
+            culvert_snap_distance,
+            overwrite,
+            dry_run,
+            json,
+        } => {
+            let reg = match (bbox, huc, region) {
+                (Some(bb), None, None) => Region::Bbox(bb.parse::<Bbox>()?),
+                (None, Some(code), None) => Region::Huc(Region::validate_huc(&code)?),
+                (None, None, Some(path)) => Region::VectorFile(path),
+                _ => {
+                    return Err(lidar::Error::InvalidArgument(
+                        "specify exactly one region selector: --bbox, --huc, or --region".into(),
+                    ));
+                }
+            };
+            let dl_opts = DownloadOptions {
+                overwrite,
+                tile_cache_dir: tile_cache,
+                dem_product: dem_product.parse::<DemProduct>()?,
+                wbd_level: wbd_level.parse::<WbdLevel>()?,
+                deduplicate_tiles: !no_deduplicate,
+                mosaic_dem: !no_mosaic,
+                clip_to_region: !no_clip,
+                culvert_half_length_m: culvert_half_length,
+                culvert_snap_distance_m: culvert_snap_distance,
+                ..Default::default()
+            };
+            if dry_run {
+                let items = query_3dep_products(&reg, &dl_opts)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&items)
+                            .map_err(|e| lidar::Error::Algorithm(e.to_string()))?
+                    );
+                } else {
+                    let total_mb: f64 =
+                        items.iter().filter_map(|i| i.size_bytes).sum::<u64>() as f64 / 1e6;
+                    println!(
+                        "Found {} USGS 3DEP '{}' product(s) (~{total_mb:.1} MB total):",
+                        items.len(),
+                        dl_opts.dem_product.tnm_dataset_name()
+                    );
+                    for it in &items {
+                        let mb = it.size_bytes.map_or(0.0, |b| b as f64 / 1e6);
+                        println!(
+                            "  {} | {} | {:.1} MB | {}",
+                            it.grid_key, it.publication_date, mb, it.title
+                        );
+                    }
+                }
+            } else {
+                let ds_list = parse_dataset_list(&datasets)?;
+                let bundle_opts = FederalBundleOptions {
+                    datasets: ds_list,
+                    download: dl_opts,
+                };
+                let res = download_federal_data(&reg, &out_dir, &bundle_opts)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&res)
+                            .map_err(|e| lidar::Error::Algorithm(e.to_string()))?
+                    );
+                } else {
+                    println!(
+                        "Downloaded federal data into {} (bbox: {}):",
+                        out_dir.display(),
+                        res.region_bbox.to_csv_string()
+                    );
+                    if let Some(ref p) = res.wbd_path {
+                        println!("  WBD:      {} ({} feature(s))", p.display(), res.wbd_count);
+                    }
+                    if !res.dem_tiles.is_empty() {
+                        println!("  3DEP:     {} tile(s)", res.dem_tiles.len());
+                    }
+                    if let Some(ref p) = res.dem_mosaic_path {
+                        println!("  DEM:      {}", p.display());
+                    }
+                    if let Some(ref p) = res.nhd_path {
+                        println!(
+                            "  NHD:      {} ({} flowline(s))",
+                            p.display(),
+                            res.nhd_count
+                        );
+                    }
+                    if let Some(ref p) = res.nwi_path {
+                        println!("  NWI:      {} ({} polygon(s))", p.display(), res.nwi_count);
+                    }
+                    if let Some(ref p) = res.roads_path {
+                        println!(
+                            "  Roads:    {} ({} segment(s))",
+                            p.display(),
+                            res.roads_count
+                        );
+                    }
+                    if let Some(ref p) = res.culverts_path {
+                        println!(
+                            "  Culverts: {} ({} crossing(s))",
+                            p.display(),
+                            res.culverts_count
+                        );
+                    }
+                    if let Some(ref p) = res.noaa_atlas14_path {
+                        let d100 = res
+                            .noaa_atlas14
+                            .as_ref()
+                            .and_then(|t| t.depth_mm("24-hr", 100))
+                            .map_or_else(|| "n/a".into(), |v| format!("{v:.1} mm"));
+                        println!("  NOAA 14:  {} (24-hr 100-yr = {d100})", p.display());
+                    }
+                    println!("  Manifest: {}", res.manifest_path.display());
+                }
+            }
+        }
+        Commands::SynthesizeCulverts {
+            streams,
+            roads,
+            output,
+            half_length,
+            snap_distance,
+            crs,
+        } => {
+            let opts = SynthesizeCulvertsOptions {
+                half_length_m: half_length,
+                snap_distance_m: snap_distance,
+                target_crs: crs,
+                ..Default::default()
+            };
+            let n = synthesize_culverts(&streams, &roads, &output, &opts)?;
+            println!(
+                "Synthesized {n} culvert crossing(s) to {}",
+                output.display()
             );
         }
         Commands::Info { input } => {

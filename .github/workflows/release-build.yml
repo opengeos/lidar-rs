@@ -94,7 +94,7 @@ jobs:
       - name: Build CLI binary
         env:
           CARGO_PROFILE_RELEASE_STRIP: symbols
-        run: cargo build --release -p lidar-cli --target ${{ matrix.platform.target }}
+        run: cargo build --release -p lidar-cli --features download --target ${{ matrix.platform.target }}
       - name: Check that the binary runs
         shell: bash
         run: |

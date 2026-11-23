@@ -14,6 +14,7 @@ lidar = "0.4"
 | `parallel` | Yes | Multi-threaded parallelism via `rayon` (filters, level-set slicing, inundation, tiling) |
 | `pointcloud` | Yes | Pure-Rust LiDAR I/O (LAS/LAZ/COPC/PLY/E57), CSF/PMF classification, and DSM/DTM/CHM gridding via `terrio/pointcloud` |
 | `serde` | Yes | `Serialize` / `Deserialize` derives on all option/result structs plus `write_connectivity_graph_json` |
+| `download` | No | Opt-in U.S. federal geospatial data downloaders (`federal`: USGS 3DEP, WBD, NHD, Transportation, USFWS NWI, NOAA Atlas 14; non-WASM, enables `ureq` with `rustls`) |
 
 For minimal WASM or embedded builds without threads or point-cloud support:
 
@@ -27,7 +28,8 @@ lidar = { version = "0.4", default-features = false, features = ["serde"] }
 | Module | Key Public Types & Functions |
 | --- | --- |
 | `filtering` | `mean_filter`, `median_filter`, `gaussian_filter` (+ `*_file` wrappers) |
-| `conditioning` | `BreachMode`, `BreachOptions` (`for_mode`), `breach_depressions`, `burn_culverts`, `BurnCulvertsOptions` |
+| `conditioning` | `BreachMode`, `BreachOptions` (`for_mode`), `breach_depressions`, `burn_culverts`, `BurnCulvertsOptions`, `synthesize_culverts`, `SynthesizeCulvertsOptions` |
+| `federal` | `Region`, `Bbox`, `WbdLevel`, `DemProduct`, `FederalDataset`, `DownloadOptions`, `FederalBundleOptions`, `download_federal_data`, `query_3dep_products`, `download_3dep_dem`, `download_wbd`, `download_nhd`, `download_nwi`, `download_roads`, `fetch_noaa_atlas14` |
 | `filling` | `extract_sinks`, `extract_sinks_in_memory`, `ExtractSinksOptions`, `InMemorySinks` |
 | `slicing` | `delineate_depressions`, `delineate_depressions_in_memory`, `NestedDepression` (24 fields), `write_depressions_csv`, `write_depressions_vector` |
 | `mounts` | `flip_dem`, `delineate_mounts`, `delineate_mounts_in_memory` |

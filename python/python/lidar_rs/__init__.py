@@ -896,6 +896,223 @@ def PlayAnimation(
     return str(res["gif_path"])
 
 
+def synthesize_culverts(
+    streams_vector: str | os.PathLike[str],
+    roads_vector: str | os.PathLike[str],
+    out_culverts: str | os.PathLike[str],
+    half_length_m: float = 25.0,
+    snap_distance_m: float = 15.0,
+    target_crs: str | None = None,
+) -> int:
+    """Synthesize deterministic road-stream culvert breach polylines by intersecting stream and road vectors."""
+    return int(
+        _lidar_rs.synthesize_culverts(
+            _as_path_str(streams_vector),
+            _as_path_str(roads_vector),
+            _as_path_str(out_culverts),
+            float(half_length_m),
+            float(snap_distance_m),
+            target_crs,
+        )
+    )
+
+
+def _normalize_bbox(
+    bbox: tuple[float, float, float, float] | list[float] | None,
+) -> tuple[float, float, float, float] | None:
+    if bbox is None:
+        return None
+    if len(bbox) != 4:
+        raise ValueError(f"bbox must have 4 elements (min_lon, min_lat, max_lon, max_lat); got {len(bbox)}")
+    return (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+
+
+def query_3dep_products(
+    *,
+    bbox: tuple[float, float, float, float] | list[float] | None = None,
+    huc: str | None = None,
+    region: str | os.PathLike[str] | None = None,
+    dem_product: str = "1m",
+    deduplicate: bool = True,
+) -> list[dict[str, Any]]:
+    """Query USGS 3DEP DEM or LiDAR Point Cloud products intersecting a region without downloading payloads."""
+    return list(
+        _lidar_rs.query_3dep_products(
+            _normalize_bbox(bbox),
+            huc,
+            _as_path_str(region) if region is not None else None,
+            dem_product,
+            bool(deduplicate),
+        )
+    )
+
+
+def download_3dep_dem(
+    out_dir: str | os.PathLike[str],
+    *,
+    bbox: tuple[float, float, float, float] | list[float] | None = None,
+    huc: str | None = None,
+    region: str | os.PathLike[str] | None = None,
+    dem_product: str = "1m",
+    mosaic_dem: bool = True,
+    clip_to_region: bool = True,
+    tile_cache_dir: str | os.PathLike[str] | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Download, optionally mosaic, and clip USGS 3DEP DEM (or LPC) tiles for a specified region."""
+    return dict(
+        _lidar_rs.download_3dep_dem(
+            _as_path_str(out_dir),
+            _normalize_bbox(bbox),
+            huc,
+            _as_path_str(region) if region is not None else None,
+            dem_product,
+            bool(mosaic_dem),
+            bool(clip_to_region),
+            _as_path_str(tile_cache_dir) if tile_cache_dir is not None else None,
+            bool(overwrite),
+        )
+    )
+
+
+def download_wbd(
+    out_path: str | os.PathLike[str],
+    *,
+    bbox: tuple[float, float, float, float] | list[float] | None = None,
+    huc: str | None = None,
+    region: str | os.PathLike[str] | None = None,
+    level: int = 12,
+    overwrite: bool = False,
+) -> int:
+    """Download USGS Watershed Boundary Dataset (WBD) polygons for a specified region."""
+    return int(
+        _lidar_rs.download_wbd(
+            _as_path_str(out_path),
+            _normalize_bbox(bbox),
+            huc,
+            _as_path_str(region) if region is not None else None,
+            int(level),
+            bool(overwrite),
+        )
+    )
+
+
+def download_nhd(
+    out_path: str | os.PathLike[str],
+    *,
+    bbox: tuple[float, float, float, float] | list[float] | None = None,
+    huc: str | None = None,
+    region: str | os.PathLike[str] | None = None,
+    clip_to_region: bool = True,
+    overwrite: bool = False,
+) -> int:
+    """Download USGS National Hydrography Dataset (NHD) flowlines for a specified region."""
+    return int(
+        _lidar_rs.download_nhd(
+            _as_path_str(out_path),
+            _normalize_bbox(bbox),
+            huc,
+            _as_path_str(region) if region is not None else None,
+            bool(clip_to_region),
+            bool(overwrite),
+        )
+    )
+
+
+def download_nwi(
+    out_path: str | os.PathLike[str],
+    *,
+    bbox: tuple[float, float, float, float] | list[float] | None = None,
+    huc: str | None = None,
+    region: str | os.PathLike[str] | None = None,
+    clip_to_region: bool = True,
+    overwrite: bool = False,
+) -> int:
+    """Download USFWS National Wetlands Inventory (NWI) polygons for a specified region."""
+    return int(
+        _lidar_rs.download_nwi(
+            _as_path_str(out_path),
+            _normalize_bbox(bbox),
+            huc,
+            _as_path_str(region) if region is not None else None,
+            bool(clip_to_region),
+            bool(overwrite),
+        )
+    )
+
+
+def download_roads(
+    out_path: str | os.PathLike[str],
+    *,
+    bbox: tuple[float, float, float, float] | list[float] | None = None,
+    huc: str | None = None,
+    region: str | os.PathLike[str] | None = None,
+    clip_to_region: bool = True,
+    overwrite: bool = False,
+) -> int:
+    """Download USGS National Transportation road and railway centerlines for a specified region."""
+    return int(
+        _lidar_rs.download_roads(
+            _as_path_str(out_path),
+            _normalize_bbox(bbox),
+            huc,
+            _as_path_str(region) if region is not None else None,
+            bool(clip_to_region),
+            bool(overwrite),
+        )
+    )
+
+
+def fetch_noaa_atlas14(
+    lat: float,
+    lon: float,
+    out_json: str | os.PathLike[str] | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Fetch NOAA Atlas 14 PDS precipitation depth frequency values (mm) for a WGS 84 point."""
+    return dict(
+        _lidar_rs.fetch_noaa_atlas14(
+            float(lat),
+            float(lon),
+            _as_path_str(out_json) if out_json is not None else None,
+            bool(overwrite),
+        )
+    )
+
+
+def download_federal_data(
+    out_dir: str | os.PathLike[str],
+    *,
+    bbox: tuple[float, float, float, float] | list[float] | None = None,
+    huc: str | None = None,
+    region: str | os.PathLike[str] | None = None,
+    datasets: str | list[str] = "all",
+    dem_product: str = "1m",
+    wbd_level: int = 12,
+    mosaic_dem: bool = True,
+    clip_to_region: bool = True,
+    tile_cache_dir: str | os.PathLike[str] | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Download a bundle of open U.S. federal datasets (WBD, 3DEP DEM, NHD, NWI, roads, culverts, NOAA Atlas 14) for a region."""
+    ds_spec = ",".join(datasets) if isinstance(datasets, (list, tuple)) else str(datasets)
+    return dict(
+        _lidar_rs.download_federal_data(
+            _as_path_str(out_dir),
+            _normalize_bbox(bbox),
+            huc,
+            _as_path_str(region) if region is not None else None,
+            ds_spec,
+            dem_product,
+            int(wbd_level),
+            bool(mosaic_dem),
+            bool(clip_to_region),
+            _as_path_str(tile_cache_dir) if tile_cache_dir is not None else None,
+            bool(overwrite),
+        )
+    )
+
+
 # Snake-case aliases
 mean_filter = MeanFilter
 median_filter = MedianFilter
@@ -934,6 +1151,15 @@ __all__ = [
     "run_pipeline",
     "breach_depressions",
     "burn_culverts",
+    "synthesize_culverts",
+    "query_3dep_products",
+    "download_3dep_dem",
+    "download_wbd",
+    "download_nhd",
+    "download_nwi",
+    "download_roads",
+    "fetch_noaa_atlas14",
+    "download_federal_data",
     "scs_curve_number_runoff",
     "scs_type2_hyetograph",
     "animate_inundation",
