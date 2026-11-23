@@ -20,7 +20,7 @@ For minimal WASM or embedded builds without threads or point-cloud support:
 
 ```toml
 [dependencies]
-lidar = { version = "0.4", default-features = false, features = ["serde"] }
+lidar = { version = "0.5", default-features = false, features = ["serde"] }
 ```
 
 ## Module Map

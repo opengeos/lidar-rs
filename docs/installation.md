@@ -59,7 +59,7 @@ Default features enable `parallel` (Rayon), `pointcloud` (LAS/LAZ/COPC/PLY/E57 +
 
 ```toml
 [dependencies]
-lidar = { version = "0.4", default-features = false, features = ["parallel"] }
+lidar = { version = "0.5", default-features = false, features = ["parallel"] }
 ```
 
 ## WebAssembly (`lidar-js`)
