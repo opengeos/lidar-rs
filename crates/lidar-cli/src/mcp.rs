@@ -631,8 +631,6 @@ fn run_child(
         }
         if cancel.load(Ordering::Relaxed) {
             drop(guard);
-            let _ = stdout.join();
-            let _ = stderr.join();
             return Ok(None);
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -1140,7 +1138,7 @@ mod tests {
     fn answers_while_running_and_honors_cancellation() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("started");
-        let script = format!("touch \"{}\"; sleep 30", marker.display());
+        let script = format!("touch \"{}\"; exec sleep 30", marker.display());
         let (send, replies) = std::sync::mpsc::channel();
         let mut s = Server::new(vec!["sh".into(), "-c".into(), script.into()], send);
         let call = json!({
