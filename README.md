@@ -90,8 +90,8 @@ curl -LsSf https://lidar-rs.opengeos.org/install.sh | sh
 # Windows (PowerShell)
 powershell -ExecutionPolicy ByPass -c "irm https://lidar-rs.opengeos.org/install.ps1 | iex"
 
-# Or from crates.io
-cargo install lidar-cli
+# Or from crates.io (add `--features download` for `lidar download`)
+cargo install lidar-cli --features download
 ```
 
 Example commands:

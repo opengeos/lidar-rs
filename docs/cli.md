@@ -60,7 +60,7 @@ lidar pipeline dem.tif out_storm \
 
 ## Federal Data Download (`lidar download`)
 
-Download open U.S. federal datasets (USGS 3DEP DEM/LPC, USGS WBD, USGS NHD, USFWS NWI, USGS National Transportation roads/railways, synthesized culverts, and NOAA Atlas 14 precipitation frequencies) for any WGS 84 bounding box, USGS HUC code (HUC-2 through HUC-12), or local polygon file:
+Download open U.S. federal datasets (USGS 3DEP DEM/LPC, USGS WBD, USGS NHD, USFWS NWI, USGS National Transportation roads and railways, synthesized culverts, and NOAA Atlas 14 precipitation frequencies) for any WGS 84 bounding box, USGS HUC code (HUC-2 through HUC-12), or local polygon file. Prebuilt release binaries include `lidar download`; when installing from crates.io, enable the opt-in feature with `cargo install lidar-cli --features download`:
 
 ```sh
 # Dry-run query for matching 1-m USGS 3DEP tiles in a HUC-12 watershed

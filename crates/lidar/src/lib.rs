@@ -41,7 +41,7 @@ pub mod animation;
 pub mod catchment;
 pub mod conditioning;
 pub mod error;
-#[cfg(feature = "download")]
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
 pub mod federal;
 pub mod filling;
 pub mod filtering;
@@ -76,7 +76,7 @@ pub use conditioning::{
     breach_depressions_file, burn_culverts, burn_culverts_file, synthesize_culverts,
 };
 pub use error::{Error, Result};
-#[cfg(feature = "download")]
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
 pub use federal::{
     Bbox, DemDownloadResult, DemProduct, DownloadOptions, FederalBundleOptions,
     FederalBundleResult, FederalDataset, NoaaAtlas14Table, Region, ResolvedRegion, TnmProductItem,

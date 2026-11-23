@@ -14,7 +14,7 @@ lidar = "0.4"
 | `parallel` | Yes | Multi-threaded parallelism via `rayon` (filters, level-set slicing, inundation, tiling) |
 | `pointcloud` | Yes | Pure-Rust LiDAR I/O (LAS/LAZ/COPC/PLY/E57), CSF/PMF classification, and DSM/DTM/CHM gridding via `terrio/pointcloud` |
 | `serde` | Yes | `Serialize` / `Deserialize` derives on all option/result structs plus `write_connectivity_graph_json` |
-| `download` | Yes | Pure-Rust U.S. federal geospatial data downloaders (`federal`: USGS 3DEP, WBD, NHD, Transportation, USFWS NWI, NOAA Atlas 14) |
+| `download` | No | Opt-in U.S. federal geospatial data downloaders (`federal`: USGS 3DEP, WBD, NHD, Transportation, USFWS NWI, NOAA Atlas 14; non-WASM, enables `ureq` with `rustls`) |
 
 For minimal WASM or embedded builds without threads or point-cloud support:
 

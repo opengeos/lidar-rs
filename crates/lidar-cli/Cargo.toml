@@ -15,8 +15,13 @@ authors.workspace = true
 name = "lidar"
 path = "src/main.rs"
 
+[features]
+default = []
+## Enable the `lidar download` subcommand (pulls `ureq` with `rustls`)
+download = ["lidar/download"]
+
 [dependencies]
-lidar = { workspace = true, features = ["parallel", "pointcloud", "serde", "download"] }
+lidar = { workspace = true, features = ["parallel", "pointcloud", "serde"] }
 richdem = { workspace = true, features = ["parallel"] }
 terrio = { workspace = true, features = ["pointcloud"] }
 clap.workspace = true

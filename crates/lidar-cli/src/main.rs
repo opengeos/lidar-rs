@@ -11,19 +11,22 @@ use lidar::pointcloud::{
     convert_lidar, lidar_to_chm, lidar_to_dsm, lidar_to_dtm,
 };
 use lidar::{
-    AnimateInundationOptions, Bbox, BreachMode, BreachOptions, BurnCulvertsOptions,
+    AnimateInundationOptions, BreachMode, BreachOptions, BurnCulvertsOptions,
     CatchmentHierarchyOptions, DelineateCatchmentsOptions, DelineateFlowPathsOptions,
-    DelineateOptions, DemProduct, DownloadOptions, ExtractSinksOptions, FederalBundleOptions,
-    HillshadeOptions, Region, RoutingMode, RunPipelineOptions, SimulateInundationOptions,
-    SynthesizeCulvertsOptions, TiledDelineationOptions, Topology, WbdLevel, add_crs,
-    animate_inundation, breach_depressions_file, burn_culverts_file, clip_image,
+    DelineateOptions, ExtractSinksOptions, HillshadeOptions, RoutingMode, RunPipelineOptions,
+    SimulateInundationOptions, SynthesizeCulvertsOptions, TiledDelineationOptions, Topology,
+    add_crs, animate_inundation, breach_depressions_file, burn_culverts_file, clip_image,
     csv_points_to_vector, delineate_catchment_hierarchy, delineate_catchments,
     delineate_depressions, delineate_depressions_tiled, delineate_flow_paths, delineate_mounts,
-    download_federal_data, export_inundation_frames_png, extract_sinks, flip_dem_file,
-    gaussian_filter_file, image_to_cog, join_csv_to_vector, load_raster, mean_filter_file,
-    median_filter_file, mosaic, parse_dataset_list, parse_resampling, polygonize,
-    query_3dep_products, reproject_image, resample, run_pipeline, scs_type2_hyetograph,
+    export_inundation_frames_png, extract_sinks, flip_dem_file, gaussian_filter_file, image_to_cog,
+    join_csv_to_vector, load_raster, mean_filter_file, median_filter_file, mosaic,
+    parse_resampling, polygonize, reproject_image, resample, run_pipeline, scs_type2_hyetograph,
     simulate_inundation, synthesize_culverts,
+};
+#[cfg(feature = "download")]
+use lidar::{
+    Bbox, DemProduct, DownloadOptions, FederalBundleOptions, Region, WbdLevel,
+    download_federal_data, parse_dataset_list, query_3dep_products,
 };
 
 #[derive(Parser)]
@@ -751,6 +754,7 @@ enum Commands {
         legend: bool,
     },
     /// Download authoritative open U.S. federal data (USGS 3DEP DEM/LPC, WBD, NHD, Transportation, USFWS NWI, NOAA Atlas 14) for a region
+    #[cfg(feature = "download")]
     Download {
         /// Output directory for downloaded federal datasets and manifest.json
         #[arg(short = 'o', long)]
@@ -807,7 +811,7 @@ enum Commands {
         streams: PathBuf,
         /// Road/railway centerline vector file (e.g. USGS Transportation .gpkg, .geojson, .shp)
         roads: PathBuf,
-        /// Output culvert breach polyline vector file (.gpkg, .geojson, .shp)
+        /// Output culvert breach polyline vector file (.gpkg or .shp)
         output: PathBuf,
         /// Half-length extracted along each stream on both sides of a crossing (meters)
         #[arg(long, default_value_t = 25.0)]
@@ -1554,6 +1558,7 @@ fn run() -> lidar::Result<()> {
                 res.gif_path.display(),
             );
         }
+        #[cfg(feature = "download")]
         Commands::Download {
             out_dir,
             bbox,

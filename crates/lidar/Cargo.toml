@@ -12,14 +12,14 @@ repository.workspace = true
 authors.workspace = true
 
 [features]
-default = ["parallel", "pointcloud", "serde", "download"]
+default = ["parallel", "pointcloud", "serde"]
 ## Multi-threaded parallelism via `rayon`
 parallel = ["dep:rayon", "richdem/parallel"]
 ## LiDAR point cloud I/O, conversion, and DSM gridding via `terrio/pointcloud` (LAS, LAZ, COPC, PLY, E57)
 pointcloud = ["terrio/pointcloud"]
 ## Serialization of depression and result structs via `serde`
 serde = ["dep:serde", "dep:serde_json", "richdem/serde"]
-## Pure-Rust U.S. federal data download utilities (USGS 3DEP, WBD, NHD, Transportation, USFWS NWI, NOAA Atlas 14)
+## Opt-in U.S. federal data download utilities (USGS 3DEP, WBD, NHD, Transportation, USFWS NWI, NOAA Atlas 14; non-WASM only, pulls `ureq` with `rustls`/`ring`)
 download = ["dep:ureq", "dep:serde", "dep:serde_json", "dep:tempfile"]
 
 [dependencies]
@@ -31,6 +31,8 @@ thiserror.workspace = true
 rayon = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tempfile = { workspace = true, optional = true }
 ureq = { workspace = true, optional = true }
 
