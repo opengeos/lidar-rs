@@ -53,6 +53,9 @@ use crate::inundation::{
 };
 use crate::slicing::{InMemoryDepressions, NestedDepression};
 
+/// Time tolerance in hours for deciding whether an event falls within the storm duration.
+const STORM_TIME_EPS_H: f64 = 1e-9;
+
 /// Hydrologic inundation routing strategy for pipeline simulations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -106,8 +109,10 @@ pub struct FsmBasinSummary {
     /// For basins merged into a parent before storm end, this records their capacity at merge.
     pub final_volume_m3: f64,
     /// Time in hours when this depression first reached full spill capacity within the simulated
-    /// storm duration (`None` if it was still filling at storm end, matching `final_volume_m3`).
-    /// `fill_time.tif` keeps extrapolated sustained-rainfall timing for such basins.
+    /// storm duration (`None` if it never filled during the storm). Every basin that is full at
+    /// storm end has a value; with variable rainfall or infiltration a basin can also fill and
+    /// then drain below its rim, so a value does not guarantee `final_volume_m3 == capacity_m3`.
+    /// `fill_time.tif` keeps extrapolated sustained-rainfall timing for basins that never filled.
     pub fill_time_h: Option<f64>,
     /// Downstream depression ID receiving spillover (`Some(0)` for DEM boundary, `None` if it did
     /// not spill within the simulated storm duration).
@@ -1562,7 +1567,7 @@ pub fn simulate_fill_spill_merge_in_memory(
         }
 
         // Snapshot storm-end volumes and routed contributing areas right when the storm window ends.
-        if in_storm_window && t_cur >= storm_duration_h - 1e-9 && !snapshot_taken {
+        if in_storm_window && t_cur >= storm_duration_h - STORM_TIME_EPS_H && !snapshot_taken {
             resolve_merges_and_cycles(
                 &mut basins,
                 &id_to_idx,
@@ -1663,7 +1668,7 @@ pub fn simulate_fill_spill_merge_in_memory(
     let mut spill_paths: Vec<SpillFlowPath> = Vec::new();
     let mut num_spill_events = 0usize;
     let mut summaries: Vec<FsmBasinSummary> = Vec::with_capacity(m);
-    let storm_end = storm_duration_h + 1e-9;
+    let storm_end = storm_duration_h + STORM_TIME_EPS_H;
 
     for b in &basins {
         if b.first_spill_time_h.is_some() {
@@ -1705,9 +1710,10 @@ pub fn simulate_fill_spill_merge_in_memory(
             final_routed_cat_area_m2: b.storm_end_routed_cat_m2,
             initial_volume_m3: b.initial_vol_m3,
             final_volume_m3: b.storm_end_vol_m3,
-            // Report only fill/spill/merge events realized within the storm so the summary stays
-            // consistent with the storm-end volumes; the unbounded post-storm tail segment exists
-            // only to give `fill_time.tif` sustained-rainfall timing for deep basins.
+            // Report only fill/spill/merge events realized within the storm; the unbounded
+            // post-storm tail segment exists only to give `fill_time.tif` sustained-rainfall
+            // timing for deep basins. `realized_spill_to` is always set together with
+            // `first_spill_time_h`, so gating on the latter bounds the spill target too.
             fill_time_h: b.first_fill_time_h.filter(|&t| t <= storm_end),
             spill_to_dep_id: b
                 .realized_spill_to

@@ -1089,6 +1089,7 @@ fn test_fill_spill_merge_end_to_end_on_sample_dem() {
         "expected hierarchical merges on nested sample DEM"
     );
 
+    // With constant rain and no infiltration no basin drains after filling, so here
     // `fill_time_h`/`spill_to_dep_id` are bounded by the storm and agree with the storm-end `final_volume_m3`:
     // the top-level basin is still filling at 50 h, so it must not report the extrapolated
     // sustained-rainfall fill time (~65 h) that `fill_time.tif` keeps for its cells.
