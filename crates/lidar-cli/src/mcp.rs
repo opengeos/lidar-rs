@@ -19,10 +19,10 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -33,14 +33,14 @@ use crate::usage::{command_names, commands, with_clap_stack};
 /// Protocol versions supported by this server, newest first.
 const VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
-/// Maximum combined bytes of command output (stderr + stdout) returned to the agent.
+/// Maximum combined bytes of command output (stderr + stdout + notices) returned to the agent.
 const MAX_OUTPUT: usize = 100_000;
 
 /// Maximum PNG size in bytes attached as MCP image content for `preview` (8 MiB).
 const MAX_IMAGE: u64 = 8 << 20;
 
-/// Maximum concurrent tool calls executed within a single JSON-RPC batch.
-const BATCH_CONCURRENCY: usize = 8;
+/// Maximum concurrent tool calls running across the entire session (standalone + batches).
+const MAX_CONCURRENT_TOOLS: usize = 8;
 
 /// Instructions sent to the AI agent during MCP `initialize`.
 const INSTRUCTIONS: &str = "lidar-rs performs terrain depression delineation (Wu et al. 2019), hydro-conditioning, LiDAR point-cloud gridding (DSM/DTM/CHM), fill-and-spill inundation simulation (static and dynamic Fill-Spill-Merge), and U.S. federal geospatial data download in pure Rust with zero GDAL dependencies.\n\
@@ -69,6 +69,60 @@ const INTERNAL_ERROR: i64 = -32603;
 /// A queued tool call: request id, tool name, and CLI arguments.
 type ToolCall = (Value, String, Vec<OsString>);
 
+/// Session-wide concurrency limiter shared across standalone calls and JSON-RPC batches.
+struct ConcurrencyLimiter {
+    active: Mutex<usize>,
+    cv: Condvar,
+    limit: usize,
+}
+
+struct ConcurrencyPermit {
+    limiter: Arc<ConcurrencyLimiter>,
+}
+
+impl Drop for ConcurrencyPermit {
+    fn drop(&mut self) {
+        let mut active = self
+            .limiter
+            .active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *active = active.saturating_sub(1);
+        self.limiter.cv.notify_one();
+    }
+}
+
+impl ConcurrencyLimiter {
+    fn new(limit: usize) -> Self {
+        Self {
+            active: Mutex::new(0),
+            cv: Condvar::new(),
+            limit: limit.max(1),
+        }
+    }
+
+    /// Acquires a permit, returning `None` if `cancel` is set before a slot opens.
+    fn acquire(self: &Arc<Self>, cancel: &AtomicBool) -> Option<ConcurrencyPermit> {
+        let mut active = self.active.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            if *active < self.limit {
+                *active += 1;
+                return Some(ConcurrencyPermit {
+                    limiter: self.clone(),
+                });
+            }
+            let (guard, _) = self
+                .cv
+                .wait_timeout(active, Duration::from_millis(50))
+                .unwrap_or_else(PoisonError::into_inner);
+            active = guard;
+        }
+    }
+}
+
 /// Stateful JSON-RPC 2.0 MCP server.
 pub struct Server {
     /// Command line that invokes `lidar` (either the native binary or `python -m lidar_rs`).
@@ -77,6 +131,8 @@ pub struct Server {
     send: Sender<String>,
     /// Active tool calls keyed by serialized request id, paired with their cancellation flag.
     running: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    /// Shared concurrency cap across all single and batched tool calls in this session.
+    limiter: Arc<ConcurrencyLimiter>,
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -87,6 +143,7 @@ impl Server {
             lidar: Arc::new(lidar),
             send,
             running: Arc::default(),
+            limiter: Arc::new(ConcurrencyLimiter::new(MAX_CONCURRENT_TOOLS)),
             workers: Vec::new(),
         }
     }
@@ -101,6 +158,7 @@ impl Server {
         {
             cancel.store(true, Ordering::Relaxed);
         }
+        self.limiter.cv.notify_all();
         for w in self.workers.drain(..) {
             let _ = w.join();
         }
@@ -153,11 +211,25 @@ impl Server {
                 "expected a JSON-RPC object",
             ));
         };
-        let id = obj.get("id").cloned();
-        let Some(method) = obj.get("method").and_then(Value::as_str) else {
-            return id
-                .filter(|_| !obj.contains_key("result") && !obj.contains_key("error"))
-                .map(|id| error(&id, INVALID_REQUEST, "expected a method"));
+        let raw_id = obj.get("id").cloned();
+        let reply_id = raw_id
+            .as_ref()
+            .filter(|id| matches!(id, Value::String(_) | Value::Number(_)))
+            .cloned()
+            .unwrap_or(Value::Null);
+
+        if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+            return Some(error(&reply_id, INVALID_REQUEST, "jsonrpc must be \"2.0\""));
+        }
+
+        let Some(method_val) = obj.get("method") else {
+            if obj.contains_key("result") || obj.contains_key("error") {
+                return None;
+            }
+            return Some(error(&reply_id, INVALID_REQUEST, "expected a method"));
+        };
+        let Some(method) = method_val.as_str() else {
+            return Some(error(&reply_id, INVALID_REQUEST, "method must be a string"));
         };
         if method == "notifications/cancelled" {
             let request = obj
@@ -172,10 +244,11 @@ impl Server {
                     .cloned()
             }) {
                 cancel.store(true, Ordering::Relaxed);
+                self.limiter.cv.notify_all();
             }
         }
         // Notifications (no id) produce no reply.
-        let id = id?;
+        let id = raw_id?;
         if !matches!(id, Value::String(_) | Value::Number(_)) {
             return Some(error(
                 &Value::Null,
@@ -240,7 +313,7 @@ impl Server {
         let send = self.send.clone();
         self.workers.retain(|w| !w.is_finished());
         self.workers.push(std::thread::spawn(move || {
-            let width = runs.len().min(BATCH_CONCURRENCY);
+            let width = runs.len().min(MAX_CONCURRENT_TOOLS);
             let queue = Arc::new(Mutex::new(runs.into_iter()));
             let workers: Vec<_> = (0..width)
                 .map(|_| {
@@ -279,22 +352,31 @@ impl Server {
             .unwrap_or_else(PoisonError::into_inner)
             .insert(key.clone(), cancel.clone());
         debug_assert!(previous.is_none(), "a running call's id was reused");
-        let (lidar, running) = (self.lidar.clone(), self.running.clone());
+        let (lidar, running, limiter) = (
+            self.lidar.clone(),
+            self.running.clone(),
+            self.limiter.clone(),
+        );
         move || {
-            let reply = if cancel.load(Ordering::Relaxed) {
-                None
-            } else {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    call_tool(&lidar, &name, args, &cancel)
-                }))
-                .map(|r| r.map(|r| json!({"jsonrpc": "2.0", "id": id, "result": r})))
-                .unwrap_or_else(|_| {
-                    Some(error(
-                        &id,
-                        INTERNAL_ERROR,
-                        "the tool call failed unexpectedly",
-                    ))
-                })
+            let reply = match limiter.acquire(&cancel) {
+                None => None,
+                Some(_permit) => {
+                    if cancel.load(Ordering::Relaxed) {
+                        None
+                    } else {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            call_tool(&lidar, &name, args, &cancel)
+                        }))
+                        .map(|r| r.map(|r| json!({"jsonrpc": "2.0", "id": id, "result": r})))
+                        .unwrap_or_else(|_| {
+                            Some(error(
+                                &id,
+                                INTERNAL_ERROR,
+                                "the tool call failed unexpectedly",
+                            ))
+                        })
+                    }
+                }
             };
             running
                 .lock()
@@ -385,14 +467,14 @@ fn call_preview(lidar: &[OsString], mut args: Vec<OsString>, cancel: &AtomicBool
         i += 1;
     }
 
-    let (path, _temp_dir) = match explicit_output {
+    let temp_output = match explicit_output {
         Some(p) if p.as_os_str() == "-" => {
             return failed(
                 "preview cannot send PNG bytes as tool text: pass -o FILE, or omit -o to receive image content"
                     .into(),
             );
         }
-        Some(p) => (p, None),
+        Some(_) => None,
         None => {
             let dir = match tempfile::Builder::new().prefix("lidar-preview-").tempdir() {
                 Ok(d) => d,
@@ -400,12 +482,17 @@ fn call_preview(lidar: &[OsString], mut args: Vec<OsString>, cancel: &AtomicBool
             };
             let p = dir.path().join("preview.png");
             args.splice(0..0, [OsString::from("-o"), p.clone().into_os_string()]);
-            (p, Some(dir))
+            Some((p, dir))
         }
     };
 
     let mut result = call_command(lidar, "preview", args, cancel);
-    if let Some(res) = result.as_mut().filter(|r| r["isError"] == false) {
+    // Attach inline PNG image content only when the caller omitted -o (temporary server output);
+    // explicit -o FILE saves to disk and returns the child's text confirmation only.
+    if let (Some((path, _dir)), Some(res)) = (
+        temp_output,
+        result.as_mut().filter(|r| r["isError"] == false),
+    ) {
         let png = std::fs::metadata(&path)
             .ok()
             .filter(|m| m.is_file() && m.len() > 0 && m.len() <= MAX_IMAGE)
@@ -444,30 +531,43 @@ fn call_command(
     let (text, failed) = match run_child(lidar, name, args, cancel) {
         Ok(None) => return None,
         Ok(Some((status, stdout, stderr))) => {
-            // Preserve stderr first so diagnostics are never truncated by large stdout.
-            let stderr = clip(
-                String::from_utf8_lossy(&stderr.0).into_owned(),
-                stderr.1,
-                MAX_OUTPUT,
-            );
-            let room = MAX_OUTPUT.saturating_sub(stderr.len());
-            let mut text = clip(
-                String::from_utf8_lossy(&stdout.0).into_owned(),
-                stdout.1,
-                room,
-            );
-            if !stderr.is_empty() {
-                if !text.is_empty() && !text.ends_with('\n') {
-                    text.push('\n');
-                }
-                text.push_str(&stderr);
-            }
             let failed = !status.success();
-            if failed {
+            let footer = if failed {
                 let code = status
                     .code()
                     .map_or_else(|| "a signal".to_string(), |c| format!("exit code {c}"));
-                text.push_str(&format!("\n(lidar {name} failed with {code})"));
+                format!("\n(lidar {name} failed with {code})")
+            } else {
+                String::new()
+            };
+            let stream_budget = MAX_OUTPUT.saturating_sub(footer.len());
+            // Preserve stderr first so diagnostics are never truncated by large stdout.
+            let stderr_text = clip(
+                String::from_utf8_lossy(&stderr.0).into_owned(),
+                stderr.1,
+                stream_budget,
+            );
+            let sep_len = usize::from(!stderr_text.is_empty());
+            let stdout_budget = stream_budget
+                .saturating_sub(stderr_text.len())
+                .saturating_sub(sep_len);
+            let mut text = if stdout_budget > 0 {
+                clip(
+                    String::from_utf8_lossy(&stdout.0).into_owned(),
+                    stdout.1,
+                    stdout_budget,
+                )
+            } else {
+                String::new()
+            };
+            if !stderr_text.is_empty() {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(&stderr_text);
+            }
+            if !footer.is_empty() {
+                text.push_str(&footer);
             }
             if text.trim().is_empty() {
                 text = format!("lidar {name} finished.");
@@ -481,6 +581,28 @@ fn call_command(
 
 type BoundedOutput = (Vec<u8>, usize);
 
+/// Ensures a spawned child process is killed and reaped on any early return or panic.
+struct ChildGuard(Option<Child>);
+
+impl ChildGuard {
+    fn as_mut(&mut self) -> &mut Child {
+        self.0.as_mut().expect("child still owned")
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 fn run_child(
     lidar: &[OsString],
     name: &str,
@@ -490,7 +612,7 @@ fn run_child(
     let (program, before) = lidar
         .split_first()
         .expect("lidar command line must contain a program");
-    let mut child = Command::new(program)
+    let child = Command::new(program)
         .args(before)
         .arg(name)
         .args(args)
@@ -499,21 +621,18 @@ fn run_child(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let stdout = read_bounded(child.stdout.take().expect("piped stdout"));
-    let stderr = read_bounded(child.stderr.take().expect("piped stderr"));
+    let mut guard = ChildGuard(Some(child));
+    let stdout = read_bounded(guard.as_mut().stdout.take().expect("piped stdout"))?;
+    let stderr = read_bounded(guard.as_mut().stderr.take().expect("piped stderr"))?;
     let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {}
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(e);
-            }
+        if let Some(status) = guard.as_mut().try_wait()? {
+            guard.disarm();
+            break status;
         }
         if cancel.load(Ordering::Relaxed) {
-            let _ = child.kill();
-            let _ = child.wait();
+            drop(guard);
+            let _ = stdout.join();
+            let _ = stderr.join();
             return Ok(None);
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -522,8 +641,8 @@ fn run_child(
     Ok(Some((status, joined(stdout), joined(stderr))))
 }
 
-fn read_bounded(mut r: impl Read + Send + 'static) -> JoinHandle<BoundedOutput> {
-    std::thread::spawn(move || {
+fn read_bounded(mut r: impl Read + Send + 'static) -> std::io::Result<JoinHandle<BoundedOutput>> {
+    std::thread::Builder::new().spawn(move || {
         let (mut kept, mut total, mut buf) = (Vec::new(), 0usize, [0u8; 8192]);
         loop {
             let n = match r.read(&mut buf) {
@@ -640,34 +759,52 @@ fn tool_list() -> Vec<Value> {
 }
 
 fn prompt_list() -> Vec<Value> {
-    vec![
-        json!({
-            "name": "delineate-depressions",
-            "description": "Inspect a DEM, choose resolution-appropriate thresholds, run the end-to-end nested depression and inundation pipeline, and preview the results.",
-            "arguments": [
-                {"name": "dem_path", "description": "Absolute path to the input DEM GeoTIFF", "required": true},
-                {"name": "out_dir", "description": "Absolute path to the output directory", "required": true}
-            ]
-        }),
-        json!({
-            "name": "watershed-fsm-study",
-            "description": "Download authoritative U.S. federal datasets (USGS 3DEP DEM, WBD, NHD, NWI, Transportation, synthesized culverts, NOAA Atlas 14) for a watershed and run a hydro-conditioned Fill-Spill-Merge storm simulation.",
-            "arguments": [
-                {"name": "region", "description": "Region selector: a USGS HUC code (e.g. 101600020102), WGS 84 bbox 'min_lon,min_lat,max_lon,max_lat', or polygon file path", "required": true},
-                {"name": "out_dir", "description": "Absolute path to the study output directory", "required": true},
-                {"name": "dem_product", "description": "Optional USGS 3DEP DEM product (1m, 10m, or 30m; default 1m)", "required": false}
-            ]
-        }),
-        json!({
-            "name": "pointcloud-terrain-products",
-            "description": "Inspect a LAS/LAZ/COPC/PLY/E57 LiDAR point cloud, generate bare-earth DTM, DSM, and Canopy Height Model (CHM), and preview the output rasters.",
-            "arguments": [
-                {"name": "pointcloud_path", "description": "Absolute path to the input LiDAR point cloud", "required": true},
-                {"name": "out_dir", "description": "Absolute path to the output directory", "required": true},
-                {"name": "resolution", "description": "Optional grid resolution in CRS units (default 1.0)", "required": false}
-            ]
-        }),
-    ]
+    let mut prompts = vec![json!({
+        "name": "delineate-depressions",
+        "description": "Inspect a DEM, choose resolution-appropriate thresholds, run the end-to-end nested depression and inundation pipeline, and preview the results.",
+        "arguments": [
+            {"name": "dem_path", "description": "Absolute path to the input DEM GeoTIFF", "required": true},
+            {"name": "out_dir", "description": "Absolute path to the output directory", "required": true}
+        ]
+    })];
+    #[cfg(feature = "download")]
+    prompts.push(json!({
+        "name": "watershed-fsm-study",
+        "description": "Download authoritative U.S. federal datasets (USGS 3DEP DEM, WBD, NHD, NWI, Transportation, synthesized culverts, NOAA Atlas 14) for a watershed and run a hydro-conditioned Fill-Spill-Merge storm simulation.",
+        "arguments": [
+            {"name": "region", "description": "Region selector: a USGS HUC code (e.g. 101600020102), WGS 84 bbox 'min_lon,min_lat,max_lon,max_lat', or polygon file path", "required": true},
+            {"name": "out_dir", "description": "Absolute path to the study output directory", "required": true},
+            {"name": "dem_product", "description": "Optional USGS 3DEP DEM product (1m, 10m, or 30m; default 1m)", "required": false}
+        ]
+    }));
+    prompts.push(json!({
+        "name": "pointcloud-terrain-products",
+        "description": "Inspect a LAS/LAZ/COPC/PLY/E57 LiDAR point cloud, generate bare-earth DTM, DSM, and Canopy Height Model (CHM), and preview the output rasters.",
+        "arguments": [
+            {"name": "pointcloud_path", "description": "Absolute path to the input LiDAR point cloud", "required": true},
+            {"name": "out_dir", "description": "Absolute path to the output directory", "required": true},
+            {"name": "resolution", "description": "Optional grid resolution in CRS units (default 1.0)", "required": false}
+        ]
+    }));
+    prompts
+}
+
+#[cfg(feature = "download")]
+fn download_region_flag(region: &str) -> &'static str {
+    let trimmed = region.trim();
+    if matches!(trimmed.len(), 2 | 4 | 6 | 8 | 10 | 12)
+        && trimmed.chars().all(|c| c.is_ascii_digit())
+    {
+        "--huc"
+    } else if trimmed.split(',').count() == 4
+        && trimmed
+            .split(',')
+            .all(|part| part.trim().parse::<f64>().is_ok())
+    {
+        "--bbox"
+    } else {
+        "--region"
+    }
 }
 
 fn get_prompt(params: &Value) -> Result<Value, RpcError> {
@@ -716,10 +853,12 @@ fn get_prompt(params: &Value) -> Result<Value, RpcError> {
                 }]
             }))
         }
+        #[cfg(feature = "download")]
         "watershed-fsm-study" => {
             let region = req_arg("region")?;
             let out = req_arg("out_dir")?;
             let product = opt_arg("dem_product", "1m");
+            let flag = download_region_flag(&region);
             Ok(json!({
                 "description": "Download federal watershed data and run hydro-conditioned Fill-Spill-Merge modeling.",
                 "messages": [{
@@ -728,8 +867,8 @@ fn get_prompt(params: &Value) -> Result<Value, RpcError> {
                         "type": "text",
                         "text": format!(
                             "Run an end-to-end watershed Fill-Spill-Merge study for region `{region}` in `{out}` using USGS 3DEP `{product}`:\n\
-                             1. Call `download` with `--dry-run` and `--dem-product {product}` first to check tile count and download size.\n\
-                             2. Run `download` for `{region}` into `{out}/federal` (`--dem-product {product}`, `--datasets all`, `--json`) to obtain 3DEP DEM, WBD, NHD, NWI, roads/railways, synthesized culverts, and NOAA Atlas 14 design storms.\n\
+                             1. Call `download` with `[\"{flag}\", \"{region}\", \"-o\", \"{out}/federal\", \"--dem-product\", \"{product}\", \"--dry-run\"]` first to check tile count and download size (use `--huc` for HUC codes, `--bbox` for WGS 84 bounds, or `--region` for polygon files).\n\
+                             2. Run `download` with `[\"{flag}\", \"{region}\", \"-o\", \"{out}/federal\", \"--dem-product\", \"{product}\", \"--datasets\", \"all\", \"--json\"]` to obtain 3DEP DEM, WBD, NHD, NWI, roads/railways, synthesized culverts, and NOAA Atlas 14 design storms.\n\
                              3. Inspect `{out}/federal/dem.tif` with `info` (`--json`). If it is in a geographic CRS (e.g., 10m/30m EPSG:4269), reproject it with `reproject` to match `{out}/federal/culverts.gpkg`.\n\
                              4. Extract the 100-year 24-hour depth from `{out}/federal/noaa_atlas14.json` and run `pipeline` with `--routing fsm --culverts {out}/federal/culverts.gpkg --streams {out}/federal/nhd_flowlines.gpkg --scs-type2-mm <DEPTH> --compress --json` into `{out}/fsm_100yr`.\n\
                              5. Call `preview` with `--fill-time {out}/fsm_100yr/fill_time.tif --scale-bar --legend` and summarize watershed storage retention and connectivity."
@@ -791,15 +930,25 @@ fn clip(mut text: String, total: usize, max: usize) -> String {
     if text.len() <= max && total <= text.len() {
         return text;
     }
-    let mut end = max.min(text.len());
+    let full_total = total.max(text.len());
+    let suffix_for = |kept: usize| format!("\n... (output cut at {kept} of {full_total} bytes)");
+    let max_suffix_len = suffix_for(max).len();
+    if max <= max_suffix_len {
+        let mut end = max.min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        return text;
+    }
+    let mut end = (max - max_suffix_len).min(text.len());
     while !text.is_char_boundary(end) {
         end -= 1;
     }
     text.truncate(end);
-    format!(
-        "{text}\n... (output cut at {end} of {} bytes)",
-        total.max(text.len())
-    )
+    let suffix = suffix_for(end);
+    text.push_str(&suffix);
+    text
 }
 
 fn error(id: &Value, code: i64, message: &str) -> Value {
@@ -889,7 +1038,13 @@ mod tests {
         let s = &mut server();
         let list = request(s, "prompts/list", json!({}));
         let prompts = list["result"]["prompts"].as_array().unwrap();
+        #[cfg(feature = "download")]
         assert_eq!(prompts.len(), 3);
+        #[cfg(not(feature = "download"))]
+        {
+            assert_eq!(prompts.len(), 2);
+            assert!(!prompts.iter().any(|p| p["name"] == "watershed-fsm-study"));
+        }
 
         let got = request(
             s,
@@ -903,6 +1058,24 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(text.contains("/data/dem.tif") && text.contains("preview"));
+
+        #[cfg(feature = "download")]
+        {
+            let huc = request(
+                s,
+                "prompts/get",
+                json!({
+                    "name": "watershed-fsm-study",
+                    "arguments": {"region": "101600020102", "out_dir": "/data/study"}
+                }),
+            );
+            assert!(
+                huc["result"]["messages"][0]["content"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("\"--huc\"")
+            );
+        }
 
         let missing = request(
             s,
@@ -939,8 +1112,25 @@ mod tests {
             serde_json::from_str::<Value>(&s.handle("{").unwrap()).unwrap()["error"]["code"],
             PARSE_ERROR
         );
+        // Invalid JSON-RPC envelopes (empty object, wrong version) return INVALID_REQUEST.
+        assert_eq!(
+            serde_json::from_str::<Value>(&s.handle("{}").unwrap()).unwrap()["error"]["code"],
+            INVALID_REQUEST
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                &s.handle(r#"{"jsonrpc":"1.0","id":1,"method":"ping"}"#)
+                    .unwrap()
+            )
+            .unwrap()["error"]["code"],
+            INVALID_REQUEST
+        );
         assert!(
             s.handle(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+                .is_none()
+        );
+        assert!(
+            s.handle(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#)
                 .is_none()
         );
     }
@@ -948,22 +1138,33 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn answers_while_running_and_honors_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("started");
+        let script = format!("touch \"{}\"; sleep 30", marker.display());
         let (send, replies) = std::sync::mpsc::channel();
-        let mut s = Server::new(vec!["sh".into(), "-c".into(), "sleep 30".into()], send);
+        let mut s = Server::new(vec!["sh".into(), "-c".into(), script.into()], send);
         let call = json!({
             "jsonrpc": "2.0",
             "id": "slow",
             "method": "tools/call",
             "params": {"name": "info", "arguments": {"args": []}}
         });
+        let started = std::time::Instant::now();
         assert!(s.handle(&call.to_string()).is_none());
+        // Wait until the child actually starts before testing cancellation.
+        while !marker.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "child never started"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert!(request(&mut s, "ping", json!({}))["result"].is_object());
         // Duplicate running id must be refused.
         let dup: Value =
             serde_json::from_str(&s.handle(&call.to_string()).expect("refusal")).unwrap();
         assert_eq!(dup["error"]["code"], INVALID_REQUEST);
 
-        let started = std::time::Instant::now();
         s.handle(
             &json!({
                 "jsonrpc": "2.0",
@@ -972,8 +1173,15 @@ mod tests {
             })
             .to_string(),
         );
+        // Verify notifications/cancelled itself terminates and clears the call BEFORE shutdown().
+        while !s.running.lock().unwrap().is_empty() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "notifications/cancelled did not stop running call"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         s.shutdown();
-        assert!(started.elapsed() < Duration::from_secs(10));
         assert!(replies.try_recv().is_err());
     }
 
@@ -1031,10 +1239,8 @@ mod tests {
 
         let long = "é".repeat(MAX_OUTPUT);
         let clipped = clip(long.clone(), long.len(), MAX_OUTPUT);
+        assert!(clipped.len() <= MAX_OUTPUT);
         assert!(clipped.ends_with(&format!("of {} bytes)", long.len())));
-        assert_eq!(
-            clip("abc".into(), 3, 1),
-            "a\n... (output cut at 1 of 3 bytes)"
-        );
+        assert_eq!(clip("abc".into(), 3, 1), "a");
     }
 }

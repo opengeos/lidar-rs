@@ -85,6 +85,7 @@ Add to `.vscode/mcp.json`:
 ## Operational Limits
 
 - Always pass absolute file paths; relative paths resolve against the working directory where the MCP client spawned the server.
-- Combined command output (`stderr` + `stdout`) is capped at 100,000 bytes (`stderr` diagnostics are preserved first so failure messages are not truncated).
-- Inline `preview` PNG attachments are capped at 8 MiB; use `--max-dim` (default `1024`) to keep images compact.
-- Tool calls execute asynchronously in child processes so `ping` and concurrent requests stay responsive. Client cancellations (`notifications/cancelled`) and EOF cleanly terminate running child processes. JSON-RPC batches execute up to 8 tool calls concurrently and return all replies together.
+- Combined command output (`stderr` + `stdout`, including any truncation notices and failure status) is capped at 100,000 bytes (`stderr` diagnostics are preserved first so failure messages are not truncated).
+- Inline `preview` PNG attachments are returned only when `-o`/`--output` is omitted (capped at 8 MiB; use `--max-dim`, default `1024`, to keep images compact). Passing `-o FILE` writes the PNG to disk and returns the command's text output only.
+- Tool calls execute asynchronously in isolated child processes with a session-wide concurrency limit of 8 simultaneous tool runs (covering both standalone calls and JSON-RPC batches), so `ping` and concurrent requests stay responsive without exhausting memory.
+- Client cancellations (`notifications/cancelled`) and EOF on standard input immediately terminate running child processes, so clients should keep stdin open until all expected replies arrive. JSON-RPC batches return all replies together once their tool calls finish.

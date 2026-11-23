@@ -1118,13 +1118,7 @@ pub fn render_inundation_frame_png_bytes(
 ) -> Result<Vec<u8>> {
     let sw = dem.width();
     let sh = dem.height();
-    if fill_time.width() != sw || fill_time.height() != sh {
-        return Err(Error::DimensionMismatch(format!(
-            "fill_time ({}x{}) does not match DEM ({sw}x{sh})",
-            fill_time.width(),
-            fill_time.height()
-        )));
-    }
+    crate::inundation::validate_grid_alignment(dem, fill_time, "fill_time")?;
     let (dw, dh, total_h) = compute_gif_dimensions(sw, sh, options)?;
     let full_bg = compute_hillshade_rgb(dem, &options.hillshade);
     let bg = downscale_rgb(&full_bg, sw, sh, dw, dh);
@@ -1203,14 +1197,8 @@ pub fn render_dem_preview_png_bytes(
 ) -> Result<Vec<u8>> {
     let sw = dem.width();
     let sh = dem.height();
-    if let Some(ov) = depth_overlay
-        && (ov.width() != sw || ov.height() != sh)
-    {
-        return Err(Error::DimensionMismatch(format!(
-            "depth overlay ({}x{}) does not match DEM ({sw}x{sh})",
-            ov.width(),
-            ov.height()
-        )));
+    if let Some(ov) = depth_overlay {
+        crate::inundation::validate_grid_alignment(dem, ov, "depth_overlay")?;
     }
     let (dw, dh, _) = compute_gif_dimensions(sw, sh, options)?;
     let full_bg = compute_hillshade_rgb(dem, &options.hillshade);
@@ -1238,7 +1226,11 @@ pub fn render_dem_preview_png_bytes(
         }
     }
     if options.show_scale_bar && !is_geographic_crs(&dem.projection, dem.geotransform) {
-        let reserve_right = if options.show_legend { 96 } else { 0 };
+        let reserve_right = if options.show_legend && depth_overlay.is_some() {
+            96
+        } else {
+            0
+        };
         draw_scale_bar(&mut rgb, dw, dh, sw, cell_m, &dem.projection, reserve_right);
     }
     if options.show_legend && depth_overlay.is_some() {

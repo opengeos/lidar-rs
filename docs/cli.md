@@ -156,7 +156,6 @@ lidar lidar-to-chm sample_forest.laz out/chm.tif --resolution 1.0 --ground-metho
 lidar info dem.tif --json --stats
 lidar preview dem.tif -o preview.png --scale-bar
 lidar preview dem.tif -o flood.png --fill-time out_pipe/fill_time.tif --hour 10 --scale-bar --legend
-lidar mcp   # start stdio Model Context Protocol server for AI agents
 lidar --json-usage   # dump machine-readable JSON command catalog
 lidar polygonize out/region.tif out/regions.geojson --field-name id
 lidar mosaic tile1.tif tile2.tif -o mosaic.tif
@@ -167,4 +166,12 @@ lidar to-cog dem.tif dem_cog.tif --compression DEFLATE
 lidar add-crs dem.tif EPSG:26915 -o dem_crs.tif
 lidar join-tables out/regions.shp out/regions_info.csv out/joined.gpkg
 lidar csv-to-vector points.csv points.shp --latitude latitude --longitude longitude
+```
+
+## AI Agents (MCP Server)
+
+`lidar mcp` runs a foreground JSON-RPC 2.0 server over stdin/stdout (normally launched by an MCP client such as Claude Code, Claude Desktop, Cursor, or VS Code; see [AI Agents (MCP)](mcp.md)):
+
+```sh
+claude mcp add lidar -- lidar mcp
 ```

@@ -3,7 +3,9 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -11,28 +13,61 @@ fn test_data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_data")
 }
 
+struct ChildReaper(Option<Child>);
+
+impl Drop for ChildReaper {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.0.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
 fn session(messages: &[Value]) -> HashMap<u64, Value> {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_lidar"))
+    let child = Command::new(env!("CARGO_BIN_EXE_lidar"))
         .arg("mcp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .expect("spawn lidar mcp");
-    let mut stdin = child.stdin.take().unwrap();
+    let mut reaper = ChildReaper(Some(child));
+    let mut stdin = reaper.0.as_mut().unwrap().stdin.take().unwrap();
+    let stdout = reaper.0.as_mut().unwrap().stdout.take().unwrap();
+
+    let (tx, rx) = mpsc::channel::<String>();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
     for m in messages {
         writeln!(stdin, "{m}").unwrap();
     }
+    stdin.flush().unwrap();
+
     let requests = messages.iter().filter(|m| m.get("id").is_some()).count();
-    let replies: HashMap<u64, Value> = BufReader::new(child.stdout.take().unwrap())
-        .lines()
-        .take(requests)
-        .map(|l| {
-            let v: Value = serde_json::from_str(&l.unwrap()).unwrap();
-            (v["id"].as_u64().unwrap(), v)
-        })
-        .collect();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut replies = HashMap::with_capacity(requests);
+    for _ in 0..requests {
+        let rem = deadline
+            .checked_duration_since(Instant::now())
+            .expect("timed out waiting for MCP reply");
+        let line = rx
+            .recv_timeout(rem)
+            .expect("timed out or EOF before receiving all MCP replies");
+        let v: Value = serde_json::from_str(&line).expect("valid JSON-RPC reply");
+        replies.insert(v["id"].as_u64().unwrap(), v);
+    }
+
     drop(stdin);
+    let mut child = reaper.0.take().unwrap();
     assert!(child.wait().unwrap().success());
+    let _ = reader.join();
     replies
 }
 
@@ -212,4 +247,21 @@ fn json_usage_catalog_describes_root_and_subcommand() {
             .iter()
             .any(|a| a["long"] == "--routing")
     );
+
+    // Non-exposed commands (`mcp`) must exit with usage error 2 rather than starting the server.
+    let out_mcp = Command::new(env!("CARGO_BIN_EXE_lidar"))
+        .args(["mcp", "--json-usage"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run lidar mcp --json-usage");
+    assert_eq!(out_mcp.status.code(), Some(2));
+
+    // Preview must refuse aliasing an input raster as its output path.
+    let dem = test_data_dir().join("dem.tif");
+    let dem_str = dem.to_str().unwrap();
+    let out_alias = Command::new(env!("CARGO_BIN_EXE_lidar"))
+        .args(["preview", dem_str, "-o", dem_str])
+        .output()
+        .expect("run lidar preview aliasing check");
+    assert!(!out_alias.status.success());
 }

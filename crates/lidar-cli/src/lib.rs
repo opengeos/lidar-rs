@@ -6,7 +6,7 @@ mod mcp;
 mod usage;
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use lidar::pointcloud::{
@@ -32,6 +32,7 @@ use lidar::{
     Bbox, DemProduct, DownloadOptions, FederalBundleOptions, Region, WbdLevel,
     download_federal_data, parse_dataset_list, query_3dep_products,
 };
+use richdem::DemNum;
 
 #[derive(Parser)]
 #[command(
@@ -1774,6 +1775,35 @@ fn dispatch(command: Commands, lidar_cmd: Option<Vec<OsString>>) -> lidar::Resul
                         .into(),
                 )
             })?;
+            let resolve = |p: &Path| -> PathBuf {
+                std::fs::canonicalize(p).unwrap_or_else(|_| {
+                    if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
+                        let parent_dir = if parent.as_os_str().is_empty() {
+                            Path::new(".")
+                        } else {
+                            parent
+                        };
+                        std::fs::canonicalize(parent_dir)
+                            .map(|cp| cp.join(name))
+                            .unwrap_or_else(|_| p.to_path_buf())
+                    } else {
+                        p.to_path_buf()
+                    }
+                })
+            };
+            let out_resolved = resolve(&out_path);
+            for input_path in [Some(dem.as_path()), fill_time.as_deref(), depth.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                if resolve(input_path) == out_resolved {
+                    return Err(lidar::Error::InvalidArgument(format!(
+                        "preview output '{}' would overwrite input raster '{}'",
+                        out_path.display(),
+                        input_path.display()
+                    )));
+                }
+            }
             if let Some(parent) = out_path.parent()
                 && !parent.as_os_str().is_empty()
             {
@@ -1799,7 +1829,7 @@ fn dispatch(command: Commands, lidar_cmd: Option<Vec<OsString>>) -> lidar::Resul
                     .data()
                     .iter()
                     .copied()
-                    .filter(|&v| v.is_finite() && v >= 0.0 && (v - ft_nd).abs() > 1e-12)
+                    .filter(|&v| v.is_finite() && v >= 0.0 && !v.rd_eq(ft_nd))
                     .fold(0.0f64, f64::max);
                 let t_hours = hour.unwrap_or(if max_ft > 0.0 { max_ft } else { 1.0 });
                 let progress = if max_ft > 0.0 {
@@ -1841,6 +1871,11 @@ fn dispatch(command: Commands, lidar_cmd: Option<Vec<OsString>>) -> lidar::Resul
             }
         }
         Commands::Mcp => {
+            if std::env::var_os("LIDAR_MCP_TOOL").is_some() {
+                return Err(lidar::Error::InvalidArgument(
+                    "refusing to start recursive `lidar mcp` inside an MCP tool subprocess".into(),
+                ));
+            }
             let cmd = match lidar_cmd {
                 Some(c) => c,
                 None => mcp::this_binary()?,
@@ -1865,15 +1900,21 @@ pub fn run_as(args: Vec<OsString>, lidar_cmd: Option<Vec<OsString>>) -> i32 {
 }
 
 fn run_as_inner(args: Vec<OsString>, lidar_cmd: Option<Vec<OsString>>) -> i32 {
-    if let Some(catalog) = usage::requested(&args) {
-        match serde_json::to_string_pretty(&catalog) {
-            Ok(json) => {
-                println!("{json}");
-                return 0;
-            }
-            Err(e) => {
-                eprintln!("error: failed serializing command catalog: {e}");
-                return 1;
+    if let Some(catalog_res) = usage::requested(&args) {
+        match catalog_res {
+            Ok(catalog) => match serde_json::to_string_pretty(&catalog) {
+                Ok(json) => {
+                    println!("{json}");
+                    return 0;
+                }
+                Err(e) => {
+                    eprintln!("error: failed serializing command catalog: {e}");
+                    return 1;
+                }
+            },
+            Err(msg) => {
+                eprintln!("error: {msg}");
+                return 2;
             }
         }
     }
