@@ -11,6 +11,8 @@ High-performance nested surface depression delineation, hydro-conditioning, LiDA
 
 Run it right now in your browser with zero installation via the live [WebAssembly Playground](playground.md) or try the [Google Colab notebook](https://colab.research.google.com/github/opengeos/lidar-rs/blob/main/examples/lidar_rs_demo.ipynb).
 
+## Demo
+
 [![Interactive inundation simulation and inundation curve in the lidar-rs WebAssembly Playground](https://files.opengeos.org/inundation_demo.gif)](playground.md)
 
 [![Nested depression hierarchy and depression tree overview in lidar-rs](https://files.opengeos.org/depression_hierarchy.webp)](playground.md)
