@@ -200,8 +200,14 @@
     return document.body && document.body.getAttribute("data-md-color-scheme") === "slate";
   }
 
+  function volumeUnitFor(areaUnit) {
+    if (areaUnit === "m²") return "m³";
+    if (areaUnit === "ft²") return "ft³";
+    return `${areaUnit || "units²"}·z`;
+  }
+
   function formatCompactVolume(vol, areaUnit) {
-    const volUnit = areaUnit === "m²" ? "m³" : `${areaUnit}·z`;
+    const volUnit = volumeUnitFor(areaUnit);
     if (!Number.isFinite(vol)) return `N/A ${volUnit}`;
     const abs = Math.abs(vol);
     if (abs >= 1e6) return `${(vol / 1e6).toFixed(2)}M ${volUnit}`;
@@ -227,7 +233,8 @@
 
   /**
    * Computes per-depression sorted owned-cell fill times and guaranteed interior badge anchor
-   * pixels (via a 2-pass L1 distance-to-boundary transform on `depIds`).
+   * pixels (via a 2-pass L1 distance-to-boundary transform on `depIds`) using dense ID-indexed
+   * typed arrays to avoid per-pixel Map hashing on large DEMs.
    */
   function precomputeDepressionGridStats(width, height, depIds, fillTimes, depressions) {
     const fillStats = new Map();
@@ -236,49 +243,51 @@
       return { fillStats, badgePos };
     }
 
+    let maxId = 0;
+    for (const d of depressions) {
+      if (d.id > maxId) maxId = d.id;
+    }
+    if (maxId <= 0) return { fillStats, badgePos };
+
     const n = width * height;
-    const totalCounts = new Map();
-    const wetCounts = new Map();
-    const sumCol = new Map();
-    const sumRow = new Map();
+    const totalCounts = new Uint32Array(maxId + 1);
+    const wetCounts = new Uint32Array(maxId + 1);
+    const sumCol = new Float64Array(maxId + 1);
+    const sumRow = new Float64Array(maxId + 1);
 
     for (let r = 0; r < height; r++) {
       const rowOff = r * width;
       for (let c = 0; c < width; c++) {
         const idx = rowOff + c;
         const id = depIds[idx];
-        if (id <= 0) continue;
-        totalCounts.set(id, (totalCounts.get(id) || 0) + 1);
-        sumCol.set(id, (sumCol.get(id) || 0) + c);
-        sumRow.set(id, (sumRow.get(id) || 0) + r);
+        if (id <= 0 || id > maxId) continue;
+        totalCounts[id]++;
+        sumCol[id] += c;
+        sumRow[id] += r;
         const ft = fillTimes[idx];
         if (Number.isFinite(ft) && ft >= 0) {
-          wetCounts.set(id, (wetCounts.get(id) || 0) + 1);
+          wetCounts[id]++;
         }
       }
     }
 
     // Allocate and populate per-depression fill-time arrays, then sort numerically.
-    const cursors = new Map();
+    const timesById = new Array(maxId + 1);
+    const cursors = new Uint32Array(maxId + 1);
     for (const d of depressions) {
-      const total = totalCounts.get(d.id) || 0;
-      const wet = wetCounts.get(d.id) || 0;
-      fillStats.set(d.id, {
-        total,
-        times: new Float64Array(wet),
-      });
-      cursors.set(d.id, 0);
+      const id = d.id;
+      const arr = new Float64Array(wetCounts[id]);
+      timesById[id] = arr;
+      fillStats.set(id, { total: totalCounts[id], times: arr });
     }
     for (let i = 0; i < n; i++) {
       const id = depIds[i];
-      if (id <= 0) continue;
+      if (id <= 0 || id > maxId) continue;
+      const arr = timesById[id];
+      if (!arr) continue;
       const ft = fillTimes[i];
       if (!Number.isFinite(ft) || ft < 0) continue;
-      const entry = fillStats.get(id);
-      if (!entry) continue;
-      const pos = cursors.get(id);
-      entry.times[pos] = ft;
-      cursors.set(id, pos + 1);
+      arr[cursors[id]++] = ft;
     }
     for (const entry of fillStats.values()) {
       entry.times.sort();
@@ -293,7 +302,7 @@
       for (let c = 0; c < width; c++) {
         const idx = rowOff + c;
         const id = depIds[idx];
-        if (id <= 0) continue;
+        if (id <= 0 || id > maxId) continue;
         if (
           c === 0 ||
           r === 0 ||
@@ -322,23 +331,42 @@
       }
     }
 
-    const bestScore = new Map();
+    const meanCol = new Float64Array(maxId + 1);
+    const meanRow = new Float64Array(maxId + 1);
+    const bestD = new Uint16Array(maxId + 1);
+    const bestDistSq = new Float64Array(maxId + 1).fill(Infinity);
+    const bestCol = new Int32Array(maxId + 1).fill(-1);
+    const bestRow = new Int32Array(maxId + 1).fill(-1);
+    for (let id = 1; id <= maxId; id++) {
+      if (totalCounts[id] > 0) {
+        meanCol[id] = sumCol[id] / totalCounts[id];
+        meanRow[id] = sumRow[id] / totalCounts[id];
+      }
+    }
+
     for (let r = 0; r < height; r++) {
       const rowOff = r * width;
       for (let c = 0; c < width; c++) {
         const idx = rowOff + c;
         const id = depIds[idx];
-        if (id <= 0) continue;
+        if (id <= 0 || id > maxId) continue;
         const d = dist[idx];
-        const total = totalCounts.get(id) || 1;
-        const mc = (sumCol.get(id) || 0) / total;
-        const mr = (sumRow.get(id) || 0) / total;
-        const distSq = (c - mc) * (c - mc) + (r - mr) * (r - mr);
-        const prev = bestScore.get(id);
-        if (!prev || d > prev.d || (d === prev.d && distSq < prev.distSq)) {
-          bestScore.set(id, { d, distSq });
-          badgePos.set(id, { col: c + 0.5, row: r + 0.5 });
+        const dc = c - meanCol[id];
+        const dr = r - meanRow[id];
+        const distSq = dc * dc + dr * dr;
+        const prevD = bestD[id];
+        if (d > prevD || (d === prevD && distSq < bestDistSq[id])) {
+          bestD[id] = d;
+          bestDistSq[id] = distSq;
+          bestCol[id] = c;
+          bestRow[id] = r;
         }
+      }
+    }
+    for (const d of depressions) {
+      const id = d.id;
+      if (bestCol[id] >= 0) {
+        badgePos.set(id, { col: bestCol[id] + 0.5, row: bestRow[id] + 0.5 });
       }
     }
 
@@ -460,6 +488,12 @@
     return trees;
   }
 
+  /**
+   * Derives live UI fill state (`dry`, `filling`, `full`) for one depression at `tHours`.
+   * Presentation-layer projection of the WASM outputs from `crates/lidar/src/inundation.rs`
+   * (`fill_time` cell grid) and `crates/lidar/src/fsm.rs` (`fill_time_h` / `merge_time_h`);
+   * keep aligned with those Rust definitions (or replace with WASM-exported per-step state).
+   */
   function computeDepressionFillState(depId, tHours, fillStats, childrenMap, memo, fsmBasinsById) {
     if (memo.has(depId)) return memo.get(depId);
     const stat = fillStats.get(depId);
@@ -651,6 +685,8 @@
     }
   }
 
+  const MAX_TREE_CANVAS_WIDTH = 8192;
+
   function computeTreeLayoutSize(tree, availW) {
     const pad = { left: 74, right: 66, top: 52, bottom: 54 };
     const nodeR = tree.leafCount > 12 || availW < 680 ? 15 : 17;
@@ -658,7 +694,7 @@
     const minSlotPx = tree.leafCount <= 9 ? 64 : 58;
     const neededW =
       pad.left + pad.right + innerPadX * 2 + Math.max(0, tree.leafCount - 1) * minSlotPx;
-    const logicalW = Math.max(availW, neededW);
+    const logicalW = Math.min(MAX_TREE_CANVAS_WIDTH, Math.max(availW, neededW));
     const levelGap =
       tree.maxLevel <= 1
         ? 0
@@ -1644,7 +1680,7 @@
     }
     ctx.textAlign = "left";
     ctx.textBaseline = "top";
-    const volUnit = player && player.areaUnit === "m²" ? "m³" : `${(player && player.areaUnit) || "units²"}·z`;
+    const volUnit = volumeUnitFor(player && player.areaUnit);
     ctx.fillText(`Stage-Volume Rating Curve (${volUnit} vs depth)`, pad.left, 3);
 
     ctx.beginPath();
@@ -1719,7 +1755,7 @@
 
     if (statsEl) {
       statsEl.innerHTML = "";
-      const volUnit = player.areaUnit === "m²" ? "m³" : `${player.areaUnit}·z`;
+      const volUnit = volumeUnitFor(player.areaUnit);
       const items = [
         ["Area", formatArea(d.area, player.areaUnit)],
         ["Volume", `${d.volume.toLocaleString(undefined, { maximumFractionDigits: 1 })} ${volUnit}`],
@@ -2273,6 +2309,17 @@
     }
   }
 
+  async function runTreeGifExport(button) {
+    if (button) button.disabled = true;
+    try {
+      await exportDepressionTreeGif();
+    } catch (e) {
+      setStatus(`Depression tree GIF export failed: ${errMsg(e)}`, true);
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
   function renderDownloads(files, includeLazyGif, includeTreeGif) {
     const el = $("lp-downloads");
     el.innerHTML = "";
@@ -2297,24 +2344,14 @@
         }
       });
       el.appendChild(btn);
-
-      if (includeTreeGif) {
-        const treeBtn = document.createElement("button");
-        treeBtn.type = "button";
-        treeBtn.className = "md-button";
-        treeBtn.textContent = "Export Depression Tree GIF";
-        treeBtn.addEventListener("click", async () => {
-          treeBtn.disabled = true;
-          try {
-            await exportDepressionTreeGif();
-          } catch (e) {
-            setStatus(`Depression tree GIF export failed: ${errMsg(e)}`, true);
-          } finally {
-            treeBtn.disabled = false;
-          }
-        });
-        el.appendChild(treeBtn);
-      }
+    }
+    if (includeTreeGif) {
+      const treeBtn = document.createElement("button");
+      treeBtn.type = "button";
+      treeBtn.className = "md-button";
+      treeBtn.textContent = "Export Depression Tree GIF";
+      treeBtn.addEventListener("click", () => runTreeGifExport(treeBtn));
+      el.appendChild(treeBtn);
     }
     for (const { label, filename, data, getData, mime } of files) {
       if (typeof getData === "function") {
@@ -2811,16 +2848,7 @@
     }
     const treeGifBtn = $("lp-tree-gif-btn");
     if (treeGifBtn) {
-      treeGifBtn.addEventListener("click", async () => {
-        treeGifBtn.disabled = true;
-        try {
-          await exportDepressionTreeGif();
-        } catch (e) {
-          setStatus(`Depression tree GIF export failed: ${errMsg(e)}`, true);
-        } finally {
-          treeGifBtn.disabled = false;
-        }
-      });
+      treeGifBtn.addEventListener("click", () => runTreeGifExport(treeGifBtn));
     }
     const treeRegionSel = $("lp-tree-region");
     if (treeRegionSel) {

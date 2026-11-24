@@ -134,7 +134,7 @@ Run **`lidar-rs`** directly in your browser via WebAssembly: DEM smoothing, sele
           </div>
         </div>
         <div class="lp-tree-canvas-wrap" id="lp-tree-canvas-wrap">
-          <canvas id="lp-tree-canvas" width="960" height="360" tabindex="0" role="img" aria-label="Depression tree graph. Use arrow keys to step through nodes and Enter to inspect." title="Click any node or use arrow keys + Enter to inspect its depression on the map"></canvas>
+          <canvas id="lp-tree-canvas" width="960" height="360" tabindex="0" role="application" aria-label="Depression tree graph. Use arrow keys to step through nodes and Enter to inspect." title="Click any node or use arrow keys + Enter to inspect its depression on the map"></canvas>
         </div>
         <div class="lp-tree-legend" id="lp-tree-legend"></div>
       </div>
