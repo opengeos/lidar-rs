@@ -106,7 +106,7 @@
   display: grid;
   grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
   gap: 1.1rem;
-  align-items: start;
+  align-items: stretch;
   margin-bottom: 1.25rem;
 }
 
@@ -117,6 +117,8 @@
 }
 
 #lidar-playground .lp-player-stage {
+  display: flex;
+  flex-direction: column;
   border: 1px solid var(--md-default-fg-color--lightest);
   border-radius: 0.4rem;
   padding: 0.75rem;
@@ -252,6 +254,8 @@
 }
 
 #lidar-playground .lp-player-side {
+  display: flex;
+  flex-direction: column;
   border: 1px solid var(--md-default-fg-color--lightest);
   border-radius: 0.4rem;
   padding: 0.75rem;
@@ -272,20 +276,19 @@
   border-radius: 0.25rem;
 }
 
-#lidar-playground .lp-gif-details {
-  margin-top: 0.75rem;
+#lidar-playground .lp-gif-link-row {
+  margin: -0.45rem 0 0.9rem;
   font-size: 0.76rem;
-}
-
-#lidar-playground .lp-gif-details summary {
-  cursor: pointer;
-  font-weight: 600;
 }
 
 #lidar-playground .lp-gif-wrap {
   display: flex;
   justify-content: center;
-  padding: 0.5rem 0 0;
+  padding: 0.65rem;
+  margin-bottom: 1rem;
+  border: 1px solid var(--md-default-fg-color--lightest);
+  border-radius: 0.35rem;
+  background: var(--md-code-bg-color);
 }
 
 #lidar-playground .lp-gif-wrap img {
@@ -293,6 +296,114 @@
   height: auto;
   image-rendering: pixelated;
   border-radius: 0.2rem;
+}
+
+#lidar-playground .lp-tree-panel {
+  border: 1px solid var(--md-default-fg-color--lightest);
+  border-radius: 0.4rem;
+  padding: 0.75rem 0.9rem;
+  background: var(--md-code-bg-color);
+  margin-bottom: 1.25rem;
+}
+
+#lidar-playground .lp-tree-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.6rem;
+  margin-bottom: 0.5rem;
+}
+
+#lidar-playground .lp-tree-head h4 {
+  margin: 0 0 0.15rem;
+}
+
+#lidar-playground .lp-tree-head p {
+  margin: 0;
+}
+
+#lidar-playground .lp-tree-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+#lidar-playground .lp-tree-region-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+
+#lidar-playground #lp-tree-region {
+  padding: 0.22rem 0.4rem;
+  border: 1px solid var(--md-default-fg-color--lighter);
+  border-radius: 0.25rem;
+  background: var(--md-default-bg-color);
+  color: var(--md-default-fg-color);
+  font-size: 0.72rem;
+}
+
+#lidar-playground .lp-tree-canvas-wrap {
+  width: 100%;
+  overflow-x: auto;
+  background: var(--md-default-bg-color);
+  border: 1px solid var(--md-default-fg-color--lightest);
+  border-radius: 0.3rem;
+}
+
+#lidar-playground #lp-tree-canvas {
+  display: block;
+  margin: 0 auto;
+}
+
+#lidar-playground .lp-tree-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.9rem;
+  margin-top: 0.5rem;
+  font-size: 0.68rem;
+  color: var(--md-default-fg-color--light);
+}
+
+#lidar-playground .lp-tree-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.32rem;
+}
+
+#lidar-playground .lp-tree-swatch {
+  width: 0.72rem;
+  height: 0.72rem;
+  border-radius: 50%;
+  display: inline-block;
+  border: 1.5px solid rgba(15, 23, 42, 0.45);
+}
+
+#lidar-playground .lp-tree-swatch-state {
+  width: 0.78rem;
+  height: 0.78rem;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+#lidar-playground .lp-tree-swatch-dry {
+  border: 1.5px dashed currentColor;
+  opacity: 0.55;
+}
+
+#lidar-playground .lp-tree-swatch-filling {
+  border: 1.5px solid #2563eb;
+  background: linear-gradient(to top, #2563eb 50%, rgba(37, 99, 235, 0.14) 50%);
+}
+
+#lidar-playground .lp-tree-swatch-full {
+  border: 1.5px solid rgba(15, 23, 42, 0.7);
+  background: #2563eb;
 }
 
 #lidar-playground .lp-canvases {
