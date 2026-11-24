@@ -340,6 +340,7 @@ pub fn add_crs(input: impl AsRef<Path>, crs: &str, output: Option<&Path>) -> Res
             _ => false,
         };
     if in_place {
+        let orig_perms = std::fs::metadata(in_path).ok().map(|m| m.permissions());
         let ext = out_path
             .extension()
             .and_then(|e| e.to_str())
@@ -357,6 +358,9 @@ pub fn add_crs(input: impl AsRef<Path>, crs: &str, output: Option<&Path>) -> Res
             let staged_path = staged.into_temp_path();
             let tmp_str = path_to_str(&staged_path)?;
             terrio::write_raster_dataset(&ds, tmp_str, &RasterWriteOptions::default())?;
+            if let Some(perms) = orig_perms {
+                let _ = std::fs::set_permissions(&staged_path, perms);
+            }
             staged_path
                 .persist(out_path)
                 .map_err(|e| Error::Io(e.error))?;
@@ -402,6 +406,9 @@ pub fn add_crs(input: impl AsRef<Path>, crs: &str, output: Option<&Path>) -> Res
             let mut guard = TempFileGuard(Some(tmp_path.clone()));
             let tmp_str = path_to_str(&tmp_path)?;
             terrio::write_raster_dataset(&ds, tmp_str, &RasterWriteOptions::default())?;
+            if let Some(perms) = orig_perms {
+                let _ = std::fs::set_permissions(&tmp_path, perms);
+            }
             std::fs::rename(&tmp_path, out_path)?;
             guard.0 = None;
         }

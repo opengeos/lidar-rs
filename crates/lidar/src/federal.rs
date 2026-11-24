@@ -649,7 +649,6 @@ pub(crate) fn is_retryable_ureq_error(err: &ureq::Error) -> bool {
         ureq::Error::BodyExceedsLimit(_)
         | ureq::Error::BadUri(_)
         | ureq::Error::Http(_)
-        | ureq::Error::HostNotFound
         | ureq::Error::InvalidProxyUrl
         | ureq::Error::TooManyRedirects
         | ureq::Error::RedirectFailed
@@ -676,18 +675,56 @@ fn retry_backoff_duration(base_ms: u64, attempt: usize) -> Duration {
 }
 
 fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TempFileGuard(Option<PathBuf>);
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            if let Some(p) = self.0.take() {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+
     ensure_parent_dir(path)?;
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".lidar_tmp_")
-        .suffix(".part")
-        .tempfile_in(parent)?;
-    tmp.as_file_mut().write_all(contents)?;
-    tmp.as_file_mut().flush()?;
-    tmp.persist(path).map_err(|e| Error::Io(e.error))?;
+
+    // Stage via OpenOptions::create_new instead of NamedTempFile so the written JSON/metadata
+    // file honors the process umask (e.g. 0644) rather than forcing 0600 permissions.
+    let pid = std::process::id();
+    let mut opened = None;
+    for _ in 0..1024 {
+        let seq = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".lidar_tmp_{pid}_{seq}.part"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                opened = Some((candidate, file));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let (tmp_path, mut file) = opened.ok_or_else(|| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "failed to allocate unique temporary file for atomic write",
+        ))
+    })?;
+    let mut guard = TempFileGuard(Some(tmp_path.clone()));
+    file.write_all(contents)?;
+    file.flush()?;
+    drop(file);
+    std::fs::rename(&tmp_path, path)?;
+    guard.0 = None;
     Ok(())
 }
 
@@ -2506,6 +2543,16 @@ pub(crate) fn clean_stale_bundle_outputs(
         .ok()
         .and_then(|txt| serde_json::from_str::<FederalBundleResult>(&txt).ok());
 
+    let out_dir_canon = std::fs::canonicalize(out_dir).ok();
+    let is_direct_child_of_out_dir = |candidate: &Path| -> bool {
+        let Some(ref od) = out_dir_canon else {
+            return false;
+        };
+        resolve_path_for_compare(candidate)
+            .and_then(|c| c.parent().map(Path::to_path_buf))
+            .is_some_and(|parent| parent == *od)
+    };
+
     if let Some(prev) = parsed_prev {
         for p in [
             prev.wbd_path.as_deref(),
@@ -2519,7 +2566,9 @@ pub(crate) fn clean_stale_bundle_outputs(
         .into_iter()
         .flatten()
         {
-            remove_if_not_kept(p);
+            if is_direct_child_of_out_dir(p) {
+                remove_if_not_kept(p);
+            }
         }
         if prev.dem_mosaic_path.is_some() {
             remove_if_not_kept(&out_dir.join(".dem.meta.json"));
@@ -3214,6 +3263,49 @@ mod tests {
             "unrecorded user dem.tif must not be deleted"
         );
 
+        // (b2) A crafted or copied manifest pointing outside out_dir must NEVER delete external
+        // files outside out_dir.
+        let external_dir = tempfile::tempdir().unwrap();
+        let external_file = external_dir.path().join("external_important.tif");
+        std::fs::write(&external_file, b"must-not-be-deleted").unwrap();
+        let crafted_dir = tempfile::tempdir().unwrap();
+        let crafted_manifest_path = crafted_dir.path().join("manifest.json");
+        let crafted_manifest = FederalBundleResult {
+            region_bbox: region_a,
+            region_key: "bbox".to_string(),
+            dem_product: opts_a.dem_product,
+            wbd_level: opts_a.wbd_level,
+            clip_to_region: opts_a.clip_to_region,
+            mosaic_dem: opts_a.mosaic_dem,
+            transportation_layers: effective_transportation_layers(&opts_a),
+            wbd_path: Some(external_file.clone()),
+            wbd_count: 1,
+            dem_tiles: Vec::new(),
+            dem_mosaic_path: Some(external_file.clone()),
+            nhd_path: None,
+            nhd_count: 0,
+            nwi_path: None,
+            nwi_count: 0,
+            roads_path: None,
+            roads_count: 0,
+            culverts_path: None,
+            culverts_count: 0,
+            noaa_atlas14_path: None,
+            noaa_atlas14: None,
+            manifest_path: crafted_manifest_path.clone(),
+        };
+        std::fs::write(
+            &crafted_manifest_path,
+            serde_json::to_string(&crafted_manifest).unwrap(),
+        )
+        .unwrap();
+        clean_stale_bundle_outputs(crafted_dir.path(), &crafted_manifest_path, None);
+        assert!(
+            external_file.exists(),
+            "manifest pointing outside out_dir must never delete external files"
+        );
+        assert!(!crafted_manifest_path.exists());
+
         // (c) keep_boundary pointing to out_dir/wbd.gpkg or aliased via ./ must never be deleted,
         // even under corrupt-manifest fallback cleanup.
         let keep_dir = tempfile::tempdir().unwrap();
@@ -3435,7 +3527,7 @@ mod tests {
 
     #[test]
     fn retry_classification_tile_filename_disambiguation_and_noaa_comment_parsing() {
-        assert!(!is_retryable_ureq_error(&ureq::Error::HostNotFound));
+        assert!(is_retryable_ureq_error(&ureq::Error::HostNotFound));
         assert!(!is_retryable_ureq_error(&ureq::Error::BadUri("bad".into())));
         assert!(!is_retryable_ureq_error(&ureq::Error::Tls("cert failed")));
         assert!(!is_retryable_ureq_error(&ureq::Error::StatusCode(400)));

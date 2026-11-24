@@ -27,11 +27,26 @@ fn add_crs_rejects_empty_crs_and_handles_aliased_in_place_paths() {
     assert!(add_crs(&dem_path, "   ", None).is_err());
 
     // Passing an aliased path (`dir/./dem.tif` vs `dir/dem.tif`) must be treated as in-place atomic
-    // replacement without corrupting the file.
+    // replacement without corrupting the file or stripping original Unix permissions.
+    #[cfg(unix)]
+    let orig_mode = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dem_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::metadata(&dem_path).unwrap().permissions().mode() & 0o777
+    };
     let aliased = tmp.path().join(".").join("dem.tif");
     add_crs(&dem_path, "32615", Some(&aliased)).unwrap();
     let ds = terrio::open_raster(dem_path.to_str().unwrap()).unwrap();
     assert_eq!(ds.raster.crs.epsg, Some(32615));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let new_mode = std::fs::metadata(&dem_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            new_mode, orig_mode,
+            "in-place add_crs must preserve original file permissions"
+        );
+    }
 }
 
 #[test]

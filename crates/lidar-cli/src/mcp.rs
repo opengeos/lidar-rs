@@ -547,7 +547,15 @@ pub(crate) fn validate_allowed_dirs(
                 }
                 Ok(paths)
             }
-            Err(_) => Ok(Vec::new()),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                ) =>
+            {
+                Ok(Vec::new())
+            }
+            Err(e) => Err((INVALID_PARAMS, e.to_string())),
         }
     })?;
 
@@ -1797,5 +1805,21 @@ mod tests {
             }),
         );
         assert_eq!(r["error"]["code"], INVALID_PARAMS);
+
+        // Help/version meta-flags are permitted, while invalid flags fail closed with INVALID_PARAMS.
+        assert!(validate_allowed_dirs("info", &[OsString::from("--help")], &allow_canon).is_ok());
+        assert_eq!(
+            validate_allowed_dirs(
+                "info",
+                &[
+                    OsString::from("--bogus-flag"),
+                    outside_file.as_os_str().to_os_string(),
+                ],
+                &allow_canon
+            )
+            .unwrap_err()
+            .0,
+            INVALID_PARAMS
+        );
     }
 }
