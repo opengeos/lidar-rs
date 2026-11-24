@@ -133,7 +133,7 @@ pub struct CatchmentHierarchyOptions {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct CatchmentHierarchyResult {
     /// Path to the output catchment hierarchy raster (e.g. `catchment_hir.tif`), where
-    /// each depression cell stores its contributing catchment area (`u32`, NoData = `0`).
+    /// each depression cell stores its contributing catchment area (`f64`, NoData = `0.0`).
     pub catchment_raster_path: PathBuf,
     /// Per-level catchment polygon shapefiles (`shapefiles/Catchment_level_*.shp`).
     pub catchment_shapefiles: Vec<PathBuf>,
@@ -244,26 +244,7 @@ fn is_missing(dem: &Array2D<f64>, v: f64) -> bool {
 }
 
 fn validate_same_grid(a: &Array2D<f64>, b: &Array2D<f64>, label: &str) -> Result<()> {
-    if a.width() != b.width() || a.height() != b.height() {
-        return Err(Error::DimensionMismatch(format!(
-            "{label} dimensions ({}x{}) do not match DEM ({}x{})",
-            b.width(),
-            b.height(),
-            a.width(),
-            a.height()
-        )));
-    }
-    for i in 0..6 {
-        let diff = (a.geotransform[i] - b.geotransform[i]).abs();
-        let tol = 1e-6 * a.geotransform[i].abs().max(1.0);
-        if diff > tol {
-            return Err(Error::InvalidArgument(format!(
-                "{label} geotransform differs from DEM at index {i}: {} vs {}",
-                b.geotransform[i], a.geotransform[i]
-            )));
-        }
-    }
-    Ok(())
+    crate::inundation::validate_grid_alignment(a, b, label)
 }
 
 /// Computes D8 flow directions with Barnes (2014) flat resolution without altering
@@ -370,47 +351,56 @@ pub fn extract_sink_labels_from_raster(
 ) -> Result<Vec<u32>> {
     validate_same_grid(dem, sink_arr, "sink raster")?;
     let nd = sink_arr.no_data();
+    let zero_is_bg = nd.rd_eq(0.0);
+    let is_bg = |v: f64| !v.is_finite() || v.rd_eq(nd) || (zero_is_bg && v == 0.0);
+
+    let dem_data = dem.data();
     let mut all_pos_int = true;
     let mut unique_ids: HashSet<u32> = HashSet::new();
     let mut max_id = 0u32;
-    for &v in sink_arr.data() {
-        if !v.is_finite() || v.rd_eq(nd) || v == 0.0 {
+    let mut fg_count = 0usize;
+    let mut matches_dem_count = 0usize;
+    for (idx, &v) in sink_arr.data().iter().enumerate() {
+        if is_bg(v) {
             continue;
         }
-        if v < 0.0 || v.fract() != 0.0 || v > u32::MAX as f64 {
-            all_pos_int = false;
-            break;
+        fg_count += 1;
+        let dz = dem_data[idx];
+        if dz.is_finite() && (v - dz).abs() <= 1e-9 {
+            matches_dem_count += 1;
         }
-        let id = v as u32;
-        unique_ids.insert(id);
-        if id > max_id {
-            max_id = id;
+        if all_pos_int {
+            if v < 1.0 || v.fract() != 0.0 || v > u32::MAX as f64 {
+                all_pos_int = false;
+            } else {
+                let id = v as u32;
+                unique_ids.insert(id);
+                if id > max_id {
+                    max_id = id;
+                }
+            }
         }
     }
-    // Only treat the raster as pre-labeled region IDs when its positive values form a
-    // dense 1..=N integer sequence (matching `region.tif`). Integer-valued elevation
-    // rasters (e.g., elevations 100..150) fall through to 4-connected `region_group`.
-    let is_dense_label_map =
-        all_pos_int && !unique_ids.is_empty() && max_id as usize == unique_ids.len();
+    // Only treat the raster as pre-labeled region IDs when its foreground values form a
+    // dense 1..=N integer sequence (matching `region.tif`) and do not simply mirror the
+    // underlying DEM elevations (e.g. coastal integer elevation bands 1..=K in `sink.tif`).
+    let is_elevation_copy = fg_count > 0 && matches_dem_count == fg_count;
+    let is_dense_label_map = all_pos_int
+        && !unique_ids.is_empty()
+        && max_id as usize == unique_ids.len()
+        && !is_elevation_copy;
     if is_dense_label_map {
         let labels = sink_arr
             .data()
             .iter()
-            .map(|&v| {
-                if !v.is_finite() || v.rd_eq(nd) || v <= 0.0 {
-                    0
-                } else {
-                    v as u32
-                }
-            })
+            .map(|&v| if is_bg(v) || v <= 0.0 { 0 } else { v as u32 })
             .collect();
         Ok(labels)
     } else {
-        // Elevation sink raster (e.g. sink.tif) or non-dense 0-background mask: group
-        // valid nonzero foreground cells into 4-connected regions.
-        let (labels, _) = region_group(sink_arr.data(), dem.width(), dem.height(), 1, |v| {
-            v.is_finite() && !v.rd_eq(nd) && v != 0.0
-        });
+        // Elevation sink raster (e.g. sink.tif) or non-dense foreground mask: group valid
+        // foreground cells into 4-connected regions without dropping 1-pixel sinks.
+        let (labels, _) =
+            region_group(sink_arr.data(), dem.width(), dem.height(), 0, |v| !is_bg(v));
         Ok(labels)
     }
 }
@@ -688,8 +678,18 @@ fn compute_level_catchment_stats(
         }
     }
 
-    // Accumulators per depression label: (count, min, max, sum, sum_sq).
-    let mut zonal: BTreeMap<u32, (usize, f64, f64, f64, f64)> = BTreeMap::new();
+    // Accumulators per depression label using Welford's online variance and `z_min`-shifted
+    // elevation sums for numerical stability on high-elevation DEMs.
+    struct ZonalAcc {
+        count: usize,
+        zmin: f64,
+        zmax: f64,
+        mean: f64,
+        m2: f64,
+        z_ref: f64,
+        sum_shifted: f64,
+    }
+    let mut zonal: BTreeMap<u32, ZonalAcc> = BTreeMap::new();
     let dem_data = dem.data();
     for (idx, &lbl) in labels.iter().enumerate() {
         if lbl == 0 {
@@ -699,23 +699,33 @@ fn compute_level_catchment_stats(
         if is_missing(dem, z) {
             continue;
         }
-        let e = zonal
-            .entry(lbl)
-            .or_insert((0, f64::INFINITY, f64::NEG_INFINITY, 0.0, 0.0));
-        e.0 += 1;
-        if z < e.1 {
-            e.1 = z;
+        let e = zonal.entry(lbl).or_insert(ZonalAcc {
+            count: 0,
+            zmin: f64::INFINITY,
+            zmax: f64::NEG_INFINITY,
+            mean: 0.0,
+            m2: 0.0,
+            z_ref: z,
+            sum_shifted: 0.0,
+        });
+        e.count += 1;
+        if z < e.zmin {
+            e.zmin = z;
         }
-        if z > e.2 {
-            e.2 = z;
+        if z > e.zmax {
+            e.zmax = z;
         }
-        e.3 += z;
-        e.4 += z * z;
+        let delta = z - e.mean;
+        e.mean += delta / e.count as f64;
+        let delta2 = z - e.mean;
+        e.m2 += delta * delta2;
+        e.sum_shifted += z - e.z_ref;
     }
 
     let mut cat_area_by_id: HashMap<u32, f64> = HashMap::new();
     let mut records = Vec::with_capacity(zonal.len());
-    for (fid, (count, zmin, zmax, zsum, zsum_sq)) in zonal {
+    for (fid, acc) in zonal {
+        let count = acc.count;
         if count == 0 {
             continue;
         }
@@ -723,11 +733,13 @@ fn compute_level_catchment_stats(
         let area = count as f64 * cell_area;
         let cat_area = c_cells as f64 * cell_area;
         let dep_to_cat_ratio = if cat_area > 0.0 { area / cat_area } else { 0.0 };
-        let mean_elev = zsum / count as f64;
-        let variance = ((zsum_sq / count as f64) - mean_elev * mean_elev).max(0.0);
+        let mean_elev = acc.mean;
+        let variance = (acc.m2 / count as f64).max(0.0);
         let std_elev = variance.sqrt();
-        let range = zmax - zmin;
-        let volume = ((count as f64) * zmax - zsum).max(0.0) * cell_area;
+        let range = acc.zmax - acc.zmin;
+        let zsum = (count as f64) * acc.z_ref + acc.sum_shifted;
+        let volume =
+            ((count as f64) * (acc.zmax - acc.z_ref) - acc.sum_shifted).max(0.0) * cell_area;
         let mean_depth = if area > 0.0 { volume / area } else { 0.0 };
 
         cat_area_by_id.insert(fid, cat_area);
@@ -738,8 +750,8 @@ fn compute_level_catchment_stats(
             area,
             cat_area,
             dep_to_cat_ratio,
-            min_elev: zmin,
-            max_elev: zmax,
+            min_elev: acc.zmin,
+            max_elev: acc.zmax,
             range,
             mean_elev,
             std_elev,
@@ -797,8 +809,8 @@ fn parse_single_level_number(path: &Path) -> Option<u32> {
 ///    - Writes the enriched depression shapefile (`shapefiles/level/Single_level_*.shp`).
 /// 3. Merges all enriched level shapefiles into `shapefiles/Merge_levels.shp` and writes
 ///    `catchment_hierarchy.csv`.
-/// 4. Writes `out_catchment_img` (e.g. `catchment_hir.tif`, `u32` rounded `cat_area`,
-///    NoData `0`), burning from highest level down to level 1 so every depression level's
+/// 4. Writes `out_catchment_img` (e.g. `catchment_hir.tif`, `f64` `cat_area`,
+///    NoData `0.0`), burning from highest level down to level 1 so every depression level's
 ///    rim carries its own contributing catchment area for [`crate::simulate_inundation`].
 pub fn delineate_catchment_hierarchy(
     in_dem: impl AsRef<Path>,
@@ -913,7 +925,7 @@ pub fn delineate_catchment_hierarchy(
             let r = load_raster::<f64>(path, None)?;
             validate_same_grid(&dem, &r, "level raster")?;
             let nd = r.no_data();
-            let (lbls, _) = region_group(r.data(), w, h, 1, |v| {
+            let (lbls, _) = region_group(r.data(), w, h, 0, |v| {
                 v.is_finite() && !v.rd_eq(nd) && v > 0.0
             });
             let mut lbl_arr = Array2D::from_vec(w, h, lbls.clone())?;
@@ -937,9 +949,7 @@ pub fn delineate_catchment_hierarchy(
         };
 
         let stats = compute_level_catchment_stats(&dem, &flowdirs, cell_area, *level, &labels)?;
-        // On-disk catchment_hir.tif stores rounded u32 areas (NoData=0), so only claim cells
-        // whose rounded value is >= 1 (area >= 0.5).
-        paint_unclaimed_catchment_area(&mut hir_data_f64, &labels, &stats.cat_area_by_id, 0.5);
+        paint_unclaimed_catchment_area(&mut hir_data_f64, &labels, &stats.cat_area_by_id, 0.0);
 
         let mut area_ratio_by_id: HashMap<u32, (f64, f64)> = HashMap::new();
         let mut rec_by_id: HashMap<u32, CatchmentHierarchyRecord> = HashMap::new();
@@ -1030,19 +1040,9 @@ pub fn delineate_catchment_hierarchy(
     })?;
     terrio::write_vector(&[merged_layer], merge_str, &VectorWriteOptions::default())?;
 
-    let hir_data: Vec<u32> = hir_data_f64
-        .into_iter()
-        .map(|area| {
-            if area > 0.0 {
-                area.round().clamp(0.0, u32::MAX as f64) as u32
-            } else {
-                0
-            }
-        })
-        .collect();
-    let mut hir_arr = Array2D::from_vec(w, h, hir_data)?;
+    let mut hir_arr = Array2D::from_vec(w, h, hir_data_f64)?;
     hir_arr.copy_metadata_from(&dem);
-    hir_arr.set_no_data(0);
+    hir_arr.set_no_data(0.0);
     save_raster(
         &hir_arr,
         out_catchment_img,
@@ -1077,15 +1077,9 @@ pub fn delineate_catchment_hierarchy_in_memory(
     depression_level: &Array2D<i32>,
     min_size: usize,
 ) -> Result<(Array2D<f64>, Vec<CatchmentHierarchyRecord>)> {
+    crate::inundation::validate_grid_alignment(dem, depression_level, "depression_level")?;
     let w = dem.width();
     let h = dem.height();
-    if depression_level.width() != w || depression_level.height() != h {
-        return Err(Error::DimensionMismatch(format!(
-            "depression_level ({}x{}) does not match DEM ({w}x{h})",
-            depression_level.width(),
-            depression_level.height()
-        )));
-    }
     let n = w * h;
     let ldata = depression_level.data();
     let max_level = ldata.iter().copied().max().unwrap_or(0);
@@ -1201,8 +1195,9 @@ pub fn delineate_catchment_hierarchy_in_memory(
     let mut uf_z_cnt = vec![0usize; d_count];
     let mut uf_z_min = vec![f64::INFINITY; d_count];
     let mut uf_z_max = vec![f64::NEG_INFINITY; d_count];
-    let mut uf_z_sum = vec![0.0f64; d_count];
-    let mut uf_z_sum_sq = vec![0.0f64; d_count];
+    let mut uf_z_mean = vec![0.0f64; d_count];
+    let mut uf_z_m2 = vec![0.0f64; d_count];
+    let mut uf_z_sum_above_min = vec![0.0f64; d_count];
     let mut active = vec![false; d_count];
 
     #[inline]
@@ -1239,8 +1234,9 @@ pub fn delineate_catchment_hierarchy_in_memory(
                 uf_z_cnt[du] = 1;
                 uf_z_min[du] = z;
                 uf_z_max[du] = z;
-                uf_z_sum[du] = z;
-                uf_z_sum_sq[du] = z * z;
+                uf_z_mean[du] = z;
+                uf_z_m2[du] = 0.0;
+                uf_z_sum_above_min[du] = 0.0;
             }
 
             let r = g_idx / w;
@@ -1271,15 +1267,39 @@ pub fn delineate_catchment_hierarchy_in_memory(
                         if uf_first_idx[drop_r] < uf_first_idx[keep] {
                             uf_first_idx[keep] = uf_first_idx[drop_r];
                         }
-                        uf_z_cnt[keep] += uf_z_cnt[drop_r];
-                        if uf_z_min[drop_r] < uf_z_min[keep] {
-                            uf_z_min[keep] = uf_z_min[drop_r];
+                        // Merge zonal elevation stats using Chan's parallel variance formula
+                        // and `z_min`-shifted elevation sums for numerical stability.
+                        let n_a = uf_z_cnt[keep];
+                        let n_b = uf_z_cnt[drop_r];
+                        if n_b > 0 {
+                            if n_a == 0 {
+                                uf_z_cnt[keep] = n_b;
+                                uf_z_min[keep] = uf_z_min[drop_r];
+                                uf_z_max[keep] = uf_z_max[drop_r];
+                                uf_z_mean[keep] = uf_z_mean[drop_r];
+                                uf_z_m2[keep] = uf_z_m2[drop_r];
+                                uf_z_sum_above_min[keep] = uf_z_sum_above_min[drop_r];
+                            } else {
+                                let n_ab = n_a + n_b;
+                                let na_f = n_a as f64;
+                                let nb_f = n_b as f64;
+                                let nab_f = n_ab as f64;
+                                let delta = uf_z_mean[drop_r] - uf_z_mean[keep];
+                                uf_z_mean[keep] += delta * (nb_f / nab_f);
+                                uf_z_m2[keep] +=
+                                    uf_z_m2[drop_r] + delta * delta * (na_f * nb_f / nab_f);
+                                let new_min = uf_z_min[keep].min(uf_z_min[drop_r]);
+                                uf_z_sum_above_min[keep] = (uf_z_sum_above_min[keep]
+                                    + na_f * (uf_z_min[keep] - new_min))
+                                    + (uf_z_sum_above_min[drop_r]
+                                        + nb_f * (uf_z_min[drop_r] - new_min));
+                                uf_z_min[keep] = new_min;
+                                if uf_z_max[drop_r] > uf_z_max[keep] {
+                                    uf_z_max[keep] = uf_z_max[drop_r];
+                                }
+                                uf_z_cnt[keep] = n_ab;
+                            }
                         }
-                        if uf_z_max[drop_r] > uf_z_max[keep] {
-                            uf_z_max[keep] = uf_z_max[drop_r];
-                        }
-                        uf_z_sum[keep] += uf_z_sum[drop_r];
-                        uf_z_sum_sq[keep] += uf_z_sum_sq[drop_r];
                     }
                 }
             }
@@ -1363,17 +1383,17 @@ pub fn delineate_catchment_hierarchy_in_memory(
             }
             let zmin = uf_z_min[ru];
             let zmax = uf_z_max[ru];
-            let zsum = uf_z_sum[ru];
-            let zsum_sq = uf_z_sum_sq[ru];
+            let z_above_min = uf_z_sum_above_min[ru];
+            let zsum = (count as f64) * zmin + z_above_min;
             let c_cells = cat_counts[fid as usize].max(count);
             let area = count as f64 * cell_area;
             let cat_area = c_cells as f64 * cell_area;
             let dep_to_cat_ratio = if cat_area > 0.0 { area / cat_area } else { 0.0 };
-            let mean_elev = zsum / count as f64;
-            let variance = ((zsum_sq / count as f64) - mean_elev * mean_elev).max(0.0);
+            let mean_elev = uf_z_mean[ru];
+            let variance = (uf_z_m2[ru] / count as f64).max(0.0);
             let std_elev = variance.sqrt();
             let range = zmax - zmin;
-            let volume = ((count as f64) * zmax - zsum).max(0.0) * cell_area;
+            let volume = ((count as f64) * range - z_above_min).max(0.0) * cell_area;
             let mean_depth = if area > 0.0 { volume / area } else { 0.0 };
 
             fid_cat_area[fid as usize] = cat_area;

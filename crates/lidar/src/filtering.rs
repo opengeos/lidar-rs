@@ -200,6 +200,13 @@ fn gaussian_kernel_1d(sigma: f64, truncate: f64) -> Result<Vec<f64>> {
         )));
     }
     let radius = raw_radius as isize;
+    if radius == 0 {
+        return Ok(vec![1.0]);
+    }
+    let denom = 2.0 * sigma * sigma;
+    if denom == 0.0 || !denom.is_finite() {
+        return Ok(vec![1.0]);
+    }
     let size = (2 * radius + 1) as usize;
     let mut kernel = Vec::new();
     kernel.try_reserve_exact(size).map_err(|e| {
@@ -207,7 +214,6 @@ fn gaussian_kernel_1d(sigma: f64, truncate: f64) -> Result<Vec<f64>> {
             "failed to allocate Gaussian kernel of size {size}: {e}"
         ))
     })?;
-    let denom = 2.0 * sigma * sigma;
     let mut sum = 0.0f64;
     for i in -radius..=radius {
         let w = (-((i * i) as f64) / denom).exp();

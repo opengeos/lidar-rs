@@ -4,7 +4,7 @@
 //! depression spill/merge graphs (`connectivity_graph.json`, `.graphml`), and
 //! georeferenced spill-path vector layers (`.gpkg`, `.geojson`, `.shp`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use richdem::{Array2D, DemNum};
@@ -19,7 +19,7 @@ use terrio::{
 
 use crate::catchment::CatchmentHierarchyRecord;
 use crate::error::{Error, Result};
-use crate::inundation::SpillFlowPath;
+use crate::inundation::{SpillFlowPath, validate_grid_alignment};
 use crate::slicing::{InMemoryDepressions, NestedDepression};
 
 /// One elevation sample on a depression's stage-storage-area rating curve.
@@ -59,15 +59,7 @@ pub fn compute_rating_curves(
             "rating curve interval must be finite and > 0, got {interval}"
         )));
     }
-    let w = sink.width();
-    let h = sink.height();
-    if deps.depression_id.width() != w || deps.depression_id.height() != h {
-        return Err(Error::DimensionMismatch(format!(
-            "depression_id ({}x{}) does not match sink ({w}x{h})",
-            deps.depression_id.width(),
-            deps.depression_id.height()
-        )));
-    }
+    validate_grid_alignment(sink, &deps.depression_id, "depression_id")?;
     let gt = sink.geotransform;
     let det = (gt[1] * gt[5] - gt[2] * gt[4]).abs();
     let cell_area = if det.is_finite() && det > 0.0 {
@@ -96,17 +88,24 @@ pub fn compute_rating_curves(
         deps.depressions.iter().map(|d| (d.id, d)).collect();
 
     fn collect_descendant_elevs(
-        id: u32,
+        root_id: u32,
         dep_by_id: &HashMap<u32, &NestedDepression>,
         owned_elevs: &[Vec<f64>],
         out: &mut Vec<f64>,
     ) {
-        if let Some(v) = owned_elevs.get(id as usize) {
-            out.extend_from_slice(v);
-        }
-        if let Some(d) = dep_by_id.get(&id) {
-            for &cid in &d.children_ids {
-                collect_descendant_elevs(cid, dep_by_id, owned_elevs, out);
+        let mut stack = vec![root_id];
+        let mut visited: HashSet<u32> = HashSet::new();
+        while let Some(id) = stack.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            if let Some(v) = owned_elevs.get(id as usize) {
+                out.extend_from_slice(v);
+            }
+            if let Some(d) = dep_by_id.get(&id) {
+                for &cid in &d.children_ids {
+                    stack.push(cid);
+                }
             }
         }
     }
@@ -124,16 +123,20 @@ pub fn compute_rating_curves(
         let z_max = d.max_elev.max(*buf.last().unwrap_or(&z_min));
         let span = (z_max - z_min).max(0.0);
 
-        // Prefix sums for O(log M) exact area & volume at each stage.
+        // Prefix sums relative to `z_min` for numerically stable O(log M) exact area & volume.
         let mut prefix_sum = Vec::with_capacity(buf.len() + 1);
         prefix_sum.push(0.0f64);
         let mut acc = 0.0f64;
         for &z in &buf {
-            acc += z;
+            acc += z - z_min;
             prefix_sum.push(acc);
         }
 
-        let n_steps = ((span / interval).ceil() as usize).clamp(1, 500);
+        let n_steps = if span <= 0.0 {
+            0
+        } else {
+            ((span / interval).ceil() as usize).clamp(1, 500)
+        };
         let eff_interval = if n_steps == 500 && span > 500.0 * interval {
             span / n_steps as f64
         } else {
@@ -148,13 +151,14 @@ pub fn compute_rating_curves(
             // Number of cells with z <= stage
             let k = buf.partition_point(|&z| z <= stage);
             let area = k as f64 * cell_area;
-            let vol = ((k as f64) * stage - prefix_sum[k]).max(0.0) * cell_area;
+            let depth = (stage - z_min).max(0.0);
+            let vol = ((k as f64) * depth - prefix_sum[k]).max(0.0) * cell_area;
             curves.push(RatingCurvePoint {
                 dep_id: d.id,
                 level: d.level,
                 region_id: d.region_id,
                 stage,
-                depth: (stage - z_min).max(0.0),
+                depth,
                 area,
                 volume: vol,
             });
@@ -266,7 +270,10 @@ struct StreamSegmentIndex {
 }
 
 impl StreamSegmentIndex {
-    fn build(segs: Vec<([f64; 2], [f64; 2])>) -> Self {
+    fn build(mut segs: Vec<([f64; 2], [f64; 2])>) -> Self {
+        segs.retain(|&(a, b)| {
+            a[0].is_finite() && a[1].is_finite() && b[0].is_finite() && b[1].is_finite()
+        });
         if segs.len() <= 32 {
             return Self {
                 segs,
@@ -459,16 +466,21 @@ fn load_stream_segments(path: &Path, dem_projection: &str) -> Result<StreamSegme
     };
     let mut segs = Vec::new();
     fn push_geom(g: &Geometry, segs: &mut Vec<([f64; 2], [f64; 2])>) {
+        let mut push_pair = |a: &Coord, b: &Coord| {
+            if a.x.is_finite() && a.y.is_finite() && b.x.is_finite() && b.y.is_finite() {
+                segs.push(([a.x, a.y], [b.x, b.y]));
+            }
+        };
         match g {
             Geometry::LineString(coords) => {
                 for w in coords.windows(2) {
-                    segs.push(([w[0].x, w[0].y], [w[1].x, w[1].y]));
+                    push_pair(&w[0], &w[1]);
                 }
             }
             Geometry::MultiLineString(lines) => {
                 for line in lines {
                     for w in line.windows(2) {
-                        segs.push(([w[0].x, w[0].y], [w[1].x, w[1].y]));
+                        push_pair(&w[0], &w[1]);
                     }
                 }
             }
@@ -522,42 +534,98 @@ pub fn build_connectivity_graph(
     stream_vector: Option<&Path>,
 ) -> Result<ConnectivityGraph> {
     let gt = deps.depression_id.geotransform;
-    if fill_time.width() != deps.depression_id.width()
-        || fill_time.height() != deps.depression_id.height()
-    {
-        return Err(Error::DimensionMismatch(format!(
-            "fill_time ({}x{}) does not match depression_id ({}x{})",
-            fill_time.width(),
-            fill_time.height(),
-            deps.depression_id.width(),
-            deps.depression_id.height()
-        )));
-    }
+    validate_grid_alignment(&deps.depression_id, fill_time, "fill_time")?;
 
-    // Approximate per-depression fill time (max finite fill time across its owned cells).
+    // Approximate per-depression fill time (max finite fill time across its owned cells)
+    // and collect each depression's earliest row-major pixel index & owned pixel count for
+    // exact spatial catchment matching.
     let max_id = deps.depressions.iter().map(|d| d.id).max().unwrap_or(0) as usize;
     let mut dep_max_ft = vec![f64::NEG_INFINITY; max_id + 1];
+    let mut first_idx = vec![usize::MAX; max_id + 1];
+    let mut subtree_count = vec![0usize; max_id + 1];
     let nd = fill_time.no_data();
-    for (&did, &ft) in deps
+    for (gidx, (&did, &ft)) in deps
         .depression_id
         .data()
         .iter()
         .zip(fill_time.data().iter())
+        .enumerate()
     {
-        if did > 0
-            && (did as usize) <= max_id
-            && ft.is_finite()
-            && !ft.rd_eq(nd)
-            && ft >= 0.0
-            && ft > dep_max_ft[did as usize]
-        {
-            dep_max_ft[did as usize] = ft;
+        if did > 0 && (did as usize) <= max_id {
+            let uid = did as usize;
+            if first_idx[uid] == usize::MAX {
+                first_idx[uid] = gidx;
+            }
+            subtree_count[uid] += 1;
+            if ft.is_finite() && !ft.rd_eq(nd) && ft >= 0.0 && ft > dep_max_ft[uid] {
+                dep_max_ft[uid] = ft;
+            }
         }
     }
 
-    // Match catchment area by `(level, cell_count)` heuristic. When two catchment records share
-    // the same `(level, count)` key, mark the key ambiguous (`None`) and fall back to the
-    // depression's own area rather than silently assigning another basin's catchment area.
+    // Propagate earliest pixel index and total pixel count from children to parents bottom-up
+    // so compound depressions match `delineate_catchment_hierarchy_in_memory`'s row-major
+    // `level_fid` ordering exactly (even when two same-level depressions have identical counts).
+    let mut parent_of: HashMap<u32, u32> = HashMap::new();
+    for d in &deps.depressions {
+        if d.parent_id > 0 {
+            parent_of.insert(d.id, d.parent_id);
+        }
+        for &cid in &d.children_ids {
+            parent_of.entry(cid).or_insert(d.id);
+        }
+    }
+    let mut asc_deps: Vec<&NestedDepression> = deps.depressions.iter().collect();
+    asc_deps.sort_by_key(|d| (d.level, d.id));
+    for d in &asc_deps {
+        let uid = d.id as usize;
+        if let Some(&pid) = parent_of.get(&d.id) {
+            let pid_u = pid as usize;
+            if pid_u > 0 && pid_u <= max_id && pid_u != uid {
+                if first_idx[uid] < first_idx[pid_u] {
+                    first_idx[pid_u] = first_idx[uid];
+                }
+                subtree_count[pid_u] += subtree_count[uid];
+            }
+        }
+    }
+
+    // Primary match: exact spatial rank within each hierarchy level (`first_idx` ascending
+    // matches `level_fid = 1..=K`), verified by per-pair cell counts.
+    let mut deps_by_level: HashMap<u32, Vec<&NestedDepression>> = HashMap::new();
+    for d in &deps.depressions {
+        deps_by_level.entry(d.level).or_default().push(d);
+    }
+    let mut recs_by_level: HashMap<u32, Vec<&CatchmentHierarchyRecord>> = HashMap::new();
+    for r in catchments {
+        recs_by_level.entry(r.level).or_default().push(r);
+    }
+    let mut exact_cat_by_id: HashMap<u32, f64> = HashMap::new();
+    for (lvl, mut ldeps) in deps_by_level {
+        let Some(mut lrecs) = recs_by_level.remove(&lvl) else {
+            continue;
+        };
+        if ldeps.len() != lrecs.len() {
+            continue;
+        }
+        if !ldeps.iter().all(|d| first_idx[d.id as usize] != usize::MAX) {
+            continue;
+        }
+        ldeps.sort_by_key(|d| first_idx[d.id as usize]);
+        lrecs.sort_by_key(|r| r.level_fid);
+        let counts_align = ldeps
+            .iter()
+            .zip(lrecs.iter())
+            .all(|(d, r)| d.count == r.count || subtree_count[d.id as usize] == r.count);
+        if counts_align {
+            for (d, r) in ldeps.into_iter().zip(lrecs) {
+                exact_cat_by_id.insert(d.id, r.cat_area);
+            }
+        }
+    }
+
+    // Fallback heuristic when `depression_id` has no pixels or levels differ in cardinality:
+    // match by unique `(level, cell_count)` key, falling back to `d.area` on collisions.
     let mut cat_by_lvl_area: HashMap<(u32, usize), Option<f64>> = HashMap::new();
     for r in catchments {
         cat_by_lvl_area
@@ -574,9 +642,10 @@ pub fn build_connectivity_graph(
                 .get(d.id as usize)
                 .copied()
                 .filter(|v| v.is_finite() && *v >= 0.0);
-            let cat_area = cat_by_lvl_area
-                .get(&(d.level, d.count))
-                .and_then(|v| *v)
+            let cat_area = exact_cat_by_id
+                .get(&d.id)
+                .copied()
+                .or_else(|| cat_by_lvl_area.get(&(d.level, d.count)).and_then(|v| *v))
                 .unwrap_or(d.area);
             GraphNode {
                 id: d.id,
@@ -730,9 +799,13 @@ pub fn connectivity_graph_to_graphml_string(graph: &ConnectivityGraph) -> String
         ("n_volume", "node", "volume", "double"),
         ("n_max_depth", "node", "max_depth", "double"),
         ("n_cat_area", "node", "cat_area", "double"),
+        ("n_fill_h", "node", "fill_time_h", "double"),
         ("n_fill_mm", "node", "fill_runoff_mm", "double"),
         ("e_type", "edge", "edge_type", "string"),
+        ("e_spill_h", "edge", "spill_time_h", "double"),
         ("e_spill_mm", "edge", "spill_runoff_mm", "double"),
+        ("e_merge_h", "edge", "merge_time_h", "double"),
+        ("e_spill_elev", "edge", "spill_elev", "double"),
         ("e_len_m", "edge", "length_m", "double"),
         ("e_stream_m", "edge", "dist_to_stream", "double"),
     ] {
@@ -764,7 +837,10 @@ pub fn connectivity_graph_to_graphml_string(graph: &ConnectivityGraph) -> String
             r#"      <data key="n_cat_area">{:.4}</data>"#,
             n.cat_area
         );
-        if let Some(fm) = n.fill_runoff_mm {
+        if let Some(ft) = n.fill_time_h.filter(|v| v.is_finite()) {
+            let _ = writeln!(out, r#"      <data key="n_fill_h">{ft:.4}</data>"#);
+        }
+        if let Some(fm) = n.fill_runoff_mm.filter(|v| v.is_finite()) {
             let _ = writeln!(out, r#"      <data key="n_fill_mm">{fm:.4}</data>"#);
         }
         let _ = writeln!(out, r#"    </node>"#);
@@ -794,11 +870,20 @@ pub fn connectivity_graph_to_graphml_string(graph: &ConnectivityGraph) -> String
             r#"      <data key="e_type">{}</data>"#,
             xml_escape(&e.edge_type)
         );
-        if let Some(sm) = e.spill_runoff_mm {
+        if let Some(st) = e.spill_time_h.filter(|v| v.is_finite()) {
+            let _ = writeln!(out, r#"      <data key="e_spill_h">{st:.4}</data>"#);
+        }
+        if let Some(sm) = e.spill_runoff_mm.filter(|v| v.is_finite()) {
             let _ = writeln!(out, r#"      <data key="e_spill_mm">{sm:.4}</data>"#);
         }
+        if let Some(mt) = e.merge_time_h.filter(|v| v.is_finite()) {
+            let _ = writeln!(out, r#"      <data key="e_merge_h">{mt:.4}</data>"#);
+        }
+        if let Some(se) = e.spill_elev.filter(|v| v.is_finite()) {
+            let _ = writeln!(out, r#"      <data key="e_spill_elev">{se:.4}</data>"#);
+        }
         let _ = writeln!(out, r#"      <data key="e_len_m">{:.4}</data>"#, e.length_m);
-        if let Some(ds) = e.dist_to_stream {
+        if let Some(ds) = e.dist_to_stream.filter(|v| v.is_finite()) {
             let _ = writeln!(out, r#"      <data key="e_stream_m">{ds:.4}</data>"#);
         }
         let _ = writeln!(out, r#"    </edge>"#);
@@ -997,7 +1082,8 @@ mod tests {
         let mut dep_id = Array2D::from_vec(4, 4, vec![0i32; 16]).unwrap();
         dep_id.geotransform = [0.0, 1.0, 0.0, 4.0, 0.0, -1.0];
         let dep_lvl = Array2D::from_vec(4, 4, vec![0i32; 16]).unwrap();
-        let fill_time = Array2D::from_vec(4, 4, vec![-1.0f64; 16]).unwrap();
+        let mut fill_time = Array2D::from_vec(4, 4, vec![-1.0f64; 16]).unwrap();
+        fill_time.copy_metadata_from(&dep_id);
 
         let deps = InMemoryDepressions {
             depression_id: dep_id,

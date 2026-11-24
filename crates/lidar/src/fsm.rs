@@ -433,14 +433,29 @@ fn find_topographic_outlet(
                 });
                 break;
             }
-        } else if r == 0 || r + 1 == h || c == 0 || c + 1 == w {
-            // Source basin directly touches the DEM boundary.
-            found = Some(TopographicOutlet {
-                to_dep_id: 0,
-                spill_elev,
-                cells: vec![(c, r)],
-            });
-            break;
+        } else {
+            let on_edge = r == 0 || r + 1 == h || c == 0 || c + 1 == w;
+            let touches_nodata = !on_edge
+                && ancestor_ids.is_empty()
+                && (1..=8).any(|d| {
+                    let nr = r as isize + D8Y[d] as isize;
+                    let nc = c as isize + D8X[d] as isize;
+                    if nr >= 0 && nc >= 0 && nr < h as isize && nc < w as isize {
+                        let nz = zdata[(nr as usize) * w + (nc as usize)];
+                        !nz.is_finite() || nz.rd_eq(z_nd)
+                    } else {
+                        false
+                    }
+                });
+            if on_edge || touches_nodata {
+                // Source basin directly touches the DEM boundary or a clipped NoData border.
+                found = Some(TopographicOutlet {
+                    to_dep_id: 0,
+                    spill_elev,
+                    cells: vec![(c, r)],
+                });
+                break;
+            }
         }
 
         for d in 1..=8 {
@@ -516,7 +531,7 @@ fn resolve_spill_target(
     mut id: u32,
 ) -> u32 {
     while id != 0 {
-        let idx = id_to_idx[id as usize];
+        let idx = id_to_idx.get(id as usize).copied().unwrap_or(usize::MAX);
         if idx == usize::MAX {
             return 0;
         }
@@ -542,7 +557,7 @@ fn find_lca(nodes: &[u32], basins: &[BasinNode], id_to_idx: &[usize]) -> Option<
     let mut common: Vec<u32> = Vec::new();
     let mut cur = first;
     while cur != 0 {
-        let idx = id_to_idx[cur as usize];
+        let idx = id_to_idx.get(cur as usize).copied().unwrap_or(usize::MAX);
         if idx == usize::MAX {
             break;
         }
@@ -553,7 +568,7 @@ fn find_lca(nodes: &[u32], basins: &[BasinNode], id_to_idx: &[usize]) -> Option<
         let mut anc = HashSet::new();
         let mut c = nid;
         while c != 0 {
-            let idx = id_to_idx[c as usize];
+            let idx = id_to_idx.get(c as usize).copied().unwrap_or(usize::MAX);
             if idx == usize::MAX {
                 break;
             }
@@ -579,7 +594,7 @@ fn lowest_active_descendant(
     let mut stack = vec![root_id];
     let mut best: Option<(f64, u32)> = None;
     while let Some(cur) = stack.pop() {
-        let idx = id_to_idx[cur as usize];
+        let idx = id_to_idx.get(cur as usize).copied().unwrap_or(usize::MAX);
         if idx == usize::MAX {
             continue;
         }
@@ -643,7 +658,7 @@ fn evaluate_topological_routing(
                 .unwrap_or(0);
             let rep = resolve_spill_target(basins, id_to_idx, basins[i].id, raw_dst);
             if rep != 0 {
-                let dst_idx = id_to_idx[rep as usize];
+                let dst_idx = id_to_idx.get(rep as usize).copied().unwrap_or(usize::MAX);
                 if dst_idx != usize::MAX && dst_idx != i {
                     target_idx_buf[i] = dst_idx;
                     indegree[dst_idx] += 1;
@@ -661,9 +676,10 @@ fn evaluate_topological_routing(
         let mut drained_any = false;
         while let Some(u) = queue.pop_front() {
             let net_spill = q_in[u] - basins[u].loss_rate_m3_h;
-            if allow_drain_revert && net_spill < -1e-15 {
+            if allow_drain_revert && net_spill < -1e-15 && basins[u].stored_vol_m3 > 1e-9 {
                 // Infiltration exceeds inflow on this full basin; un-spill and drain.
                 basins[u].state = BasinState::Active;
+                basins[u].spill_override = None;
                 drained_any = true;
                 break;
             }
@@ -857,17 +873,16 @@ pub fn simulate_fill_spill_merge_in_memory(
         children_map.insert(d.id, d.children_ids.clone());
         if d.parent_id > 0 {
             parent_map.insert(d.id, d.parent_id);
-        } else {
-            for &cid in &d.children_ids {
-                parent_map.insert(cid, d.id);
-            }
+        }
+        for &cid in &d.children_ids {
+            parent_map.entry(cid).or_insert(d.id);
         }
     }
 
     let dep_ids = depressions.depression_id.data();
     let mut pixels_by_id: HashMap<u32, Vec<usize>> = HashMap::new();
     for (idx, &did) in dep_ids.iter().enumerate() {
-        if did > 0 && (did as usize) <= max_id && id_to_idx[did as usize] != usize::MAX {
+        if did > 0 && id_to_idx.get(did as usize).copied().unwrap_or(usize::MAX) != usize::MAX {
             pixels_by_id.entry(did as u32).or_default().push(idx);
         }
     }
@@ -930,7 +945,8 @@ pub fn simulate_fill_spill_merge_in_memory(
 
                 let dir = fdata[cur] as usize;
                 if dir == NO_FLOW as usize || dir > 8 {
-                    if did > 0 && (did as usize) <= max_id && id_to_idx[did as usize] != usize::MAX
+                    if did > 0
+                        && id_to_idx.get(did as usize).copied().unwrap_or(usize::MAX) != usize::MAX
                     {
                         break lowest_leaf_descendant(did as u32, &dep_by_id, &mut leaf_memo);
                     }
@@ -939,7 +955,8 @@ pub fn simulate_fill_spill_merge_in_memory(
                 let nr = (cur / w) as isize + D8Y[dir] as isize;
                 let nc = (cur % w) as isize + D8X[dir] as isize;
                 if nr < 0 || nc < 0 || nr >= h as isize || nc >= w as isize {
-                    if did > 0 && (did as usize) <= max_id && id_to_idx[did as usize] != usize::MAX
+                    if did > 0
+                        && id_to_idx.get(did as usize).copied().unwrap_or(usize::MAX) != usize::MAX
                     {
                         break lowest_leaf_descendant(did as u32, &dep_by_id, &mut leaf_memo);
                     }
@@ -948,7 +965,8 @@ pub fn simulate_fill_spill_merge_in_memory(
                 let next = (nr as usize) * w + (nc as usize);
                 let nz = zdata[next];
                 if !nz.is_finite() || nz.rd_eq(z_nd) {
-                    if did > 0 && (did as usize) <= max_id && id_to_idx[did as usize] != usize::MAX
+                    if did > 0
+                        && id_to_idx.get(did as usize).copied().unwrap_or(usize::MAX) != usize::MAX
                     {
                         break lowest_leaf_descendant(did as u32, &dep_by_id, &mut leaf_memo);
                     }
@@ -1095,8 +1113,8 @@ pub fn simulate_fill_spill_merge_in_memory(
     for &dep_idx in &level_order {
         let d = &depressions.depressions[dep_idx];
         let pid = parent_map.get(&d.id).copied().unwrap_or(d.parent_id);
-        if pid > 0 && (pid as usize) <= max_id {
-            let pidx = id_to_idx[pid as usize];
+        if pid > 0 {
+            let pidx = id_to_idx.get(pid as usize).copied().unwrap_or(usize::MAX);
             if pidx != usize::MAX && z_rims[dep_idx] > z_rims[pidx] {
                 z_rims[pidx] = z_rims[dep_idx];
             }
@@ -1115,21 +1133,23 @@ pub fn simulate_fill_spill_merge_in_memory(
         let z_rim = z_rims[dep_idx];
 
         let mut hypso_cells: Vec<HypsoCell> = Vec::with_capacity(all_cells.len());
+        let z_base = all_cells.first().map_or(0.0, |&(z, _)| z);
         let mut prefix_sum = 0.0f64;
         let mut capacity_m3 = 0.0f64;
         for (i, &(z, gi)) in all_cells.iter().enumerate() {
+            let dz = z - z_base;
             let thresh = if i == 0 {
                 0.0
             } else if (z - all_cells[i - 1].0).abs() <= 1e-12 {
                 hypso_cells[i - 1].threshold_vol
             } else {
-                ((i as f64) * z - prefix_sum).max(0.0) * cell_area
+                ((i as f64) * dz - prefix_sum).max(0.0) * cell_area
             };
             hypso_cells.push(HypsoCell {
                 grid_idx: gi,
                 threshold_vol: thresh,
             });
-            prefix_sum += z;
+            prefix_sum += dz;
             capacity_m3 += (z_rim - z).max(0.0) * cell_area;
         }
 
@@ -1229,11 +1249,11 @@ pub fn simulate_fill_spill_merge_in_memory(
     }
 
     // 6. Build piecewise-constant rainfall segments.
-    // Each segment is `(dt_h, rain_m_h, within_storm_window)`.
+    // Each segment is `(dt_h, rain_m_h, within_storm_window, snapshot_after_segment)`.
     // For constant rainfall, Segment 1 covers `[0, storm_duration_h]` (used for mass balance
     // and storm volume summaries), and Segment 2 covers `[storm_duration_h, infinity]` so
     // deep basins still receive exact finite `fill_time` values in `fill_time.tif`.
-    let mut segments: Vec<(f64, f64, bool)> = Vec::new();
+    let mut segments: Vec<(f64, f64, bool, bool)> = Vec::new();
     if let Some(hyeto) = forcing.hyetograph {
         let mut elapsed = 0.0f64;
         for &(dt, cm_h) in hyeto {
@@ -1244,18 +1264,21 @@ pub fn simulate_fill_spill_merge_in_memory(
             if elapsed < storm_duration_h - 1e-12 && elapsed + dt > storm_duration_h + 1e-12 {
                 let first_dt = storm_duration_h - elapsed;
                 let second_dt = dt - first_dt;
-                segments.push((first_dt, rain_m_h, true));
-                segments.push((second_dt, rain_m_h, false));
+                segments.push((first_dt, rain_m_h, true, false));
+                segments.push((second_dt, rain_m_h, false, false));
             } else {
                 let in_storm = elapsed < storm_duration_h - 1e-12;
-                segments.push((dt, rain_m_h, in_storm));
+                segments.push((dt, rain_m_h, in_storm, false));
             }
             elapsed += dt;
         }
     } else {
         let rain_m_h = options.rain_intensity_cm_h / 100.0;
-        segments.push((storm_duration_h, rain_m_h, true));
-        segments.push((f64::INFINITY, rain_m_h, false));
+        segments.push((storm_duration_h, rain_m_h, true, false));
+        segments.push((f64::INFINITY, rain_m_h, false, false));
+    }
+    if let Some(last_storm) = segments.iter_mut().rev().find(|s| s.2) {
+        last_storm.3 = true;
     }
 
     // Helper: resolve all ready parent merges and break any full spill cycles so the
@@ -1276,7 +1299,7 @@ pub fn simulate_fill_spill_merge_in_memory(
                     continue;
                 }
                 let all_children_full = basins[idx].children_ids.iter().all(|&cid| {
-                    let cidx = id_to_idx[cid as usize];
+                    let cidx = id_to_idx.get(cid as usize).copied().unwrap_or(usize::MAX);
                     cidx != usize::MAX
                         && matches!(
                             basins[cidx].state,
@@ -1292,8 +1315,8 @@ pub fn simulate_fill_spill_merge_in_memory(
                 let mut merged_cat = basins[idx].local_cat_area_m2;
                 let mut merged_eff_cat = basins[idx].local_eff_cat_area_m2;
                 for cid in child_ids {
-                    let cidx = id_to_idx[cid as usize];
-                    if basins[cidx].state == BasinState::FullSpilling {
+                    let cidx = id_to_idx.get(cid as usize).copied().unwrap_or(usize::MAX);
+                    if cidx != usize::MAX && basins[cidx].state == BasinState::FullSpilling {
                         merged_vol += basins[cidx].stored_vol_m3;
                         merged_cat += basins[cidx].local_cat_area_m2;
                         merged_eff_cat += basins[cidx].local_eff_cat_area_m2;
@@ -1357,7 +1380,7 @@ pub fn simulate_fill_spill_merge_in_memory(
                     if rep == 0 {
                         break;
                     }
-                    let next_idx = id_to_idx[rep as usize];
+                    let next_idx = id_to_idx.get(rep as usize).copied().unwrap_or(usize::MAX);
                     if next_idx == usize::MAX || basins[next_idx].state != BasinState::FullSpilling
                     {
                         break;
@@ -1378,13 +1401,17 @@ pub fn simulate_fill_spill_merge_in_memory(
                 let break_id = *cyc
                     .iter()
                     .min_by(|&&a, &&b| {
-                        let za = basins[id_to_idx[a as usize]]
-                            .outlet
-                            .as_ref()
+                        let za = id_to_idx
+                            .get(a as usize)
+                            .copied()
+                            .filter(|&i| i != usize::MAX)
+                            .and_then(|i| basins[i].outlet.as_ref())
                             .map_or(f64::INFINITY, |o| o.spill_elev);
-                        let zb = basins[id_to_idx[b as usize]]
-                            .outlet
-                            .as_ref()
+                        let zb = id_to_idx
+                            .get(b as usize)
+                            .copied()
+                            .filter(|&i| i != usize::MAX)
+                            .and_then(|i| basins[i].outlet.as_ref())
                             .map_or(f64::INFINITY, |o| o.spill_elev);
                         za.total_cmp(&zb).then_with(|| a.cmp(&b))
                     })
@@ -1395,8 +1422,14 @@ pub fn simulate_fill_spill_merge_in_memory(
                         lowest_active_descendant(lca, |x| cyc_set.contains(&x), basins, id_to_idx)
                     })
                     .unwrap_or(0);
-                basins[id_to_idx[break_id as usize]].spill_override = Some(new_target);
-                changed = true;
+                let bidx = id_to_idx
+                    .get(break_id as usize)
+                    .copied()
+                    .unwrap_or(usize::MAX);
+                if bidx != usize::MAX {
+                    basins[bidx].spill_override = Some(new_target);
+                    changed = true;
+                }
             }
 
             if !changed {
@@ -1420,7 +1453,14 @@ pub fn simulate_fill_spill_merge_in_memory(
     let mut indegree = vec![0usize; m];
     let mut target_idx_buf = vec![usize::MAX; m];
 
-    for (seg_dt, rain_m_h, in_storm_window) in segments {
+    for (seg_idx, (seg_dt, rain_m_h, in_storm_window, snapshot_after_segment)) in
+        segments.into_iter().enumerate()
+    {
+        if seg_idx > 0 && rain_m_h < last_rain_m_h - 1e-15 {
+            for b in &mut basins {
+                b.spill_override = None;
+            }
+        }
         last_rain_m_h = rain_m_h;
         let t_seg_end = if seg_dt.is_finite() {
             t_cur + seg_dt
@@ -1546,7 +1586,8 @@ pub fn simulate_fill_spill_merge_in_memory(
                             );
                         }
 
-                        if basins[i].stored_vol_m3 >= basins[i].capacity_m3 - 1e-9 {
+                        if q_net > 1e-15 && basins[i].stored_vol_m3 >= basins[i].capacity_m3 - 1e-9
+                        {
                             basins[i].stored_vol_m3 = basins[i].capacity_m3;
                             basins[i].state = BasinState::FullSpilling;
                             if basins[i].first_fill_time_h.is_none() {
@@ -1578,7 +1619,7 @@ pub fn simulate_fill_spill_merge_in_memory(
         }
 
         // Snapshot storm-end volumes and routed contributing areas right when the storm window ends.
-        if in_storm_window && t_cur >= storm_duration_h - STORM_TIME_EPS_H && !snapshot_taken {
+        if snapshot_after_segment && !snapshot_taken {
             resolve_merges_and_cycles(
                 &mut basins,
                 &id_to_idx,

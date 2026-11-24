@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::raster_ops::{ensure_no_path_collision, join_csv_to_vector, polygonize};
-use crate::region::{RegionProps, region_group, region_props_xy};
+use crate::region::{RegionProps, region_group, region_props_affine};
 
 /// Geometric and topographic attributes of an extracted sink (depression region).
 ///
@@ -248,20 +248,6 @@ pub fn extract_sinks_with_filled_in_memory(
 
     let no_data = dem.no_data();
     let gt = dem.geotransform;
-    let res_x = gt[1].hypot(gt[4]);
-    let res_y = gt[2].hypot(gt[5]);
-    let det = (gt[1] * gt[5] - gt[2] * gt[4]).abs();
-    let (res_x, res_y, cell_area) = if res_x > 0.0
-        && res_x.is_finite()
-        && res_y > 0.0
-        && res_y.is_finite()
-        && det > 0.0
-        && det.is_finite()
-    {
-        (res_x, res_y, det)
-    } else {
-        (1.0, 1.0, 1.0)
-    };
 
     let is_missing = |v: f64| !v.is_finite() || v.rd_eq(no_data);
 
@@ -303,16 +289,7 @@ pub fn extract_sinks_with_filled_in_memory(
     depth.set_no_data(0.0);
 
     // Depression properties on original DEM elevations.
-    let props = region_props_xy(
-        &labels,
-        nb_labels,
-        dem.data(),
-        w,
-        h,
-        res_x,
-        res_y,
-        cell_area,
-    );
+    let props = region_props_affine(&labels, nb_labels, dem.data(), w, h, &gt);
     let depressions: Vec<SinkDepression> = props.iter().map(SinkDepression::from).collect();
 
     // Region ID raster (i32, 0 outside).
@@ -321,16 +298,50 @@ pub fn extract_sinks_with_filled_in_memory(
     region.copy_metadata_from(dem);
     region.set_no_data(0);
 
-    // Sink DEM (original elevation inside retained depressions, 0 outside).
-    let mut sink_vec = vec![0.0f64; n];
-    for i in 0..n {
-        if labels[i] > 0 {
+    // Sink DEM (original elevation inside retained depressions, collision-free NoData outside).
+    // Preserve 0.0 as NoData whenever no retained sink cell equals 0.0 for backward compatibility.
+    // When any retained sink cell has z == 0.0 (for example coastal sea-level depressions), select
+    // a NoData sentinel strictly outside the retained sink elevation range.
+    let mut has_zero_sink = false;
+    let mut min_sink_z = f64::INFINITY;
+    let mut max_sink_z = f64::NEG_INFINITY;
+    for (i, &lbl) in labels.iter().enumerate() {
+        if lbl > 0 {
+            let z = dem.get_i(i);
+            if z == 0.0 {
+                has_zero_sink = true;
+            }
+            if z < min_sink_z {
+                min_sink_z = z;
+            }
+            if z > max_sink_z {
+                max_sink_z = z;
+            }
+        }
+    }
+    let sink_nd = if !has_zero_sink {
+        0.0
+    } else if no_data.is_finite() && (no_data < min_sink_z || no_data > max_sink_z) {
+        no_data
+    } else if -9999.0 < min_sink_z {
+        -9999.0
+    } else {
+        let shifted = min_sink_z - 9999.0;
+        if shifted.is_finite() && shifted < min_sink_z {
+            shifted
+        } else {
+            f64::NAN
+        }
+    };
+    let mut sink_vec = vec![sink_nd; n];
+    for (i, &lbl) in labels.iter().enumerate() {
+        if lbl > 0 {
             sink_vec[i] = dem.get_i(i);
         }
     }
     let mut sink = Array2D::from_vec(w, h, sink_vec)?;
     sink.copy_metadata_from(dem);
-    sink.set_no_data(0.0);
+    sink.set_no_data(sink_nd);
 
     // Refined DEM: small depressions remain filled; large depressions keep original elevation.
     let mut refined_vec = dem_filled.data().to_vec();

@@ -3,7 +3,7 @@
 //! Pure-Rust replacement for `scipy.ndimage.label` + `regionGroup` and
 //! `skimage.measure.regionprops` used throughout `opengeos/lidar`.
 
-use std::f64::consts::{FRAC_PI_4, PI, SQRT_2};
+use std::f64::consts::{FRAC_PI_4, PI};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -105,6 +105,11 @@ where
             let up = if row > 0 { labels[i - width] } else { 0 };
             match (left, up) {
                 (0, 0) => {
+                    assert!(
+                        parent.len() <= u32::MAX as usize,
+                        "region_group exceeded maximum label count ({})",
+                        u32::MAX
+                    );
                     let next = parent.len() as u32;
                     parent.push(next);
                     labels[i] = next;
@@ -162,8 +167,23 @@ where
 }
 
 /// Computes `skimage.measure.perimeter` (Benkrid & Crookes 2000, 4-neighborhood)
-/// on a binary mask of dimensions `bh × bw`.
+/// on a binary mask of dimensions `bh × bw` in pixel units.
+#[cfg(test)]
 pub(crate) fn benkrid_crookes_perimeter(mask: &[bool], bw: usize, bh: usize) -> f64 {
+    benkrid_crookes_perimeter_affine(mask, bw, bh, (1.0, 0.0), (0.0, -1.0))
+}
+
+/// Anisotropic / affine-aware Benkrid & Crookes (2000) 4-neighborhood perimeter estimator
+/// using column basis vector `vx = (gt[1], gt[4])` and row basis vector `vy = (gt[2], gt[5])`.
+///
+/// Reduces identically to `benkrid_crookes_perimeter * res` for square north-up pixels.
+pub(crate) fn benkrid_crookes_perimeter_affine(
+    mask: &[bool],
+    bw: usize,
+    bh: usize,
+    vx: (f64, f64),
+    vy: (f64, f64),
+) -> f64 {
     if bw == 0 || bh == 0 {
         return 0.0;
     }
@@ -187,8 +207,11 @@ pub(crate) fn benkrid_crookes_perimeter(mask: &[bool], bw: usize, bh: usize) -> 
     }
 
     // 2. Convolve border with [[10, 2, 10], [2, 1, 2], [10, 2, 10]] (constant 0 border)
-    // and sum Benkrid & Crookes weights matching scikit-image.
-    let diag_half = 0.5 * (1.0 + SQRT_2);
+    // and weight each segment by its true map-unit step length along vx, vy, vx+vy, vx-vy.
+    let res_x = vx.0.hypot(vx.1);
+    let res_y = vy.0.hypot(vy.1);
+    let diag_pos = (vx.0 + vy.0).hypot(vx.1 + vy.1);
+    let diag_neg = (vx.0 - vy.0).hypot(vx.1 - vy.1);
     let mut perim = 0.0f64;
 
     let get = |r: isize, c: isize| -> u8 {
@@ -206,16 +229,31 @@ pub(crate) fn benkrid_crookes_perimeter(mask: &[bool], bw: usize, bh: usize) -> 
             }
             let ri = r as isize;
             let ci = c as isize;
-            let ortho = get(ri - 1, ci) + get(ri + 1, ci) + get(ri, ci - 1) + get(ri, ci + 1);
-            let diag = get(ri - 1, ci - 1)
-                + get(ri - 1, ci + 1)
-                + get(ri + 1, ci - 1)
-                + get(ri + 1, ci + 1);
+            let horiz = get(ri, ci - 1) + get(ri, ci + 1);
+            let vert = get(ri - 1, ci) + get(ri + 1, ci);
+            let ortho = horiz + vert;
+            let d_pos = get(ri - 1, ci - 1) + get(ri + 1, ci + 1);
+            let d_neg = get(ri - 1, ci + 1) + get(ri + 1, ci - 1);
+            let diag = d_pos + d_neg;
             let code = 1u8 + 2 * ortho + 10 * diag;
+            let ortho_len = if horiz > vert {
+                res_x
+            } else if vert > horiz {
+                res_y
+            } else {
+                0.5 * (res_x + res_y)
+            };
+            let diag_len = if d_pos > d_neg {
+                diag_pos
+            } else if d_neg > d_pos {
+                diag_neg
+            } else {
+                0.5 * (diag_pos + diag_neg)
+            };
             perim += match code {
-                5 | 7 | 15 | 17 | 25 | 27 => 1.0,
-                21 | 33 => SQRT_2,
-                13 | 23 => diag_half,
+                5 | 7 | 15 | 17 | 25 | 27 => ortho_len,
+                21 | 33 => diag_len,
+                13 | 23 => 0.5 * (ortho_len + diag_len),
                 _ => 0.0,
             };
         }
@@ -270,6 +308,57 @@ pub fn region_props_xy(
     res_y: f64,
     cell_area: f64,
 ) -> Vec<RegionProps> {
+    region_props_affine_inner(
+        labels,
+        nb_labels,
+        elev,
+        width,
+        height,
+        (res_x, 0.0),
+        (0.0, -res_y),
+        cell_area,
+    )
+}
+
+/// Computes region properties using a full 6-element GDAL-style affine geotransform,
+/// accurately handling anisotropic pixel spacings, rotation, and shear in both
+/// perimeter and second central spatial moments.
+pub(crate) fn region_props_affine(
+    labels: &[u32],
+    nb_labels: u32,
+    elev: &[f64],
+    width: usize,
+    height: usize,
+    gt: &[f64; 6],
+) -> Vec<RegionProps> {
+    let res_x = gt[1].hypot(gt[4]);
+    let res_y = gt[2].hypot(gt[5]);
+    let det = (gt[1] * gt[5] - gt[2] * gt[4]).abs();
+    let (vx, vy, cell_area) = if res_x > 0.0
+        && res_x.is_finite()
+        && res_y > 0.0
+        && res_y.is_finite()
+        && det > 0.0
+        && det.is_finite()
+    {
+        ((gt[1], gt[4]), (gt[2], gt[5]), det)
+    } else {
+        ((1.0, 0.0), (0.0, -1.0), 1.0)
+    };
+    region_props_affine_inner(labels, nb_labels, elev, width, height, vx, vy, cell_area)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn region_props_affine_inner(
+    labels: &[u32],
+    nb_labels: u32,
+    elev: &[f64],
+    width: usize,
+    height: usize,
+    vx: (f64, f64),
+    vy: (f64, f64),
+    cell_area: f64,
+) -> Vec<RegionProps> {
     let n = width
         .checked_mul(height)
         .expect("region_props dimensions overflow usize");
@@ -301,13 +390,14 @@ pub fn region_props_xy(
     let mut sum_rr = vec![0.0f64; k];
     let mut sum_cc = vec![0.0f64; k];
     let mut sum_rc = vec![0.0f64; k];
+    let mut valid_z_count = vec![0usize; k];
+    let mut z_ref = vec![0.0f64; k];
     let mut min_elev = vec![f64::INFINITY; k];
     let mut max_elev = vec![f64::NEG_INFINITY; k];
-    let mut sum_elev = vec![0.0f64; k];
+    let mut sum_elev_shifted = vec![0.0f64; k];
 
     for r in 0..height {
         let off = r * width;
-        let rf = r as f64 * res_y;
         for c in 0..width {
             let lbl = labels[off + c];
             if lbl == 0 {
@@ -318,7 +408,6 @@ pub fn region_props_xy(
                 "label {lbl} exceeds nb_labels ({nb_labels})"
             );
             let idx = (lbl - 1) as usize;
-            let cf = c as f64 * res_x;
             let z = elev[off + c];
 
             if count[idx] == 0 {
@@ -337,23 +426,42 @@ pub fn region_props_xy(
             if c + 1 > max_col[idx] {
                 max_col[idx] = c + 1;
             }
+            // Shift coordinates relative to `first_pixel` before accumulating moments
+            // to avoid catastrophic cancellation on large raster indices.
+            let dr_pix = r as f64 - first_pixel[idx].0 as f64;
+            let dc_pix = c as f64 - first_pixel[idx].1 as f64;
+            let cf = dc_pix * vx.0 + dr_pix * vy.0;
+            let rf = -(dc_pix * vx.1 + dr_pix * vy.1);
             sum_r[idx] += rf;
             sum_c[idx] += cf;
             sum_rr[idx] += rf * rf;
             sum_cc[idx] += cf * cf;
             sum_rc[idx] += rf * cf;
-            if z < min_elev[idx] {
-                min_elev[idx] = z;
+
+            if z.is_finite() {
+                if valid_z_count[idx] == 0 {
+                    z_ref[idx] = z;
+                }
+                valid_z_count[idx] += 1;
+                if z < min_elev[idx] {
+                    min_elev[idx] = z;
+                }
+                if z > max_elev[idx] {
+                    max_elev[idx] = z;
+                }
+                sum_elev_shifted[idx] += z - z_ref[idx];
             }
-            if z > max_elev[idx] {
-                max_elev[idx] = z;
-            }
-            sum_elev[idx] += z;
         }
     }
 
-    let mean_res = 0.5 * (res_x + res_y);
-    let min_res = res_x.min(res_y);
+    let res_x = vx.0.hypot(vx.1);
+    let res_y = vy.0.hypot(vy.1);
+    let max_side = res_x.max(res_y);
+    let min_res = if max_side > 0.0 && cell_area > 0.0 {
+        (cell_area / max_side).min(res_x.min(res_y))
+    } else {
+        res_x.min(res_y)
+    };
     let mut props = Vec::with_capacity(k);
 
     for idx in 0..k {
@@ -369,7 +477,7 @@ pub fn region_props_xy(
         let bh = r1 - r0;
         let bw = c1 - c0;
 
-        // Build local binary mask over bbox to compute Benkrid & Crookes perimeter.
+        // Build local binary mask over bbox to compute affine-aware Benkrid & Crookes perimeter.
         let mut mask = vec![false; bw * bh];
         let target = (idx + 1) as u32;
         for r in r0..r1 {
@@ -381,9 +489,9 @@ pub fn region_props_xy(
                 }
             }
         }
-        let perimeter = benkrid_crookes_perimeter(&mask, bw, bh) * mean_res;
+        let perimeter = benkrid_crookes_perimeter_affine(&mask, bw, bh, vx, vy);
 
-        // Second central spatial moments in map units (matches skimage when res_x == res_y).
+        // Second central spatial moments in map units (matches skimage when square north-up).
         let r_bar = sum_r[idx] / nf;
         let c_bar = sum_c[idx] / nf;
         let mu20 = (sum_rr[idx] / nf - r_bar * r_bar).max(0.0);
@@ -419,10 +527,16 @@ pub fn region_props_xy(
         let bbox_area = (bw * bh) as f64;
         let area_bbox_ratio = if bbox_area > 0.0 { nf / bbox_area } else { 0.0 };
 
-        let min_z = min_elev[idx];
-        let max_z = max_elev[idx];
-        let max_depth = max_z - min_z;
-        let mean_depth = (max_z * nf - sum_elev[idx]) / nf;
+        let (min_z, max_z, max_depth, mean_depth) = if valid_z_count[idx] > 0 {
+            let z_nf = valid_z_count[idx] as f64;
+            let min_z = min_elev[idx];
+            let max_z = max_elev[idx];
+            let max_depth = (max_z - min_z).max(0.0);
+            let mean_depth = ((max_z - z_ref[idx]) * z_nf - sum_elev_shifted[idx]).max(0.0) / z_nf;
+            (min_z, max_z, max_depth, mean_depth)
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        };
         let area = nf * cell_area;
         let volume = mean_depth * area;
 

@@ -19,7 +19,9 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
-use richdem::{Array2D, D8X, D8Y, DemNum, NO_FLOW, Topology, load_raster, save_raster};
+use richdem::{
+    Array2D, D8X, D8Y, DemNum, FLOWDIR_NO_DATA, NO_FLOW, Topology, load_raster, save_raster,
+};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
@@ -277,20 +279,26 @@ fn region_fill_times(
             if obj.max_depth < min_depth {
                 continue;
             }
-            let (fr, fc) = obj.first_pixel;
-            let raw_cat = task.roi_catchment[fr * bw + fc];
-            // If catchment raster is 0/missing at this cell, fall back to direct rainfall
+            let (or0, oc0, or1, oc1) = obj.bbox;
+            let mut raw_cat = 0.0f64;
+            for r in or0..or1 {
+                let off = r * bw;
+                for c in oc0..oc1 {
+                    if label_objects[off + c] == obj.label {
+                        let v = task.roi_catchment[off + c];
+                        if v.is_finite() && v > raw_cat {
+                            raw_cat = v;
+                        }
+                    }
+                }
+            }
+            // If catchment raster is 0/missing across this slice, fall back to direct rainfall
             // over the depression's own footprint so valid depressions still simulate cleanly.
-            let cat_area = if raw_cat.is_finite() && raw_cat > 0.0 {
-                raw_cat
-            } else {
-                obj.area
-            };
+            let cat_area = if raw_cat > 0.0 { raw_cat } else { obj.area };
             if cat_area <= 0.0 {
                 continue;
             }
             let t_fill = obj.volume / (cat_area * rain_m_h);
-            let (or0, oc0, or1, oc1) = obj.bbox;
             for r in or0..or1 {
                 let off = r * bw;
                 for c in oc0..oc1 {
@@ -315,25 +323,9 @@ pub fn simulate_inundation_in_memory(
     options: &SimulateInundationOptions,
 ) -> Result<(Array2D<f64>, usize)> {
     let _ = validate_options(options)?;
+    validate_grid_alignment(sink, catchment_area, "catchment raster")?;
     let w = sink.width();
     let h = sink.height();
-    if catchment_area.width() != w || catchment_area.height() != h {
-        return Err(Error::DimensionMismatch(format!(
-            "catchment raster ({}x{}) does not match sink raster ({w}x{h})",
-            catchment_area.width(),
-            catchment_area.height()
-        )));
-    }
-    for i in 0..6 {
-        let diff = (sink.geotransform[i] - catchment_area.geotransform[i]).abs();
-        let tol = 1e-6 * sink.geotransform[i].abs().max(1.0);
-        if diff > tol {
-            return Err(Error::InvalidArgument(format!(
-                "catchment geotransform differs from sink raster at index {i}: {} vs {}",
-                catchment_area.geotransform[i], sink.geotransform[i]
-            )));
-        }
-    }
 
     let metrics = affine_metrics(&sink.geotransform);
     let nd = sink.no_data();
@@ -636,12 +628,38 @@ pub(crate) fn trace_downstream_away_from_source(
         let c = cur % w;
         let on_boundary = r == 0 || r + 1 == h || c == 0 || c + 1 == w;
         let dir = flowdirs[cur] as usize;
+        if dir == FLOWDIR_NO_DATA as usize {
+            // Stepped onto a NoData cell outside the valid DEM domain: pop the NoData cell and
+            // accept as a clipped-watershed boundary exit when the preceding valid cell is not
+            // part of an enclosing ancestor ring.
+            trace.pop();
+            let prev_is_ancestor = trace.last().is_some_and(|&prev| is_ancestor(prev));
+            if !trace.is_empty() && !prev_is_ancestor {
+                if target_dep != 0 {
+                    trace.truncate(last_target_len);
+                }
+                return Some((trace, target_dep));
+            }
+            for &idx in &trace {
+                trapped_in_pit[idx] = reject_gen;
+            }
+            return None;
+        }
         if dir == NO_FLOW as usize || dir > 8 {
             if target_dep != 0 && !is_ancestor(cur) {
                 trace.truncate(last_target_len);
                 return Some((trace, target_dep));
             }
-            if on_boundary && !is_ancestor(cur) {
+            let touches_nodata = (1..=8).any(|d| {
+                let nr = r as isize + D8Y[d] as isize;
+                let nc = c as isize + D8X[d] as isize;
+                nr >= 0
+                    && nc >= 0
+                    && nr < h as isize
+                    && nc < w as isize
+                    && flowdirs[(nr as usize) * w + (nc as usize)] == FLOWDIR_NO_DATA
+            });
+            if (on_boundary || touches_nodata) && !is_ancestor(cur) {
                 return Some((trace, 0));
             }
             for &idx in &trace {
@@ -721,8 +739,11 @@ pub fn delineate_spill_flow_paths_in_memory(
     for d in &depressions.depressions {
         dep_by_id.insert(d.id, d);
         children_map.insert(d.id, d.children_ids.clone());
+        if d.parent_id > 0 {
+            parent_map.insert(d.id, d.parent_id);
+        }
         for &cid in &d.children_ids {
-            parent_map.insert(cid, d.id);
+            parent_map.entry(cid).or_insert(d.id);
         }
     }
 
@@ -1274,19 +1295,30 @@ pub fn scs_type2_hyetograph(
         }
         1.0
     };
-    let raw_steps = (duration_h / time_step_h).ceil();
-    if !raw_steps.is_finite() || raw_steps < 1.0 || raw_steps > MAX_SIMULATION_STEPS as f64 {
+    let raw_steps = ((duration_h / time_step_h) - 1e-12).ceil().max(1.0);
+    if !raw_steps.is_finite() || raw_steps > MAX_SIMULATION_STEPS as f64 {
         return Err(Error::InvalidArgument(format!(
             "hyetograph requires {raw_steps} steps (duration_h={duration_h}, time_step_h={time_step_h}), exceeding MAX_SIMULATION_STEPS ({MAX_SIMULATION_STEPS})"
         )));
     }
     let n_steps = raw_steps as usize;
+    let t_eps = 1e-12 * duration_h.max(1.0);
     let mut out = Vec::with_capacity(n_steps);
     let mut prev_t = 0.0f64;
     let mut prev_frac = 0.0f64;
     for k in 1..=n_steps {
-        let t = (k as f64 * time_step_h).min(duration_h);
-        let dt = (t - prev_t).max(1e-9);
+        if prev_t >= duration_h - t_eps {
+            break;
+        }
+        let t = if k == n_steps {
+            duration_h
+        } else {
+            (k as f64 * time_step_h).min(duration_h)
+        };
+        let dt = t - prev_t;
+        if dt <= 0.0 {
+            break;
+        }
         let frac = interp(t / duration_h);
         let d_mm = ((frac - prev_frac) * total_precip_mm).max(0.0);
         let intensity_cm_h = (d_mm / 10.0) / dt;
@@ -1488,54 +1520,52 @@ fn region_fill_times_forced(
             if obj.max_depth < min_depth {
                 continue;
             }
-            let (fr, fc) = obj.first_pixel;
-            let raw_cat = task.roi_catchment[fr * bw + fc];
-            let cat_area = if raw_cat.is_finite() && raw_cat > 0.0 {
-                raw_cat
-            } else {
-                obj.area
-            };
-            if cat_area <= 0.0 {
-                continue;
-            }
-
             let (or0, oc0, or1, oc1) = obj.bbox;
-            // Compute remaining unfilled volume (deducting antecedent water) and mean C / infiltration.
-            let mut rem_vol = obj.volume;
+            // Sample maximum valid catchment area across the slice (so compound slices do not
+            // pick an inner child's catchment area from `first_pixel`) while computing remaining
+            // unfilled volume (deducting antecedent water) and mean C / infiltration.
+            let mut raw_cat = 0.0f64;
+            let mut ant_vol = 0.0f64;
             let mut c_sum = 0.0f64;
             let mut c_cnt = 0usize;
             let mut inf_sum = 0.0f64;
             let mut inf_cnt = 0usize;
-            if task.roi_antecedent.is_some()
-                || task.roi_runoff_coeff.is_some()
-                || task.roi_infil_m_h.is_some()
-            {
-                let mut ant_vol = 0.0f64;
-                for r in or0..or1 {
-                    let off = r * bw;
-                    for c in oc0..oc1 {
-                        if label_objects[off + c] != obj.label {
-                            continue;
-                        }
-                        if let Some(ref ant) = task.roi_antecedent {
-                            let h0 = ant[off + c].max(0.0);
-                            if h0 > 0.0 {
-                                let cell_depth = (obj.max_elev - img[off + c]).max(0.0);
-                                ant_vol += h0.min(cell_depth) * cell_area;
-                            }
-                        }
-                        if let Some(ref rc) = task.roi_runoff_coeff {
-                            c_sum += rc[off + c].clamp(0.0, 1.0);
-                            c_cnt += 1;
-                        }
-                        if let Some(ref inf) = task.roi_infil_m_h {
-                            inf_sum += inf[off + c].max(0.0);
-                            inf_cnt += 1;
+            for r in or0..or1 {
+                let off = r * bw;
+                for c in oc0..oc1 {
+                    if label_objects[off + c] != obj.label {
+                        continue;
+                    }
+                    let cv = task.roi_catchment[off + c];
+                    if cv.is_finite() && cv > raw_cat {
+                        raw_cat = cv;
+                    }
+                    if let Some(ref ant) = task.roi_antecedent {
+                        let h0 = ant[off + c].max(0.0);
+                        if h0 > 0.0 {
+                            let cell_depth = (obj.max_elev - img[off + c]).max(0.0);
+                            ant_vol += h0.min(cell_depth) * cell_area;
                         }
                     }
+                    if let Some(ref rc) = task.roi_runoff_coeff {
+                        c_sum += rc[off + c].clamp(0.0, 1.0);
+                        c_cnt += 1;
+                    }
+                    if let Some(ref inf) = task.roi_infil_m_h {
+                        inf_sum += inf[off + c].max(0.0);
+                        inf_cnt += 1;
+                    }
                 }
-                rem_vol = (obj.volume - ant_vol).max(0.0);
             }
+            let cat_area = if raw_cat > 0.0 { raw_cat } else { obj.area };
+            if cat_area <= 0.0 {
+                continue;
+            }
+            let rem_vol = if task.roi_antecedent.is_some() {
+                (obj.volume - ant_vol).max(0.0)
+            } else {
+                obj.volume
+            };
             let mean_c = if c_cnt > 0 { c_sum / c_cnt as f64 } else { 1.0 };
             let mean_inf_m_h = if inf_cnt > 0 {
                 inf_sum / inf_cnt as f64

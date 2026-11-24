@@ -338,49 +338,58 @@ fn carve_polyline(
         return 0;
     }
 
-    // Determine valid start and end elevations along the culvert polyline.
-    let mut z_start: Option<f64> = None;
-    let mut z_end: Option<f64> = None;
-    for &(c, r) in &path_cells {
+    // Determine first and last valid cells and their elevations along the culvert polyline.
+    let mut start_info: Option<(usize, f64)> = None;
+    let mut end_info: Option<(usize, f64)> = None;
+    for (i, &(c, r)) in path_cells.iter().enumerate() {
         let v = dem.get(c, r);
         if v.is_finite() && !v.rd_eq(nd) {
-            z_start = Some(v);
+            start_info = Some((i, v));
             break;
         }
     }
-    for &(c, r) in path_cells.iter().rev() {
+    for (i, &(c, r)) in path_cells.iter().enumerate().rev() {
         let v = dem.get(c, r);
         if v.is_finite() && !v.rd_eq(nd) {
-            z_end = Some(v);
+            end_info = Some((i, v));
             break;
         }
     }
-    let (Some(za), Some(zb)) = (z_start, z_end) else {
+    let (Some((i_start, za)), Some((i_end, zb))) = (start_info, end_info) else {
         return 0;
     };
 
-    let n = path_cells.len();
+    let span = i_end.saturating_sub(i_start);
+    let min_end = za.min(zb);
+    let start_cell = path_cells[i_start];
+    let end_cell = path_cells[i_end];
     let hw = options.half_width_cells;
     let mut carved = 0usize;
-    for (i, &(c, r)) in path_cells.iter().enumerate() {
-        let t = if n > 1 {
-            i as f64 / (n - 1) as f64
+    for (i, &(c, r)) in path_cells[i_start..=i_end].iter().enumerate() {
+        let abs_i = i_start + i;
+        let t = if span > 0 {
+            i as f64 / span as f64
         } else {
             0.0
         };
-        // Keep the two endpoints tied to the receiving bed so carving never creates an outlet pit.
-        let offset = if i == 0 || i + 1 == n {
+        // Keep endpoints tied to the receiving bed and never undercut `za.min(zb)` so
+        // carving stays monotonic without creating an artificial interior outlet pit.
+        let is_endpoint = abs_i == i_start || abs_i == i_end;
+        let offset = if is_endpoint {
             0.0
         } else {
             options.depth_offset
         };
-        let target_z = za + t * (zb - za) - offset;
+        let target_z = (za + t * (zb - za) - offset).max(min_end);
         let r_lo = r.saturating_sub(hw);
         let r_hi = r.saturating_add(hw).min(h - 1);
         let c_lo = c.saturating_sub(hw);
         let c_hi = c.saturating_add(hw).min(w - 1);
         for nru in r_lo..=r_hi {
             for ncu in c_lo..=c_hi {
+                if (ncu, nru) == start_cell || (ncu, nru) == end_cell {
+                    continue;
+                }
                 let cur = dem.get(ncu, nru);
                 if cur.is_finite() && !cur.rd_eq(nd) && cur > target_z {
                     dem.set(ncu, nru, target_z);
@@ -452,24 +461,34 @@ fn carve_point(dem: &mut Array2D<f64>, x: f64, y: f64, options: &BurnCulvertsOpt
     let hw = options.half_width_cells;
     let mut carved = 0usize;
     let n = path.len();
+    if n == 0 {
+        return 0;
+    }
+    let start_cell = path[0];
+    let end_cell = path[n - 1];
+    let min_end = z1.min(z2);
     for (i, &(c, r)) in path.iter().enumerate() {
         let t = if n > 1 {
             i as f64 / (n - 1) as f64
         } else {
             0.0
         };
-        let offset = if i == 0 || i + 1 == n {
+        let is_endpoint = i == 0 || i + 1 == n;
+        let offset = if is_endpoint {
             0.0
         } else {
             options.depth_offset
         };
-        let z_interp = z1 + t * (z2 - z1) - offset;
+        let z_interp = (z1 + t * (z2 - z1) - offset).max(min_end);
         let r_lo = r.saturating_sub(hw);
         let r_hi = r.saturating_add(hw).min(h - 1);
         let c_lo = c.saturating_sub(hw);
         let c_hi = c.saturating_add(hw).min(w - 1);
         for nru in r_lo..=r_hi {
             for ncu in c_lo..=c_hi {
+                if (ncu, nru) == start_cell || (ncu, nru) == end_cell {
+                    continue;
+                }
                 let cur = dem.get(ncu, nru);
                 if cur.is_finite() && !cur.rd_eq(nd) && cur > z_interp {
                     dem.set(ncu, nru, z_interp);
@@ -1413,8 +1432,9 @@ mod tests {
         let (conditioned, carved) =
             burn_culverts(&dem, &culvert_path, &BurnCulvertsOptions::default()).unwrap();
         assert!(carved >= 1);
-        // Embankment at col 5, row 5 must be breached down to ~9.95 m
-        assert!(conditioned.get(5, 5) < 10.0);
+        // Embankment at col 5, row 5 must be breached flush to the 10.0 m valley bed
+        // without undercutting below the receiving outlet elevation.
+        assert!((conditioned.get(5, 5) - 10.0).abs() < 1e-6);
         // Embankment away from culvert (row 1) remains at 15.0 m
         assert!((conditioned.get(5, 1) - 15.0).abs() < 1e-6);
     }
@@ -1559,9 +1579,15 @@ mod tests {
         let (burned, carved) =
             burn_culverts(&dem, &culverts_path, &BurnCulvertsOptions::default()).unwrap();
         assert!(carved >= 2, "expected both road embankments carved");
-        // Stream at y=5200100 corresponds to row 20
-        assert!(burned.get(80, 20) < 10.0, "crossing 1 should be breached");
-        assert!(burned.get(145, 20) < 10.0, "crossing 2 should be breached");
+        // Stream at y=5200100 corresponds to row 20: embankments breached flush to 10.0 m valley
+        assert!(
+            (burned.get(80, 20) - 10.0).abs() < 1e-6,
+            "crossing 1 should be breached to valley bed"
+        );
+        assert!(
+            (burned.get(145, 20) - 10.0).abs() < 1e-6,
+            "crossing 2 should be breached to valley bed"
+        );
         // Embankments away from the stream remain untouched
         assert!((burned.get(80, 2) - 15.0).abs() < 1e-6);
         assert!((burned.get(145, 2) - 15.0).abs() < 1e-6);
