@@ -172,12 +172,60 @@ assert.ok(spillPaths.length >= 3, `expected >= 3 spill paths, got ${spillPaths.l
 const spillGeo = JSON.parse(sim.spillPathsGeojson());
 assert.equal(spillGeo.type, "FeatureCollection");
 assert.equal(spillGeo.features.length, spillPaths.length);
-const [firstLon, firstLat] = spillGeo.features[0].geometry.coordinates[0];
-assertWgs84Coord([firstLon, firstLat], "sim.spillPathsGeojson");
-assert.ok(
-  Math.abs(depLon - firstLon) < 0.05 && Math.abs(depLat - firstLat) < 0.05,
-  `depressionsGeojson [${depLon}, ${depLat}] must align with spillPathsGeojson [${firstLon}, ${firstLat}]`,
-);
+
+function polygonBounds(geom) {
+  const rings =
+    geom.type === "Polygon"
+      ? geom.coordinates
+      : geom.type === "MultiPolygon"
+        ? geom.coordinates.flat()
+        : [];
+  let minLon = Infinity;
+  let maxLon = -Infinity;
+  let minLat = Infinity;
+  let maxLat = -Infinity;
+  for (const ring of rings) {
+    for (const [lon, lat] of ring) {
+      if (lon < minLon) minLon = lon;
+      if (lon > maxLon) maxLon = lon;
+      if (lat < minLat) minLat = lat;
+      if (lat > maxLat) maxLat = lat;
+    }
+  }
+  return { minLon, maxLon, minLat, maxLat };
+}
+
+const depBoundsById = new Map();
+for (const feat of depGeo.features) {
+  const id = feat.properties.id;
+  const b = polygonBounds(feat.geometry);
+  const prev = depBoundsById.get(id);
+  if (prev) {
+    prev.minLon = Math.min(prev.minLon, b.minLon);
+    prev.maxLon = Math.max(prev.maxLon, b.maxLon);
+    prev.minLat = Math.min(prev.minLat, b.minLat);
+    prev.maxLat = Math.max(prev.maxLat, b.maxLat);
+  } else {
+    depBoundsById.set(id, b);
+  }
+}
+
+const degTol = 0.0002;
+for (const spillFeat of spillGeo.features) {
+  const [startLon, startLat] = spillFeat.geometry.coordinates[0];
+  assertWgs84Coord([startLon, startLat], "sim.spillPathsGeojson");
+  const fromId = spillFeat.properties.from_dep_id;
+  const bbox = depBoundsById.get(fromId);
+  assert.ok(bbox, `expected depression polygon for spill from_dep_id=${fromId}`);
+  assert.ok(
+    startLon >= bbox.minLon - degTol &&
+      startLon <= bbox.maxLon + degTol &&
+      startLat >= bbox.minLat - degTol &&
+      startLat <= bbox.maxLat + degTol,
+    `spill start [${startLon}, ${startLat}] for dep ${fromId} outside depression bbox ` +
+      `[${bbox.minLon}, ${bbox.minLat}, ${bbox.maxLon}, ${bbox.maxLat}]`,
+  );
+}
 
 const gif = sim.encodeGif(150, true, 200, true);
 const header = new TextDecoder().decode(gif.slice(0, 6));

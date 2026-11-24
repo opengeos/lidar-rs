@@ -1076,7 +1076,7 @@
       palette[palLen * 3 + 2] = parseInt(h.slice(4, 6), 16);
       palLen++;
     }
-    // Cap data-driven entries at 192 so all 64 colors of the 4x4x4 fallback cube fit in 256 slots.
+    // Cap total palette entries (seeded level colors + data buckets) at 192 so all 64 colors of the 4x4x4 fallback cube fit in 256 slots.
     const maxDataColors = 192;
     for (let i = 0; i < buckets.length && palLen < maxDataColors; i++) {
       const k = buckets[i];
