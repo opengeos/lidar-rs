@@ -2513,9 +2513,10 @@ fn manifest_matches_request(
 ///
 /// Only called when `manifest_path` already exists so pointing `-o` at a directory without a
 /// prior `manifest.json` never deletes unrelated user files. When `manifest.json` parses cleanly,
-/// only the bundle paths recorded in that prior manifest (plus DEM metadata sidecars and stale
-/// `region_huc_*.geojson` files in `out_dir`) are removed; if `manifest.json` is corrupt, falls
-/// back to removing known bundle artifact names in `out_dir`.
+/// only direct-child bundle paths in `out_dir` recorded in that prior manifest (plus DEM metadata
+/// sidecars and stale `region_huc_*.geojson` files in `out_dir`) are removed. If `manifest.json`
+/// fails to parse, only `manifest.json` itself is removed so arbitrary unverified files in
+/// `out_dir` are never deleted.
 pub(crate) fn clean_stale_bundle_outputs(
     out_dir: &Path,
     manifest_path: &Path,
@@ -2574,31 +2575,15 @@ pub(crate) fn clean_stale_bundle_outputs(
             remove_if_not_kept(&out_dir.join(".dem.meta.json"));
             remove_if_not_kept(&out_dir.join("dem.tif.meta.json"));
         }
-    } else {
-        const FALLBACK_STALE_FILES: &[&str] = &[
-            "wbd.gpkg",
-            "dem.tif",
-            "nhd_flowlines.gpkg",
-            "nwi_wetlands.gpkg",
-            "usgs_roads.gpkg",
-            "culverts.gpkg",
-            "noaa_atlas14.json",
-            ".dem.meta.json",
-            "dem.tif.meta.json",
-        ];
-        for name in FALLBACK_STALE_FILES {
-            remove_if_not_kept(&out_dir.join(name));
-        }
-    }
-
-    if let Ok(entries) = std::fs::read_dir(out_dir) {
-        for entry in entries.flatten() {
-            let fname = entry.file_name();
-            if let Some(s) = fname.to_str()
-                && s.starts_with("region_huc_")
-                && s.ends_with(".geojson")
-            {
-                remove_if_not_kept(&entry.path());
+        if let Ok(entries) = std::fs::read_dir(out_dir) {
+            for entry in entries.flatten() {
+                let fname = entry.file_name();
+                if let Some(s) = fname.to_str()
+                    && s.starts_with("region_huc_")
+                    && s.ends_with(".geojson")
+                {
+                    remove_if_not_kept(&entry.path());
+                }
             }
         }
     }
@@ -3306,45 +3291,136 @@ mod tests {
         );
         assert!(!crafted_manifest_path.exists());
 
-        // (c) keep_boundary pointing to out_dir/wbd.gpkg or aliased via ./ must never be deleted,
-        // even under corrupt-manifest fallback cleanup.
+        // (c) keep_boundary pointing to out_dir/wbd.gpkg or aliased via ./ must never be deleted
+        // when cleaning a valid mismatched manifest.
         let keep_dir = tempfile::tempdir().unwrap();
         let keep_wbd = keep_dir.path().join("wbd.gpkg");
         let keep_huc = keep_dir.path().join("region_huc_10160002.geojson");
         let stale_nhd = keep_dir.path().join("nhd_flowlines.gpkg");
-        let corrupt_manifest = keep_dir.path().join("manifest.json");
+        let valid_manifest_path = keep_dir.path().join("manifest.json");
         std::fs::write(&keep_wbd, b"active-boundary-wbd").unwrap();
         std::fs::write(&keep_huc, b"active-huc-boundary").unwrap();
         std::fs::write(&stale_nhd, b"stale-nhd").unwrap();
-        std::fs::write(&corrupt_manifest, b"{not valid json").unwrap();
+        let valid_manifest = FederalBundleResult {
+            region_bbox: region_a,
+            region_key: "bbox".to_string(),
+            dem_product: opts_a.dem_product,
+            wbd_level: opts_a.wbd_level,
+            clip_to_region: opts_a.clip_to_region,
+            mosaic_dem: opts_a.mosaic_dem,
+            transportation_layers: effective_transportation_layers(&opts_a),
+            wbd_path: Some(keep_wbd.clone()),
+            wbd_count: 1,
+            dem_tiles: Vec::new(),
+            dem_mosaic_path: None,
+            nhd_path: Some(stale_nhd.clone()),
+            nhd_count: 1,
+            nwi_path: None,
+            nwi_count: 0,
+            roads_path: None,
+            roads_count: 0,
+            culverts_path: None,
+            culverts_count: 0,
+            noaa_atlas14_path: None,
+            noaa_atlas14: None,
+            manifest_path: valid_manifest_path.clone(),
+        };
+        std::fs::write(
+            &valid_manifest_path,
+            serde_json::to_string(&valid_manifest).unwrap(),
+        )
+        .unwrap();
 
         let aliased_wbd = keep_dir.path().join(".").join("wbd.gpkg");
-        clean_stale_bundle_outputs(keep_dir.path(), &corrupt_manifest, Some(&aliased_wbd));
+        clean_stale_bundle_outputs(keep_dir.path(), &valid_manifest_path, Some(&aliased_wbd));
         assert!(
             keep_wbd.exists(),
             "active wbd.gpkg boundary must be preserved"
         );
         assert!(
             !stale_nhd.exists(),
-            "stale nhd should be removed on corrupt fallback"
+            "stale nhd recorded in valid manifest should be removed"
         );
         assert!(
             !keep_huc.exists(),
-            "unkept region_huc file should be removed"
+            "unkept region_huc file should be removed when valid manifest is invalidated"
         );
 
-        // Re-create corrupt manifest and verify aliased region_huc_ keep_boundary is preserved.
+        // Re-create valid manifest and verify aliased region_huc_ keep_boundary is preserved.
         std::fs::write(&keep_huc, b"active-huc-boundary").unwrap();
-        std::fs::write(&corrupt_manifest, b"{not valid json").unwrap();
+        std::fs::write(
+            &valid_manifest_path,
+            serde_json::to_string(&valid_manifest).unwrap(),
+        )
+        .unwrap();
         let aliased_huc = keep_dir
             .path()
             .join(".")
             .join("region_huc_10160002.geojson");
-        clean_stale_bundle_outputs(keep_dir.path(), &corrupt_manifest, Some(&aliased_huc));
+        clean_stale_bundle_outputs(keep_dir.path(), &valid_manifest_path, Some(&aliased_huc));
         assert!(
             keep_huc.exists(),
             "active region_huc boundary must be preserved across aliased paths"
         );
+
+        // (d) When manifest.json is corrupt/unparseable, ONLY manifest.json itself is removed so
+        // arbitrary unverified files in out_dir are never deleted.
+        let corrupt_dir = tempfile::tempdir().unwrap();
+        let unverified_dem = corrupt_dir.path().join("dem.tif");
+        let unverified_wbd = corrupt_dir.path().join("wbd.gpkg");
+        let corrupt_manifest = corrupt_dir.path().join("manifest.json");
+        std::fs::write(&unverified_dem, b"keep-dem").unwrap();
+        std::fs::write(&unverified_wbd, b"keep-wbd").unwrap();
+        std::fs::write(&corrupt_manifest, b"{not valid json").unwrap();
+        clean_stale_bundle_outputs(corrupt_dir.path(), &corrupt_manifest, None);
+        assert!(!corrupt_manifest.exists());
+        assert!(
+            unverified_dem.exists(),
+            "corrupt manifest must not delete unverified dem.tif"
+        );
+        assert!(
+            unverified_wbd.exists(),
+            "corrupt manifest must not delete unverified wbd.gpkg"
+        );
+    }
+
+    /// Reads an HTTP/1.1 request (headers up to `\r\n\r\n` plus the exact `Content-Length` body)
+    /// from `stream` before replying, avoiding Winsock TCP RST (`os error 10053`) on Windows when
+    /// closing a connection while unread POST body bytes remain in flight.
+    fn drain_http_request_body(stream: &mut std::net::TcpStream) -> String {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut req_bytes = Vec::new();
+        let mut tmp_buf = [0u8; 1024];
+        let mut header_end = None;
+        let mut content_len = 0usize;
+        loop {
+            let n = stream.read(&mut tmp_buf).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            req_bytes.extend_from_slice(&tmp_buf[..n]);
+            if header_end.is_none()
+                && let Some(pos) = req_bytes.windows(4).position(|w| w == b"\r\n\r\n")
+            {
+                header_end = Some(pos + 4);
+                let hdr = String::from_utf8_lossy(&req_bytes[..pos]);
+                for line in hdr.lines() {
+                    if let Some((k, v)) = line.split_once(':')
+                        && k.trim().eq_ignore_ascii_case("content-length")
+                    {
+                        content_len = v.trim().parse::<usize>().unwrap_or(0);
+                    }
+                }
+            }
+            if let Some(he) = header_end
+                && req_bytes.len() >= he + content_len
+            {
+                break;
+            }
+        }
+        header_end
+            .map(|he| String::from_utf8_lossy(&req_bytes[he..]).into_owned())
+            .unwrap_or_default()
     }
 
     #[test]
@@ -3381,8 +3457,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             for attempt in 0..2 {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut req_buf = [0u8; 1024];
-                let _ = stream.read(&mut req_buf);
+                let _ = drain_http_request_body(&mut stream);
                 if attempt == 0 {
                     // Claim 16 bytes but send only 5 bytes before closing.
                     let _ = stream.write_all(
@@ -3393,6 +3468,8 @@ mod tests {
                         b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\n0123456789abcdef",
                     );
                 }
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
             }
         });
 
@@ -3427,14 +3504,15 @@ mod tests {
         let empty_srv = std::thread::spawn(move || {
             let (mut stream, _) = empty_listener.accept().unwrap();
             empty_hits_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let mut req_buf = [0u8; 2048];
-            let _ = stream.read(&mut req_buf);
+            let _ = drain_http_request_body(&mut stream);
             let body = r#"{"type":"FeatureCollection","features":[]}"#;
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
         });
         let agent = make_agent(10);
         let empty_oids: Vec<i64> = (1..=20).collect();
@@ -3457,41 +3535,7 @@ mod tests {
         let cap_srv = std::thread::spawn(move || {
             for _ in 0..3 {
                 let (mut stream, _) = cap_listener.accept().unwrap();
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                // Read full HTTP headers + Content-Length body (ureq sends headers and POST body
-                // in separate writes).
-                let mut req_bytes = Vec::new();
-                let mut tmp_buf = [0u8; 1024];
-                let mut header_end = None;
-                let mut content_len = 0usize;
-                loop {
-                    let n = stream.read(&mut tmp_buf).unwrap_or(0);
-                    if n == 0 {
-                        break;
-                    }
-                    req_bytes.extend_from_slice(&tmp_buf[..n]);
-                    if header_end.is_none()
-                        && let Some(pos) = req_bytes.windows(4).position(|w| w == b"\r\n\r\n")
-                    {
-                        header_end = Some(pos + 4);
-                        let hdr = String::from_utf8_lossy(&req_bytes[..pos]);
-                        for line in hdr.lines() {
-                            if let Some((k, v)) = line.split_once(':')
-                                && k.trim().eq_ignore_ascii_case("content-length")
-                            {
-                                content_len = v.trim().parse::<usize>().unwrap_or(0);
-                            }
-                        }
-                    }
-                    if let Some(he) = header_end
-                        && req_bytes.len() >= he + content_len
-                    {
-                        break;
-                    }
-                }
-                let body_part = header_end
-                    .map(|he| String::from_utf8_lossy(&req_bytes[he..]).into_owned())
-                    .unwrap_or_default();
+                let body_part = drain_http_request_body(&mut stream);
                 let oids: Vec<i64> = body_part
                     .split('&')
                     .find_map(|kv| kv.strip_prefix("objectIds="))
@@ -3511,6 +3555,8 @@ mod tests {
                     body.len()
                 );
                 let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
             }
         });
         let cap_res = fetch_arcgis_oid_chunk(
@@ -3523,6 +3569,53 @@ mod tests {
         .unwrap();
         cap_srv.join().unwrap();
         assert_eq!(cap_res.len(), 4);
+    }
+
+    #[test]
+    fn bilinear_mosaic_masks_nodata_seam_without_blending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tile_a = tmp.path().join("tile_a.tif");
+        let tile_b = tmp.path().join("tile_b.tif");
+        let mosaic_out = tmp.path().join("mosaic.tif");
+
+        let nd = -9999.0_f64;
+        // Left tile: valid 100.0 on columns 0..3, NoData (-9999.0) on right seam column 3.
+        let mut data_a = vec![100.0_f64; 4 * 4];
+        for r in 0..4 {
+            data_a[r * 4 + 3] = nd;
+        }
+        let mut arr_a = richdem::Array2D::from_vec(4, 4, data_a).unwrap();
+        arr_a.set_no_data(nd);
+        arr_a.geotransform = [500_000.0, 1.0, 0.0, 4_500_004.0, 0.0, -1.0];
+        arr_a.projection = "EPSG:32615".to_string();
+        richdem::save_raster(&arr_a, &tile_a, None, false).unwrap();
+
+        // Right tile shifted by 0.5 px (forces bilinear resampling) with NoData on its left edge.
+        let mut data_b = vec![120.0_f64; 4 * 4];
+        for r in 0..4 {
+            data_b[r * 4] = nd;
+        }
+        let mut arr_b = richdem::Array2D::from_vec(4, 4, data_b).unwrap();
+        arr_b.set_no_data(nd);
+        arr_b.geotransform = [500_002.5, 1.0, 0.0, 4_500_004.0, 0.0, -1.0];
+        arr_b.projection = "EPSG:32615".to_string();
+        richdem::save_raster(&arr_b, &tile_b, None, false).unwrap();
+
+        mosaic_with_resampling(&[&tile_a, &tile_b], &mosaic_out, Resampling::Bilinear).unwrap();
+        let mosaicked = richdem::load_raster::<f64>(&mosaic_out, None).unwrap();
+        let out_nd = mosaicked.no_data();
+        let mut valid_count = 0usize;
+        for &v in mosaicked.data() {
+            if !v.is_finite() || (v - out_nd).abs() < 1e-6 {
+                continue;
+            }
+            valid_count += 1;
+            assert!(
+                (99.0..=121.0).contains(&v),
+                "bilinear mosaic blended NoData (-9999.0) into valid pixel: {v}"
+            );
+        }
+        assert!(valid_count > 0);
     }
 
     #[test]
