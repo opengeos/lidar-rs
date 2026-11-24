@@ -17,7 +17,7 @@ Run it right now in your browser with zero installation via the live [WebAssembl
 
 [![Interactive inundation simulation and inundation curve in the lidar-rs WebAssembly Playground](https://files.opengeos.org/inundation_demo.gif)](playground.md)
 
-[![Progressive depression tree graph building bottom-up with rising water layers in the lidar-rs WebAssembly Playground](https://files.opengeos.org/dem_depression_tree.gif)](playground.md)
+[![Progressive depression tree graph building bottom-up with rising water layers in the lidar-rs WebAssembly Playground](https://files.opengeos.org/depression_tree.gif)](playground.md)
 
 ## Key Capabilities
 
