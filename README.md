@@ -16,9 +16,7 @@ High-performance nested surface depression delineation, hydro-conditioning, LiDA
 
 [![Nested depression hierarchy and depression tree overview in lidar-rs](https://files.opengeos.org/depression_hierarchy.webp)](https://lidar-rs.opengeos.org/playground/)
 
-[![Interactive inundation simulation and inundation curve in the lidar-rs WebAssembly Playground](https://files.opengeos.org/inundation_demo.gif)](https://lidar-rs.opengeos.org/playground/)
-
-[![Progressive depression tree graph building bottom-up with rising water layers in the lidar-rs WebAssembly Playground](https://files.opengeos.org/dem_depression_tree.gif)](https://lidar-rs.opengeos.org/playground/)
+[![Synchronized inundation simulation, inundation curve, and progressive depression tree graph in the lidar-rs WebAssembly Playground](https://files.opengeos.org/inundation_tree_demo.gif)](https://lidar-rs.opengeos.org/playground/)
 
 ## Highlights
 
