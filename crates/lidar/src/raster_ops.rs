@@ -92,7 +92,7 @@ fn polygonize_dataset(ds: &RasterDataset, out_vector: &Path, field_name: &str) -
     Ok(count)
 }
 
-fn resolve_path_for_compare(path: &Path) -> Option<PathBuf> {
+pub(crate) fn resolve_path_for_compare(path: &Path) -> Option<PathBuf> {
     if let Ok(canon) = std::fs::canonicalize(path) {
         return Some(canon);
     }
@@ -544,13 +544,10 @@ fn has_leading_zero(s: &str) -> bool {
     int_part.len() > 1 && int_part.starts_with('0')
 }
 
-fn normalize_text_join_key(raw: &str) -> String {
+fn normalize_numeric_join_key(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
-    if has_leading_zero(trimmed) {
-        return trimmed.to_string();
-    }
     if let Ok(i) = trimmed.parse::<i64>() {
-        return i.to_string();
+        return Some(i.to_string());
     }
     if let Ok(f) = trimmed.parse::<f64>()
         && f.is_finite()
@@ -559,9 +556,17 @@ fn normalize_text_join_key(raw: &str) -> String {
         && f < (i64::MAX as f64)
         && f.abs() <= ((1u64 << 53) as f64)
     {
-        return (f as i64).to_string();
+        return Some((f as i64).to_string());
     }
-    trimmed.to_string()
+    None
+}
+
+fn normalize_text_join_key(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if has_leading_zero(trimmed) {
+        return trimmed.to_string();
+    }
+    normalize_numeric_join_key(trimmed).unwrap_or_else(|| trimmed.to_string())
 }
 
 fn field_value_join_key(val: &FieldValue) -> Option<String> {
@@ -716,11 +721,21 @@ pub fn join_csv_to_vector(
         csv_keep_cols.push(ci);
     }
 
-    // Build lookup map from normalized CSV join key to row.
+    // Build lookup maps from CSV join keys to rows.
+    // `lookup` preserves leading zeros for text columns (HUC/FIPS/GEOID codes), while
+    // `numeric_lookup` lets zero-padded CSV keys (e.g. "0123") still match numeric vector fields.
+    let vec_key_is_numeric = matches!(
+        src_layer.schema.fields()[vec_key_idx].field_type,
+        FieldType::Integer | FieldType::Float
+    );
     let mut lookup: HashMap<String, &Vec<String>> = HashMap::with_capacity(rows.len());
+    let mut numeric_lookup: HashMap<String, &Vec<String>> = HashMap::new();
     for row in &rows {
         if let Some(k) = row.get(csv_key_idx) {
             lookup.insert(normalize_text_join_key(k), row);
+            if let Some(num_key) = normalize_numeric_join_key(k) {
+                numeric_lookup.insert(num_key, row);
+            }
         }
     }
 
@@ -729,11 +744,18 @@ pub fn join_csv_to_vector(
         for &vi in &keep_vec_indices {
             attrs.push(feat.attributes.get(vi).cloned().unwrap_or(FieldValue::Null));
         }
-        let matched = feat
-            .attributes
-            .get(vec_key_idx)
-            .and_then(field_value_join_key)
-            .and_then(|k| lookup.get(&k).copied());
+        let matched = feat.attributes.get(vec_key_idx).and_then(|val| {
+            let key = field_value_join_key(val)?;
+            lookup.get(&key).copied().or_else(|| {
+                let allow_numeric_fallback = vec_key_is_numeric
+                    || matches!(val, FieldValue::Integer(_) | FieldValue::Float(_));
+                if allow_numeric_fallback {
+                    numeric_lookup.get(&key).copied()
+                } else {
+                    None
+                }
+            })
+        });
 
         for (&ci, &ftype) in csv_keep_cols.iter().zip(&csv_col_types) {
             let val = matched

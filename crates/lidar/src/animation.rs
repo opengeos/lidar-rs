@@ -185,13 +185,14 @@ pub fn compute_hillshade_rgb(dem: &Array2D<f64>, opts: &HillshadeOptions) -> Vec
     }
     let span = (vmax - vmin).max(1e-12);
 
-    // Scale finite differences by pixel cell spacing in map units for projected CRSs,
-    // defaulting to 1.0 for geographic CRSs or missing/degenerate geotransforms.
+    // Scale finite differences by full pixel-vector lengths in map units for projected CRSs
+    // (supporting rotated geotransforms), defaulting to 1.0 for geographic CRSs or missing
+    // geotransforms.
     let (cell_x, cell_y) = if is_geographic_crs(&dem.projection, dem.geotransform) {
         (1.0, 1.0)
     } else {
-        let dx = dem.geotransform[1].abs();
-        let dy = dem.geotransform[5].abs();
+        let dx = dem.geotransform[1].hypot(dem.geotransform[4]);
+        let dy = dem.geotransform[2].hypot(dem.geotransform[5]);
         let cx = if dx.is_finite() && dx > 0.0 { dx } else { 1.0 };
         let cy = if dy.is_finite() && dy > 0.0 { dy } else { 1.0 };
         (cx, cy)
@@ -744,21 +745,19 @@ where
             draw_active_spill_paths(body, dw, dh, sw, sh, &wet, t_hours, spill_paths);
         }
 
+        let legend_label = options.legend_label.as_deref().unwrap_or("WATER");
+        let has_spills = !spill_paths.is_empty();
         if options.show_scale_bar && !is_geographic_crs(&dem.projection, dem.geotransform) {
             let cell_m = dem.geotransform[1].hypot(dem.geotransform[4]).max(1e-6);
-            let reserve_right = if options.show_legend { 96 } else { 0 };
+            let reserve_right = if options.show_legend {
+                legend_box_width(legend_label, has_spills) + 12
+            } else {
+                0
+            };
             draw_scale_bar(body, dw, dh, sw, cell_m, &dem.projection, reserve_right);
         }
         if options.show_legend {
-            let legend_label = options.legend_label.as_deref().unwrap_or("WATER");
-            draw_legend_box(
-                body,
-                dw,
-                dh,
-                options.water_rgb,
-                legend_label,
-                !spill_paths.is_empty(),
-            );
+            draw_legend_box(body, dw, dh, options.water_rgb, legend_label, has_spills);
         }
 
         let mut gif_frame = Frame::from_rgb_speed(dw as u16, total_h as u16, &frame_rgb, 10);
@@ -1081,6 +1080,11 @@ fn draw_scale_bar(
     }
 }
 
+fn legend_box_width(label: &str, has_spills: bool) -> usize {
+    let text_cols = label.chars().count().max(if has_spills { 5 } else { 0 });
+    (17 + text_cols * 6 + 6).max(84)
+}
+
 fn draw_legend_box(
     body: &mut [u8],
     dw: usize,
@@ -1089,8 +1093,7 @@ fn draw_legend_box(
     label: &str,
     has_spills: bool,
 ) {
-    let text_cols = label.chars().count().max(if has_spills { 5 } else { 0 });
-    let box_w = (17 + text_cols * 6 + 6).max(84);
+    let box_w = legend_box_width(label, has_spills);
     let box_h = if has_spills { 30usize } else { 18usize };
     if dw < box_w + 16 || dh < box_h + 16 {
         return;
@@ -1272,20 +1275,18 @@ pub fn render_inundation_frame_png_bytes(
     if !spill_paths.is_empty() {
         draw_active_spill_paths(body, dw, dh, sw, sh, &wet, t_hours, spill_paths);
     }
+    let legend_label = options.legend_label.as_deref().unwrap_or("WATER");
+    let has_spills = !spill_paths.is_empty();
     if options.show_scale_bar && !is_geographic_crs(&dem.projection, dem.geotransform) {
-        let reserve_right = if options.show_legend { 96 } else { 0 };
+        let reserve_right = if options.show_legend {
+            legend_box_width(legend_label, has_spills) + 12
+        } else {
+            0
+        };
         draw_scale_bar(body, dw, dh, sw, cell_m, &dem.projection, reserve_right);
     }
     if options.show_legend {
-        let legend_label = options.legend_label.as_deref().unwrap_or("WATER");
-        draw_legend_box(
-            body,
-            dw,
-            dh,
-            options.water_rgb,
-            legend_label,
-            !spill_paths.is_empty(),
-        );
+        draw_legend_box(body, dw, dh, options.water_rgb, legend_label, has_spills);
     }
     encode_rgb_to_png_bytes(&frame_rgb, dw, total_h)
 }
@@ -1327,16 +1328,16 @@ pub fn render_dem_preview_png_bytes(
             }
         }
     }
+    let legend_label = options.legend_label.as_deref().unwrap_or("DEPTH");
     if options.show_scale_bar && !is_geographic_crs(&dem.projection, dem.geotransform) {
         let reserve_right = if options.show_legend && depth_overlay.is_some() {
-            96
+            legend_box_width(legend_label, false) + 12
         } else {
             0
         };
         draw_scale_bar(&mut rgb, dw, dh, sw, cell_m, &dem.projection, reserve_right);
     }
     if options.show_legend && depth_overlay.is_some() {
-        let legend_label = options.legend_label.as_deref().unwrap_or("DEPTH");
         draw_legend_box(&mut rgb, dw, dh, options.water_rgb, legend_label, false);
     }
     encode_rgb_to_png_bytes(&rgb, dw, dh)
@@ -1451,20 +1452,18 @@ pub fn export_inundation_frames_png(
         if !spill_paths.is_empty() {
             draw_active_spill_paths(body, dw, dh, sw, sh, &wet, t_hours, spill_paths);
         }
+        let legend_label = options.legend_label.as_deref().unwrap_or("WATER");
+        let has_spills = !spill_paths.is_empty();
         if draw_scale {
-            let reserve_right = if options.show_legend { 96 } else { 0 };
+            let reserve_right = if options.show_legend {
+                legend_box_width(legend_label, has_spills) + 12
+            } else {
+                0
+            };
             draw_scale_bar(body, dw, dh, sw, cell_m, &dem.projection, reserve_right);
         }
         if options.show_legend {
-            let legend_label = options.legend_label.as_deref().unwrap_or("WATER");
-            draw_legend_box(
-                body,
-                dw,
-                dh,
-                options.water_rgb,
-                legend_label,
-                !spill_paths.is_empty(),
-            );
+            draw_legend_box(body, dw, dh, options.water_rgb, legend_label, has_spills);
         }
 
         let png_bytes = encode_rgb_to_png_bytes(&frame_rgb, dw, total_h)?;
@@ -1765,6 +1764,12 @@ mod tests {
         let rgb1 = compute_hillshade_rgb(&d1, &HillshadeOptions::default());
         let rgb10 = compute_hillshade_rgb(&d10, &HillshadeOptions::default());
         assert_eq!(rgb1, rgb10);
+
+        // Rotated geotransform with pixel vector length 10m (6, 8) yields identical spacing to 10m.
+        let mut d10_rot = d10.clone();
+        d10_rot.geotransform = [0.0, 6.0, 8.0, 0.0, 8.0, -6.0];
+        let rgb10_rot = compute_hillshade_rgb(&d10_rot, &HillshadeOptions::default());
+        assert_eq!(rgb10, rgb10_rot);
     }
 
     #[test]

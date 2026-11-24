@@ -892,7 +892,7 @@ enum Commands {
     },
     /// Run a Model Context Protocol (MCP) server over stdin/stdout for AI agents
     Mcp {
-        /// Restrict MCP tool file and directory path arguments to stay under the given directory (repeatable)
+        /// Cooperative guardrail restricting MCP tool path arguments to the given directory before invocation (repeatable; pair with OS sandboxing for kernel-level isolation)
         #[arg(long = "allow-dir", value_name = "DIR")]
         allow_dir: Vec<PathBuf>,
     },

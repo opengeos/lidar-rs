@@ -214,6 +214,49 @@ fn join_csv_to_vector_hardening_nan_leading_zeros_empty_rows_collision_and_shp_d
         join_csv_to_vector(&vec_path, &valid_empty_csv, &out_empty, "code", "code").unwrap(),
         3
     );
+
+    // Zero-padded CSV key ("0123") still joins cleanly onto a numeric Integer vector column (123).
+    let int_vec_path = tmp.path().join("int_ids.gpkg");
+    let mut int_layer = Layer::new("int_ids".to_string()).with_geom_type(GeometryType::Point);
+    SpatialRef::from_epsg(4326)
+        .unwrap()
+        .apply_to_layer(&mut int_layer);
+    int_layer
+        .schema
+        .add_field(FieldDef::new("id".to_string(), FieldType::Integer));
+    int_layer.features.push(Feature {
+        fid: 1,
+        geometry: Some(Geometry::Point(Coord::xy(-99.0, 47.0))),
+        attributes: vec![FieldValue::Integer(123)],
+    });
+    terrio::write_vector(
+        &[int_layer],
+        int_vec_path.to_str().unwrap(),
+        &VectorWriteOptions::default(),
+    )
+    .unwrap();
+    let padded_csv = tmp.path().join("padded.csv");
+    std::fs::write(&padded_csv, "id,tag\n0123,matched_int\n").unwrap();
+    let out_int_join = tmp.path().join("int_joined.gpkg");
+    assert_eq!(
+        join_csv_to_vector(&int_vec_path, &padded_csv, &out_int_join, "id", "id").unwrap(),
+        1
+    );
+    let int_ds = terrio::open_vector(
+        out_int_join.to_str().unwrap(),
+        &VectorOpenOptions::default(),
+    )
+    .unwrap();
+    let tag_idx = int_ds.layers[0]
+        .schema
+        .fields()
+        .iter()
+        .position(|f| f.name == "tag")
+        .unwrap();
+    assert_eq!(
+        int_ds.layers[0].features[0].attributes.get(tag_idx),
+        Some(&FieldValue::Text("matched_int".to_string()))
+    );
 }
 
 #[cfg(feature = "pointcloud")]

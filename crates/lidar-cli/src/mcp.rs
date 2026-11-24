@@ -156,6 +156,11 @@ impl Server {
     }
 
     /// Restricts path arguments passed via MCP tool calls to reside under one of `allowed_dirs`.
+    ///
+    /// This is a cooperative argument-validation guardrail for local MCP agents (validating and
+    /// canonicalizing paths prior to spawning tool subprocesses), not an OS-enforced sandbox
+    /// against concurrent local filesystem symlink races. Deployments requiring kernel-enforced
+    /// filesystem isolation should pair this with OS sandboxing (such as Landlock or containers).
     pub fn with_allowed_dirs(mut self, allowed_dirs: Vec<PathBuf>) -> Self {
         let canonical = allowed_dirs
             .into_iter()
@@ -426,6 +431,10 @@ impl Server {
 }
 
 /// Validates and extracts `(tool_name, cli_args)` from `tools/call` parameters.
+///
+/// Per the MCP specification, `arguments` is optional: omitted, `null`, or empty `{}` arguments
+/// are accepted as an empty `args` list, whereas non-object `arguments`, non-empty objects missing
+/// `"args"`, non-string `"args"` elements, or embedded NUL bytes return `INVALID_PARAMS`.
 pub(crate) fn parse_tool_call(params: &Value) -> Result<(String, Vec<OsString>), RpcError> {
     let params_obj = params
         .as_object()
@@ -437,14 +446,15 @@ pub(crate) fn parse_tool_call(params: &Value) -> Result<(String, Vec<OsString>),
     if !command_names().iter().any(|c| c == name) {
         return Err((INVALID_PARAMS, format!("unknown tool '{name}'")));
     }
-    let arguments = params_obj
-        .get("arguments")
-        .and_then(Value::as_object)
-        .ok_or((INVALID_PARAMS, "arguments must be an object".to_string()))?;
-    let items = arguments.get("args").and_then(Value::as_array).ok_or((
-        INVALID_PARAMS,
-        "arguments.args must be an array of strings".to_string(),
-    ))?;
+    let items = match params_obj.get("arguments") {
+        None | Some(Value::Null) => return Ok((name.to_string(), Vec::new())),
+        Some(Value::Object(map)) if map.is_empty() => return Ok((name.to_string(), Vec::new())),
+        Some(Value::Object(map)) => map.get("args").and_then(Value::as_array).ok_or((
+            INVALID_PARAMS,
+            "arguments.args must be an array of strings".to_string(),
+        ))?,
+        Some(_) => return Err((INVALID_PARAMS, "arguments must be an object".to_string())),
+    };
     let mut args = Vec::with_capacity(items.len());
     for v in items {
         let Some(s) = v.as_str() else {
@@ -501,6 +511,11 @@ fn resolve_path_for_allowlist(path: &Path, depth: usize) -> std::io::Result<Path
 
 /// Ensures every `PathBuf` argument parsed by Clap for subcommand `name` resolves inside at least
 /// one directory in `allowed_dirs`.
+///
+/// Cooperative argument-validation guardrail for local MCP agents: validates and canonicalizes
+/// path arguments before spawning the tool subprocess. Because child commands open paths by name,
+/// kernel-enforced sandboxing (such as Landlock or container mounts) is still required to defend
+/// against concurrent local filesystem symlink races.
 pub(crate) fn validate_allowed_dirs(
     name: &str,
     args: &[OsString],
@@ -797,8 +812,9 @@ fn run_child(
         }
         if cancel.load(Ordering::Relaxed) {
             drop(guard);
-            let _ = stdout.join();
-            let _ = stderr.join();
+            // Do not join stdout/stderr reader threads here: if a launcher left a grandchild
+            // holding inherited pipe descriptors, joining would block cancellation and hold
+            // the concurrency permit indefinitely.
             return Ok(None);
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -1555,19 +1571,29 @@ mod tests {
 
     #[test]
     fn parse_tool_call_enforces_object_arguments_args_array_and_no_nuls() {
-        // Missing arguments or empty {} must be rejected.
+        // Omitted, null, or empty `{}` arguments are accepted per MCP optional-arguments spec.
         assert_eq!(
-            parse_tool_call(&json!({"name": "info"})).unwrap_err().0,
-            INVALID_PARAMS
+            parse_tool_call(&json!({"name": "info"})).unwrap(),
+            ("info".to_string(), Vec::new())
         );
         assert_eq!(
-            parse_tool_call(&json!({"name": "info", "arguments": {}}))
+            parse_tool_call(&json!({"name": "info", "arguments": null})).unwrap(),
+            ("info".to_string(), Vec::new())
+        );
+        assert_eq!(
+            parse_tool_call(&json!({"name": "info", "arguments": {}})).unwrap(),
+            ("info".to_string(), Vec::new())
+        );
+        // Non-object arguments, non-empty objects missing "args", non-array args, and NUL bytes
+        // must all be rejected with INVALID_PARAMS.
+        assert_eq!(
+            parse_tool_call(&json!({"name": "info", "arguments": "bad"}))
                 .unwrap_err()
                 .0,
             INVALID_PARAMS
         );
         assert_eq!(
-            parse_tool_call(&json!({"name": "info", "arguments": "bad"}))
+            parse_tool_call(&json!({"name": "info", "arguments": {"input": "/a.tif"}}))
                 .unwrap_err()
                 .0,
             INVALID_PARAMS
