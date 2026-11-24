@@ -35,6 +35,7 @@
   let pendingGif = null; // { key: string, promise: Promise<string | null> }
   let loadGeneration = 0;
   let runToken = 0;
+  let treeGifExporting = false;
 
   // Interactive inundation player state
   let player = null;
@@ -73,10 +74,12 @@
   function currentGifOptions() {
     const pingPong = $("lp-pingpong") ? $("lp-pingpong").checked : true;
     const showSpills = $("lp-spill-paths") ? $("lp-spill-paths").checked : true;
+    const delayMs = Math.max(50, Math.min(1000, parseInt($("lp-speed")?.value || "150", 10) || 150));
     return {
       pingPong,
       showSpills,
-      key: `${currentSimId}:${pingPong ? 1 : 0}:${showSpills ? 1 : 0}`,
+      delayMs,
+      key: `${currentSimId}:${pingPong ? 1 : 0}:${showSpills ? 1 : 0}:${delayMs}`,
     };
   }
 
@@ -110,6 +113,8 @@
     currentSimStem = "";
     invalidateCachedGif();
     pendingGif = null;
+    const downloadsEl = $("lp-downloads");
+    if (downloadsEl) downloadsEl.innerHTML = "";
   }
 
   function stopPlayer() {
@@ -615,12 +620,16 @@
         return b.level - a.level || a.id - b.id;
       });
 
-    const activeTree = (treeRegions || []).find((t) => t.regionId === activeRegionId);
-    const childrenMap = activeTree ? activeTree.childrenMap : null;
+    const treeByRegion = new Map();
+    for (const t of treeRegions || []) {
+      treeByRegion.set(t.regionId, t);
+    }
 
     for (const d of ordered) {
       const pos = badgePos.get(d.id);
       if (!pos) continue;
+      const depTree = treeByRegion.get(d.region_id);
+      const childrenMap = depTree ? depTree.childrenMap : null;
       const state = computeDepressionFillState(
         d.id,
         tHours,
@@ -703,14 +712,14 @@
 
   const MAX_TREE_CANVAS_WIDTH = 8192;
 
-  function computeTreeLayoutSize(tree, availW) {
+  function computeTreeLayoutSize(tree, availW, maxLogicalW = MAX_TREE_CANVAS_WIDTH) {
     const pad = { left: 74, right: 66, top: 52, bottom: 54 };
     const nodeR = tree.leafCount > 12 || availW < 680 ? 15 : 17;
     const innerPadX = nodeR + 18;
     const minSlotPx = tree.leafCount <= 9 ? 64 : 58;
     const neededW =
       pad.left + pad.right + innerPadX * 2 + Math.max(0, tree.leafCount - 1) * minSlotPx;
-    const logicalW = Math.min(MAX_TREE_CANVAS_WIDTH, Math.max(availW, neededW));
+    const logicalW = Math.min(maxLogicalW, Math.max(availW, neededW));
     const levelGap =
       tree.maxLevel <= 1
         ? 0
@@ -1058,16 +1067,18 @@
 
     const palette = new Uint8Array(256 * 3);
     let palLen = 0;
-    const maxDataColors = 224;
-    for (let i = 0; i < buckets.length && palLen < maxDataColors; i++) {
-      const k = buckets[i];
-      const c = counts[k];
-      palette[palLen * 3] = Math.round(sumR[k] / c);
-      palette[palLen * 3 + 1] = Math.round(sumG[k] / c);
-      palette[palLen * 3 + 2] = Math.round(sumB[k] / c);
+    // Seed exact hierarchy level colors first so node fills never drift during quantization.
+    for (const hex of LEVEL_COLORS) {
+      if (palLen >= 256) break;
+      const h = hex.replace("#", "");
+      palette[palLen * 3] = parseInt(h.slice(0, 2), 16);
+      palette[palLen * 3 + 1] = parseInt(h.slice(2, 4), 16);
+      palette[palLen * 3 + 2] = parseInt(h.slice(4, 6), 16);
       palLen++;
     }
-    for (let i = maxDataColors; i < buckets.length && palLen < 256; i++) {
+    // Cap data-driven entries at 192 so all 64 colors of the 4x4x4 fallback cube fit in 256 slots.
+    const maxDataColors = 192;
+    for (let i = 0; i < buckets.length && palLen < maxDataColors; i++) {
       const k = buckets[i];
       const c = counts[k];
       palette[palLen * 3] = Math.round(sumR[k] / c);
@@ -1496,7 +1507,7 @@
     const regionPart = playerRef.treeRegions.length > 1 ? `_region${tree.regionId}` : "";
     a.download = `${stemRef || "lidar"}_depression_tree${regionPart}.gif`;
     a.click();
-    setTimeout(() => URL.revokeObjectURL(blobUrl), 2000);
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 30000);
     setStatus(
       `Exported depression tree GIF (${(gifBytes.length / 1024).toFixed(0)} KB, ${schedule.length} frames) in ${elapsed.toFixed(0)} ms.`,
     );
@@ -1522,13 +1533,14 @@
 
     const wrap = $("lp-tree-canvas-wrap");
     const availW = Math.max(320, (wrap ? wrap.clientWidth : 800) - 2);
-    const layout = computeTreeLayoutSize(tree, availW);
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const maxLogicalW = Math.floor(MAX_TREE_CANVAS_WIDTH / dpr);
+    const layout = computeTreeLayoutSize(tree, availW, maxLogicalW);
     const { logicalW, logicalH } = layout;
 
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
     canvas.style.width = `${logicalW}px`;
     canvas.style.height = `${logicalH}px`;
-    const targetW = Math.round(logicalW * dpr);
+    const targetW = Math.min(MAX_TREE_CANVAS_WIDTH, Math.round(logicalW * dpr));
     const targetH = Math.round(logicalH * dpr);
     if (canvas.width !== targetW || canvas.height !== targetH) {
       canvas.width = targetW;
@@ -1580,7 +1592,7 @@
     player.treeHitNodes = hitNodes;
   }
 
-  function renderSelectedOverlay(ctx, width, height, depIds, selectedId, depsById, spillPaths) {
+  function compositeSelectedDepressionIntoBuf(frameBuf, width, height, depIds, selectedId, depsById) {
     if (!selectedId || !depIds || !depsById) return;
     const sel = depsById.get(selectedId);
     if (!sel) return;
@@ -1591,8 +1603,7 @@
     }
 
     // Draw crisp gold contour around the selected depression (and soft amber around parent/children)
-    const img = ctx.getImageData(0, 0, width, height);
-    const d = img.data;
+    // directly into frameBuf before ctx.putImageData to avoid GPU readback and preserve spill paths.
     for (let r = 0; r < height; r++) {
       const rowOff = r * width;
       for (let c = 0; c < width; c++) {
@@ -1611,55 +1622,72 @@
         const p = idx * 4;
         if (id === selectedId) {
           if (isBorder) {
-            d[p] = 251;
-            d[p + 1] = 191;
-            d[p + 2] = 36;
-            d[p + 3] = 255;
+            frameBuf[p] = 251;
+            frameBuf[p + 1] = 191;
+            frameBuf[p + 2] = 36;
+            frameBuf[p + 3] = 255;
           } else {
-            d[p] = Math.min(255, Math.round(d[p] * 0.72 + 251 * 0.28));
-            d[p + 1] = Math.min(255, Math.round(d[p + 1] * 0.72 + 191 * 0.28));
-            d[p + 2] = Math.min(255, Math.round(d[p + 2] * 0.72 + 36 * 0.28));
+            frameBuf[p] = Math.min(255, Math.round(frameBuf[p] * 0.72 + 251 * 0.28));
+            frameBuf[p + 1] = Math.min(255, Math.round(frameBuf[p + 1] * 0.72 + 191 * 0.28));
+            frameBuf[p + 2] = Math.min(255, Math.round(frameBuf[p + 2] * 0.72 + 36 * 0.28));
           }
         } else if (isBorder) {
-          d[p] = 249;
-          d[p + 1] = 115;
-          d[p + 2] = 22;
-          d[p + 3] = 255;
+          frameBuf[p] = 249;
+          frameBuf[p + 1] = 115;
+          frameBuf[p + 2] = 22;
+          frameBuf[p + 3] = 255;
         }
       }
     }
-    ctx.putImageData(img, 0, 0);
+  }
 
+  function drawSelectedSpillPaths(ctx, width, height, selectedId, spillPaths) {
+    if (!selectedId || !Array.isArray(spillPaths)) return;
     // Highlight outgoing spill path from selected depression in vivid amber
     const spillScale = Math.max(1, Math.min(width, height) / 400);
-    if (Array.isArray(spillPaths)) {
-      for (const sp of spillPaths) {
-        if (sp.from_dep_id !== selectedId || !sp.cells || sp.cells.length < 2) continue;
-        ctx.save();
-        ctx.lineCap = "round";
-        ctx.lineJoin = "round";
-        ctx.beginPath();
-        ctx.moveTo(sp.cells[0][0] + 0.5, sp.cells[0][1] + 0.5);
-        for (let i = 1; i < sp.cells.length; i++) {
-          ctx.lineTo(sp.cells[i][0] + 0.5, sp.cells[i][1] + 0.5);
-        }
-        ctx.strokeStyle = "rgba(120, 53, 15, 0.9)";
-        ctx.lineWidth = 4.6 * spillScale;
-        ctx.stroke();
-        ctx.strokeStyle = "#fbbf24";
-        ctx.lineWidth = 2.4 * spillScale;
-        ctx.stroke();
-        ctx.restore();
+    for (const sp of spillPaths) {
+      if (sp.from_dep_id !== selectedId || !sp.cells || sp.cells.length < 2) continue;
+      ctx.save();
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.beginPath();
+      ctx.moveTo(sp.cells[0][0] + 0.5, sp.cells[0][1] + 0.5);
+      for (let i = 1; i < sp.cells.length; i++) {
+        ctx.lineTo(sp.cells[i][0] + 0.5, sp.cells[i][1] + 0.5);
       }
+      ctx.strokeStyle = "rgba(120, 53, 15, 0.9)";
+      ctx.lineWidth = 4.6 * spillScale;
+      ctx.stroke();
+      ctx.strokeStyle = "#fbbf24";
+      ctx.lineWidth = 2.4 * spillScale;
+      ctx.stroke();
+      ctx.restore();
     }
+  }
+
+  function prepareHidpiCanvas(canvas, defaultW, defaultH) {
+    const logicalW = Number(canvas.dataset.logicalWidth) || canvas.width || defaultW;
+    const logicalH = Number(canvas.dataset.logicalHeight) || canvas.height || defaultH;
+    if (!canvas.dataset.logicalWidth) {
+      canvas.dataset.logicalWidth = String(logicalW);
+      canvas.dataset.logicalHeight = String(logicalH);
+    }
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const targetW = Math.round(logicalW * dpr);
+    const targetH = Math.round(logicalH * dpr);
+    if (canvas.width !== targetW || canvas.height !== targetH) {
+      canvas.width = targetW;
+      canvas.height = targetH;
+    }
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return { ctx, w: logicalW, h: logicalH };
   }
 
   function renderRatingChart(points) {
     const canvas = $("lp-rating-chart");
     if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    const w = canvas.width;
-    const h = canvas.height;
+    const { ctx, w, h } = prepareHidpiCanvas(canvas, 420, 145);
     ctx.clearRect(0, 0, w, h);
     if (!points || points.length === 0) return;
 
@@ -1669,6 +1697,7 @@
     const fg = getComputedStyle(document.body).color || "#333";
     const maxD = Math.max(...points.map((p) => p.depth), 1e-6);
     const maxV = Math.max(...points.map((p) => p.volume), 1e-6);
+    const elevUnit = (player && player.elevUnit) || "";
 
     const xOf = (d) => pad.left + (d / maxD) * pw;
     const yOf = (v) => pad.top + ph * (1 - v / maxV);
@@ -1693,7 +1722,7 @@
     ctx.textBaseline = "top";
     for (const frac of [0, 0.5, 1]) {
       const d = maxD * frac;
-      ctx.fillText(`${d.toFixed(2)}m`, xOf(d), pad.top + ph + 5);
+      ctx.fillText(`${d.toFixed(2)}${elevUnit}`, xOf(d), pad.top + ph + 5);
     }
     ctx.textAlign = "left";
     ctx.textBaseline = "top";
@@ -1773,10 +1802,11 @@
     if (statsEl) {
       statsEl.innerHTML = "";
       const volUnit = volumeUnitFor(player.areaUnit);
+      const depthUnit = player.elevUnit ? ` ${player.elevUnit}` : "";
       const items = [
         ["Area", formatArea(d.area, player.areaUnit)],
         ["Volume", `${d.volume.toLocaleString(undefined, { maximumFractionDigits: 1 })} ${volUnit}`],
-        ["Max / Mean Depth", `${d.max_depth.toFixed(2)} / ${d.avg_depth.toFixed(2)} m`],
+        ["Max / Mean Depth", `${d.max_depth.toFixed(2)} / ${d.avg_depth.toFixed(2)}${depthUnit}`],
         ["Parent / Children", `${parentStr} / ${childrenStr}`],
         ["Circularity / HI", `${d.circularity.toFixed(2)} / ${d.hypsometric_integral.toFixed(2)}`],
         ["Rim Slope / Spill", `${d.rim_slope_deg.toFixed(1)}° / ${spillRunoff}`],
@@ -1979,6 +2009,17 @@
       }
     }
 
+    if (player.selectedDepId > 0) {
+      compositeSelectedDepressionIntoBuf(
+        frameBuf,
+        width,
+        height,
+        player.depIds,
+        player.selectedDepId,
+        player.depsById,
+      );
+    }
+
     const canvas = $("lp-player-canvas");
     if (canvas.width !== width || canvas.height !== height) {
       canvas.width = width;
@@ -1993,15 +2034,7 @@
       : 0;
 
     if (player.selectedDepId > 0) {
-      renderSelectedOverlay(
-        ctx,
-        width,
-        height,
-        player.depIds,
-        player.selectedDepId,
-        player.depsById,
-        spillPaths,
-      );
+      drawSelectedSpillPaths(ctx, width, height, player.selectedDepId, spillPaths);
     }
 
     const showBadges = $("lp-id-badges") ? $("lp-id-badges").checked : true;
@@ -2035,9 +2068,7 @@
     if (!player) return;
     const canvas = $("lp-chart");
     if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    const w = canvas.width;
-    const h = canvas.height;
+    const { ctx, w, h } = prepareHidpiCanvas(canvas, 420, 200);
     const { steps, stepIdx } = player;
     if (!steps.length) return;
 
@@ -2280,7 +2311,7 @@
         return ensureGifUrl();
       }
       const t0 = performance.now();
-      const gifBytes = simRef.encodeGif(150, opts.pingPong, 400, opts.showSpills);
+      const gifBytes = simRef.encodeGif(opts.delayMs, opts.pingPong, 400, opts.showSpills);
       if (currentSim !== simRef) {
         return null;
       }
@@ -2327,14 +2358,25 @@
     }
   }
 
-  async function runTreeGifExport(button) {
-    if (button) button.disabled = true;
+  function setTreeGifButtonsDisabled(disabled) {
+    const headerBtn = $("lp-tree-gif-btn");
+    if (headerBtn) headerBtn.disabled = disabled;
+    document.querySelectorAll('#lp-downloads button[data-tree-gif-btn="1"]').forEach((btn) => {
+      btn.disabled = disabled;
+    });
+  }
+
+  async function runTreeGifExport() {
+    if (treeGifExporting) return;
+    treeGifExporting = true;
+    setTreeGifButtonsDisabled(true);
     try {
       await exportDepressionTreeGif();
     } catch (e) {
       setStatus(`Depression tree GIF export failed: ${errMsg(e)}`, true);
     } finally {
-      if (button) button.disabled = false;
+      treeGifExporting = false;
+      setTreeGifButtonsDisabled(false);
     }
   }
 
@@ -2367,8 +2409,10 @@
       const treeBtn = document.createElement("button");
       treeBtn.type = "button";
       treeBtn.className = "md-button";
+      treeBtn.dataset.treeGifBtn = "1";
+      treeBtn.disabled = treeGifExporting;
       treeBtn.textContent = "Export Depression Tree GIF";
-      treeBtn.addEventListener("click", () => runTreeGifExport(treeBtn));
+      treeBtn.addEventListener("click", () => runTreeGifExport());
       el.appendChild(treeBtn);
     }
     for (const { label, filename, data, getData, mime } of files) {
@@ -2385,7 +2429,7 @@
             a.href = url;
             a.download = filename;
             a.click();
-            setTimeout(() => URL.revokeObjectURL(url), 1000);
+            setTimeout(() => URL.revokeObjectURL(url), 30000);
           } catch (e) {
             setStatus(`${label} export failed: ${errMsg(e)}`, true);
           }
@@ -2440,21 +2484,23 @@
         td.textContent = String(val);
         tr.appendChild(td);
       }
-      tr.tabIndex = 0;
-      tr.setAttribute("role", "button");
-      const activateRow = () => {
-        if (player) {
-          stopPlayer();
-          selectDepression(d.id);
-        }
-      };
-      tr.addEventListener("click", activateRow);
-      tr.addEventListener("keydown", (e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          activateRow();
-        }
-      });
+      if (player !== null) {
+        tr.tabIndex = 0;
+        tr.setAttribute("role", "button");
+        const activateRow = () => {
+          if (player) {
+            stopPlayer();
+            selectDepression(d.id);
+          }
+        };
+        tr.addEventListener("click", activateRow);
+        tr.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            activateRow();
+          }
+        });
+      }
       tbody.appendChild(tr);
     }
   }
@@ -2631,6 +2677,10 @@
         }
         renderSummary(summaryCards);
 
+        const requireSim = () => {
+          if (!currentSim) throw new Error("No active inundation simulation");
+          return currentSim;
+        };
         const downloadItems = [
           {
             label: "Export PNG Snapshot (Scale + Legend)",
@@ -2638,26 +2688,26 @@
             getData: () => {
               const showSpills = $("lp-spill-paths") ? $("lp-spill-paths").checked : true;
               const idx = player ? player.stepIdx : 0;
-              return sim.renderFramePng(idx, true, true, showSpills);
+              return requireSim().renderFramePng(idx, true, true, showSpills);
             },
             mime: "image/png",
           },
-          { label: "Depressions GeoJSON", filename: `${stem}_depressions.geojson`, data: sim.depressionsGeojson(), mime: "application/geo+json" },
-          { label: "Spill Flow Paths GeoJSON", filename: `${stem}_spill_paths.geojson`, getData: () => sim.spillPathsGeojson(), mime: "application/geo+json" },
-          { label: "Connectivity Graph JSON", filename: `${stem}_connectivity_graph.json`, getData: () => sim.connectivityGraphJson(), mime: "application/json" },
-          { label: "Connectivity GraphML", filename: `${stem}_connectivity_graph.graphml`, getData: () => sim.connectivityGraphml(), mime: "application/xml" },
-          { label: "Rating Curves CSV", filename: `${stem}_rating_curves.csv`, getData: () => sim.ratingCurvesCsv(), mime: "text/csv" },
-          { label: "Inundation Curve CSV", filename: `${stem}_inundation_curve.csv`, getData: () => sim.inundationCurveCsv(), mime: "text/csv" },
-          { label: "Depression Level GeoTIFF", filename: `${stem}_level.tif`, data: sim.levelTif(), mime: "image/tiff" },
-          { label: "Fill Time GeoTIFF", filename: `${stem}_fill_time.tif`, data: sim.fillTimeTif(), mime: "image/tiff" },
-          { label: "Catchment Hierarchy GeoTIFF", filename: `${stem}_catchment_hir.tif`, data: sim.catchmentHirTif(), mime: "image/tiff" },
-          { label: "Sink GeoTIFF", filename: `${stem}_sink.tif`, data: sim.sinkTif(), mime: "image/tiff" },
+          { label: "Depressions GeoJSON", filename: `${stem}_depressions.geojson`, getData: () => requireSim().depressionsGeojson(), mime: "application/geo+json" },
+          { label: "Spill Flow Paths GeoJSON", filename: `${stem}_spill_paths.geojson`, getData: () => requireSim().spillPathsGeojson(), mime: "application/geo+json" },
+          { label: "Connectivity Graph JSON", filename: `${stem}_connectivity_graph.json`, getData: () => requireSim().connectivityGraphJson(), mime: "application/json" },
+          { label: "Connectivity GraphML", filename: `${stem}_connectivity_graph.graphml`, getData: () => requireSim().connectivityGraphml(), mime: "application/xml" },
+          { label: "Rating Curves CSV", filename: `${stem}_rating_curves.csv`, getData: () => requireSim().ratingCurvesCsv(), mime: "text/csv" },
+          { label: "Inundation Curve CSV", filename: `${stem}_inundation_curve.csv`, getData: () => requireSim().inundationCurveCsv(), mime: "text/csv" },
+          { label: "Depression Level GeoTIFF", filename: `${stem}_level.tif`, getData: () => requireSim().levelTif(), mime: "image/tiff" },
+          { label: "Fill Time GeoTIFF", filename: `${stem}_fill_time.tif`, getData: () => requireSim().fillTimeTif(), mime: "image/tiff" },
+          { label: "Catchment Hierarchy GeoTIFF", filename: `${stem}_catchment_hir.tif`, getData: () => requireSim().catchmentHirTif(), mime: "image/tiff" },
+          { label: "Sink GeoTIFF", filename: `${stem}_sink.tif`, getData: () => requireSim().sinkTif(), mime: "image/tiff" },
         ];
         if (fsmMassBalance && typeof sim.fsmBasinsCsv === "function") {
           const fsmItem = {
             label: "FSM Basins CSV",
             filename: `${stem}_fsm_basins.csv`,
-            getData: () => sim.fsmBasinsCsv(),
+            getData: () => requireSim().fsmBasinsCsv(),
             mime: "text/csv",
           };
           const curveIdx = downloadItems.findIndex((item) => item.label === "Inundation Curve CSV");
@@ -2745,7 +2795,7 @@
         setStatus(`Analysis failed: ${errMsg(e)}`, true);
       }
     } finally {
-      if ($("lp-run")) {
+      if (token === runToken && $("lp-run")) {
         $("lp-run").disabled = !loadedFile;
       }
     }
@@ -2820,7 +2870,9 @@
     if (sampleClsa) sampleClsa.addEventListener("click", () => loadSample("clsa"));
     $("lp-sample-dsm").addEventListener("click", () => loadSample("dsm"));
     $("lp-file").addEventListener("change", (e) => {
-      if (e.target.files[0]) loadFile(e.target.files[0]);
+      const file = e.target.files[0];
+      e.target.value = "";
+      if (file) loadFile(file);
     });
 
     // Lazy GIF preview toggled by disclosure button under Downloads
@@ -2869,7 +2921,7 @@
     }
     const treeGifBtn = $("lp-tree-gif-btn");
     if (treeGifBtn) {
-      treeGifBtn.addEventListener("click", () => runTreeGifExport(treeGifBtn));
+      treeGifBtn.addEventListener("click", () => runTreeGifExport());
     }
     const treeRegionSel = $("lp-tree-region");
     if (treeRegionSel) {
@@ -2931,6 +2983,7 @@
       if (player && player.playing) {
         startPlayer();
       }
+      refreshGifOptions();
     });
     const inspectorClear = $("lp-inspector-clear");
     if (inspectorClear) {
@@ -3059,11 +3112,12 @@
       const rect = e.currentTarget.getBoundingClientRect();
       const padLeft = 46;
       const padRight = 16;
-      const scaleX = e.currentTarget.width / rect.width;
+      const logicalW = Number(e.currentTarget.dataset.logicalWidth) || e.currentTarget.width;
+      const scaleX = logicalW / rect.width;
       const x = (e.clientX - rect.left) * scaleX;
       const frac = Math.min(
         1,
-        Math.max(0, (x - padLeft) / (e.currentTarget.width - padLeft - padRight)),
+        Math.max(0, (x - padLeft) / (logicalW - padLeft - padRight)),
       );
       stopPlayer();
       const maxT = Math.max(player.steps[player.steps.length - 1].time_hours, 1e-6);

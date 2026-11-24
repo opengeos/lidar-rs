@@ -4,7 +4,8 @@ description = "Python bindings for lidar-rs (pure-Rust port of opengeos/lidar wi
 publish = false
 version = "0.5.0"
 edition = "2024"
-license = "MIT"
+# Compiled wheel bundles richdem (GPL-3.0-only); lidar-rs source code itself is MIT.
+license = "GPL-3.0-only"
 rust-version = "1.90"
 repository = "https://github.com/opengeos/lidar-rs"
 
@@ -19,3 +20,8 @@ lidar = { path = "../crates/lidar", features = ["parallel", "pointcloud", "serde
 lidar-cli = { path = "../crates/lidar-cli", features = ["download"] }
 pyo3 = { version = "0.29", features = ["extension-module", "abi3-py311"] }
 numpy = "0.29"
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1

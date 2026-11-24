@@ -7,7 +7,8 @@ name = "lidar-rs"
 dynamic = ["version"]
 description = "Pure-Rust port of opengeos/lidar for delineating nested surface depressions and mounts in DEMs (powered by terrio and richdem)"
 readme = "README.md"
-license = "MIT"
+# Compiled wheel bundles richdem (GPL-3.0-only); lidar-rs source code itself is MIT.
+license = "GPL-3.0-only"
 license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.11"
 authors = [
@@ -18,7 +19,7 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
     "Programming Language :: Python :: 3",
     "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: GIS",
@@ -50,3 +51,6 @@ testpaths = ["tests"]
 
 [tool.ruff]
 target-version = "py311"
+
+[tool.ruff.lint.isort]
+known-first-party = ["lidar_rs"]
