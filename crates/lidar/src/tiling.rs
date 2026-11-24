@@ -205,8 +205,7 @@ fn process_one_tile(
         min_cell: (usize, usize),
         intersects_core: bool,
         touches_internal_pad_edge: bool,
-        in_seam_band: bool,
-        cells: Vec<usize>,
+        seam_cells: Vec<usize>,
     }
     let mut reg_acc: HashMap<u32, RegAcc> = HashMap::new();
     for r in 0..th {
@@ -226,8 +225,7 @@ fn process_one_tile(
                     min_cell: (gr, gc),
                     intersects_core: false,
                     touches_internal_pad_edge: false,
-                    in_seam_band: false,
-                    cells: Vec::new(),
+                    seam_cells: Vec::new(),
                 });
                 e.count += 1;
                 if gr >= win.core_r0 && gr < win.core_r1 && gc >= win.core_c0 && gc < win.core_c1 {
@@ -237,10 +235,11 @@ fn process_one_tile(
                 if on_pad_r || on_pad_c {
                     e.touches_internal_pad_edge = true;
                 }
+                // Only cells in this tile's seam band can appear inside a neighboring tile's
+                // padded window; interior-core cells are never shared across tiles.
                 if gr < inner_r0 || gr >= inner_r1 || gc < inner_c0 || gc >= inner_c1 {
-                    e.in_seam_band = true;
+                    e.seam_cells.push(gr * full_w + gc);
                 }
-                e.cells.push(gr * full_w + gc);
                 // Row-major scan visits `(gr, gc)` in strictly ascending order, so strict `<`
                 // deterministically retains the earliest pixel on elevation ties.
                 if z.is_finite() && !z.rd_eq(sink_nd) && z < e.min_elev {
@@ -266,17 +265,12 @@ fn process_one_tile(
         if acc.count == 0 {
             continue;
         }
-        let seam_cells = if acc.in_seam_band {
-            acc.cells
-        } else {
-            Vec::new()
-        };
         out.push(TileRegionOutput {
             min_cell: acc.min_cell,
             total_cells: acc.count,
             intersects_core: acc.intersects_core,
             touches_internal_pad_edge: acc.touches_internal_pad_edge,
-            seam_cells,
+            seam_cells: acc.seam_cells,
             depressions: reg_deps,
         });
     }

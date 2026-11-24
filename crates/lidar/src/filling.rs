@@ -329,6 +329,10 @@ pub fn extract_sinks_with_filled_in_memory(
         let shifted = min_sink_z - 9999.0;
         if shifted.is_finite() && shifted < min_sink_z {
             shifted
+        } else if -f64::MAX < min_sink_z {
+            -f64::MAX
+        } else if f64::MAX > max_sink_z {
+            f64::MAX
         } else {
             f64::NAN
         }

@@ -748,13 +748,18 @@ fn core_numerical_and_edge_case_regressions() {
     }
 
     // 8b. SCS Type II hyetograph must not emit an extra 1e-9 overshoot step when duration/dt
-    // slightly exceeds an integer in IEEE 754 (0.7 / 0.1 = 7.000000000000001).
+    // slightly exceeds an integer in IEEE 754 (0.7 / 0.1 = 7.000000000000001), and must reject
+    // sub-epsilon durations rather than returning an empty vector.
     let hyeto = scs_type2_hyetograph(50.0, 0.7, 0.1).unwrap();
     assert_eq!(hyeto.len(), 7, "got hyeto={hyeto:?}");
     let total_t: f64 = hyeto.iter().map(|&(dt, _)| dt).sum();
     let total_mm: f64 = hyeto.iter().map(|&(dt, cm_h)| dt * cm_h * 10.0).sum();
     assert!((total_t - 0.7).abs() < 1e-9);
     assert!((total_mm - 50.0).abs() < 1e-6);
+    assert!(
+        scs_type2_hyetograph(50.0, 1e-13, 1e-13).is_err(),
+        "sub-epsilon duration_h must return InvalidArgument instead of empty vec"
+    );
 
     // 8c. High-elevation numerical stability (Chan variance & z_min-shifted volumes).
     let base_z = 1e8f64;
@@ -881,13 +886,21 @@ fn core_numerical_and_edge_case_regressions() {
         delineate_depressions_tiled(&frac_dem_path, tmp.path().join("bad3"), &bad_int).is_err()
     );
 
-    // Build a 32x20 DEM with a basin straddling the tile seam at col 16 (cols 13..=18, rows 7..=12).
+    // Build a 32x32 DEM (2x2 tiles of size 16 with overlap 6) containing:
+    // 1. A basin straddling all 4 tiles right at the corner seam (rows 13..=18, cols 13..=18),
+    // 2. An interior-only basin strictly inside tile (0, 0) (rows 3..=6, cols 3..=6).
     let tw = 32usize;
-    let th = 20usize;
+    let th = 32usize;
     let mut seam_z = vec![20.0f64; tw * th];
-    for r in 7..=12 {
+    for r in 13..=18 {
         for c in 13..=18 {
-            seam_z[r * tw + c] = 15.0 + ((r as i32 - 9).abs() + (c as i32 - 16).abs()) as f64 * 0.2;
+            seam_z[r * tw + c] =
+                15.0 + ((r as i32 - 16).abs() + (c as i32 - 16).abs()) as f64 * 0.2;
+        }
+    }
+    for r in 3..=6 {
+        for c in 3..=6 {
+            seam_z[r * tw + c] = 15.0 + ((r as i32 - 4).abs() + (c as i32 - 4).abs()) as f64 * 0.2;
         }
     }
     let seam_dem = make_dem(
@@ -917,8 +930,8 @@ fn core_numerical_and_edge_case_regressions() {
     assert_eq!(tiled_res.num_tiles, 4);
     assert_eq!(
         tiled_res.depressions.len(),
-        1,
-        "seam-straddling basin must appear exactly once, got {:?}",
+        2,
+        "2x2 corner-straddling basin + interior basin must appear exactly once each, got {:?}",
         tiled_res.depressions
     );
 

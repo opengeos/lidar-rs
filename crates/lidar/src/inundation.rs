@@ -1326,6 +1326,11 @@ pub fn scs_type2_hyetograph(
         prev_t = t;
         prev_frac = frac;
     }
+    if out.is_empty() {
+        return Err(Error::InvalidArgument(format!(
+            "duration_h={duration_h} is too short to produce a hyetograph step"
+        )));
+    }
     Ok(out)
 }
 
