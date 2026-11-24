@@ -58,13 +58,11 @@ fn write_array2d_tif<T: DemNum>(arr: &Array2D<T>, name: &str) -> Result<Vec<u8>,
     write_raster_bytes(&ds, name, &opts).map_err(to_js_err)
 }
 
-/// Reprojects a vector layer to RFC 7946 WGS 84 (`EPSG:4326`) when its source CRS is known,
-/// omitting the deprecated `crs` member once reprojected. Falls back cleanly when the input
-/// raster has no CRS metadata.
-fn reproject_layer_to_wgs84_if_known(
-    mut layer: Layer,
-    fallback_projection: &str,
-) -> Result<Layer, JsValue> {
+/// Reprojects a vector layer to RFC 7946 WGS 84 (`EPSG:4326`) when its source CRS is known
+/// and reprojection succeeds, omitting the deprecated `crs` member once reprojected. Falls
+/// back cleanly to the original layer when the input raster has no CRS metadata or uses an
+/// unrecognized local CRS.
+fn reproject_layer_to_wgs84_if_known(mut layer: Layer, fallback_projection: &str) -> Layer {
     if layer.crs.is_none() {
         let trimmed = fallback_projection.trim();
         if !trimmed.is_empty()
@@ -75,14 +73,17 @@ fn reproject_layer_to_wgs84_if_known(
     }
     let src_srs = terrio::crs::SpatialRef::from_layer(&layer);
     if !src_srs.is_unknown() {
-        if src_srs.epsg != Some(4326) {
-            let wgs84 = terrio::crs::SpatialRef::from_epsg(4326).map_err(to_js_err)?;
-            layer = terrio::vector::reproject_layer(&layer, &wgs84).map_err(to_js_err)?;
+        if src_srs.epsg == Some(4326) {
+            // RFC 7946 omits the deprecated `crs` member for WGS 84 coordinates.
+            layer.crs = None;
+        } else if let Ok(wgs84) = terrio::crs::SpatialRef::from_epsg(4326)
+            && let Ok(mut reprojected) = terrio::vector::reproject_layer(&layer, &wgs84)
+        {
+            reprojected.crs = None;
+            return reprojected;
         }
-        // RFC 7946 omits the deprecated `crs` member for WGS 84 coordinates.
-        layer.crs = None;
     }
-    Ok(layer)
+    layer
 }
 
 fn polygonize_array_to_geojson<T: DemNum>(
@@ -99,7 +100,7 @@ fn polygonize_array_to_geojson<T: DemNum>(
         mask: None,
     };
     let layer = terrio_polygonize(&ds, &opts).map_err(to_js_err)?;
-    let layer = reproject_layer_to_wgs84_if_known(layer, &arr.projection)?;
+    let layer = reproject_layer_to_wgs84_if_known(layer, &arr.projection);
     let bytes = write_vector_bytes(&[layer], "features.geojson", &VectorWriteOptions::default())
         .map_err(to_js_err)?;
     String::from_utf8(bytes).map_err(to_js_err)
@@ -113,17 +114,26 @@ fn feature_positive_id(feat: &Feature) -> Option<u32> {
     }
 }
 
-fn polygonize_sinks_to_geojson(
-    region: &Array2D<i32>,
-    depressions: &[SinkDepression],
-) -> Result<String, JsValue> {
-    let ds = array2d_to_dataset(region).map_err(to_js_err)?;
+fn polygonize_with_attributes_to_geojson<A, FId, FAttrs>(
+    id_raster: &Array2D<i32>,
+    layer_name: &str,
+    id_field_name: &str,
+    fields: &[(&str, FieldType)],
+    items: &[A],
+    item_id: FId,
+    build_attrs: FAttrs,
+) -> Result<String, JsValue>
+where
+    FId: Fn(&A) -> u32,
+    FAttrs: Fn(&A) -> Vec<FieldValue>,
+{
+    let ds = array2d_to_dataset(id_raster).map_err(to_js_err)?;
     let poly_layer = terrio_polygonize(
         &ds,
         &PolygonizeOptions {
             band: 0,
-            field_name: "region_id".to_string(),
-            layer_name: "sinks".to_string(),
+            field_name: id_field_name.to_string(),
+            layer_name: layer_name.to_string(),
             connectedness8: false,
             ignore_nodata: false,
             mask: None,
@@ -131,11 +141,39 @@ fn polygonize_sinks_to_geojson(
     )
     .map_err(to_js_err)?;
 
-    let dep_map: HashMap<u32, &SinkDepression> =
-        depressions.iter().map(|d| (d.region_id, d)).collect();
-    let mut layer = Layer::new("sinks".to_string()).with_geom_type(GeometryType::Polygon);
+    let item_map: HashMap<u32, &A> = items.iter().map(|item| (item_id(item), item)).collect();
+    let mut layer = Layer::new(layer_name.to_string()).with_geom_type(GeometryType::Polygon);
     layer.crs = poly_layer.crs.clone();
-    for (name, ftype) in [
+    for &(name, ftype) in fields {
+        layer.schema.add_field(FieldDef::new(name, ftype));
+    }
+
+    for feat in poly_layer.features {
+        let Some(id) = feature_positive_id(&feat) else {
+            continue;
+        };
+        let Some(item) = item_map.get(&id) else {
+            continue;
+        };
+        layer.features.push(Feature {
+            fid: (layer.features.len() + 1) as u64,
+            geometry: feat.geometry,
+            attributes: build_attrs(item),
+        });
+    }
+
+    let layer = reproject_layer_to_wgs84_if_known(layer, &id_raster.projection);
+    let filename = format!("{layer_name}.geojson");
+    let bytes = write_vector_bytes(&[layer], &filename, &VectorWriteOptions::default())
+        .map_err(to_js_err)?;
+    String::from_utf8(bytes).map_err(to_js_err)
+}
+
+fn polygonize_sinks_to_geojson(
+    region: &Array2D<i32>,
+    depressions: &[SinkDepression],
+) -> Result<String, JsValue> {
+    const FIELDS: &[(&str, FieldType)] = &[
         ("region_id", FieldType::Integer),
         ("count", FieldType::Integer),
         ("area", FieldType::Float),
@@ -151,21 +189,16 @@ fn polygonize_sinks_to_geojson(
         ("eccentricity", FieldType::Float),
         ("orientation", FieldType::Float),
         ("area_bbox_ratio", FieldType::Float),
-    ] {
-        layer.schema.add_field(FieldDef::new(name, ftype));
-    }
-
-    for feat in poly_layer.features {
-        let Some(rid) = feature_positive_id(&feat) else {
-            continue;
-        };
-        let Some(d) = dep_map.get(&rid) else {
-            continue;
-        };
-        layer.features.push(Feature {
-            fid: (layer.features.len() + 1) as u64,
-            geometry: feat.geometry,
-            attributes: vec![
+    ];
+    polygonize_with_attributes_to_geojson(
+        region,
+        "sinks",
+        "region_id",
+        FIELDS,
+        depressions,
+        |d| d.region_id,
+        |d| {
+            vec![
                 FieldValue::Integer(d.region_id as i64),
                 FieldValue::Integer(d.count as i64),
                 FieldValue::Float(d.area),
@@ -181,38 +214,16 @@ fn polygonize_sinks_to_geojson(
                 FieldValue::Float(d.eccentricity),
                 FieldValue::Float(d.orientation),
                 FieldValue::Float(d.area_bbox_ratio),
-            ],
-        });
-    }
-
-    let layer = reproject_layer_to_wgs84_if_known(layer, &region.projection)?;
-    let bytes = write_vector_bytes(&[layer], "sinks.geojson", &VectorWriteOptions::default())
-        .map_err(to_js_err)?;
-    String::from_utf8(bytes).map_err(to_js_err)
+            ]
+        },
+    )
 }
 
 fn polygonize_depressions_to_geojson(
     depression_id: &Array2D<i32>,
     depressions: &[NestedDepression],
 ) -> Result<String, JsValue> {
-    let ds = array2d_to_dataset(depression_id).map_err(to_js_err)?;
-    let poly_layer = terrio_polygonize(
-        &ds,
-        &PolygonizeOptions {
-            band: 0,
-            field_name: "id".to_string(),
-            layer_name: "depressions".to_string(),
-            connectedness8: false,
-            ignore_nodata: false,
-            mask: None,
-        },
-    )
-    .map_err(to_js_err)?;
-
-    let dep_map: HashMap<u32, &NestedDepression> = depressions.iter().map(|d| (d.id, d)).collect();
-    let mut layer = Layer::new("depressions".to_string()).with_geom_type(GeometryType::Polygon);
-    layer.crs = poly_layer.crs.clone();
-    for (name, ftype) in [
+    const FIELDS: &[(&str, FieldType)] = &[
         ("id", FieldType::Integer),
         ("parent_id", FieldType::Integer),
         ("level", FieldType::Integer),
@@ -236,21 +247,16 @@ fn polygonize_depressions_to_geojson(
         ("hypsometric_integral", FieldType::Float),
         ("rim_slope_deg", FieldType::Float),
         ("artifact_flag", FieldType::Integer),
-    ] {
-        layer.schema.add_field(FieldDef::new(name, ftype));
-    }
-
-    for feat in poly_layer.features {
-        let Some(did) = feature_positive_id(&feat) else {
-            continue;
-        };
-        let Some(d) = dep_map.get(&did) else {
-            continue;
-        };
-        layer.features.push(Feature {
-            fid: (layer.features.len() + 1) as u64,
-            geometry: feat.geometry,
-            attributes: vec![
+    ];
+    polygonize_with_attributes_to_geojson(
+        depression_id,
+        "depressions",
+        "id",
+        FIELDS,
+        depressions,
+        |d| d.id,
+        |d| {
+            vec![
                 FieldValue::Integer(d.id as i64),
                 FieldValue::Integer(d.parent_id as i64),
                 FieldValue::Integer(d.level as i64),
@@ -274,18 +280,9 @@ fn polygonize_depressions_to_geojson(
                 FieldValue::Float(d.hypsometric_integral),
                 FieldValue::Float(d.rim_slope_deg),
                 FieldValue::Integer(i64::from(d.artifact_flag)),
-            ],
-        });
-    }
-
-    let layer = reproject_layer_to_wgs84_if_known(layer, &depression_id.projection)?;
-    let bytes = write_vector_bytes(
-        &[layer],
-        "depressions.geojson",
-        &VectorWriteOptions::default(),
+            ]
+        },
     )
-    .map_err(to_js_err)?;
-    String::from_utf8(bytes).map_err(to_js_err)
 }
 
 fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
@@ -545,7 +542,7 @@ pub fn polygonize_to_geojson(
         mask: None,
     };
     let layer = terrio_polygonize(&ds, &opts).map_err(to_js_err)?;
-    let layer = reproject_layer_to_wgs84_if_known(layer, "")?;
+    let layer = reproject_layer_to_wgs84_if_known(layer, "");
     let out = write_vector_bytes(&[layer], "features.geojson", &VectorWriteOptions::default())
         .map_err(to_js_err)?;
     String::from_utf8(out).map_err(to_js_err)

@@ -7,6 +7,9 @@
 # - `wbraster` never calls `ZipArchive::extract` or `ZipStreamReader::extract`,
 #   and only enables the `deflate` feature (not `aes-crypto` or `legacy-zip`).
 # - `wbraster`'s Zarr reader is unreachable without `TERRIO_WBRASTER_FALLBACK=YES`.
+# - Matches upstream `opengeos/terrio`'s `.cargo/audit.toml`; the `wasm32` build
+#   (`js/Cargo.toml`) enables `terrio` with `default-features = false, features = ["geotiff"]`
+#   (no Zarr or zip sensor bundles).
 #
 # Remove these entries once `terrio` upgrades past `wbraster 0.2.1` (or drops
 # `wbraster`). The `audit` CI job enforces that these exact advisories only

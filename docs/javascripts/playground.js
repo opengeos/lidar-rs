@@ -71,10 +71,14 @@
     if (idx !== -1) activeObjectUrls.splice(idx, 1);
   }
 
+  function readSpeedMs() {
+    return Math.max(50, Math.min(1000, parseInt($("lp-speed")?.value || "200", 10) || 200));
+  }
+
   function currentGifOptions() {
     const pingPong = $("lp-pingpong") ? $("lp-pingpong").checked : true;
     const showSpills = $("lp-spill-paths") ? $("lp-spill-paths").checked : true;
-    const delayMs = Math.max(50, Math.min(1000, parseInt($("lp-speed")?.value || "150", 10) || 150));
+    const delayMs = readSpeedMs();
     return {
       pingPong,
       showSpills,
@@ -1300,7 +1304,7 @@
       playerRef.treeRegions[0];
     const pingPong = $("lp-pingpong") ? $("lp-pingpong").checked : true;
     const showOutline = $("lp-tree-outline") ? $("lp-tree-outline").checked : true;
-    const delayMs = Math.max(60, Math.min(400, parseInt($("lp-speed")?.value || "150", 10) || 150));
+    const delayMs = readSpeedMs();
 
     setStatus("Encoding animated depression tree GIF in browser…");
     await nextTick();
@@ -2174,7 +2178,7 @@
     player.playing = true;
     const btn = $("lp-play-btn");
     if (btn) btn.textContent = "Pause";
-    const delayMs = parseInt($("lp-speed")?.value || "200", 10) || 200;
+    const delayMs = readSpeedMs();
     playTimer = setInterval(stepPlayer, delayMs);
   }
 

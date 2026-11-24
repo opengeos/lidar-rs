@@ -57,8 +57,8 @@ function firstPolygonCoord(geom) {
 
 function assertWgs84Coord([lon, lat], label) {
   assert.ok(
-    lon >= -180 && lon <= 180 && lat >= -90 && lat <= 90,
-    `${label}: expected WGS 84 lon/lat coordinates, got [${lon}, ${lat}]`,
+    lon >= -95 && lon <= -92 && lat >= 45 && lat <= 48,
+    `${label}: expected Minnesota WGS 84 [lon, lat] in [-95..-92, 45..48], got [${lon}, ${lat}]`,
   );
 }
 

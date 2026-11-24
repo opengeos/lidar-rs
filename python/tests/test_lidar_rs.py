@@ -534,11 +534,12 @@ def test_file_filters_return_modes_and_non_contiguous(tmp_path: Path):
     assert isinstance(mean_arr, np.ndarray)
     assert mean_arr.shape == (400, 400)
 
-    # Non-contiguous (Fortran-ordered / strided) array works identically to contiguous
+    # Non-contiguous (Fortran-ordered) array passed directly to Rust exercises from_py_array2 fallback
     base = np.arange(64, dtype=np.float64).reshape((8, 8))
     f_order = np.asfortranarray(base)
-    c_out = lidar_rs.MeanFilter(base, kernel_size=3)
-    f_out = lidar_rs.MeanFilter(f_order, kernel_size=3)
+    assert not f_order.flags.c_contiguous
+    c_out = lidar_rs._lidar_rs.mean_filter_array(base, 3, None)
+    f_out = lidar_rs._lidar_rs.mean_filter_array(f_order, 3, None)
     np.testing.assert_allclose(c_out, f_out)
 
 
