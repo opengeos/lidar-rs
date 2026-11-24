@@ -369,7 +369,7 @@ pub fn extract_sink_labels_from_raster(
         if dz.is_finite() && (v - dz).abs() <= 1e-9 {
             matches_dem_count += 1;
         }
-        if all_pos_int {
+        if all_pos_int && v != 0.0 {
             if v < 1.0 || v.fract() != 0.0 || v > u32::MAX as f64 {
                 all_pos_int = false;
             } else {

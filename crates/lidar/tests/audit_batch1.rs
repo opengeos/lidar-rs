@@ -795,8 +795,8 @@ fn core_numerical_and_edge_case_regressions() {
         hi_recs[0].volume
     );
 
-    // 8d. 1-pixel sink preservation & coastal integer elevation bands {1.0, 2.0, 3.0} in
-    // extract_sink_labels_from_raster.
+    // 8d. 1-pixel sink preservation, coastal integer elevation bands {1.0, 2.0, 3.0}, and
+    // 0-background dense label rasters whose declared NoData is not 0.0 (e.g. -9999.0).
     let mut coastal_dem_data = vec![5.0f64; 25];
     coastal_dem_data[6] = 1.0;
     coastal_dem_data[7] = 2.0;
@@ -828,6 +828,37 @@ fn core_numerical_and_edge_case_regressions() {
     assert_eq!(clabels[7], clabels[8]);
     assert!(clabels[6] > 0);
     assert!(clabels[18] > 0 && clabels[18] != clabels[6]);
+
+    // 0-background dense label raster (0/1/2) with declared NoData = -9999.0 must keep 0 as
+    // background and preserve dense labels 1 and 2 instead of merging 0 cells into foreground.
+    let label_dem = make_dem(
+        5,
+        5,
+        vec![20.0; 25],
+        -9999.0,
+        [0.0, 1.0, 0.0, 5.0, 0.0, -1.0],
+    );
+    let mut label_mask_data = vec![0.0f64; 25];
+    label_mask_data[6] = 1.0;
+    label_mask_data[7] = 1.0;
+    label_mask_data[18] = 2.0;
+    let label_mask = make_dem(
+        5,
+        5,
+        label_mask_data,
+        -9999.0,
+        [0.0, 1.0, 0.0, 5.0, 0.0, -1.0],
+    );
+    let mlabels = extract_sink_labels_from_raster(&label_dem, &label_mask).unwrap();
+    assert_eq!(mlabels[0], 0, "0.0 background cell must remain label 0");
+    assert_eq!(mlabels[6], 1);
+    assert_eq!(mlabels[7], 1);
+    assert_eq!(mlabels[18], 2);
+    assert_eq!(
+        mlabels.iter().filter(|&&l| l > 0).count(),
+        3,
+        "only the 3 labeled foreground pixels should be non-zero"
+    );
 
     // 8e. File-based `delineate_catchment_hierarchy` saves `f64` catchment_hir.tif preserving
     // fractional areas (0.25 m^2 cell area).
@@ -982,6 +1013,42 @@ fn core_numerical_and_edge_case_regressions() {
     let row_deps = delineate_depressions_in_memory(&row_sink, 0, 0.0, 0.5).unwrap();
     assert_eq!(row_deps.depressions.len(), 1);
     assert_eq!(row_deps.depressions[0].count, 3);
+
+    // `min_depth == 0.0` at `elev == min_elev`:
+    // (a) Single flat-bottom bowl must NOT create a spurious zero-depth child.
+    let mut single_bowl = vec![12.0f64; 25];
+    for r in 1..4 {
+        for c in 1..4 {
+            single_bowl[r * 5 + c] = 11.0;
+        }
+    }
+    single_bowl[2 * 5 + 2] = 10.0;
+    let single_sink = make_dem(5, 5, single_bowl, 0.0, [0.0, 1.0, 0.0, 5.0, 0.0, -1.0]);
+    let single_deps = delineate_depressions_in_memory(&single_sink, 0, 0.0, 0.5).unwrap();
+    assert_eq!(
+        single_deps.depressions.len(),
+        1,
+        "single flat-bottom bowl with min_depth=0.0 must not spawn a spurious zero-depth child"
+    );
+
+    // (b) Compound basin with two disconnected flat-bottom sub-bowls at z == min_elev (10.0)
+    // separated by a 10.5 saddle inside an 11.0 rim MUST split into 1 parent + 2 children.
+    let mut twin_flat = vec![11.0f64; 3 * 7];
+    // Left 1x2 flat floor at cols 1..=2, row 1; saddle 10.5 at col 3; right 1x2 flat floor at cols 4..=5.
+    twin_flat[7 + 1] = 10.0;
+    twin_flat[7 + 2] = 10.0;
+    twin_flat[7 + 3] = 10.5;
+    twin_flat[7 + 4] = 10.0;
+    twin_flat[7 + 5] = 10.0;
+    let twin_sink = make_dem(7, 3, twin_flat, 0.0, [0.0, 1.0, 0.0, 3.0, 0.0, -1.0]);
+    let twin_deps = delineate_depressions_in_memory(&twin_sink, 1, 0.0, 0.5).unwrap();
+    assert_eq!(
+        twin_deps.depressions.len(),
+        3,
+        "two disconnected flat-bottom sub-bowls at z == min_elev must split when min_depth == 0.0, got {:?}",
+        twin_deps.depressions
+    );
+    assert_eq!(twin_deps.max_level, 2);
 
     // 8h. `region.rs`: NaN elevation guarded + anisotropic perimeter exactness.
     let labels_4x4 = vec![1u32; 16];
