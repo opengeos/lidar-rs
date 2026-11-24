@@ -27,8 +27,11 @@ done
 
 ## Documentation Figures & Demos
 
-All screenshots, comparison figures, and animated GIFs embedded in this documentation are hosted under `https://files.opengeos.org/lidar/images/`:
+All screenshots, comparison figures, and animated GIFs embedded in this documentation are hosted under `https://files.opengeos.org/` and `https://files.opengeos.org/lidar/images/`:
 
+- [depression_hierarchy.webp](https://files.opengeos.org/depression_hierarchy.webp): Nested depression hierarchy overview (Levels 1-5) and corresponding depression tree graph with spill elevations and volumes.
+- [inundation_tree_demo.gif](https://files.opengeos.org/inundation_tree_demo.gif): Synchronized WebAssembly Playground animation showing rising/falling surface inundation, inundation curve, numbered ID badges, and progressive bottom-up depression tree construction.
+- [depression_tree.gif](https://files.opengeos.org/depression_tree.gif): Standalone animated depression tree graph exported directly from the WebAssembly Playground.
 - [inundation_spill_demo.gif](https://files.opengeos.org/lidar/images/inundation_spill_demo.gif): Pure-Rust shaded-relief inundation animation with overland spill paths, scale bar, and legend.
 - [publication_frame_spill_paths.png](https://files.opengeos.org/lidar/images/publication_frame_spill_paths.png): Single publication-ready PNG snapshot exported by `lidar export-frames`.
 - [playground_inspector.png](https://files.opengeos.org/lidar/images/playground_inspector.png): Interactive WebAssembly Playground showing Depression Inspector and Stage-Volume Rating Curve.
