@@ -1,6 +1,47 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
-  <rect width="64" height="64" rx="14" fill="#0f766e"/>
-  <ellipse cx="32" cy="34" rx="22" ry="15" stroke="#ccfbf1" stroke-width="2.5"/>
-  <ellipse cx="32" cy="34" rx="14" ry="9.5" stroke="#5eead4" stroke-width="2.5"/>
-  <ellipse cx="32" cy="34" rx="6.5" ry="4.5" fill="#f97316"/>
+  <defs>
+    <linearGradient id="bg" x1="4" y1="4" x2="60" y2="60" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0d4f4c"/>
+      <stop offset="100%" stop-color="#0f766e"/>
+    </linearGradient>
+    <linearGradient id="pool" x1="-26" y1="0" x2="26" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#5eead4" stop-opacity="0.26"/>
+      <stop offset="100%" stop-color="#ccfbf1" stop-opacity="0.14"/>
+    </linearGradient>
+    <linearGradient id="core" x1="-16" y1="6" x2="16" y2="-6" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ea580c"/>
+      <stop offset="100%" stop-color="#fb923c"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded deep-teal badge -->
+  <rect x="0.75" y="0.75" width="62.5" height="62.5" rx="13.5" fill="url(#bg)" stroke="#5eead4" stroke-opacity="0.24" stroke-width="1.5"/>
+
+  <!-- Two nested depressions merging inside a shared level-set contour -->
+  <g transform="translate(32 32) rotate(-36)">
+    <!-- Level 2: Merged outer contour with saddle pinch -->
+    <path
+      d="M -25.0 0
+         C -25.0 -9.8, -18.2 -15.2, -10.5 -15.2
+         C -4.2 -15.2, -1.6 -9.6, 2.2 -9.6
+         C 5.6 -9.6, 8.0 -13.4, 13.0 -13.4
+         C 20.0 -13.4, 25.0 -8.2, 25.0 0
+         C 25.0 8.2, 20.0 13.4, 13.0 13.4
+         C 8.0 13.4, 5.6 9.6, 2.2 9.6
+         C -1.6 9.6, -4.2 15.2, -10.5 15.2
+         C -18.2 15.2, -25.0 9.8, -25.0 0 Z"
+      fill="url(#pool)"
+      stroke="#ccfbf1"
+      stroke-width="2.6"
+      stroke-linejoin="round"
+    />
+
+    <!-- Level 1: Two distinct inner depression contours meeting across the saddle -->
+    <circle cx="-11.0" cy="0" r="9.4" fill="#14b8a6" fill-opacity="0.24" stroke="#5eead4" stroke-width="2.2"/>
+    <circle cx="12.2" cy="0" r="7.8" fill="#14b8a6" fill-opacity="0.24" stroke="#5eead4" stroke-width="2.2"/>
+
+    <!-- Deepest sink cores -->
+    <circle cx="-11.0" cy="0" r="4.6" fill="url(#core)"/>
+    <circle cx="12.2" cy="0" r="3.6" fill="url(#core)"/>
+  </g>
 </svg>
