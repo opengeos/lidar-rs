@@ -6,9 +6,22 @@
   const SCRIPT_SRC = document.currentScript ? document.currentScript.src : window.location.href;
   const SITE_ROOT = new URL("../", SCRIPT_SRC);
   const WASM_URL = new URL("wasm/lidar_js.js", SITE_ROOT).href;
-  const SAMPLE_URLS = {
-    dem: new URL("samples/dem.tif", SITE_ROOT).href,
-    dsm: new URL("samples/dsm.tif", SITE_ROOT).href,
+  const SAMPLES = {
+    dem: {
+      url: new URL("samples/dem.tif", SITE_ROOT).href,
+      name: "dem.tif",
+      mode: "inundation",
+    },
+    clsa: {
+      url: "https://data.source.coop/giswqs/opengeos/CLSA_DEM.tif",
+      name: "CLSA_DEM.tif",
+      mode: "inundation",
+    },
+    dsm: {
+      url: new URL("samples/dsm.tif", SITE_ROOT).href,
+      name: "dsm.tif",
+      mode: "mounts",
+    },
   };
 
   let modulePromise = null;
@@ -587,7 +600,8 @@
     if (!depressions || depressions.length === 0 || !badgePos || badgePos.size === 0) return;
 
     const showAll = depressions.length <= 40;
-    const r = Math.max(7, Math.min(11, Math.round(Math.min(width, height) * 0.025)));
+    const minDim = Math.min(width, height);
+    const r = Math.max(8, Math.round(minDim * 0.025));
     const memo = new Map();
     const hitBadges = [];
 
@@ -618,13 +632,15 @@
       const isSelected = d.id === selectedDepId;
       const color = levelColor(d.level);
       const alpha = isSelected || state.status !== "dry" ? 0.96 : 0.62;
+      const ringWidth = isSelected ? Math.max(2.4, r * 0.24) : Math.max(1.5, r * 0.15);
+      const shadowPad = isSelected ? Math.max(2, r * 0.2) : Math.max(0.5, r * 0.06);
 
       ctx.save();
       ctx.globalAlpha = alpha;
 
       // Subtle dark shadow for contrast over both bright hillshade and deep water
       ctx.beginPath();
-      ctx.arc(pos.col, pos.row, r + (isSelected ? 2 : 0.5), 0, Math.PI * 2);
+      ctx.arc(pos.col, pos.row, r + shadowPad, 0, Math.PI * 2);
       ctx.fillStyle = "rgba(15, 23, 42, 0.55)";
       ctx.fill();
 
@@ -635,7 +651,7 @@
       ctx.fill();
 
       // Crisp white ring (gold when selected)
-      ctx.lineWidth = isSelected ? 2.4 : 1.5;
+      ctx.lineWidth = ringWidth;
       ctx.strokeStyle = isSelected ? "#fbbf24" : "#ffffff";
       ctx.stroke();
 
@@ -649,7 +665,7 @@
       ctx.fillText(label, pos.col, pos.row + 0.5);
       ctx.restore();
 
-      const drawnRadius = r + (isSelected ? 2 : 0.75);
+      const drawnRadius = r + Math.max(shadowPad, ringWidth * 0.5);
       hitBadges.push({ id: d.id, x: pos.col, y: pos.row, r: drawnRadius });
     }
 
@@ -1615,6 +1631,7 @@
     ctx.putImageData(img, 0, 0);
 
     // Highlight outgoing spill path from selected depression in vivid amber
+    const spillScale = Math.max(1, Math.min(width, height) / 400);
     if (Array.isArray(spillPaths)) {
       for (const sp of spillPaths) {
         if (sp.from_dep_id !== selectedId || !sp.cells || sp.cells.length < 2) continue;
@@ -1627,10 +1644,10 @@
           ctx.lineTo(sp.cells[i][0] + 0.5, sp.cells[i][1] + 0.5);
         }
         ctx.strokeStyle = "rgba(120, 53, 15, 0.9)";
-        ctx.lineWidth = 4.6;
+        ctx.lineWidth = 4.6 * spillScale;
         ctx.stroke();
         ctx.strokeStyle = "#fbbf24";
-        ctx.lineWidth = 2.4;
+        ctx.lineWidth = 2.4 * spillScale;
         ctx.stroke();
         ctx.restore();
       }
@@ -1811,6 +1828,7 @@
 
   function drawActiveSpillPaths(ctx, width, height, fillTimes, tHours, spillPaths, stepIdx) {
     if (!spillPaths || !spillPaths.length || tHours <= 0) return 0;
+    const scale = Math.max(1, Math.min(width, height) / 400);
     let activeCount = 0;
     for (const path of spillPaths) {
       if (
@@ -1863,25 +1881,25 @@
           ctx.lineTo(path.cells[i][0] + 0.5, path.cells[i][1] + 0.5);
         }
         ctx.strokeStyle = "rgba(10, 26, 62, 0.85)";
-        ctx.lineWidth = 4.2;
+        ctx.lineWidth = 4.2 * scale;
         ctx.stroke();
 
         // Solid sky-blue stream channel
         ctx.strokeStyle = "#38bdf8";
-        ctx.lineWidth = 2.2;
+        ctx.lineWidth = 2.2 * scale;
         ctx.stroke();
 
         // Animated bright-white flowing dashes showing downstream spill direction
-        ctx.setLineDash([4, 6]);
-        ctx.lineDashOffset = -(stepIdx * 3);
+        ctx.setLineDash([4 * scale, 6 * scale]);
+        ctx.lineDashOffset = -(stepIdx * 3 * scale);
         ctx.strokeStyle = "rgba(224, 242, 254, 0.92)";
-        ctx.lineWidth = 1.4;
+        ctx.lineWidth = 1.4 * scale;
         ctx.stroke();
         ctx.setLineDash([]);
 
         // Directional arrowhead at downstream shoreline tip
         const [tx, ty] = [path.cells[end][0] + 0.5, path.cells[end][1] + 0.5];
-        const tailIdx = Math.max(start, end - 6);
+        const tailIdx = Math.max(start, end - Math.max(6, Math.round(6 * scale)));
         const [bx, by] = [path.cells[tailIdx][0] + 0.5, path.cells[tailIdx][1] + 0.5];
         const dx = tx - bx;
         const dy = ty - by;
@@ -1889,7 +1907,7 @@
         if (len > 0.5) {
           const ux = dx / len;
           const uy = dy / len;
-          const headLen = 8.5;
+          const headLen = 8.5 * scale;
           const spread = 0.52;
           const cosS = Math.cos(spread);
           const sinS = Math.sin(spread);
@@ -1906,7 +1924,7 @@
           ctx.fillStyle = "#38bdf8";
           ctx.fill();
           ctx.strokeStyle = "rgba(10, 26, 62, 0.9)";
-          ctx.lineWidth = 1.2;
+          ctx.lineWidth = 1.2 * scale;
           ctx.stroke();
         }
         ctx.restore();
@@ -2749,9 +2767,10 @@
   }
 
   async function loadSample(kind) {
+    const sample = SAMPLES[kind];
+    if (!sample) return;
     const gen = ++loadGeneration;
-    const url = SAMPLE_URLS[kind];
-    const name = `${kind}.tif`;
+    const { url, name, mode } = sample;
     try {
       setStatus(`Downloading sample ${name}…`);
       const resp = await fetch(url);
@@ -2759,7 +2778,7 @@
       const bytes = new Uint8Array(await resp.arrayBuffer());
       if (gen !== loadGeneration) return;
       loadedFile = { bytes, name };
-      $("lp-mode").value = kind === "dsm" ? "mounts" : "inundation";
+      $("lp-mode").value = mode;
       syncModeFields();
       $("lp-run").disabled = false;
       await runAnalysis();
@@ -2797,6 +2816,8 @@
     $("lp-mode").addEventListener("change", syncModeFields);
     $("lp-run").addEventListener("click", runAnalysis);
     $("lp-sample-dem").addEventListener("click", () => loadSample("dem"));
+    const sampleClsa = $("lp-sample-clsa");
+    if (sampleClsa) sampleClsa.addEventListener("click", () => loadSample("clsa"));
     $("lp-sample-dsm").addEventListener("click", () => loadSample("dsm"));
     $("lp-file").addEventListener("change", (e) => {
       if (e.target.files[0]) loadFile(e.target.files[0]);

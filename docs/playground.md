@@ -8,8 +8,9 @@ Run **`lidar-rs`** directly in your browser via WebAssembly: DEM smoothing, sele
   <div class="lp-drop" id="lp-drop">
     <p><strong>Drop a DEM or DSM GeoTIFF here</strong> or <label class="lp-link">choose a file<input type="file" id="lp-file" accept=".tif,.tiff,.img,.asc" class="lp-visually-hidden"></label>.</p>
     <p class="lp-hint">Single-band GeoTIFF / COG elevation rasters. Everything stays in your browser memory.</p>
-    <p class="lp-samples">Or try a bundled sample:
+    <p class="lp-samples">Or try a sample dataset:
       <button type="button" id="lp-sample-dem">Sample DEM: Depressions &amp; Inundation (400×400)</button>
+      <button type="button" id="lp-sample-clsa">Cottonwood Lake Study Area Topobathy (1877×1730, 0.5 m)</button>
       <button type="button" id="lp-sample-dsm">Sample DSM: Mounts / Canopies (400×400)</button>
     </p>
   </div>
