@@ -26,6 +26,13 @@
   text-decoration: underline;
 }
 
+#lidar-playground .lp-link-btn {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+}
+
 #lidar-playground .lp-hint {
   color: var(--md-default-fg-color--light);
   font-size: 0.72rem;
@@ -338,13 +345,19 @@
   font-weight: 600;
 }
 
-#lidar-playground #lp-tree-region {
+#lidar-playground #lp-tree-region,
+#lidar-playground #lp-tree-node-select {
   padding: 0.22rem 0.4rem;
   border: 1px solid var(--md-default-fg-color--lighter);
   border-radius: 0.25rem;
   background: var(--md-default-bg-color);
   color: var(--md-default-fg-color);
   font-size: 0.72rem;
+}
+
+#lidar-playground #lp-tree-canvas:focus-visible {
+  outline: 2px solid var(--md-accent-fg-color);
+  outline-offset: -2px;
 }
 
 #lidar-playground .lp-tree-canvas-wrap {

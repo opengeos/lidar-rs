@@ -125,12 +125,16 @@ Run **`lidar-rs`** directly in your browser via WebAssembly: DEM smoothing, sele
               Region
               <select id="lp-tree-region" aria-label="Sink region hierarchy"></select>
             </label>
+            <label class="lp-tree-region-wrap" id="lp-tree-node-wrap">
+              Node
+              <select id="lp-tree-node-select" aria-label="Inspect depression node"></select>
+            </label>
             <label class="lp-inline-check"><input type="checkbox" id="lp-tree-outline" checked> Show unreached outline</label>
             <button type="button" id="lp-tree-gif-btn" class="lp-icon-btn" title="Export animated depression tree GIF">Download GIF</button>
           </div>
         </div>
         <div class="lp-tree-canvas-wrap" id="lp-tree-canvas-wrap">
-          <canvas id="lp-tree-canvas" width="960" height="360" title="Click any node to inspect its depression on the map"></canvas>
+          <canvas id="lp-tree-canvas" width="960" height="360" tabindex="0" role="img" aria-label="Depression tree graph. Use arrow keys to step through nodes and Enter to inspect." title="Click any node or use arrow keys + Enter to inspect its depression on the map"></canvas>
         </div>
         <div class="lp-tree-legend" id="lp-tree-legend"></div>
       </div>
@@ -159,7 +163,7 @@ Run **`lidar-rs`** directly in your browser via WebAssembly: DEM smoothing, sele
     <h3>Downloads</h3>
     <div class="lp-downloads" id="lp-downloads"></div>
     <p class="lp-gif-link-row" id="lp-gif-link-row" hidden>
-      <a href="#" id="lp-gif-preview-link" class="lp-link">Preview exported animated GIF</a>
+      <button type="button" id="lp-gif-preview-link" class="lp-link lp-link-btn" aria-controls="lp-gif-wrap" aria-expanded="false">Preview exported animated GIF</button>
     </p>
     <div class="lp-gif-wrap" id="lp-gif-wrap" hidden>
       <img id="lp-gif" alt="Simulated surface inundation animated GIF">

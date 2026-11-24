@@ -143,6 +143,35 @@
     return `${area.toLocaleString(undefined, { maximumFractionDigits: 0 })} ${unit}`;
   }
 
+  /**
+   * Detects the vertical elevation unit suffix from an explicit vertical CRS definition
+   * (`VERT_CS` / `VERTCRS` in WKT or `+vunits=` in PROJ). Returns `""` when no vertical unit
+   * is declared so horizontal units never mislabel vertical elevations.
+   */
+  function detectElevationUnit(projection) {
+    const raw = projection || "";
+    if (!raw) return "";
+    const projVunits = raw.match(/\+vunits=([a-z0-9_-]+)/i);
+    if (projVunits) {
+      const vu = projVunits[1].toLowerCase();
+      if (vu === "m" || vu === "meter" || vu === "metre") return "m";
+      if (vu === "ft" || vu === "us-ft" || vu.includes("foot")) return "ft";
+    }
+    const vertStart = raw.search(/VERT_CS\[|VERTCRS\[/i);
+    if (vertStart === -1) return "";
+    const vertSlice = raw.slice(vertStart).toLowerCase();
+    const unitMatch = vertSlice.match(/(?:lengthunit|unit)\[\s*"([^"]+)"/);
+    if (!unitMatch) return "";
+    const u = unitMatch[1];
+    if (u.includes("foot") || u.includes("feet") || u === "ft" || u === "us_survey_foot") {
+      return "ft";
+    }
+    if (u.includes("metre") || u.includes("meter") || u === "m") {
+      return "m";
+    }
+    return "";
+  }
+
   const LEVEL_COLORS = [
     "#1d4ed8", // Level 1 (Leaf): Royal Blue
     "#06b6d4", // Level 2: Cyan
@@ -431,32 +460,96 @@
     return trees;
   }
 
-  function computeDepressionFillState(depId, tHours, fillStats, childrenMap, memo) {
+  function computeDepressionFillState(depId, tHours, fillStats, childrenMap, memo, fsmBasinsById) {
     if (memo.has(depId)) return memo.get(depId);
     const stat = fillStats.get(depId);
     let frac = 0;
+    let allCellsWet = false;
     if (stat && stat.total > 0) {
       const wet = tHours > 0 ? upperBound(stat.times, tHours) : 0;
       frac = wet / stat.total;
+      allCellsWet = wet === stat.total;
     } else if (childrenMap && childrenMap.has(depId)) {
       const kids = childrenMap.get(depId);
       if (kids.length > 0) {
-        let allFull = true;
+        let allChildrenFull = true;
         for (const cid of kids) {
-          const ks = computeDepressionFillState(cid, tHours, fillStats, childrenMap, memo);
-          if (ks.frac < 1) allFull = false;
+          const ks = computeDepressionFillState(
+            cid,
+            tHours,
+            fillStats,
+            childrenMap,
+            memo,
+            fsmBasinsById,
+          );
+          if (ks.status !== "full") allChildrenFull = false;
         }
-        frac = allFull ? 1 : 0;
+        frac = allChildrenFull ? 1 : 0;
+        allCellsWet = allChildrenFull;
       }
     }
-    const status = frac <= 0 ? "dry" : frac >= 0.999 ? "full" : "filling";
-    const res = { frac: Math.min(1, Math.max(0, frac)), status };
+
+    let status;
+    const fsmBasin = fsmBasinsById ? fsmBasinsById.get(depId) : null;
+    if (fsmBasin) {
+      const isFull =
+        tHours > 0 &&
+        typeof fsmBasin.fill_time_h === "number" &&
+        Number.isFinite(fsmBasin.fill_time_h) &&
+        tHours >= fsmBasin.fill_time_h;
+      const isMerged =
+        tHours > 0 &&
+        typeof fsmBasin.merge_time_h === "number" &&
+        Number.isFinite(fsmBasin.merge_time_h) &&
+        tHours >= fsmBasin.merge_time_h;
+      const hasWater = frac > 0 || isFull || isMerged;
+      status = !hasWater ? "dry" : isFull || isMerged ? "full" : "filling";
+    } else {
+      status = frac <= 0 ? "dry" : allCellsWet ? "full" : "filling";
+    }
+
+    const clampedFrac = Math.min(1, Math.max(0, frac));
+    const res = { frac: clampedFrac, status };
     memo.set(depId, res);
     return res;
   }
 
+  function populateTreeNodeSelect(tree, selectedDepId) {
+    const sel = $("lp-tree-node-select");
+    const wrap = $("lp-tree-node-wrap");
+    if (!sel || !wrap) return;
+    sel.innerHTML = "";
+    if (!tree || !tree.nodes || tree.nodes.length === 0) {
+      wrap.hidden = true;
+      return;
+    }
+    wrap.hidden = false;
+    const placeholder = document.createElement("option");
+    placeholder.value = "0";
+    placeholder.textContent = "Inspect node…";
+    sel.appendChild(placeholder);
+    const ordered = tree.nodes
+      .slice()
+      .sort((a, b) => b.level - a.level || a.id - b.id);
+    for (const d of ordered) {
+      const opt = document.createElement("option");
+      opt.value = String(d.id);
+      opt.textContent = `#${d.id} (Lvl ${d.level})`;
+      sel.appendChild(opt);
+    }
+    sel.value = selectedDepId && tree.byId.has(selectedDepId) ? String(selectedDepId) : "0";
+  }
+
   function drawDepressionBadges(ctx, width, height, playerState, tHours) {
-    const { depressions, badgePos, fillStats, selectedDepId, activeRegionId, treeRegions } = playerState;
+    const {
+      depressions,
+      badgePos,
+      fillStats,
+      fsmBasinsById,
+      selectedDepId,
+      activeRegionId,
+      treeRegions,
+    } = playerState;
     if (!depressions || depressions.length === 0 || !badgePos || badgePos.size === 0) return;
 
     const showAll = depressions.length <= 40;
@@ -480,7 +573,14 @@
     for (const d of ordered) {
       const pos = badgePos.get(d.id);
       if (!pos) continue;
-      const state = computeDepressionFillState(d.id, tHours, fillStats, childrenMap, memo);
+      const state = computeDepressionFillState(
+        d.id,
+        tHours,
+        fillStats,
+        childrenMap,
+        memo,
+        fsmBasinsById,
+      );
       const isSelected = d.id === selectedDepId;
       const color = levelColor(d.level);
       const alpha = isSelected || state.status !== "dry" ? 0.96 : 0.62;
@@ -515,7 +615,8 @@
       ctx.fillText(label, pos.col, pos.row + 0.5);
       ctx.restore();
 
-      hitBadges.push({ id: d.id, x: pos.col, y: pos.row, r: r + 3 });
+      const drawnRadius = r + (isSelected ? 2 : 0.75);
+      hitBadges.push({ id: d.id, x: pos.col, y: pos.row, r: drawnRadius });
     }
 
     playerState.badgeHitTargets = hitBadges;
@@ -576,7 +677,9 @@
       fg,
       canvasBg,
       areaUnit,
+      elevUnit = "",
       fillStats,
+      fsmBasinsById = null,
       selectedDepId = 0,
       hoveredTreeDepId = 0,
       offsetY = 0,
@@ -584,7 +687,14 @@
 
     const states = new Map();
     for (const d of tree.nodes) {
-      computeDepressionFillState(d.id, tHours, fillStats, tree.childrenMap, states);
+      computeDepressionFillState(
+        d.id,
+        tHours,
+        fillStats,
+        tree.childrenMap,
+        states,
+        fsmBasinsById,
+      );
     }
 
     let activeCount = 0;
@@ -592,7 +702,7 @@
     let maxActiveLevel = 0;
     for (const d of tree.nodes) {
       const st = states.get(d.id);
-      if (st && st.frac > 0) {
+      if (st && st.status !== "dry") {
         activeCount++;
         if (d.level > maxActiveLevel) maxActiveLevel = d.level;
         if (st.status === "full") fullCount++;
@@ -681,12 +791,20 @@
       const isRelatedToSelected =
         selectedDepId > 0 && (childId === selectedDepId || parentId === selectedDepId);
 
+      const childFsm = fsmBasinsById ? fsmBasinsById.get(childId) : null;
+      const isMerged = childFsm
+        ? tHours > 0 &&
+          typeof childFsm.merge_time_h === "number" &&
+          Number.isFinite(childFsm.merge_time_h) &&
+          tHours >= childFsm.merge_time_h
+        : pSt.status !== "dry";
+
       ctx.save();
       ctx.beginPath();
       ctx.moveTo(cPos.x, cPos.y);
       ctx.lineTo(pPos.x, pPos.y);
 
-      if (pSt.frac > 0) {
+      if (isMerged) {
         ctx.strokeStyle = isRelatedToSelected ? "#f59e0b" : edgeMergedColor;
         ctx.lineWidth = isRelatedToSelected ? 3.0 : 2.3;
         ctx.stroke();
@@ -767,7 +885,8 @@
         ctx.beginPath();
         ctx.arc(pos.x, pos.y, nodeR, 0, Math.PI * 2);
         ctx.clip();
-        const fillY = pos.y + nodeR - 2 * nodeR * st.frac;
+        const visualFrac = Math.min(0.92, Math.max(0.08, st.frac));
+        const fillY = pos.y + nodeR - 2 * nodeR * visualFrac;
         ctx.fillStyle = color;
         ctx.fillRect(pos.x - nodeR, fillY, nodeR * 2, pos.y + nodeR - fillY + 1);
         ctx.strokeStyle = "rgba(255, 255, 255, 0.85)";
@@ -787,7 +906,7 @@
         ctx.font = `700 ${idFontSize}px sans-serif`;
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
-        ctx.fillStyle = st.frac >= 0.55 ? "#ffffff" : dark ? "#f8fafc" : "#0f172a";
+        ctx.fillStyle = visualFrac >= 0.55 ? "#ffffff" : dark ? "#f8fafc" : "#0f172a";
         ctx.fillText(String(d.id), pos.x, pos.y + 0.5);
       } else {
         ctx.beginPath();
@@ -805,10 +924,11 @@
         ctx.fillText(String(d.id), pos.x, pos.y + 0.5);
       }
 
+      const fillingPct = Math.min(99, Math.max(1, Math.round(st.frac * 100)));
       const elevLine =
         st.status === "filling"
-          ? `${d.max_elev.toFixed(1)}m (${Math.round(st.frac * 100)}%)`
-          : `${d.max_elev.toFixed(1)}m`;
+          ? `${d.max_elev.toFixed(1)}${elevUnit} (${fillingPct}%)`
+          : `${d.max_elev.toFixed(1)}${elevUnit}`;
       const volLine = formatCompactVolume(d.volume, areaUnit);
 
       ctx.font = "10px sans-serif";
@@ -844,11 +964,15 @@
     return { hitNodes, activeCount, fullCount, maxActiveLevel };
   }
 
+  const MAX_TREE_GIF_FRAME_PIXELS = 40_000_000;
+  const MAX_TREE_GIF_DIM = 1600;
+
   /**
-   * Minimal pure-JS GIF89a encoder with shared 256-color Global Color Table and LSB-first LZW.
-   * Tailored for crisp vector/canvas diagrams (exact solid colors, fast O(1) 15-bit LUT).
+   * Minimal pure-JS streaming GIF89a encoder with shared 256-color Global Color Table and
+   * LSB-first LZW. Calls `renderFrameRgba(frameIdx)` lazily so only one RGBA buffer is live
+   * at a time.
    */
-  function encodeRgbaFramesToGif(framesRgba, width, height, delayMs) {
+  function encodeStreamedFramesToGif(frameCount, renderFrameRgba, width, height, delayMs) {
     const nPix = width * height;
     const delayCs = Math.max(2, Math.round((delayMs || 150) / 10));
 
@@ -857,13 +981,11 @@
     const sumR = new Float64Array(32768);
     const sumG = new Float64Array(32768);
     const sumB = new Float64Array(32768);
-    const sampleCount = Math.min(framesRgba.length, 16);
+    const sampleCount = Math.min(frameCount, 16);
     for (let s = 0; s < sampleCount; s++) {
       const fi =
-        sampleCount === 1
-          ? 0
-          : Math.round((s * (framesRgba.length - 1)) / (sampleCount - 1));
-      const rgba = framesRgba[fi];
+        sampleCount === 1 ? 0 : Math.round((s * (frameCount - 1)) / (sampleCount - 1));
+      const rgba = renderFrameRgba(fi);
       for (let i = 0; i < rgba.length; i += 4) {
         const r = rgba[i];
         const g = rgba[i + 1];
@@ -893,7 +1015,6 @@
       palette[palLen * 3 + 2] = Math.round(sumB[k] / c);
       palLen++;
     }
-    // Fill remaining slots with additional observed colors, then a small uniform fallback cube
     for (let i = maxDataColors; i < buckets.length && palLen < 256; i++) {
       const k = buckets[i];
       const c = counts[k];
@@ -985,8 +1106,8 @@
     const subBlock = new Uint8Array(255);
     const indexed = new Uint8Array(nPix);
 
-    for (let f = 0; f < framesRgba.length; f++) {
-      const rgba = framesRgba[f];
+    for (let f = 0; f < frameCount; f++) {
+      const rgba = renderFrameRgba(f);
       for (let i = 0, p = 0; i < nPix; i++, p += 4) {
         const r = rgba[p];
         const g = rgba[p + 1];
@@ -1082,6 +1203,9 @@
       }
 
       emit(prefix);
+      if (nextCode === 1 << codeSize && codeSize < 12) {
+        codeSize++;
+      }
       emit(eoiCode);
       if (bitCount > 0) {
         subBlock[subLen++] = bitBuf & 0xff;
@@ -1103,23 +1227,51 @@
   }
 
   async function exportDepressionTreeGif() {
-    if (!player || !player.treeRegions || player.treeRegions.length === 0) return;
+    const playerRef = player;
+    const simIdRef = currentSimId;
+    const stemRef = currentSimStem;
+    if (!playerRef || !playerRef.treeRegions || playerRef.treeRegions.length === 0) return;
+
     const tree =
-      player.treeRegions.find((t) => t.regionId === player.activeRegionId) || player.treeRegions[0];
+      playerRef.treeRegions.find((t) => t.regionId === playerRef.activeRegionId) ||
+      playerRef.treeRegions[0];
     const pingPong = $("lp-pingpong") ? $("lp-pingpong").checked : true;
     const showOutline = $("lp-tree-outline") ? $("lp-tree-outline").checked : true;
     const delayMs = Math.max(60, Math.min(400, parseInt($("lp-speed")?.value || "150", 10) || 150));
 
     setStatus("Encoding animated depression tree GIF in browser…");
     await nextTick();
+    if (player !== playerRef || currentSimId !== simIdRef) return;
     const t0 = performance.now();
 
-    const steps = player.steps;
+    const wrap = $("lp-tree-canvas-wrap");
+    const baseW = Math.max(640, Math.min(960, (wrap ? wrap.clientWidth : 720) - 2));
+    const layout = computeTreeLayoutSize(tree, baseW);
+    const bannerH = 38;
+    const legendH = 30;
+    const rawW = layout.logicalW;
+    const rawH = bannerH + layout.logicalH + legendH;
+    const scale = Math.min(1, MAX_TREE_GIF_DIM / rawW, MAX_TREE_GIF_DIM / rawH);
+    const gifW = Math.max(1, Math.round(rawW * scale));
+    const gifH = Math.max(1, Math.round(rawH * scale));
+
+    const framePixels = gifW * gifH;
+    const maxBudgetFrames = Math.floor(MAX_TREE_GIF_FRAME_PIXELS / Math.max(1, framePixels));
+    if (maxBudgetFrames < 2) {
+      setStatus(
+        `Depression tree GIF exceeds browser pixel budget (${gifW}×${gifH}); try a smaller region.`,
+        true,
+      );
+      return;
+    }
+
+    const steps = playerRef.steps;
     const totalHours = steps.length > 0 ? steps[steps.length - 1].time_hours : 0;
 
-    // Build frame schedule (honoring ping-pong; cap total frames at 160 for fast browser encoding)
+    // Build frame schedule bounded by both max frame count and total frame-pixel budget
     let indices = steps.map((_, i) => i);
-    const maxForward = pingPong ? 80 : 160;
+    const maxTotalFrames = Math.min(160, maxBudgetFrames);
+    const maxForward = pingPong ? Math.max(2, Math.floor((maxTotalFrames + 2) / 2)) : maxTotalFrames;
     if (indices.length > maxForward) {
       const sampled = [];
       for (let s = 0; s < maxForward; s++) {
@@ -1130,17 +1282,10 @@
     const schedule = indices.map((idx) => ({ idx, phase: "RISING" }));
     if (pingPong && indices.length > 2) {
       for (let j = indices.length - 2; j >= 1; j--) {
+        if (schedule.length >= maxTotalFrames) break;
         schedule.push({ idx: indices[j], phase: "FALLING" });
       }
     }
-
-    const wrap = $("lp-tree-canvas-wrap");
-    const baseW = Math.max(640, Math.min(960, (wrap ? wrap.clientWidth : 720) - 2));
-    const layout = computeTreeLayoutSize(tree, baseW);
-    const bannerH = 38;
-    const legendH = 30;
-    const gifW = Math.round(layout.logicalW);
-    const gifH = Math.round(bannerH + layout.logicalH + legendH);
 
     const offscreen = document.createElement("canvas");
     offscreen.width = gifW;
@@ -1154,23 +1299,25 @@
     const bannerBg = dark ? "#1f2430" : "#f1f5f9";
     const borderCol = dark ? "#2e3545" : "#e2e8f0";
 
-    const framesRgba = [];
-    for (const { idx, phase } of schedule) {
+    const renderFrameRgba = (schedIdx) => {
+      const { idx, phase } = schedule[schedIdx];
       const step = steps[idx];
       const tHours = step ? step.time_hours : 0;
       const fracTime = totalHours > 0 ? Math.min(1, Math.max(0, tHours / totalHours)) : 0;
 
+      ctx.setTransform(scale, 0, 0, scale, 0, 0);
       ctx.fillStyle = canvasBg;
-      ctx.fillRect(0, 0, gifW, gifH);
+      ctx.fillRect(0, 0, rawW, rawH);
 
-      // Draw tree scene
       const res = drawDepressionTreeScene(ctx, layout, tree, tHours, {
         showOutline,
         dark,
         fg,
         canvasBg,
-        areaUnit: player.areaUnit,
-        fillStats: player.fillStats,
+        areaUnit: playerRef.areaUnit,
+        elevUnit: playerRef.elevUnit,
+        fillStats: playerRef.fillStats,
+        fsmBasinsById: playerRef.fsmBasinsById,
         selectedDepId: 0,
         hoveredTreeDepId: 0,
         offsetY: bannerH,
@@ -1178,23 +1325,23 @@
 
       // Top telemetry banner
       ctx.fillStyle = bannerBg;
-      ctx.fillRect(0, 0, gifW, bannerH);
+      ctx.fillRect(0, 0, rawW, bannerH);
       ctx.strokeStyle = borderCol;
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(0, bannerH - 0.5);
-      ctx.lineTo(gifW, bannerH - 0.5);
+      ctx.lineTo(rawW, bannerH - 0.5);
       ctx.stroke();
 
       // Animated progress bar at bottom of banner
       ctx.fillStyle = "#1473e1";
-      ctx.fillRect(0, bannerH - 3, Math.round(gifW * fracTime), 3);
+      ctx.fillRect(0, bannerH - 3, Math.round(rawW * fracTime), 3);
 
       ctx.font = "700 12.5px sans-serif";
       ctx.fillStyle = fg;
       ctx.textAlign = "left";
       ctx.textBaseline = "middle";
-      const regionSuffix = player.treeRegions.length > 1 ? ` (Region ${tree.regionId})` : "";
+      const regionSuffix = playerRef.treeRegions.length > 1 ? ` (Region ${tree.regionId})` : "";
       ctx.fillText(
         `Depression Tree${regionSuffix} · ${phase} · T = ${tHours.toFixed(1)} / ${totalHours.toFixed(1)} h`,
         14,
@@ -1210,14 +1357,14 @@
           : res.fullCount === tree.nodes.length
             ? `${tree.nodes.length}/${tree.nodes.length} full · Complete`
             : `${res.activeCount}/${tree.nodes.length} active · ${res.fullCount} full · Lvl ${res.maxActiveLevel}/${tree.maxLevel}`;
-      ctx.fillText(rightLabel, gifW - 14, bannerH * 0.48);
+      ctx.fillText(rightLabel, rawW - 14, bannerH * 0.48);
 
       // Bottom legend bar
       const legY = bannerH + layout.logicalH;
       ctx.strokeStyle = borderCol;
       ctx.beginPath();
       ctx.moveTo(0, legY + 0.5);
-      ctx.lineTo(gifW, legY + 0.5);
+      ctx.lineTo(rawW, legY + 0.5);
       ctx.stroke();
 
       ctx.font = "10.5px sans-serif";
@@ -1238,15 +1385,14 @@
         ctx.fillStyle = subFg;
         ctx.fillText(txt, lx + 14, cy + 0.5);
         lx += 14 + ctx.measureText(txt).width + 14;
-        if (lx > gifW - 160) break;
+        if (lx > rawW - 160) break;
       }
-      // State indicators on right side of legend bar
       const stateItems = [
         { label: "Full", kind: "full" },
         { label: "Filling", kind: "filling" },
         { label: "Dry", kind: "dry" },
       ];
-      let rx = gifW - 14;
+      let rx = rawW - 14;
       for (const stItem of stateItems) {
         const tw = ctx.measureText(stItem.label).width;
         rx -= tw;
@@ -1279,20 +1425,28 @@
         rx -= 12;
       }
 
-      framesRgba.push(new Uint8ClampedArray(ctx.getImageData(0, 0, gifW, gifH).data));
-    }
+      return ctx.getImageData(0, 0, gifW, gifH).data;
+    };
 
-    const gifBytes = encodeRgbaFramesToGif(framesRgba, gifW, gifH, delayMs);
+    const gifBytes = encodeStreamedFramesToGif(
+      schedule.length,
+      renderFrameRgba,
+      gifW,
+      gifH,
+      delayMs,
+    );
+    if (player !== playerRef || currentSimId !== simIdRef) return;
+
     const elapsed = performance.now() - t0;
     const blobUrl = URL.createObjectURL(new Blob([gifBytes], { type: "image/gif" }));
     const a = document.createElement("a");
     a.href = blobUrl;
-    const regionPart = player.treeRegions.length > 1 ? `_region${tree.regionId}` : "";
-    a.download = `${currentSimStem || "lidar"}_depression_tree${regionPart}.gif`;
+    const regionPart = playerRef.treeRegions.length > 1 ? `_region${tree.regionId}` : "";
+    a.download = `${stemRef || "lidar"}_depression_tree${regionPart}.gif`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(blobUrl), 2000);
     setStatus(
-      `Exported depression tree GIF (${(gifBytes.length / 1024).toFixed(0)} KB, ${framesRgba.length} frames) in ${elapsed.toFixed(0)} ms.`,
+      `Exported depression tree GIF (${(gifBytes.length / 1024).toFixed(0)} KB, ${schedule.length} frames) in ${elapsed.toFixed(0)} ms.`,
     );
   }
 
@@ -1349,7 +1503,9 @@
         fg,
         canvasBg,
         areaUnit: player.areaUnit,
+        elevUnit: player.elevUnit,
         fillStats: player.fillStats,
+        fsmBasinsById: player.fsmBasinsById,
         selectedDepId: player.selectedDepId,
         hoveredTreeDepId: player.hoveredTreeDepId,
         offsetY: 0,
@@ -1529,6 +1685,8 @@
       if (emptyEl) emptyEl.hidden = false;
       if (bodyEl) bodyEl.hidden = true;
       if (clearBtn) clearBtn.hidden = true;
+      const nodeSel = $("lp-tree-node-select");
+      if (nodeSel) nodeSel.value = "0";
       renderPlayerFrame();
       return;
     }
@@ -1541,7 +1699,11 @@
         const regSel = $("lp-tree-region");
         if (regSel) regSel.value = String(d.region_id);
         renderTreeLegend(targetTree);
+        populateTreeNodeSelect(targetTree, d.id);
       }
+    } else {
+      const nodeSel = $("lp-tree-node-select");
+      if (nodeSel) nodeSel.value = String(d.id);
     }
     const outSpill = (player.spillPaths || []).find((s) => s.from_dep_id === d.id);
     const effMmH = player.rainIntensity * player.runoffCoeff * 10.0;
@@ -1944,6 +2106,8 @@
     rainIntensity,
     runoffCoeff,
     areaUnit,
+    elevUnit,
+    fsmBasinsById,
   ) {
     stopPlayer();
     const depsById = new Map();
@@ -1984,6 +2148,9 @@
     }
     if (treeRegions.length > 0) {
       renderTreeLegend(treeRegions[0]);
+      populateTreeNodeSelect(treeRegions[0], 0);
+    } else {
+      populateTreeNodeSelect(null, 0);
     }
 
     // Prepend the dry initial state (T = 0 h) so playback, scrubbing, and chart clicks start at T0.
@@ -2010,6 +2177,7 @@
       depsById,
       ratingCurvesByDep,
       fillStats,
+      fsmBasinsById: fsmBasinsById || null,
       badgePos,
       badgeHitTargets: [],
       treeRegions,
@@ -2022,6 +2190,7 @@
       rainIntensity,
       runoffCoeff,
       areaUnit,
+      elevUnit: elevUnit || "",
       frameBuf: new Uint8ClampedArray(width * height * 4),
       stepIdx: 0,
       direction: 1,
@@ -2104,7 +2273,7 @@
     }
   }
 
-  function renderDownloads(files, includeLazyGif) {
+  function renderDownloads(files, includeLazyGif, includeTreeGif) {
     const el = $("lp-downloads");
     el.innerHTML = "";
     if (includeLazyGif) {
@@ -2129,21 +2298,23 @@
       });
       el.appendChild(btn);
 
-      const treeBtn = document.createElement("button");
-      treeBtn.type = "button";
-      treeBtn.className = "md-button";
-      treeBtn.textContent = "Export Depression Tree GIF";
-      treeBtn.addEventListener("click", async () => {
-        treeBtn.disabled = true;
-        try {
-          await exportDepressionTreeGif();
-        } catch (e) {
-          setStatus(`Depression tree GIF export failed: ${errMsg(e)}`, true);
-        } finally {
-          treeBtn.disabled = false;
-        }
-      });
-      el.appendChild(treeBtn);
+      if (includeTreeGif) {
+        const treeBtn = document.createElement("button");
+        treeBtn.type = "button";
+        treeBtn.className = "md-button";
+        treeBtn.textContent = "Export Depression Tree GIF";
+        treeBtn.addEventListener("click", async () => {
+          treeBtn.disabled = true;
+          try {
+            await exportDepressionTreeGif();
+          } catch (e) {
+            setStatus(`Depression tree GIF export failed: ${errMsg(e)}`, true);
+          } finally {
+            treeBtn.disabled = false;
+          }
+        });
+        el.appendChild(treeBtn);
+      }
     }
     for (const { label, filename, data, getData, mime } of files) {
       if (typeof getData === "function") {
@@ -2314,6 +2485,7 @@
         const w = sim.width;
         const h = sim.height;
         const areaUnit = detectAreaUnit(sim.projection);
+        const elevUnit = detectElevationUnit(sim.projection);
         const hill = sim.hillshadeRgba();
         const depth = sim.depthRgba();
         const level = sim.levelRgba();
@@ -2326,6 +2498,12 @@
           typeof sim.ratingCurvesJson === "function" ? JSON.parse(sim.ratingCurvesJson()) : [];
         const steps = JSON.parse(sim.stepsJson());
         const spillPaths = JSON.parse(sim.spillPathsJson());
+        const fsmBasins =
+          typeof sim.fsmBasinsJson === "function" ? JSON.parse(sim.fsmBasinsJson()) : [];
+        const fsmBasinsById =
+          Array.isArray(fsmBasins) && fsmBasins.length > 0
+            ? new Map(fsmBasins.map((b) => [b.dep_id, b]))
+            : null;
         const lastStep = steps.length > 0 ? steps[steps.length - 1] : null;
 
         $("lp-results").hidden = false;
@@ -2336,7 +2514,10 @@
         const gifLinkRow = $("lp-gif-link-row");
         if (gifLinkRow) gifLinkRow.hidden = false;
         const gifPreviewLink = $("lp-gif-preview-link");
-        if (gifPreviewLink) gifPreviewLink.textContent = "Preview exported animated GIF";
+        if (gifPreviewLink) {
+          gifPreviewLink.textContent = "Preview exported animated GIF";
+          gifPreviewLink.setAttribute("aria-expanded", "false");
+        }
         const gifWrap = $("lp-gif-wrap");
         if (gifWrap) gifWrap.hidden = true;
         const gifImg = $("lp-gif");
@@ -2355,6 +2536,8 @@
           rain,
           runoffCoeff,
           areaUnit,
+          elevUnit,
+          fsmBasinsById,
         );
 
         drawRgba($("lp-c-hillshade"), w, h, hill, null);
@@ -2429,7 +2612,7 @@
             downloadItems.push(fsmItem);
           }
         }
-        renderDownloads(downloadItems, true);
+        renderDownloads(downloadItems, true, depressions.length > 0);
 
         renderTable(depressions);
         setStatus(
@@ -2464,6 +2647,11 @@
           $("lp-cap-level").textContent = "Nested Mount / Canopy Levels (over hillshade)";
           const gifLinkRow = $("lp-gif-link-row");
           if (gifLinkRow) gifLinkRow.hidden = true;
+          const gifPreviewLink = $("lp-gif-preview-link");
+          if (gifPreviewLink) {
+            gifPreviewLink.textContent = "Preview exported animated GIF";
+            gifPreviewLink.setAttribute("aria-expanded", "false");
+          }
           const gifWrap = $("lp-gif-wrap");
           if (gifWrap) gifWrap.hidden = true;
           const gifImg = $("lp-gif");
@@ -2577,15 +2765,15 @@
       if (e.target.files[0]) loadFile(e.target.files[0]);
     });
 
-    // Lazy GIF preview toggled by hyperlink under Downloads
+    // Lazy GIF preview toggled by disclosure button under Downloads
     const gifPreviewLink = $("lp-gif-preview-link");
     const gifWrap = $("lp-gif-wrap");
     if (gifPreviewLink && gifWrap) {
-      gifPreviewLink.addEventListener("click", (e) => {
-        e.preventDefault();
+      gifPreviewLink.addEventListener("click", () => {
         if (!currentSim) return;
         const opening = gifWrap.hidden;
         gifWrap.hidden = !opening;
+        gifPreviewLink.setAttribute("aria-expanded", opening ? "true" : "false");
         gifPreviewLink.textContent = opening
           ? "Hide animated GIF preview"
           : "Preview exported animated GIF";
@@ -2641,8 +2829,20 @@
         const rid = parseInt(treeRegionSel.value, 10) || 0;
         player.activeRegionId = rid;
         const target = (player.treeRegions || []).find((t) => t.regionId === rid);
-        if (target) renderTreeLegend(target);
+        if (target) {
+          renderTreeLegend(target);
+          populateTreeNodeSelect(target, player.selectedDepId);
+        }
         renderPlayerFrame();
+      });
+    }
+    const treeNodeSel = $("lp-tree-node-select");
+    if (treeNodeSel) {
+      treeNodeSel.addEventListener("change", () => {
+        if (!player) return;
+        const depId = parseInt(treeNodeSel.value, 10) || 0;
+        stopPlayer();
+        selectDepression(depId);
       });
     }
 
@@ -2756,6 +2956,52 @@
         if (player.hoveredTreeDepId !== 0) {
           player.hoveredTreeDepId = 0;
           renderDepressionTree();
+        }
+      });
+      treeCanvas.addEventListener("keydown", (e) => {
+        if (!player || !player.treeRegions || !player.treeRegions.length) return;
+        const tree =
+          player.treeRegions.find((t) => t.regionId === player.activeRegionId) ||
+          player.treeRegions[0];
+        if (!tree || !tree.nodes.length) return;
+        const ordered = tree.nodes
+          .slice()
+          .sort(
+            (a, b) =>
+              (tree.slotX.get(a.id) ?? 0) - (tree.slotX.get(b.id) ?? 0) ||
+              a.level - b.level ||
+              a.id - b.id,
+          );
+        const curId = player.hoveredTreeDepId || player.selectedDepId;
+        const curIdx = ordered.findIndex((n) => n.id === curId);
+        if (e.key === "ArrowRight" || e.key === "ArrowUp") {
+          e.preventDefault();
+          const next = ordered[(curIdx + 1 + ordered.length) % ordered.length];
+          player.hoveredTreeDepId = next.id;
+          renderDepressionTree();
+        } else if (e.key === "ArrowLeft" || e.key === "ArrowDown") {
+          e.preventDefault();
+          const prev = ordered[(curIdx - 1 + ordered.length) % ordered.length];
+          player.hoveredTreeDepId = prev.id;
+          renderDepressionTree();
+        } else if (e.key === "Home") {
+          e.preventDefault();
+          player.hoveredTreeDepId = ordered[0].id;
+          renderDepressionTree();
+        } else if (e.key === "End") {
+          e.preventDefault();
+          player.hoveredTreeDepId = ordered[ordered.length - 1].id;
+          renderDepressionTree();
+        } else if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          const targetId = player.hoveredTreeDepId || ordered[0].id;
+          stopPlayer();
+          selectDepression(targetId);
+        } else if (e.key === "Escape") {
+          if (player.selectedDepId > 0) {
+            e.preventDefault();
+            selectDepression(0);
+          }
         }
       });
     }
