@@ -255,6 +255,117 @@ fn clipped_watershed_nodata_border_discovers_spill_exit() {
     assert!(fsm.mass_balance.mass_balance_error_m3.abs() < 1e-6);
 }
 
+/// Item 2b: An interior NoData void (such as a lake dropout surrounded by valid DEM cells and
+/// disconnected from the raster border) must NOT create a fake domain boundary exit (`to_dep_id == 0`);
+/// instead, the upstream basin must spill over its valid saddle into the downstream basin.
+#[test]
+fn interior_nodata_void_does_not_create_fake_boundary_exit() {
+    let w = 13usize;
+    let h = 13usize;
+    let nd = -9999.0f64;
+    // Gently east-sloping valid terrain (20.0 -> 19.4) with zero exterior NoData.
+    let mut z = vec![0.0f64; w * h];
+    for r in 0..h {
+        for c in 0..w {
+            z[r * w + c] = 20.0 - c as f64 * 0.05;
+        }
+    }
+    // Upstream Basin A (west, cols 2..=4, rows 5..=7): graded 16.0 -> 14.0.
+    for r in 5..=7 {
+        for c in 2..=4 {
+            z[r * w + c] = 16.0;
+        }
+    }
+    z[6 * w + 3] = 14.0;
+    // Downstream Basin B (east, cols 8..=10, rows 4..=8): wide enough to catch all eastbound
+    // flow around the interior NoData void at (5..=6, 6).
+    for r in 4..=8 {
+        for c in 8..=10 {
+            z[r * w + c] = 14.0;
+        }
+    }
+    z[6 * w + 9] = 12.0;
+    // Place an interior NoData void at (c=6, r=6) with a lower valid pit cell (c=5, r=6) = 19.0
+    // directly adjacent to both Basin A and the interior NoData void. Because the void is
+    // disconnected from the raster border, neither static spill discovery nor FSM may treat
+    // (c=5, r=6) -> (c=6, r=6) as a domain exit (`to_dep_id == 0`).
+    z[6 * w + 5] = 19.0;
+    z[6 * w + 6] = nd;
+
+    let dem = make_dem(w, h, z, nd, [0.0, 1.0, 0.0, h as f64, 0.0, -1.0]);
+    let sinks = extract_sinks_in_memory(&dem, 2, Topology::D8).unwrap();
+    let deps = delineate_depressions_in_memory(&sinks.sink, 2, 0.2, 0.5).unwrap();
+    assert_eq!(deps.depressions.len(), 2, "expected Basin A and Basin B");
+
+    let dep_a = deps.depression_id.get(3, 6) as u32;
+    let dep_b = deps.depression_id.get(9, 6) as u32;
+    assert!(dep_a > 0 && dep_b > 0 && dep_a != dep_b);
+
+    let (hir, _) =
+        delineate_catchment_hierarchy_in_memory(&sinks.dem_refined, &deps.depression_level, 2)
+            .unwrap();
+    let opts = SimulateInundationOptions {
+        min_size: 2,
+        min_depth: 0.2,
+        interval: 0.5,
+        rain_intensity_cm_h: 50.0,
+        rain_duration_h: 5.0,
+        time_step_h: 1.0,
+        compress: false,
+    };
+    let (ft, _) = simulate_inundation_in_memory(&sinks.sink, &hir, &opts).unwrap();
+    let static_paths =
+        delineate_spill_flow_paths_in_memory(&sinks.dem_refined, &deps, &ft).unwrap();
+    let path_a = static_paths
+        .iter()
+        .find(|p| p.from_dep_id == dep_a)
+        .expect("expected static spill path from Basin A");
+    assert_eq!(
+        path_a.to_dep_id, dep_b,
+        "interior NoData void must NOT become a fake boundary exit; Basin A must spill to Basin B"
+    );
+
+    let fsm = simulate_fill_spill_merge_in_memory(
+        &sinks.dem_refined,
+        &sinks.sink,
+        &deps,
+        &opts,
+        &InundationForcing::default(),
+    )
+    .unwrap();
+    let basin_a = fsm.basins.iter().find(|b| b.dep_id == dep_a).unwrap();
+    assert_eq!(
+        basin_a.spill_to_dep_id,
+        Some(dep_b),
+        "FSM Basin A must spill into Basin B, not treat interior NoData void as boundary exit"
+    );
+    assert!(fsm.mass_balance.mass_balance_error_m3.abs() < 1e-6);
+
+    // Also verify the `in_source` direct-touch branch in `find_topographic_outlet`:
+    // when Basin A's own cell directly touches an interior NoData void (at (c=5, r=6)) while the
+    // raster border is completely valid, FSM must still route Basin A into Basin B, not to 0.
+    let mut dem_direct = sinks.dem_refined.clone();
+    dem_direct.set(5, 6, nd);
+    let fsm_direct = simulate_fill_spill_merge_in_memory(
+        &dem_direct,
+        &sinks.sink,
+        &deps,
+        &opts,
+        &InundationForcing::default(),
+    )
+    .unwrap();
+    let basin_a_direct = fsm_direct
+        .basins
+        .iter()
+        .find(|b| b.dep_id == dep_a)
+        .unwrap();
+    assert_eq!(
+        basin_a_direct.spill_to_dep_id,
+        Some(dep_b),
+        "direct touch of an interior NoData void must not trigger a fake boundary exit"
+    );
+}
+
 /// Item 3: Low-gradient polyline culvert (with NoData tails and `half_width_cells = 1`) and point
 /// culvert carve monotonically without creating an interior depression below the outlet endpoint
 /// or overwriting endpoints.
@@ -861,15 +972,22 @@ fn core_numerical_and_edge_case_regressions() {
     );
 
     // 8e. File-based `delineate_catchment_hierarchy` saves `f64` catchment_hir.tif preserving
-    // fractional areas (0.25 m^2 cell area).
+    // fractional areas below 0.5 m^2 (1-cell sink at 0.5x0.5 m resolution -> exact 0.25 m^2).
     let tmp = tempfile::tempdir().unwrap();
     let frac_dem_path = tmp.path().join("frac_dem.tif");
     let lvl_dir = tmp.path().join("levels");
     std::fs::create_dir_all(&lvl_dir).unwrap();
     let lvl1_path = lvl_dir.join("Single_level_1.tif");
     let hir_out_path = tmp.path().join("hir").join("catchment_hir.tif");
-    let mut frac_z = vec![10.0f64; 25];
-    frac_z[12] = 8.0; // 1-pixel sink at center
+    // Ring around center at 10.0 drains strictly outward to 9.0 border; center at 9.5 is an
+    // isolated 1-cell sink whose exact catchment area is 1 * 0.25 = 0.25 m^2 (< 0.5 m^2).
+    let mut frac_z = vec![9.0f64; 25];
+    for r in 1..4 {
+        for c in 1..4 {
+            frac_z[r * 5 + c] = 10.0;
+        }
+    }
+    frac_z[12] = 9.5;
     let frac_dem = make_dem(5, 5, frac_z, -9999.0, [0.0, 0.5, 0.0, 2.5, 0.0, -0.5]);
     let mut lvl1_data = vec![0.0f64; 25];
     lvl1_data[12] = 1.0;
@@ -885,12 +1003,15 @@ fn core_numerical_and_edge_case_regressions() {
     .unwrap();
     let hir_loaded = load_raster::<f64>(&hir_res.catchment_raster_path, None).unwrap();
     assert!(
-        (hir_loaded.get(2, 2) - hir_res.records[0].cat_area).abs() < 1e-6,
-        "f64 catchment_hir.tif must preserve fractional catchment area {}, got {}",
-        hir_res.records[0].cat_area,
+        (hir_res.records[0].cat_area - 0.25).abs() < 1e-6,
+        "expected exact 0.25 m^2 catchment area, got {}",
+        hir_res.records[0].cat_area
+    );
+    assert!(
+        (hir_loaded.get(2, 2) - 0.25).abs() < 1e-6,
+        "f64 catchment_hir.tif must preserve exact fractional area 0.25 m^2 (< 0.5), got {}",
         hir_loaded.get(2, 2)
     );
-    assert!((hir_loaded.get(2, 2) - 0.25).abs() < 1e-6 || hir_loaded.get(2, 2) > 0.0);
 
     // 8f. `delineate_depressions_tiled` upfront validation and seam deduplication.
     let bad_ov = TiledDelineationOptions {

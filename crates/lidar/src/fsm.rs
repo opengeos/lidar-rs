@@ -48,8 +48,8 @@ use crate::catchment::d8_flow_directions_resolved;
 use crate::error::{Error, Result};
 use crate::inundation::{
     HeapCell, InundationForcing, SimulateInundationOptions, SpillFlowPath, affine_metrics,
-    trace_downstream_away_from_source, validate_forcing_grids, validate_grid_alignment,
-    validate_options_with_hyetograph,
+    compute_exterior_nodata_mask, trace_downstream_away_from_source, validate_forcing_grids,
+    validate_grid_alignment, validate_options_with_hyetograph,
 };
 use crate::slicing::{InMemoryDepressions, NestedDepression};
 
@@ -308,6 +308,7 @@ fn find_topographic_outlet(
     zdata: &[f64],
     z_nd: f64,
     fdata: &[u8],
+    exterior_nodata: &[bool],
     dep_ids: &[i32],
     children_map: &HashMap<u32, Vec<u32>>,
     parent_map: &HashMap<u32, u32>,
@@ -401,6 +402,7 @@ fn find_topographic_outlet(
                 w,
                 h,
                 fdata,
+                exterior_nodata,
                 dep_ids,
                 &scratch.in_source,
                 &desc_ids,
@@ -435,20 +437,20 @@ fn find_topographic_outlet(
             }
         } else {
             let on_edge = r == 0 || r + 1 == h || c == 0 || c + 1 == w;
-            let touches_nodata = !on_edge
+            let touches_exterior_nodata = !on_edge
                 && ancestor_ids.is_empty()
                 && (1..=8).any(|d| {
                     let nr = r as isize + D8Y[d] as isize;
                     let nc = c as isize + D8X[d] as isize;
-                    if nr >= 0 && nc >= 0 && nr < h as isize && nc < w as isize {
-                        let nz = zdata[(nr as usize) * w + (nc as usize)];
-                        !nz.is_finite() || nz.rd_eq(z_nd)
-                    } else {
-                        false
-                    }
+                    nr >= 0
+                        && nc >= 0
+                        && nr < h as isize
+                        && nc < w as isize
+                        && exterior_nodata[(nr as usize) * w + (nc as usize)]
                 });
-            if on_edge || touches_nodata {
-                // Source basin directly touches the DEM boundary or a clipped NoData border.
+            if on_edge || touches_exterior_nodata {
+                // Top-level source basin directly touches the raster edge or an exterior-connected
+                // NoData border (never an interior NoData void).
                 found = Some(TopographicOutlet {
                     to_dep_id: 0,
                     spill_elev,
@@ -1002,6 +1004,7 @@ pub fn simulate_fill_spill_merge_in_memory(
 
     // 4. Discover topographic spill outlets for every depression (parallel when enabled),
     // checking out reusable scratch buffers from a pool strictly bounded by active worker count.
+    let exterior_nodata = compute_exterior_nodata_mask(fdata, w, h);
     #[cfg(feature = "parallel")]
     let outlets: Vec<Option<TopographicOutlet>> = {
         let pool = std::sync::Mutex::new(Vec::<OutletSearchScratch>::new());
@@ -1021,6 +1024,7 @@ pub fn simulate_fill_spill_merge_in_memory(
                     zdata,
                     z_nd,
                     fdata,
+                    &exterior_nodata,
                     dep_ids,
                     &children_map,
                     &parent_map,
@@ -1046,6 +1050,7 @@ pub fn simulate_fill_spill_merge_in_memory(
                     zdata,
                     z_nd,
                     fdata,
+                    &exterior_nodata,
                     dep_ids,
                     &children_map,
                     &parent_map,

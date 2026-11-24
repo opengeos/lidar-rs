@@ -12,7 +12,7 @@
 //! `inundation_summary.csv`.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -569,12 +569,61 @@ impl Ord for HeapCell {
 /// or terminates at an interior `NO_FLOW` micro-pit or cycle without a valid downstream target
 /// (memoized in `trapped_in_pit`), so the outward Priority-Flood search steps across
 /// sub-threshold micro-pits until it locates a valid overland outlet.
+/// Identifies NoData cells (`FLOWDIR_NO_DATA`) that are 4-connected to the outer raster
+/// boundary. Interior NoData voids (e.g. lake dropouts surrounded by valid DEM cells) remain
+/// `false` so they are never mistaken for clipped-watershed domain exits.
+pub(crate) fn compute_exterior_nodata_mask(flowdirs: &[u8], w: usize, h: usize) -> Vec<bool> {
+    let n = w * h;
+    let mut exterior = vec![false; n];
+    if w == 0 || h == 0 {
+        return exterior;
+    }
+    let mut queue = VecDeque::new();
+    let mut seed = |r: usize, c: usize, exterior: &mut [bool]| {
+        let idx = r * w + c;
+        if flowdirs[idx] == FLOWDIR_NO_DATA && !exterior[idx] {
+            exterior[idx] = true;
+            queue.push_back(idx);
+        }
+    };
+    for c in 0..w {
+        seed(0, c, &mut exterior);
+        if h > 1 {
+            seed(h - 1, c, &mut exterior);
+        }
+    }
+    for r in 1..h.saturating_sub(1) {
+        seed(r, 0, &mut exterior);
+        if w > 1 {
+            seed(r, w - 1, &mut exterior);
+        }
+    }
+    while let Some(idx) = queue.pop_front() {
+        let r = idx / w;
+        let c = idx % w;
+        let nbrs = [
+            (r > 0).then(|| idx - w),
+            (r + 1 < h).then(|| idx + w),
+            (c > 0).then(|| idx - 1),
+            (c + 1 < w).then(|| idx + 1),
+        ];
+        for nidx in nbrs.into_iter().flatten() {
+            if flowdirs[nidx] == FLOWDIR_NO_DATA && !exterior[nidx] {
+                exterior[nidx] = true;
+                queue.push_back(nidx);
+            }
+        }
+    }
+    exterior
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn trace_downstream_away_from_source(
     start_idx: usize,
     w: usize,
     h: usize,
     flowdirs: &[u8],
+    exterior_nodata: &[bool],
     dep_ids: &[i32],
     in_source: &[bool],
     desc_ids: &HashSet<u32>,
@@ -629,16 +678,19 @@ pub(crate) fn trace_downstream_away_from_source(
         let on_boundary = r == 0 || r + 1 == h || c == 0 || c + 1 == w;
         let dir = flowdirs[cur] as usize;
         if dir == FLOWDIR_NO_DATA as usize {
-            // Stepped onto a NoData cell outside the valid DEM domain: pop the NoData cell and
-            // accept as a clipped-watershed boundary exit when the preceding valid cell is not
-            // part of an enclosing ancestor ring.
+            // Pop the NoData cell. Accept as a clipped-watershed boundary exit only when the
+            // NoData cell is connected to the raster border (never for interior NoData voids)
+            // and the preceding valid cell is not part of an enclosing ancestor ring.
             trace.pop();
             let prev_is_ancestor = trace.last().is_some_and(|&prev| is_ancestor(prev));
             if !trace.is_empty() && !prev_is_ancestor {
                 if target_dep != 0 {
                     trace.truncate(last_target_len);
+                    return Some((trace, target_dep));
                 }
-                return Some((trace, target_dep));
+                if exterior_nodata[cur] {
+                    return Some((trace, 0));
+                }
             }
             for &idx in &trace {
                 trapped_in_pit[idx] = reject_gen;
@@ -650,16 +702,16 @@ pub(crate) fn trace_downstream_away_from_source(
                 trace.truncate(last_target_len);
                 return Some((trace, target_dep));
             }
-            let touches_nodata = (1..=8).any(|d| {
+            let touches_exterior_nodata = (1..=8).any(|d| {
                 let nr = r as isize + D8Y[d] as isize;
                 let nc = c as isize + D8X[d] as isize;
                 nr >= 0
                     && nc >= 0
                     && nr < h as isize
                     && nc < w as isize
-                    && flowdirs[(nr as usize) * w + (nc as usize)] == FLOWDIR_NO_DATA
+                    && exterior_nodata[(nr as usize) * w + (nc as usize)]
             });
-            if (on_boundary || touches_nodata) && !is_ancestor(cur) {
+            if (on_boundary || touches_exterior_nodata) && !is_ancestor(cur) {
                 return Some((trace, 0));
             }
             for &idx in &trace {
@@ -726,6 +778,7 @@ pub fn delineate_spill_flow_paths_in_memory(
 
     let flowdirs = d8_flow_directions_resolved(dem_refined)?;
     let fdata = flowdirs.data();
+    let exterior_nodata = compute_exterior_nodata_mask(fdata, w, h);
     let zdata = dem_refined.data();
     let z_nd = dem_refined.no_data();
     let dep_ids = depressions.depression_id.data();
@@ -895,6 +948,7 @@ pub fn delineate_spill_flow_paths_in_memory(
                     w,
                     h,
                     fdata,
+                    &exterior_nodata,
                     dep_ids,
                     &in_source,
                     &desc_ids,
@@ -2782,11 +2836,13 @@ mod tests {
         let mut trapped_in_pit = vec![0u32; w * h];
         let mut seen_stamp = vec![0u32; w * h];
 
+        let exterior_nodata = compute_exterior_nodata_mask(&flowdirs, w, h);
         let res = trace_downstream_away_from_source(
             1,
             w,
             h,
             &flowdirs,
+            &exterior_nodata,
             &dep_ids,
             &in_source,
             &desc_ids,
@@ -2916,11 +2972,13 @@ mod tests {
         // Interior pit at (2, 1), boundary NO_FLOW at (4, 1), east flow at (3, 1) -> (4, 1)
         flowdirs[w + 3] = 5u8; // east -> (4, 1) which is NO_FLOW on boundary
 
+        let exterior_nodata = compute_exterior_nodata_mask(&flowdirs, w, h);
         let interior_pit = trace_downstream_away_from_source(
             w + 2,
             w,
             h,
             &flowdirs,
+            &exterior_nodata,
             &dep_ids,
             &in_source,
             &desc_ids,
@@ -2941,6 +2999,7 @@ mod tests {
             w,
             h,
             &flowdirs,
+            &exterior_nodata,
             &dep_ids,
             &in_source,
             &desc_ids,
@@ -2966,6 +3025,7 @@ mod tests {
             w,
             h,
             &flowdirs,
+            &exterior_nodata,
             &dep_ids,
             &in_source,
             &desc_ids,

@@ -28,6 +28,8 @@ pub struct TiledDelineationOptions {
     /// Core (non-overlapping) tile width and height in pixels (default `2048`).
     pub tile_size: usize,
     /// Overlap halo added around each side of a tile in pixels (default `128`).
+    /// Note: seam deduplication memory and merge time scale with the number of sink pixels
+    /// falling inside tile overlap bands, so keep `overlap` proportional to expected basin width.
     pub overlap: usize,
     /// Optional median filter kernel size (`<= 1` skips smoothing; default `3`).
     pub kernel_size: usize,
@@ -358,8 +360,9 @@ fn run_tiled_generic<T: DemNum>(
             }
             x
         }
-        let mut cell_owner: HashMap<usize, usize> = HashMap::new();
-        let mut min_cell_owner: HashMap<(usize, usize), usize> = HashMap::new();
+        let total_seam_cells: usize = seam_regions.iter().map(|r| r.seam_cells.len()).sum();
+        let mut cell_owner: HashMap<usize, usize> = HashMap::with_capacity(total_seam_cells);
+        let mut min_cell_owner: HashMap<(usize, usize), usize> = HashMap::with_capacity(m);
         for (i, reg) in seam_regions.iter().enumerate() {
             if let Some(&prev) = min_cell_owner.get(&reg.min_cell) {
                 let ra = find(&mut parent, prev);

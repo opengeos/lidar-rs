@@ -613,6 +613,9 @@ pub fn build_connectivity_graph(
         }
         ldeps.sort_by_key(|d| first_idx[d.id as usize]);
         lrecs.sort_by_key(|r| r.level_fid);
+        // Accept either `d.count` (level-set depression footprint) or `subtree_count` (total
+        // pixels owned by `d` and its descendants in `depression_id`, matching the cumulative
+        // `level <= L` mask used by `delineate_catchment_hierarchy_in_memory`).
         let counts_align = ldeps
             .iter()
             .zip(lrecs.iter())
