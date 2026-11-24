@@ -10,9 +10,15 @@
 
 High-performance nested surface depression delineation, hydro-conditioning, LiDAR point-cloud gridding, and fill-and-spill inundation simulation in **pure Rust**, ported from [`opengeos/lidar`](https://github.com/opengeos/lidar) and powered by [`terrio`](https://github.com/opengeos/terrio) and [`richdem`](https://github.com/opengeos/richdem-rs) with **zero GDAL or C/C++ dependencies**.
 
+**Documentation:** [User Guides](https://lidar-rs.opengeos.org/guides/) | [Sample Datasets](https://lidar-rs.opengeos.org/datasets/) | [CLI](https://lidar-rs.opengeos.org/cli/) | [AI Agents (MCP)](https://lidar-rs.opengeos.org/mcp/) | [Rust](https://lidar-rs.opengeos.org/rust/) | [Python](https://lidar-rs.opengeos.org/python/) | [JavaScript / WASM](https://lidar-rs.opengeos.org/javascript/) | [Live Playground](https://lidar-rs.opengeos.org/playground/)
+
+## Demo
+
+[![Nested depression hierarchy and depression tree overview in lidar-rs](https://files.opengeos.org/depression_hierarchy.webp)](https://lidar-rs.opengeos.org/playground/)
+
 [![Interactive inundation simulation and inundation curve in the lidar-rs WebAssembly Playground](https://files.opengeos.org/inundation_demo.gif)](https://lidar-rs.opengeos.org/playground/)
 
-**Documentation:** [User Guides](https://lidar-rs.opengeos.org/guides/) | [Sample Datasets](https://lidar-rs.opengeos.org/datasets/) | [CLI](https://lidar-rs.opengeos.org/cli/) | [AI Agents (MCP)](https://lidar-rs.opengeos.org/mcp/) | [Rust](https://lidar-rs.opengeos.org/rust/) | [Python](https://lidar-rs.opengeos.org/python/) | [JavaScript / WASM](https://lidar-rs.opengeos.org/javascript/) | [Live Playground](https://lidar-rs.opengeos.org/playground/)
+[![Progressive depression tree graph building bottom-up with rising water layers in the lidar-rs WebAssembly Playground](https://files.opengeos.org/dem_depression_tree.gif)](https://lidar-rs.opengeos.org/playground/)
 
 ## Highlights
 
