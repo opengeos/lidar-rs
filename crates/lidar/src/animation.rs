@@ -69,12 +69,20 @@ pub struct AnimateInundationOptions {
     pub time_step_h: Option<f64>,
     /// Optional rainfall intensity in cm/h for the banner title.
     pub rain_intensity_cm_h: Option<f64>,
+    /// Optional time-varying scaled runoff hyetograph `Vec<(dt_h, intensity_cm_h)>` for per-frame
+    /// cumulative runoff banner labels.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub scaled_hyetograph: Option<Vec<(f64, f64)>>,
     /// Draw a bottom-left scale bar in map units (default `false`).
     #[cfg_attr(feature = "serde", serde(default))]
     pub show_scale_bar: bool,
     /// Draw a compact bottom-right color swatch legend (default `false`).
     #[cfg_attr(feature = "serde", serde(default))]
     pub show_legend: bool,
+    /// Optional override label for the primary legend swatch (defaults to `"WATER"` for inundation
+    /// frames and `"DEPTH"` for DEM depth previews).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub legend_label: Option<String>,
     /// Optional vector polylines (in source DEM `(col, row)` coordinates) overlaid onto each frame.
     #[cfg_attr(feature = "serde", serde(default))]
     pub overlay_polylines: Vec<Vec<(usize, usize)>>,
@@ -99,8 +107,10 @@ impl Default for AnimateInundationOptions {
             hillshade: HillshadeOptions::default(),
             time_step_h: Some(1.0),
             rain_intensity_cm_h: None,
+            scaled_hyetograph: None,
             show_scale_bar: false,
             show_legend: false,
+            legend_label: None,
             overlay_polylines: Vec::new(),
             overlay_rgb: default_overlay_rgb(),
         }
@@ -175,17 +185,17 @@ pub fn compute_hillshade_rgb(dem: &Array2D<f64>, opts: &HillshadeOptions) -> Vec
     }
     let span = (vmax - vmin).max(1e-12);
 
-    // Build finite elevation buffer (replacing NoData with vmin for stable central differences).
-    let elev: Vec<f64> = data
-        .iter()
-        .map(|&v| {
-            if v.is_finite() && !v.rd_eq(nd) {
-                v
-            } else {
-                vmin
-            }
-        })
-        .collect();
+    // Scale finite differences by pixel cell spacing in map units for projected CRSs,
+    // defaulting to 1.0 for geographic CRSs or missing/degenerate geotransforms.
+    let (cell_x, cell_y) = if is_geographic_crs(&dem.projection, dem.geotransform) {
+        (1.0, 1.0)
+    } else {
+        let dx = dem.geotransform[1].abs();
+        let dy = dem.geotransform[5].abs();
+        let cx = if dx.is_finite() && dx > 0.0 { dx } else { 1.0 };
+        let cy = if dy.is_finite() && dy > 0.0 { dy } else { 1.0 };
+        (cx, cy)
+    };
 
     let az_rad = opts.azimuth_deg.to_radians();
     let el_rad = opts.elevation_deg.to_radians();
@@ -204,9 +214,6 @@ pub fn compute_hillshade_rgb(dem: &Array2D<f64>, opts: &HillshadeOptions) -> Vec
 
     let mut rgb = vec![0u8; w * h * 3];
     for r in 0..h {
-        let r_prev = r.saturating_sub(1);
-        let r_next = (r + 1).min(h.saturating_sub(1));
-        let dr_denom = (r_next - r_prev).max(1) as f64;
         for c in 0..w {
             let idx = r * w + c;
             let raw = data[idx];
@@ -216,12 +223,39 @@ pub fn compute_hillshade_rgb(dem: &Array2D<f64>, opts: &HillshadeOptions) -> Vec
                 rgb[idx * 3 + 2] = 32;
                 continue;
             }
-            let c_prev = c.saturating_sub(1);
-            let c_next = (c + 1).min(w.saturating_sub(1));
-            let dc_denom = (c_next - c_prev).max(1) as f64;
+            // Substitute the center pixel's elevation for missing or NoData neighbors so
+            // raster boundaries and NoData masks never produce artificial cliff halos.
+            let up_val = if r > 0 {
+                let v = data[(r - 1) * w + c];
+                (v.is_finite() && !v.rd_eq(nd)).then_some(v)
+            } else {
+                None
+            };
+            let dn_val = if r + 1 < h {
+                let v = data[(r + 1) * w + c];
+                (v.is_finite() && !v.rd_eq(nd)).then_some(v)
+            } else {
+                None
+            };
+            let dr_steps = (usize::from(up_val.is_some()) + usize::from(dn_val.is_some())).max(1);
+            let dr =
+                (dn_val.unwrap_or(raw) - up_val.unwrap_or(raw)) / (dr_steps as f64 * cell_y) * zf;
 
-            let dr = (elev[r_next * w + c] - elev[r_prev * w + c]) / dr_denom * zf;
-            let dc = (elev[r * w + c_next] - elev[r * w + c_prev]) / dc_denom * zf;
+            let lt_val = if c > 0 {
+                let v = data[r * w + (c - 1)];
+                (v.is_finite() && !v.rd_eq(nd)).then_some(v)
+            } else {
+                None
+            };
+            let rt_val = if c + 1 < w {
+                let v = data[r * w + (c + 1)];
+                (v.is_finite() && !v.rd_eq(nd)).then_some(v)
+            } else {
+                None
+            };
+            let dc_steps = (usize::from(lt_val.is_some()) + usize::from(rt_val.is_some())).max(1);
+            let dc =
+                (rt_val.unwrap_or(raw) - lt_val.unwrap_or(raw)) / (dc_steps as f64 * cell_x) * zf;
 
             // Cross product of vr=(dr, 1, 0) and vc=(dc, 0, 1) -> (1, -dr, -dc).
             let nx = 1.0;
@@ -649,9 +683,21 @@ where
             None => format!("STEP {}/{num_steps}", src_idx + 1),
         };
         let phase = if rising { "RISING" } else { "FALLING" };
-        let banner_text = match options.rain_intensity_cm_h {
-            Some(r) => format!("{phase}  {time_label}  ({r:.1} CM/H)"),
-            None => format!("{phase}  {time_label}"),
+        let banner_text = if let (Some(hyeto), Some(dt)) =
+            (options.scaled_hyetograph.as_deref(), options.time_step_h)
+        {
+            let t_hours = (src_idx + 1) as f64 * dt;
+            let cum_mm = crate::inundation::cumulative_runoff_mm(
+                t_hours,
+                options.rain_intensity_cm_h.unwrap_or(0.0),
+                Some(hyeto),
+            );
+            format!("{phase}  {time_label}  ({cum_mm:.0} MM)")
+        } else {
+            match options.rain_intensity_cm_h {
+                Some(r) => format!("{phase}  {time_label}  ({r:.1} CM/H)"),
+                None => format!("{phase}  {time_label}"),
+            }
         };
         draw_banner(
             &mut frame_rgb[..dw * banner_h * 3],
@@ -704,7 +750,15 @@ where
             draw_scale_bar(body, dw, dh, sw, cell_m, &dem.projection, reserve_right);
         }
         if options.show_legend {
-            draw_legend_box(body, dw, dh, options.water_rgb, !spill_paths.is_empty());
+            let legend_label = options.legend_label.as_deref().unwrap_or("WATER");
+            draw_legend_box(
+                body,
+                dw,
+                dh,
+                options.water_rgb,
+                legend_label,
+                !spill_paths.is_empty(),
+            );
         }
 
         let mut gif_frame = Frame::from_rgb_speed(dw as u16, total_h as u16, &frame_rgb, 10);
@@ -951,9 +1005,14 @@ fn draw_scale_bar(
         return;
     }
     let p_lower = projection.to_ascii_lowercase();
-    let unit_is_feet =
-        p_lower.contains("foot") || p_lower.contains("feet") || p_lower.contains("us_survey_foot");
-    let cell_m = if unit_is_feet {
+    let unit_is_us_survey_feet = p_lower.contains("us_survey_foot")
+        || p_lower.contains("us survey foot")
+        || p_lower.contains("+units=us-ft");
+    let unit_is_intl_feet = !unit_is_us_survey_feet
+        && (p_lower.contains("foot") || p_lower.contains("feet") || p_lower.contains("+units=ft"));
+    let cell_m = if unit_is_us_survey_feet {
+        cell_units * (1200.0 / 3937.0)
+    } else if unit_is_intl_feet {
         cell_units * 0.3048
     } else {
         cell_units
@@ -1022,8 +1081,16 @@ fn draw_scale_bar(
     }
 }
 
-fn draw_legend_box(body: &mut [u8], dw: usize, dh: usize, water_rgb: [u8; 3], has_spills: bool) {
-    let box_w = 84usize;
+fn draw_legend_box(
+    body: &mut [u8],
+    dw: usize,
+    dh: usize,
+    water_rgb: [u8; 3],
+    label: &str,
+    has_spills: bool,
+) {
+    let text_cols = label.chars().count().max(if has_spills { 5 } else { 0 });
+    let box_w = (17 + text_cols * 6 + 6).max(84);
     let box_h = if has_spills { 30usize } else { 18usize };
     if dw < box_w + 16 || dh < box_h + 16 {
         return;
@@ -1038,7 +1105,7 @@ fn draw_legend_box(body: &mut [u8], dw: usize, dh: usize, water_rgb: [u8; 3], ha
             body[p + 2] = ((body[p + 2] as u16 + 32) / 3) as u8;
         }
     }
-    // Water swatch
+    // Primary swatch
     for y in (ly0 + 5)..(ly0 + 11) {
         for x in (lx0 + 5)..(lx0 + 13) {
             let p = (y * dw + x) * 3;
@@ -1047,7 +1114,7 @@ fn draw_legend_box(body: &mut [u8], dw: usize, dh: usize, water_rgb: [u8; 3], ha
             body[p + 2] = water_rgb[2];
         }
     }
-    draw_text_5x7(body, dw, dh, lx0 + 17, ly0 + 5, "WATER", [245, 248, 255]);
+    draw_text_5x7(body, dw, dh, lx0 + 17, ly0 + 5, label, [245, 248, 255]);
     if has_spills {
         for y in (ly0 + 17)..(ly0 + 23) {
             for x in (lx0 + 5)..(lx0 + 13) {
@@ -1086,24 +1153,34 @@ pub fn encode_rgb_to_png_bytes(rgb: &[u8], width: usize, height: usize) -> Resul
 
 /// Returns `true` when the DEM projection metadata indicates geographic (angular degree)
 /// coordinates where a linear metric scale bar would be misleading.
-fn is_geographic_crs(projection: &str, geotransform: [f64; 6]) -> bool {
-    let p = projection.to_ascii_lowercase();
-    let is_projected = p.contains("projcs[")
-        || p.contains("projcrs[")
-        || p.contains("+proj=utm")
-        || p.contains("+proj=aea")
-        || p.contains("+proj=lcc")
-        || p.contains("+proj=merc");
-    if !is_projected
-        && (p.contains("geogcs[")
-            || p.contains("geogcrs[")
-            || p.contains("epsg:4326")
-            || p.contains("+proj=longlat"))
-    {
-        return true;
+pub(crate) fn is_geographic_crs(projection: &str, geotransform: [f64; 6]) -> bool {
+    let trimmed = projection.trim();
+    if !trimmed.is_empty() {
+        if let Ok(srs) = terrio::crs::SpatialRef::parse(trimmed)
+            && !srs.is_unknown()
+        {
+            return srs.is_geographic();
+        }
+        let p = trimmed.to_ascii_lowercase();
+        let is_projected = p.contains("projcs[")
+            || p.contains("projcrs[")
+            || p.contains("+proj=utm")
+            || p.contains("+proj=aea")
+            || p.contains("+proj=lcc")
+            || p.contains("+proj=merc");
+        if !is_projected
+            && (p.contains("geogcs[")
+                || p.contains("geogcrs[")
+                || p.contains("epsg:4326")
+                || p.contains("epsg:4269")
+                || p.contains("+proj=longlat"))
+        {
+            return true;
+        }
+        return false;
     }
     let cell = geotransform[1].hypot(geotransform[4]);
-    projection.trim().is_empty() && cell > 0.0 && cell < 1e-2
+    cell > 0.0 && cell < 1e-2
 }
 
 /// Renders a single shaded-relief inundation frame at `t_hours` into PNG bytes
@@ -1116,6 +1193,16 @@ pub fn render_inundation_frame_png_bytes(
     spill_paths: &[SpillFlowPath],
     options: &AnimateInundationOptions,
 ) -> Result<Vec<u8>> {
+    if !t_hours.is_finite() || t_hours < 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "t_hours must be finite and >= 0, got {t_hours}"
+        )));
+    }
+    if !progress.is_finite() || progress < 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "progress must be finite and >= 0, got {progress}"
+        )));
+    }
     let sw = dem.width();
     let sh = dem.height();
     crate::inundation::validate_grid_alignment(dem, fill_time, "fill_time")?;
@@ -1131,15 +1218,22 @@ pub fn render_inundation_frame_png_bytes(
 
     let wet: Vec<bool> = ft_data
         .iter()
-        .map(|&ft| {
-            t_hours > 0.0 && ft.is_finite() && !ft.rd_eq(ft_nd) && (0.0..=t_hours).contains(&ft)
-        })
+        .map(|&ft| ft.is_finite() && !ft.rd_eq(ft_nd) && (0.0..=t_hours).contains(&ft))
         .collect();
 
     let mut frame_rgb = vec![0u8; dw * total_h * 3];
-    let label = match options.rain_intensity_cm_h {
-        Some(r) => format!("T = {t_hours:.1}H  ({:.0} MM)", t_hours * r * 10.0),
-        None => format!("T = {t_hours:.1}H"),
+    let label = if let Some(hyeto) = options.scaled_hyetograph.as_deref() {
+        let cum_mm = crate::inundation::cumulative_runoff_mm(
+            t_hours,
+            options.rain_intensity_cm_h.unwrap_or(0.0),
+            Some(hyeto),
+        );
+        format!("T = {t_hours:.1}H  ({cum_mm:.0} MM)")
+    } else {
+        match options.rain_intensity_cm_h {
+            Some(r) => format!("T = {t_hours:.1}H  ({:.0} MM)", t_hours * r * 10.0),
+            None => format!("T = {t_hours:.1}H"),
+        }
     };
     draw_banner(
         &mut frame_rgb,
@@ -1175,7 +1269,7 @@ pub fn render_inundation_frame_png_bytes(
             options.overlay_rgb,
         );
     }
-    if !spill_paths.is_empty() && t_hours > 0.0 {
+    if !spill_paths.is_empty() {
         draw_active_spill_paths(body, dw, dh, sw, sh, &wet, t_hours, spill_paths);
     }
     if options.show_scale_bar && !is_geographic_crs(&dem.projection, dem.geotransform) {
@@ -1183,7 +1277,15 @@ pub fn render_inundation_frame_png_bytes(
         draw_scale_bar(body, dw, dh, sw, cell_m, &dem.projection, reserve_right);
     }
     if options.show_legend {
-        draw_legend_box(body, dw, dh, options.water_rgb, !spill_paths.is_empty());
+        let legend_label = options.legend_label.as_deref().unwrap_or("WATER");
+        draw_legend_box(
+            body,
+            dw,
+            dh,
+            options.water_rgb,
+            legend_label,
+            !spill_paths.is_empty(),
+        );
     }
     encode_rgb_to_png_bytes(&frame_rgb, dw, total_h)
 }
@@ -1234,7 +1336,8 @@ pub fn render_dem_preview_png_bytes(
         draw_scale_bar(&mut rgb, dw, dh, sw, cell_m, &dem.projection, reserve_right);
     }
     if options.show_legend && depth_overlay.is_some() {
-        draw_legend_box(&mut rgb, dw, dh, options.water_rgb, false);
+        let legend_label = options.legend_label.as_deref().unwrap_or("DEPTH");
+        draw_legend_box(&mut rgb, dw, dh, options.water_rgb, legend_label, false);
     }
     encode_rgb_to_png_bytes(&rgb, dw, dh)
 }
@@ -1295,9 +1398,18 @@ pub fn export_inundation_frames_png(
             .map(|&ft| ft.is_finite() && !ft.rd_eq(ft_nd) && (0.0..=t_hours).contains(&ft))
             .collect();
 
-        let label = match options.rain_intensity_cm_h {
-            Some(r) => format!("T = {t_hours:.1}H  ({:.0} MM)", t_hours * r * 10.0),
-            None => format!("T = {t_hours:.1}H"),
+        let label = if let Some(hyeto) = options.scaled_hyetograph.as_deref() {
+            let cum_mm = crate::inundation::cumulative_runoff_mm(
+                t_hours,
+                options.rain_intensity_cm_h.unwrap_or(0.0),
+                Some(hyeto),
+            );
+            format!("T = {t_hours:.1}H  ({cum_mm:.0} MM)")
+        } else {
+            match options.rain_intensity_cm_h {
+                Some(r) => format!("T = {t_hours:.1}H  ({:.0} MM)", t_hours * r * 10.0),
+                None => format!("T = {t_hours:.1}H"),
+            }
         };
         let progress = (src_idx + 1) as f64 / num_steps as f64;
         draw_banner(
@@ -1344,7 +1456,15 @@ pub fn export_inundation_frames_png(
             draw_scale_bar(body, dw, dh, sw, cell_m, &dem.projection, reserve_right);
         }
         if options.show_legend {
-            draw_legend_box(body, dw, dh, options.water_rgb, !spill_paths.is_empty());
+            let legend_label = options.legend_label.as_deref().unwrap_or("WATER");
+            draw_legend_box(
+                body,
+                dw,
+                dh,
+                options.water_rgb,
+                legend_label,
+                !spill_paths.is_empty(),
+            );
         }
 
         let png_bytes = encode_rgb_to_png_bytes(&frame_rgb, dw, total_h)?;
@@ -1579,5 +1699,133 @@ mod tests {
             0,
             "channel must disappear at merge_time_h"
         );
+    }
+
+    #[test]
+    fn geographic_crs_detects_nad83_epsg_4269_and_projected_utms() {
+        assert!(is_geographic_crs(
+            "EPSG:4269",
+            [0.0, 0.0001, 0.0, 0.0, 0.0, -0.0001]
+        ));
+        assert!(is_geographic_crs(
+            "EPSG:4326",
+            [0.0, 0.0001, 0.0, 0.0, 0.0, -0.0001]
+        ));
+        assert!(!is_geographic_crs(
+            "EPSG:26915",
+            [500_000.0, 1.0, 0.0, 4_500_000.0, 0.0, -1.0]
+        ));
+        assert!(!is_geographic_crs(
+            "EPSG:5070",
+            [0.0, 10.0, 0.0, 0.0, 0.0, -10.0]
+        ));
+    }
+
+    #[test]
+    fn hillshade_avoids_nodata_cliff_halo_and_scales_by_cell_spacing() {
+        // 7x7 flat plateau at 500.0 with a NoData border and a single low valid cell (100.0)
+        // in the corner so vmin = 100.0 << plateau.
+        let mut data = vec![-9999.0; 7 * 7];
+        for r in 1..6 {
+            for c in 1..6 {
+                data[r * 7 + c] = 500.0;
+            }
+        }
+        data[0] = 100.0;
+        let mut dem = Array2D::from_vec(7, 7, data).unwrap();
+        dem.set_no_data(-9999.0);
+        dem.projection = "EPSG:26915".to_string();
+        dem.geotransform = [500_000.0, 1.0, 0.0, 4_500_000.0, 0.0, -1.0];
+
+        let rgb = compute_hillshade_rgb(&dem, &HillshadeOptions::default());
+        let interior = &rgb[(3 * 7 + 3) * 3..(3 * 7 + 3) * 3 + 3];
+        let border_by_nodata = &rgb[(3 * 7 + 5) * 3..(3 * 7 + 5) * 3 + 3];
+        assert_eq!(
+            interior, border_by_nodata,
+            "plateau pixel adjacent to NoData must not suffer a cliff halo"
+        );
+
+        // Cell-spacing invariance: same physical 0.5 slope sampled at 1m vs 10m produces identical
+        // hillshade brightness for pixels at the same normalized elevation.
+        let mut ramp_1m = vec![0.0; 5 * 5];
+        let mut ramp_10m = vec![0.0; 5 * 5];
+        for r in 0..5 {
+            for c in 0..5 {
+                ramp_1m[r * 5 + c] = 100.0 + 0.5 * (c as f64);
+                ramp_10m[r * 5 + c] = 100.0 + 0.5 * (c as f64 * 10.0);
+            }
+        }
+        let mut d1 = Array2D::from_vec(5, 5, ramp_1m).unwrap();
+        d1.projection = "EPSG:26915".to_string();
+        d1.geotransform = [0.0, 1.0, 0.0, 0.0, 0.0, -1.0];
+        let mut d10 = Array2D::from_vec(5, 5, ramp_10m).unwrap();
+        d10.projection = "EPSG:26915".to_string();
+        d10.geotransform = [0.0, 10.0, 0.0, 0.0, 0.0, -10.0];
+
+        let rgb1 = compute_hillshade_rgb(&d1, &HillshadeOptions::default());
+        let rgb10 = compute_hillshade_rgb(&d10, &HillshadeOptions::default());
+        assert_eq!(rgb1, rgb10);
+    }
+
+    #[test]
+    fn render_inundation_frame_validates_time_and_renders_antecedent_water_at_t0() {
+        let dem = Array2D::from_vec(12, 12, vec![100.0; 144]).unwrap();
+        let mut ft_data = vec![-1.0; 144];
+        ft_data[6 * 12 + 6] = 0.0; // antecedent water at t=0
+        ft_data[6 * 12 + 7] = 2.0; // inundated later
+        let mut ft = Array2D::from_vec(12, 12, ft_data).unwrap();
+        ft.set_no_data(-1.0);
+
+        let opts = AnimateInundationOptions::default();
+        assert!(render_inundation_frame_png_bytes(&dem, &ft, f64::NAN, 0.0, &[], &opts).is_err());
+        assert!(render_inundation_frame_png_bytes(&dem, &ft, -0.5, 0.0, &[], &opts).is_err());
+        assert!(render_inundation_frame_png_bytes(&dem, &ft, 0.0, f64::NAN, &[], &opts).is_err());
+        assert!(render_inundation_frame_png_bytes(&dem, &ft, 0.0, -0.1, &[], &opts).is_err());
+
+        let png_t0 = render_inundation_frame_png_bytes(&dem, &ft, 0.0, 0.0, &[], &opts).unwrap();
+        let mut ft_dry = Array2D::from_vec(12, 12, vec![-1.0; 144]).unwrap();
+        ft_dry.set_no_data(-1.0);
+        let png_dry =
+            render_inundation_frame_png_bytes(&dem, &ft_dry, 0.0, 0.0, &[], &opts).unwrap();
+        assert_ne!(
+            png_t0, png_dry,
+            "t_hours == 0.0 must render cells with fill_time == 0.0"
+        );
+
+        // Hyetograph option renders valid GIF bytes.
+        let hyeto_opts = AnimateInundationOptions {
+            ping_pong: false,
+            scaled_hyetograph: Some(vec![(1.0, 2.0), (1.0, 6.0)]),
+            show_legend: true,
+            ..Default::default()
+        };
+        let (gif_bytes, frames, _, _) =
+            animate_inundation_to_bytes(&dem, &ft, 2, 1.0, &hyeto_opts).unwrap();
+        assert_eq!(frames, 2);
+        assert!(gif_bytes.starts_with(b"GIF89a"));
+
+        // Depth preview legend uses "DEPTH" by default (distinct from "WATER").
+        let depth = Array2D::from_vec(120, 60, vec![1.0; 120 * 60]).unwrap();
+        let big_dem = Array2D::from_vec(120, 60, vec![100.0; 120 * 60]).unwrap();
+        let depth_default = render_dem_preview_png_bytes(
+            &big_dem,
+            Some(&depth),
+            &AnimateInundationOptions {
+                show_legend: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let depth_water = render_dem_preview_png_bytes(
+            &big_dem,
+            Some(&depth),
+            &AnimateInundationOptions {
+                show_legend: true,
+                legend_label: Some("WATER".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_ne!(depth_default, depth_water);
     }
 }

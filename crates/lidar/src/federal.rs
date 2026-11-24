@@ -19,24 +19,25 @@
 //! - **End-to-end bundle** (downloads all selected federal datasets, optionally mosaics/clips
 //!   the 3DEP DEM and synthesizes road-stream culverts): [`download_federal_data`]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use terrio::crs::{SpatialRef, Transformer};
+use terrio::ops::Resampling;
 use terrio::ops::topology::make_valid as terrio_make_valid;
 use terrio::ops::vector_clip::{ClipRegion, ClipTemplateOptions, clip as terrio_vector_clip};
 use terrio::{VectorOpenOptions, VectorWriteOptions};
 
 use crate::conditioning::{SynthesizeCulvertsOptions, synthesize_culverts};
 use crate::error::{Error, Result};
-use crate::raster_ops::{clip_image, mosaic};
+use crate::raster_ops::{clip_image, mosaic_with_resampling};
 
 /// USGS Watershed Boundary Dataset (WBD) MapServer base URL.
 pub const USGS_WBD_BASE_URL: &str =
@@ -643,16 +644,51 @@ fn make_download_agent(timeout_secs: u64) -> ureq::Agent {
     ureq::Agent::new_with_config(config)
 }
 
-fn is_retryable_ureq_error(err: &ureq::Error) -> bool {
+pub(crate) fn is_retryable_ureq_error(err: &ureq::Error) -> bool {
     match err {
         ureq::Error::BodyExceedsLimit(_)
         | ureq::Error::BadUri(_)
+        | ureq::Error::Http(_)
+        | ureq::Error::HostNotFound
         | ureq::Error::InvalidProxyUrl
         | ureq::Error::TooManyRedirects
-        | ureq::Error::RedirectFailed => false,
+        | ureq::Error::RedirectFailed
+        | ureq::Error::RequireHttpsOnly(_)
+        | ureq::Error::LargeResponseHeader(_, _)
+        | ureq::Error::Tls(_)
+        | ureq::Error::Pem(_)
+        | ureq::Error::Rustls(_) => false,
         ureq::Error::StatusCode(code) => *code == 408 || *code == 429 || *code >= 500,
         _ => true,
     }
+}
+
+fn retry_backoff_duration(base_ms: u64, attempt: usize) -> Duration {
+    let linear_ms = base_ms.saturating_mul(attempt as u64 + 1);
+    let max_jitter = (linear_ms / 4).max(1);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos() as u64);
+    let mixed = nanos
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add((attempt as u64).wrapping_mul(1_442_695_040_888_963_407));
+    Duration::from_millis(linear_ms.saturating_add(mixed % max_jitter))
+}
+
+fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    ensure_parent_dir(path)?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".lidar_tmp_")
+        .suffix(".part")
+        .tempfile_in(parent)?;
+    tmp.as_file_mut().write_all(contents)?;
+    tmp.as_file_mut().flush()?;
+    tmp.persist(path).map_err(|e| Error::Io(e.error))?;
+    Ok(())
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<()> {
@@ -721,7 +757,7 @@ fn http_get_text(
                     return Err(Error::Http(format!("GET {url} failed: {last_err}")));
                 }
                 if attempt < max_retries {
-                    std::thread::sleep(Duration::from_millis(1200 * (attempt as u64 + 1)));
+                    std::thread::sleep(retry_backoff_duration(1200, attempt));
                 }
             }
         }
@@ -764,7 +800,7 @@ fn http_post_form_text(
                     return Err(Error::Http(format!("POST {url} failed: {last_err}")));
                 }
                 if attempt < max_retries {
-                    std::thread::sleep(Duration::from_millis(1500 * (attempt as u64 + 1)));
+                    std::thread::sleep(retry_backoff_duration(1500, attempt));
                 }
             }
         }
@@ -783,6 +819,7 @@ fn http_download_file(
     overwrite: bool,
     max_retries: usize,
 ) -> Result<PathBuf> {
+    let expected_bytes = expected_bytes.filter(|&n| n > 0);
     if !overwrite
         && dest.exists()
         && let Ok(meta) = std::fs::metadata(dest)
@@ -820,6 +857,23 @@ fn http_download_file(
                     DownloadAttemptErr::Fatal(err)
                 }
             })?;
+            let has_content_encoding = resp
+                .headers()
+                .get("content-encoding")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| {
+                    let trimmed = v.trim();
+                    !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("identity")
+                });
+            let header_content_length = if expected_bytes.is_none() && !has_content_encoding {
+                resp.headers()
+                    .get("content-length")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .filter(|&n| n > 0)
+            } else {
+                None
+            };
             let mut reader = resp.body_mut().as_reader();
             let mut buf = vec![0u8; 256 * 1024];
             let mut written: u64 = 0;
@@ -845,7 +899,8 @@ fn http_download_file(
                     "GET {url} returned empty body"
                 ))));
             }
-            if let Some(exp) = expected_bytes
+            let verify_len = expected_bytes.or(header_content_length);
+            if let Some(exp) = verify_len
                 && written != exp
             {
                 return Err(DownloadAttemptErr::Retryable(Error::Http(format!(
@@ -867,7 +922,7 @@ fn http_download_file(
                 drop(tmp_file);
                 last_err = e.to_string();
                 if attempt < max_retries {
-                    std::thread::sleep(Duration::from_millis(2000 * (attempt as u64 + 1)));
+                    std::thread::sleep(retry_backoff_duration(2000, attempt));
                 }
             }
         }
@@ -1236,6 +1291,32 @@ fn write_geojson_feature_collection(
     Ok(final_count)
 }
 
+/// Decides whether an ArcGIS `objectIds` chunk response was truncated by a server transfer
+/// limit and should be bisected into smaller chunks.
+///
+/// - Never bisects single-OID chunks (`chunk_len <= 1`).
+/// - Always bisects when the server explicitly sets `exceededTransferLimit: true`.
+/// - When `!exceeded` and `features_len == 0`, returns `false` so missing or null-geometry
+///   OIDs do not trigger recursive empty-chunk amplification.
+/// - When `!exceeded` and `0 < features_len < chunk_len`, only bisects when `features_len`
+///   hits a plausible server transfer cap (`>= 1000`).
+pub(crate) fn should_bisect_arcgis_chunk(
+    exceeded: bool,
+    features_len: usize,
+    chunk_len: usize,
+) -> bool {
+    if chunk_len <= 1 {
+        return false;
+    }
+    if exceeded {
+        return true;
+    }
+    if features_len == 0 {
+        return false;
+    }
+    features_len < chunk_len && features_len >= 1000
+}
+
 fn fetch_arcgis_oid_chunk(
     agent: &ureq::Agent,
     query_url: &str,
@@ -1276,7 +1357,10 @@ fn fetch_arcgis_oid_chunk(
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
-    if (exceeded || features.len() < chunk.len()) && chunk.len() > 1 {
+    if !exceeded && features.is_empty() {
+        return Ok(features);
+    }
+    if should_bisect_arcgis_chunk(exceeded, features.len(), chunk.len()) {
         let mid = chunk.len() / 2;
         let mut left =
             fetch_arcgis_oid_chunk(agent, query_url, &chunk[..mid], out_fields, max_retries)?;
@@ -1657,7 +1741,10 @@ pub(crate) fn parse_tnm_products_json(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let size_bytes = it.get("sizeInBytes").and_then(Value::as_u64);
+        let size_bytes = it
+            .get("sizeInBytes")
+            .and_then(Value::as_u64)
+            .filter(|&n| n > 0);
         let format = it
             .get("format")
             .and_then(Value::as_str)
@@ -1812,6 +1899,66 @@ pub fn download_3dep_dem(
     download_3dep_dem_resolved(&resolved, out_dir, opts, opts.overwrite)
 }
 
+fn fnv1a_hash64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+fn insert_filename_tag(filename: &str, tag: &str) -> String {
+    if let Some(dot) = filename.rfind('.')
+        && dot > 0
+    {
+        format!("{}_{tag}{}", &filename[..dot], &filename[dot..])
+    } else {
+        format!("{filename}_{tag}")
+    }
+}
+
+/// Assigns collision-free local tile filenames for `products` so parallel tile downloads never
+/// race on the same destination path. Non-colliding tiles keep their exact sanitized basename.
+pub(crate) fn assign_unique_tile_filenames(products: &[TnmProductItem]) -> Vec<String> {
+    let base_names: Vec<String> = products
+        .iter()
+        .map(|it| sanitize_tile_filename(&it.download_url, &it.grid_key))
+        .collect();
+    let mut counts: HashMap<String, usize> = HashMap::with_capacity(base_names.len());
+    for name in &base_names {
+        *counts.entry(name.to_ascii_lowercase()).or_insert(0) += 1;
+    }
+
+    let mut used: HashSet<String> = HashSet::with_capacity(base_names.len());
+    let mut out = Vec::with_capacity(base_names.len());
+    for (idx, (item, base)) in products.iter().zip(base_names).enumerate() {
+        let lower = base.to_ascii_lowercase();
+        let candidate = if counts.get(&lower).copied().unwrap_or(0) <= 1 && used.insert(lower) {
+            base
+        } else {
+            let short_hash = format!(
+                "{:08x}",
+                (fnv1a_hash64(item.download_url.as_bytes()) as u32)
+            );
+            let tagged = insert_filename_tag(&base, &short_hash);
+            if used.insert(tagged.to_ascii_lowercase()) {
+                tagged
+            } else {
+                let mut disambig = insert_filename_tag(&base, &format!("{short_hash}_{idx}"));
+                let mut extra = 1usize;
+                while !used.insert(disambig.to_ascii_lowercase()) {
+                    disambig = insert_filename_tag(&base, &format!("{short_hash}_{idx}_{extra}"));
+                    extra += 1;
+                }
+                disambig
+            }
+        };
+        out.push(candidate);
+    }
+    out
+}
+
 fn download_3dep_dem_resolved(
     resolved: &ResolvedRegion,
     out_dir: &Path,
@@ -1833,9 +1980,11 @@ fn download_3dep_dem_resolved(
         .unwrap_or_else(|| out_dir.join("tiles"));
     std::fs::create_dir_all(&tiles_dir)?;
 
+    let filenames = assign_unique_tile_filenames(&products);
+    let pairs: Vec<(&TnmProductItem, &String)> = products.iter().zip(filenames.iter()).collect();
+
     let agent = make_download_agent(opts.timeout_secs);
-    let download_one = |item: &TnmProductItem| -> Result<PathBuf> {
-        let fname = sanitize_tile_filename(&item.download_url, &item.grid_key);
+    let download_one = |(item, fname): &(&TnmProductItem, &String)| -> Result<PathBuf> {
         let dest = tiles_dir.join(fname);
         http_download_file(
             &agent,
@@ -1854,17 +2003,14 @@ fn download_3dep_dem_resolved(
             .build()
             .map_err(|e| Error::Algorithm(format!("failed creating download thread pool: {e}")))?;
         pool.install(|| {
-            products
+            pairs
                 .par_iter()
                 .map(download_one)
                 .collect::<Result<Vec<_>>>()
         })?
     };
     #[cfg(not(feature = "parallel"))]
-    let tile_paths: Vec<PathBuf> = products
-        .iter()
-        .map(download_one)
-        .collect::<Result<Vec<_>>>()?;
+    let tile_paths: Vec<PathBuf> = pairs.iter().map(download_one).collect::<Result<Vec<_>>>()?;
 
     let mosaic_path = if opts.mosaic_dem && opts.dem_product.is_raster() && !tile_paths.is_empty() {
         let final_dem = out_dir.join("dem.tif");
@@ -1907,7 +2053,7 @@ fn download_3dep_dem_resolved(
                             .tempfile_in(out_dir)?;
                         let raw_path = raw_tmp.into_temp_path();
                         let raw_pb = raw_path.to_path_buf();
-                        mosaic(&tile_paths, &raw_pb)?;
+                        mosaic_with_resampling(&tile_paths, &raw_pb, Resampling::Bilinear)?;
                         clip_image(
                             &raw_pb,
                             resolved.boundary_path.as_ref().expect("boundary path"),
@@ -1917,7 +2063,7 @@ fn download_3dep_dem_resolved(
                 } else if tile_paths.len() == 1 {
                     std::fs::copy(&tile_paths[0], &staged_pb)?;
                 } else {
-                    mosaic(&tile_paths, &staged_pb)?;
+                    mosaic_with_resampling(&tile_paths, &staged_pb, Resampling::Bilinear)?;
                 }
                 Ok(())
             })();
@@ -1926,7 +2072,7 @@ fn download_3dep_dem_resolved(
                 .persist(&final_dem)
                 .map_err(|e| Error::Io(e.error))?;
             if let Ok(meta_json) = serde_json::to_string(&expected_meta) {
-                let _ = std::fs::write(&meta_path, meta_json);
+                let _ = write_file_atomic(&meta_path, meta_json.as_bytes());
             }
         }
         Some(final_dem)
@@ -2060,7 +2206,13 @@ fn download_roads_resolved(
     let mut all_features: Vec<Value> = Vec::new();
     for &lyr in layers {
         let url = format!("{USGS_TRANSPORTATION_BASE_URL}/{lyr}/query");
-        let fc = fetch_arcgis_paginated(&agent, &url, &base_params, "*", opts)?;
+        let fc = fetch_arcgis_paginated(
+            &agent,
+            &url,
+            &base_params,
+            "FULL_STREET_NAME,MTFCC_CODE",
+            opts,
+        )?;
         if let Some(feats) = fc.get("features").and_then(Value::as_array) {
             for feat in feats {
                 let mut f = feat.clone();
@@ -2102,20 +2254,41 @@ fn download_roads_resolved(
     write_geojson_feature_collection(&merged, out_path, "usgs_roads", mask)
 }
 
+fn find_js_assignment_rhs<'a>(body: &'a str, ident: &str) -> Option<&'a str> {
+    let bytes = body.as_bytes();
+    let mut offset = 0usize;
+    while let Some(rel) = body[offset..].find(ident) {
+        let idx = offset + rel;
+        let end_ident = idx + ident.len();
+        let prev_ok =
+            idx == 0 || !(bytes[idx - 1].is_ascii_alphanumeric() || bytes[idx - 1] == b'_');
+        if prev_ok {
+            let mut pos = end_ident;
+            while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+            if pos < bytes.len() && bytes[pos] == b'=' && bytes.get(pos + 1) != Some(&b'=') {
+                return Some(&body[pos + 1..]);
+            }
+        }
+        offset = end_ident;
+    }
+    None
+}
+
 /// Parses the JavaScript-formatted `quantiles = [[...]];` response from NOAA Atlas 14 CGI.
 pub(crate) fn parse_noaa_atlas14_response(
     lat: f64,
     lon: f64,
     body: &str,
 ) -> Result<NoaaAtlas14Table> {
-    let key_idx = body.find("quantiles").ok_or_else(|| {
+    let after_eq = find_js_assignment_rhs(body, "quantiles").ok_or_else(|| {
         Error::Parse("NOAA Atlas 14 response missing 'quantiles' array (point may be outside Atlas 14 coverage)".into())
     })?;
-    let after_key = &body[key_idx..];
-    let start = after_key
+    let start = after_eq
         .find("[[")
         .ok_or_else(|| Error::Parse("NOAA Atlas 14 quantiles opening '[[' not found".into()))?;
-    let rest = &after_key[start..];
+    let rest = &after_eq[start..];
     let end = rest
         .find("]];")
         .map(|i| i + 2)
@@ -2202,10 +2375,9 @@ pub fn fetch_noaa_atlas14(
     let table = parse_noaa_atlas14_response(lat, lon, &body)?;
 
     if let Some(p) = out_json {
-        ensure_parent_dir(p)?;
         let pretty = serde_json::to_string_pretty(&table)
             .map_err(|e| Error::Parse(format!("failed serializing NOAA Atlas 14 JSON: {e}")))?;
-        std::fs::write(p, pretty)?;
+        write_file_atomic(p, pretty.as_bytes())?;
     }
     Ok(table)
 }
@@ -2255,6 +2427,44 @@ fn manifest_matches_request(
         && prev.transportation_layers == effective_transportation_layers(opts)
 }
 
+/// Removes known per-region bundle artifacts in `out_dir` when invalidating a mismatched
+/// `manifest.json`, preserving `keep_boundary` (if any) and leaving tile caches untouched.
+pub(crate) fn clean_stale_bundle_outputs(out_dir: &Path, keep_boundary: Option<&Path>) {
+    const STALE_FILES: &[&str] = &[
+        "manifest.json",
+        "wbd.gpkg",
+        "dem.tif",
+        "nhd_flowlines.gpkg",
+        "nwi_wetlands.gpkg",
+        "usgs_roads.gpkg",
+        "culverts.gpkg",
+        "noaa_atlas14.json",
+        ".dem.meta.json",
+        "dem.tif.meta.json",
+    ];
+    for name in STALE_FILES {
+        let _ = std::fs::remove_file(out_dir.join(name));
+    }
+    let keep_name = keep_boundary
+        .filter(|p| p.parent() == Some(out_dir))
+        .and_then(|p| p.file_name())
+        .map(std::ffi::OsStr::to_os_string);
+    if let Ok(entries) = std::fs::read_dir(out_dir) {
+        for entry in entries.flatten() {
+            let fname = entry.file_name();
+            if keep_name.as_deref() == Some(fname.as_os_str()) {
+                continue;
+            }
+            if let Some(s) = fname.to_str()
+                && s.starts_with("region_huc_")
+                && s.ends_with(".geojson")
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 /// Downloads a complete bundle of open U.S. federal datasets for `region` into `out_dir`.
 ///
 /// Downloads every dataset listed in `opts.datasets` (defaulting to WBD, 3DEP DEM, NHD,
@@ -2291,9 +2501,9 @@ pub fn download_federal_data(
         manifest_matches_request(&manifest_path, &reg_key, &resolved.bbox, &opts.download);
     let mut bundle_dl_opts = opts.download.clone();
     if !cache_matches {
-        // Invalidate any stale manifest before overwriting per-region outputs so an interrupted
-        // run can never leave mixed-region files matched by the old manifest.
-        let _ = std::fs::remove_file(&manifest_path);
+        // Invalidate any stale manifest and per-region bundle files before writing new outputs
+        // so a partial subset run for Region B can never inherit stale Region A files.
+        clean_stale_bundle_outputs(out_dir, resolved.boundary_path.as_deref());
         bundle_dl_opts.overwrite = true;
     }
 
@@ -2416,7 +2626,7 @@ pub fn download_federal_data(
     };
     let manifest_json = serde_json::to_string_pretty(&result)
         .map_err(|e| Error::Parse(format!("failed serializing manifest JSON: {e}")))?;
-    std::fs::write(&manifest_path, manifest_json)?;
+    write_file_atomic(&manifest_path, manifest_json.as_bytes())?;
     Ok(result)
 }
 
@@ -2747,5 +2957,216 @@ mod tests {
         )
         .unwrap();
         assert_eq!(n_clip, 1);
+    }
+
+    #[test]
+    fn stale_cross_region_cache_invalidation_cleans_bundle_files_but_keeps_tiles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = tmp.path();
+        let tiles_dir = out_dir.join("tiles");
+        std::fs::create_dir_all(&tiles_dir).unwrap();
+        let cached_tile = tiles_dir.join("USGS_1M_14_x47y523.tif");
+        std::fs::write(&cached_tile, b"tile-bytes").unwrap();
+
+        let region_a = Bbox::new(-99.2, 47.0, -99.0, 47.2).unwrap();
+        let opts_a = DownloadOptions::default();
+        let manifest_path = out_dir.join("manifest.json");
+        let manifest_a = FederalBundleResult {
+            region_bbox: region_a,
+            region_key: "bbox".to_string(),
+            dem_product: opts_a.dem_product,
+            wbd_level: opts_a.wbd_level,
+            clip_to_region: opts_a.clip_to_region,
+            mosaic_dem: opts_a.mosaic_dem,
+            transportation_layers: effective_transportation_layers(&opts_a),
+            wbd_path: Some(out_dir.join("wbd.gpkg")),
+            wbd_count: 1,
+            dem_tiles: vec![cached_tile.clone()],
+            dem_mosaic_path: Some(out_dir.join("dem.tif")),
+            nhd_path: Some(out_dir.join("nhd_flowlines.gpkg")),
+            nhd_count: 1,
+            nwi_path: Some(out_dir.join("nwi_wetlands.gpkg")),
+            nwi_count: 1,
+            roads_path: Some(out_dir.join("usgs_roads.gpkg")),
+            roads_count: 1,
+            culverts_path: Some(out_dir.join("culverts.gpkg")),
+            culverts_count: 1,
+            noaa_atlas14_path: Some(out_dir.join("noaa_atlas14.json")),
+            noaa_atlas14: None,
+            manifest_path: manifest_path.clone(),
+        };
+        std::fs::write(&manifest_path, serde_json::to_string(&manifest_a).unwrap()).unwrap();
+
+        let stale_files = [
+            "wbd.gpkg",
+            "dem.tif",
+            "nhd_flowlines.gpkg",
+            "nwi_wetlands.gpkg",
+            "usgs_roads.gpkg",
+            "culverts.gpkg",
+            "noaa_atlas14.json",
+            ".dem.meta.json",
+            "dem.tif.meta.json",
+            "region_huc_10160002.geojson",
+        ];
+        for name in stale_files {
+            std::fs::write(out_dir.join(name), b"stale-region-a").unwrap();
+        }
+
+        // Run download_federal_data for a DIFFERENT region (Region B) with an empty dataset subset
+        // (simulating a partial request like [Dem] that leaves wbd.gpkg unrequested).
+        let region_b = Bbox::new(-98.2, 46.0, -98.0, 46.2).unwrap();
+        let res = download_federal_data(
+            &Region::Bbox(region_b),
+            out_dir,
+            &FederalBundleOptions {
+                datasets: Vec::new(),
+                download: DownloadOptions::default(),
+            },
+        )
+        .unwrap();
+        assert_eq!(res.region_bbox, region_b);
+
+        for name in stale_files {
+            assert!(
+                !out_dir.join(name).exists(),
+                "stale Region A file '{name}' should have been removed on cache invalidation"
+            );
+        }
+        assert!(
+            cached_tile.exists(),
+            "tile cache files must never be removed on bundle invalidation"
+        );
+        assert!(manifest_path.exists());
+        assert!(manifest_matches_request(
+            &manifest_path,
+            "bbox",
+            &region_b,
+            &DownloadOptions::default()
+        ));
+    }
+
+    #[test]
+    fn tnm_size_in_bytes_zero_parses_as_none_and_content_length_verified() {
+        let json = serde_json::json!({
+            "items": [
+                {
+                    "title": "USGS 1 Meter 14 x47y523 ZeroSize",
+                    "publicationDate": "2024-01-01",
+                    "downloadURL": "https://example.org/zero.tif",
+                    "sizeInBytes": 0,
+                    "format": "GeoTIFF",
+                    "boundingBox": {"minX": -99.3, "minY": 47.0, "maxX": -99.1, "maxY": 47.2}
+                },
+                {
+                    "title": "USGS 1 Meter 14 x48y523 KnownSize",
+                    "publicationDate": "2024-01-01",
+                    "downloadURL": "https://example.org/known.tif",
+                    "sizeInBytes": 4096,
+                    "format": "GeoTIFF",
+                    "boundingBox": {"minX": -99.3, "minY": 47.0, "maxX": -99.1, "maxY": 47.2}
+                }
+            ]
+        });
+        let items = parse_tnm_products_json(&json, None, false);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].size_bytes, None);
+        assert_eq!(items[1].size_bytes, Some(4096));
+
+        // Verify http_download_file enforces Content-Length when expected_bytes is None and retries
+        // on a truncated transfer.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut req_buf = [0u8; 1024];
+                let _ = stream.read(&mut req_buf);
+                if attempt == 0 {
+                    // Claim 16 bytes but send only 5 bytes before closing.
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\nhello",
+                    );
+                } else {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\n0123456789abcdef",
+                    );
+                }
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("tile.tif");
+        let agent = make_download_agent(10);
+        let url = format!("http://{addr}/tile.tif");
+        let saved = http_download_file(&agent, &url, &dest, None, true, 1).unwrap();
+        server.join().unwrap();
+        assert_eq!(std::fs::read(&saved).unwrap(), b"0123456789abcdef");
+    }
+
+    #[test]
+    fn arcgis_oid_bisection_avoids_amplification_on_missing_oids() {
+        assert!(!should_bisect_arcgis_chunk(false, 0, 50));
+        assert!(!should_bisect_arcgis_chunk(false, 48, 50));
+        assert!(!should_bisect_arcgis_chunk(false, 50, 50));
+        assert!(should_bisect_arcgis_chunk(false, 1000, 2000));
+        assert!(should_bisect_arcgis_chunk(true, 10, 50));
+        assert!(!should_bisect_arcgis_chunk(true, 0, 1));
+    }
+
+    #[test]
+    fn retry_classification_tile_filename_disambiguation_and_noaa_comment_parsing() {
+        assert!(!is_retryable_ureq_error(&ureq::Error::HostNotFound));
+        assert!(!is_retryable_ureq_error(&ureq::Error::BadUri("bad".into())));
+        assert!(!is_retryable_ureq_error(&ureq::Error::Tls("cert failed")));
+        assert!(!is_retryable_ureq_error(&ureq::Error::StatusCode(400)));
+        assert!(!is_retryable_ureq_error(&ureq::Error::StatusCode(404)));
+        assert!(is_retryable_ureq_error(&ureq::Error::StatusCode(408)));
+        assert!(is_retryable_ureq_error(&ureq::Error::StatusCode(429)));
+        assert!(is_retryable_ureq_error(&ureq::Error::StatusCode(503)));
+
+        let bb = Bbox::new(-99.3, 47.0, -99.1, 47.2).unwrap();
+        let products = vec![
+            TnmProductItem {
+                grid_key: "14_x47y523".into(),
+                title: "A".into(),
+                publication_date: "2023-01-01".into(),
+                download_url: "https://example.org/a/tile.tif".into(),
+                size_bytes: None,
+                format: "GeoTIFF".into(),
+                bbox: bb,
+            },
+            TnmProductItem {
+                grid_key: "14_x48y523".into(),
+                title: "B".into(),
+                publication_date: "2023-01-01".into(),
+                download_url: "https://example.org/b/tile.tif".into(),
+                size_bytes: None,
+                format: "GeoTIFF".into(),
+                bbox: bb,
+            },
+            TnmProductItem {
+                grid_key: "14_x49y523".into(),
+                title: "C".into(),
+                publication_date: "2023-01-01".into(),
+                download_url: "https://example.org/c/unique.tif".into(),
+                size_bytes: None,
+                format: "GeoTIFF".into(),
+                bbox: bb,
+            },
+        ];
+        let names = assign_unique_tile_filenames(&products);
+        assert_eq!(names.len(), 3);
+        assert_ne!(names[0], names[1]);
+        assert!(names[0].ends_with(".tif") && names[1].ends_with(".tif"));
+        assert_eq!(names[2], "unique.tif");
+
+        // Comment mentioning "quantiles" and prefixed "upper_quantiles" must not hijack parsing.
+        let body = "// Note: quantiles are reported in metric mm; see [[0]]\n\
+                    upper_quantiles = [['999.0']];\n\
+                    quantiles = [['12.5', '18.0']];\n";
+        let tbl = parse_noaa_atlas14_response(47.0, -99.0, body).unwrap();
+        assert!((tbl.depth_mm("5-min", 1).unwrap() - 12.5).abs() < 1e-6);
+        assert!((tbl.depth_mm("5-min", 2).unwrap() - 18.0).abs() < 1e-6);
     }
 }

@@ -84,10 +84,17 @@ pub fn parse_return_kind(s: &str) -> Result<ReturnKind> {
 
 /// Parses a comma-separated list of LiDAR return kinds using [`parse_return_kind`].
 pub fn parse_return_kinds(s: &str) -> Result<Vec<ReturnKind>> {
-    s.split(',')
+    let parsed: Vec<ReturnKind> = s
+        .split(',')
         .filter(|part| !part.trim().is_empty())
         .map(parse_return_kind)
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    if parsed.is_empty() {
+        return Err(Error::InvalidArgument(
+            "return kind list cannot be empty".into(),
+        ));
+    }
+    Ok(parsed)
 }
 
 /// Options for [`lidar_to_dsm`].
@@ -212,14 +219,17 @@ pub fn convert_lidar(
     point_format_id: Option<u8>,
     minor_version: Option<u8>,
 ) -> Result<usize> {
-    let cloud = read_lidar(source)?;
+    let src_path = source.as_ref();
+    let dst_path = destination.as_ref();
+    crate::raster_ops::ensure_no_path_collision(src_path, &[dst_path])?;
+    let cloud = read_lidar(src_path)?;
     let n = cloud.len();
     let opts = PointWriteOptions {
         point_format: point_format_id,
         minor_version,
         ..Default::default()
     };
-    write_lidar(&cloud, destination, &opts)?;
+    write_lidar(&cloud, dst_path, &opts)?;
     Ok(n)
 }
 
@@ -295,7 +305,36 @@ pub fn lidar_to_dsm(
             options.resolution
         )));
     }
+    if let Some(r) = options.radius
+        && (!r.is_finite() || r <= 0.0)
+    {
+        return Err(Error::InvalidArgument(format!(
+            "radius must be finite and > 0, got {r}"
+        )));
+    }
+    if let Some(lo) = options.min_z
+        && !lo.is_finite()
+    {
+        return Err(Error::InvalidArgument(format!(
+            "min_z must be finite, got {lo}"
+        )));
+    }
+    if let Some(hi) = options.max_z
+        && !hi.is_finite()
+    {
+        return Err(Error::InvalidArgument(format!(
+            "max_z must be finite, got {hi}"
+        )));
+    }
+    if let (Some(lo), Some(hi)) = (options.min_z, options.max_z)
+        && lo > hi
+    {
+        return Err(Error::InvalidArgument(format!(
+            "min_z ({lo}) must be <= max_z ({hi})"
+        )));
+    }
     let out_path = out_dsm.as_ref();
+    crate::raster_ops::ensure_no_path_collision(in_lidar.as_ref(), &[out_path])?;
     ensure_parent_dir(out_path)?;
     let out_str = path_to_str(out_path)?;
 
@@ -379,7 +418,15 @@ pub fn lidar_to_dtm(
             options.resolution
         )));
     }
+    if let Some(r) = options.radius
+        && (!r.is_finite() || r <= 0.0)
+    {
+        return Err(Error::InvalidArgument(format!(
+            "radius must be finite and > 0, got {r}"
+        )));
+    }
     let out_path = out_dtm.as_ref();
+    crate::raster_ops::ensure_no_path_collision(in_lidar.as_ref(), &[out_path])?;
     ensure_parent_dir(out_path)?;
     let out_str = path_to_str(out_path)?;
 
@@ -433,7 +480,15 @@ pub fn lidar_to_chm(
             options.resolution
         )));
     }
+    if let Some(r) = options.radius
+        && (!r.is_finite() || r <= 0.0)
+    {
+        return Err(Error::InvalidArgument(format!(
+            "radius must be finite and > 0, got {r}"
+        )));
+    }
     let out_path = out_chm.as_ref();
+    crate::raster_ops::ensure_no_path_collision(in_lidar.as_ref(), &[out_path])?;
     ensure_parent_dir(out_path)?;
 
     let raw = read_lidar(in_lidar)?;

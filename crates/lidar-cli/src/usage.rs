@@ -13,15 +13,34 @@ use serde_json::{Value, json};
 const WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 /// Runs `f` on a scoped thread with a 16 MiB stack so CLI parsing and large command dispatch
-/// frames never overflow small platform or test-thread stacks.
+/// frames never overflow small platform or test-thread stacks. Falls back to the calling thread
+/// if the OS refuses to spawn a worker thread.
 pub(crate) fn with_clap_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    let slot = std::sync::Mutex::new(Some(f));
     std::thread::scope(|scope| {
-        std::thread::Builder::new()
+        match std::thread::Builder::new()
             .stack_size(WORKER_STACK_SIZE)
-            .spawn_scoped(scope, f)
-            .expect("spawn CLI worker thread")
-            .join()
-            .expect("CLI worker thread panicked")
+            .spawn_scoped(scope, || {
+                let func = slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                    .expect("CLI worker slot populated");
+                func()
+            }) {
+            Ok(handle) => match handle.join() {
+                Ok(val) => val,
+                Err(payload) => std::panic::resume_unwind(payload),
+            },
+            Err(_) => {
+                let func = slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                    .expect("CLI fallback slot populated");
+                func()
+            }
+        }
     })
 }
 
@@ -168,9 +187,14 @@ fn value_type(arg: &Arg) -> &'static str {
         return "path";
     }
     if id == TypeId::of::<usize>()
+        || id == TypeId::of::<isize>()
         || id == TypeId::of::<u8>()
         || id == TypeId::of::<u16>()
         || id == TypeId::of::<u32>()
+        || id == TypeId::of::<u64>()
+        || id == TypeId::of::<i8>()
+        || id == TypeId::of::<i16>()
+        || id == TypeId::of::<i32>()
         || id == TypeId::of::<i64>()
     {
         return "integer";
