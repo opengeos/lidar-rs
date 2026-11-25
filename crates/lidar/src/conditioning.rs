@@ -1592,13 +1592,12 @@ pub fn classify_embankment_artifacts(
     let zdata = dem.data();
     let z_nd = dem.no_data();
 
-    // Reusable per-cell generation stamps and per-(cell, crossed_barrier) Pareto label sets
-    // for resource-constrained shortest-path search across barriers.
+    // Reusable per-cell generation stamps and sparse per-(cell, crossed_barrier) Pareto
+    // label map for resource-constrained shortest-path search across barriers.
     const MAX_PARETO_PER_STATE: usize = 8;
     let mut in_dep_stamp = vec![0u32; n];
     let mut outer_stamp = vec![0u32; n];
-    let mut state_stamp = vec![0u32; n * 2];
-    let mut state_pareto: Vec<Vec<(f64, f64)>> = vec![Vec::new(); n * 2];
+    let mut state_pareto: HashMap<usize, Vec<(f64, f64)>> = HashMap::new();
     let mut labels: Vec<BreachLabel> = Vec::new();
     let mut stamp_gen = 0u32;
     let mut heap: BinaryHeap<BreachHeapState> = BinaryHeap::new();
@@ -1632,7 +1631,6 @@ pub fn classify_embankment_artifacts(
         if stamp_gen == 0 {
             in_dep_stamp.fill(0);
             outer_stamp.fill(0);
-            state_stamp.fill(0);
             stamp_gen = 1;
         }
 
@@ -1649,6 +1647,7 @@ pub fn classify_embankment_artifacts(
         // exterior neighbor cells for rim linearity profiling.
         heap.clear();
         labels.clear();
+        state_pareto.clear();
         let mut outer_ring: Vec<usize> = Vec::new();
         for &idx in &dep_cells {
             let r = idx / w;
@@ -1671,9 +1670,7 @@ pub fn classify_embankment_artifacts(
             }
             if on_perimeter {
                 let skey = idx * 2;
-                state_stamp[skey] = stamp_gen;
-                state_pareto[skey].clear();
-                state_pareto[skey].push((0.0, 0.0));
+                state_pareto.insert(skey, vec![(0.0, 0.0)]);
                 let label_id = labels.len();
                 labels.push(BreachLabel {
                     cell: idx,
@@ -1697,8 +1694,8 @@ pub fn classify_embankment_artifacts(
         while let Some(state) = heap.pop() {
             let lbl = labels[state.label_id];
             let skey = lbl.cell * 2 + usize::from(lbl.crossed_barrier);
-            if state_stamp[skey] == stamp_gen {
-                let dominated = state_pareto[skey].iter().any(|&(c, d)| {
+            if let Some(pareto) = state_pareto.get(&skey) {
+                let dominated = pareto.iter().any(|&(c, d)| {
                     (c < lbl.cost - 1e-12 && d <= lbl.dist_m + 1e-12)
                         || (c <= lbl.cost + 1e-12 && d < lbl.dist_m - 1e-12)
                 });
@@ -1738,11 +1735,7 @@ pub fn classify_embankment_artifacts(
                 let step_cost = step_len_m[d] * (1.0 + (nz - dep.min_elev).max(0.0) / depth_scale);
                 let next_cost = lbl.cost + step_cost;
                 let nskey = nidx * 2 + usize::from(next_crossed);
-                if state_stamp[nskey] != stamp_gen {
-                    state_stamp[nskey] = stamp_gen;
-                    state_pareto[nskey].clear();
-                }
-                let pareto = &mut state_pareto[nskey];
+                let pareto = state_pareto.entry(nskey).or_default();
                 if pareto
                     .iter()
                     .any(|&(c, dm)| c <= next_cost + 1e-12 && dm <= next_dist + 1e-12)

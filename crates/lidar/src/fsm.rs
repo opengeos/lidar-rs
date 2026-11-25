@@ -48,9 +48,9 @@ use crate::catchment::d8_flow_directions_resolved;
 use crate::error::{Error, Result};
 use crate::inundation::{
     GreenAmptParams, HeapCell, InundationForcing, SimulateInundationOptions, SpillFlowPath,
-    affine_metrics, compute_exterior_nodata_mask, solve_green_ampt_ponded,
-    trace_downstream_away_from_source, validate_forcing_grids, validate_grid_alignment,
-    validate_options_with_hyetograph,
+    affine_metrics, compute_exterior_nodata_mask, green_ampt_infiltration_rate_cm_h,
+    solve_green_ampt_ponded, trace_downstream_away_from_source, validate_forcing_grids,
+    validate_grid_alignment, validate_options_with_hyetograph,
 };
 use crate::region::crs_metric_basis;
 use crate::slicing::{InMemoryDepressions, NestedDepression};
@@ -1933,13 +1933,16 @@ fn simulate_fill_spill_merge_impl(
                     if p.footprint_area_m2 > 0.0 {
                         p.ga_cum_infil_cm = child_ga_weighted / p.footprint_area_m2;
                     }
-                    let ga_rate_m_h = if in_storm_window && rem_seg_dt_h.is_finite() {
-                        let dt_eff = rem_seg_dt_h.max(1e-6);
-                        let f_new = solve_green_ampt_ponded(ga, p.ga_cum_infil_cm, dt_eff);
-                        ((f_new - p.ga_cum_infil_cm) / dt_eff) / 100.0
-                    } else {
-                        ga.ks_cm_h / 100.0
-                    };
+                    let ga_rate_m_h =
+                        if in_storm_window && rem_seg_dt_h.is_finite() && rem_seg_dt_h > 1e-12 {
+                            let f_new =
+                                solve_green_ampt_ponded(ga, p.ga_cum_infil_cm, rem_seg_dt_h);
+                            ((f_new - p.ga_cum_infil_cm) / rem_seg_dt_h) / 100.0
+                        } else if in_storm_window && p.ga_cum_infil_cm > 1e-12 {
+                            green_ampt_infiltration_rate_cm_h(ga, p.ga_cum_infil_cm) / 100.0
+                        } else {
+                            ga.ks_cm_h / 100.0
+                        };
                     p.ga_loss_rate_m3_h = ga_rate_m_h * p.footprint_area_m2;
                     p.loss_rate_m3_h = p.static_loss_rate_m3_h + p.ga_loss_rate_m3_h;
                 }
@@ -2178,6 +2181,7 @@ fn simulate_fill_spill_merge_impl(
     let mut num_merge_events = 0usize;
     let mut snapshot_taken = false;
     let mut last_rain_m_h = 0.0f64;
+    let mut last_storm_seg_dt = ga_substep_h;
     let mut topology_dirty = true;
     let mut hydrograph: Vec<FsmHydrographPoint> = Vec::with_capacity(segments.len() + 8);
     let mut any_basin_drained_in_storm = false;
@@ -2185,6 +2189,9 @@ fn simulate_fill_spill_merge_impl(
     for (seg_idx, (seg_dt, rain_m_h, in_storm_window, snapshot_after_segment)) in
         segments.into_iter().enumerate()
     {
+        if in_storm_window && seg_dt.is_finite() && seg_dt > 0.0 {
+            last_storm_seg_dt = seg_dt;
+        }
         if seg_idx > 0 && rain_m_h < last_rain_m_h - 1e-15 {
             for &i in &live_indices {
                 basins[i].spill_override = None;
@@ -2478,7 +2485,7 @@ fn simulate_fill_spill_merge_impl(
                     t_cur,
                     true,
                     green_ampt,
-                    0.0,
+                    last_storm_seg_dt,
                     &mut num_merge_events,
                     &mut fill_time_data,
                     &mut cycle_color,
@@ -2539,7 +2546,7 @@ fn simulate_fill_spill_merge_impl(
                 t_cur,
                 true,
                 green_ampt,
-                0.0,
+                last_storm_seg_dt,
                 &mut num_merge_events,
                 &mut fill_time_data,
                 &mut cycle_color,
@@ -2828,7 +2835,7 @@ pub fn write_fsm_hydrograph_csv(
 /// raster dimensions (`width`, `height`), and a characteristic overland/channel flow
 /// velocity (`velocity_m_s > 0.0`).
 ///
-/// Uses CRS-aware metric basis vectors ([`crate::region::crs_metric_scale`]) so metric
+/// Uses the same CRS-aware metric basis as [`crate::region::crs_metric_scale`] so metric
 /// projected CRSs, foot-based projected CRSs (e.g. State Plane US survey feet), rotated
 /// affine grids, and geographic CRSs (`EPSG:4326`, `EPSG:4269`) all measure path lengths
 /// in SI meters. Returns `0.0` when `spill_paths` is empty.
