@@ -33,6 +33,10 @@ pub enum Error {
     #[error("algorithm error: {0}")]
     Algorithm(String),
 
+    /// Operation was cancelled via a [`crate::CancellationToken`].
+    #[error("operation cancelled")]
+    Cancelled,
+
     /// Network or remote web-service request failure.
     #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
     #[error("HTTP error: {0}")]

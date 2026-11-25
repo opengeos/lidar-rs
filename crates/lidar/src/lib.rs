@@ -53,6 +53,7 @@ pub mod merge_tree;
 pub mod mounts;
 #[cfg(feature = "pointcloud")]
 pub mod pointcloud;
+pub mod progress;
 pub mod raster_ops;
 pub mod region;
 pub mod slicing;
@@ -127,10 +128,10 @@ pub use inundation::{
     compute_inundation_step_summaries, cumulative_runoff_mm, delineate_spill_flow_paths_in_memory,
     format_inundation_curve_csv, green_ampt_hyetograph_losses, green_ampt_infiltration_rate_cm_h,
     load_hyetograph_csv, parse_hyetograph_csv, run_full_pipeline_in_memory, run_pipeline,
-    scale_forcing_by_rainfall_grid, scs_cn_incremental_hyetograph, scs_curve_number_runoff,
-    scs_hyetograph, scs_type2_hyetograph, simulate_inundation, simulate_inundation_advanced,
-    simulate_inundation_in_memory, simulate_inundation_pipeline_in_memory,
-    simulate_inundation_with_forcing_in_memory,
+    run_pipeline_with_control, scale_forcing_by_rainfall_grid, scs_cn_incremental_hyetograph,
+    scs_curve_number_runoff, scs_hyetograph, scs_type2_hyetograph, simulate_inundation,
+    simulate_inundation_advanced, simulate_inundation_in_memory,
+    simulate_inundation_pipeline_in_memory, simulate_inundation_with_forcing_in_memory,
     simulate_inundation_with_weighted_catchment_in_memory, write_inundation_summary_csv,
 };
 pub use merge_tree::{
@@ -150,6 +151,9 @@ pub use pointcloud::{
     points_to_dsm, points_to_dtm, read_lidar, read_lidar_filtered, read_lidar_in_polygon,
     read_lidar_windowed, write_lidar,
 };
+pub use progress::{
+    CancellationToken, ExecutionControl, FnProgress, ProgressCallback, ProgressEvent,
+};
 pub use raster_ops::{
     add_crs, clip_image, csv_points_to_vector, image_to_cog, join_csv_to_vector, mosaic,
     parse_resampling, polygonize, polygonize_array, reproject_image, resample,
@@ -165,7 +169,8 @@ pub use slicing::{
 };
 pub use tiling::{
     TiledDelineationOptions, TiledDelineationResult, TiledOutputOptions,
-    delineate_depressions_tiled, delineate_depressions_tiled_with_outputs, load_dem_f32,
+    delineate_depressions_tiled, delineate_depressions_tiled_with_control,
+    delineate_depressions_tiled_with_outputs, load_dem_f32,
 };
 
 /// Re-exports from `richdem` (`Array2D`, `Topology`, `load_raster`, `save_raster`).

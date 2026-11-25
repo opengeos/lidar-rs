@@ -55,7 +55,7 @@ fn root() -> Command {
 
 /// Returns whether `command` is exposed in both `--json-usage` and MCP `tools/list`.
 fn exposed(command: &Command) -> bool {
-    !matches!(command.get_name(), "mcp" | "help")
+    !matches!(command.get_name(), "mcp" | "help" | "completions")
 }
 
 /// All top-level commands served by both `--json-usage` and MCP `tools/list`.

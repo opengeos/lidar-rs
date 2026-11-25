@@ -37,6 +37,7 @@ use crate::conditioning::{BreachOptions, breach_depressions, validate_breach_opt
 use crate::error::{Error, Result};
 use crate::filling::extract_sinks_in_memory;
 use crate::filtering::median_filter;
+use crate::progress::ExecutionControl;
 use crate::slicing::{
     NestedDepression, delineate_depressions_in_memory, write_depressions_csv,
     write_depressions_vector_with_enclosing,
@@ -819,14 +820,35 @@ fn merge_and_export_tiled(
     })
 }
 
+fn report_tile_completion(
+    progress_mtx: &Mutex<usize>,
+    num_tiles: usize,
+    control: &ExecutionControl,
+) {
+    let mut completed = progress_mtx
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *completed += 1;
+    let done = *completed;
+    let frac = 0.05 + 0.85 * (done as f64 / num_tiles.max(1) as f64);
+    control.report(
+        "tile",
+        frac,
+        Some(format!("Completed tile {done}/{num_tiles}")),
+    );
+}
+
 fn run_tiled_in_memory<T: DemNum>(
     dem: &Array2D<T>,
     out_dir: &Path,
     options: &TiledDelineationOptions,
     outputs: &TiledOutputOptions,
+    control: &ExecutionControl,
 ) -> Result<TiledDelineationResult> {
     #[cfg(test)]
     EAGER_FALLBACK_READS.fetch_add(1, Ordering::Relaxed);
+
+    control.check_cancelled()?;
 
     let meta = RasterMeta {
         width: dem.width(),
@@ -846,9 +868,16 @@ fn run_tiled_in_memory<T: DemNum>(
 
     let windows = build_tile_windows(meta.width, meta.height, options.tile_size, options.overlap);
     let num_tiles = windows.len();
+    control.report(
+        "prepare",
+        0.05,
+        Some(format!("Scheduled {num_tiles} tile(s)")),
+    );
+    let progress_mtx = Mutex::new(0usize);
     let run_one = |win: TileWindow| -> Result<Vec<TileRegionOutput>> {
+        control.check_cancelled()?;
         let tile = extract_tile_f64(dem, win)?;
-        process_one_tile(
+        let res = process_one_tile(
             tile,
             win,
             meta.width,
@@ -856,7 +885,10 @@ fn run_tiled_in_memory<T: DemNum>(
             options,
             outputs,
             stitched_mtx.as_ref(),
-        )
+        )?;
+        control.check_cancelled()?;
+        report_tile_completion(&progress_mtx, num_tiles, control);
+        Ok(res)
     };
 
     #[cfg(feature = "parallel")]
@@ -871,6 +903,13 @@ fn run_tiled_in_memory<T: DemNum>(
         .map(run_one)
         .collect::<Result<Vec<_>>>()?;
 
+    control.check_cancelled()?;
+    control.report(
+        "merge",
+        0.95,
+        Some(format!("Merging {num_tiles} tile(s) and writing outputs")),
+    );
+
     let stitched = match stitched_mtx {
         Some(m) => Some(
             m.into_inner()
@@ -878,7 +917,9 @@ fn run_tiled_in_memory<T: DemNum>(
         ),
         None => None,
     };
-    merge_and_export_tiled(per_tile, num_tiles, &meta, out_dir, outputs, stitched)
+    let res = merge_and_export_tiled(per_tile, num_tiles, &meta, out_dir, outputs, stitched)?;
+    control.report("complete", 1.0, Some("Tiled delineation complete".into()));
+    Ok(res)
 }
 
 fn validate_tiled_options(
@@ -960,10 +1001,31 @@ pub fn delineate_depressions_tiled_with_outputs(
     options: &TiledDelineationOptions,
     outputs: &TiledOutputOptions,
 ) -> Result<TiledDelineationResult> {
+    delineate_depressions_tiled_with_control(
+        in_dem,
+        out_dir,
+        options,
+        outputs,
+        &ExecutionControl::default(),
+    )
+}
+
+/// Runs [`delineate_depressions_tiled_with_outputs`] with progress reporting and
+/// cooperative cancellation via [`ExecutionControl`].
+///
+/// Reports monotonic tile completion progress across parallel workers and checks
+/// `control.check_cancelled()` before each tile and before final merging/export.
+pub fn delineate_depressions_tiled_with_control(
+    in_dem: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+    options: &TiledDelineationOptions,
+    outputs: &TiledOutputOptions,
+    control: &ExecutionControl,
+) -> Result<TiledDelineationResult> {
     validate_tiled_options(options, outputs)?;
+    control.check_cancelled()?;
     let in_dem = in_dem.as_ref();
     let out_dir = out_dir.as_ref();
-    std::fs::create_dir_all(out_dir)?;
 
     let csv_path = out_dir.join("depressions_info.csv");
     let id_path = out_dir.join("depression_id.tif");
@@ -980,6 +1042,8 @@ pub fn delineate_depressions_tiled_with_outputs(
         out_paths.push(gpkg_path.as_path());
     }
     crate::raster_ops::ensure_no_path_collision(in_dem, &out_paths)?;
+    control.check_cancelled()?;
+    std::fs::create_dir_all(out_dir)?;
 
     // Out-of-core windowed path via `terrio::open_raster_lazy`:
     // - If `open_raster_lazy` succeeds AND `lazy.reads_by_window()` is true, read each padded
@@ -1017,9 +1081,16 @@ pub fn delineate_depressions_tiled_with_outputs(
                 let windows =
                     build_tile_windows(meta.width, meta.height, options.tile_size, options.overlap);
                 let num_tiles = windows.len();
+                control.report(
+                    "prepare",
+                    0.05,
+                    Some(format!("Scheduled {num_tiles} tile(s)")),
+                );
+                let progress_mtx = Mutex::new(0usize);
                 let run_one = |win: TileWindow| -> Result<Vec<TileRegionOutput>> {
+                    control.check_cancelled()?;
                     let tile = read_tile_window_lazy(p_str, &meta, win)?;
-                    process_one_tile(
+                    let res = process_one_tile(
                         tile,
                         win,
                         meta.width,
@@ -1027,7 +1098,10 @@ pub fn delineate_depressions_tiled_with_outputs(
                         options,
                         outputs,
                         stitched_mtx.as_ref(),
-                    )
+                    )?;
+                    control.check_cancelled()?;
+                    report_tile_completion(&progress_mtx, num_tiles, control);
+                    Ok(res)
                 };
 
                 #[cfg(feature = "parallel")]
@@ -1042,6 +1116,13 @@ pub fn delineate_depressions_tiled_with_outputs(
                     .map(run_one)
                     .collect::<Result<Vec<_>>>()?;
 
+                control.check_cancelled()?;
+                control.report(
+                    "merge",
+                    0.95,
+                    Some(format!("Merging {num_tiles} tile(s) and writing outputs")),
+                );
+
                 let stitched =
                     match stitched_mtx {
                         Some(m) => Some(m.into_inner().map_err(|_| {
@@ -1049,9 +1130,10 @@ pub fn delineate_depressions_tiled_with_outputs(
                         })?),
                         None => None,
                     };
-                return merge_and_export_tiled(
-                    per_tile, num_tiles, &meta, out_dir, outputs, stitched,
-                );
+                let res =
+                    merge_and_export_tiled(per_tile, num_tiles, &meta, out_dir, outputs, stitched)?;
+                control.report("complete", 1.0, Some("Tiled delineation complete".into()));
+                return Ok(res);
             }
             Ok(_) => {
                 // Driver does not read by window; fall through to one shared in-memory load.
@@ -1066,12 +1148,13 @@ pub fn delineate_depressions_tiled_with_outputs(
     }
 
     // Fallback for legacy non-lazy formats (e.g., ESRI ASCII grids or non-UTF-8 paths).
+    control.check_cancelled()?;
     if options.use_f32 {
         let dem = load_raster::<f32>(in_dem, None)?;
-        run_tiled_in_memory(&dem, out_dir, options, outputs)
+        run_tiled_in_memory(&dem, out_dir, options, outputs, control)
     } else {
         let dem = load_raster::<f64>(in_dem, None)?;
-        run_tiled_in_memory(&dem, out_dir, options, outputs)
+        run_tiled_in_memory(&dem, out_dir, options, outputs, control)
     }
 }
 
@@ -1221,8 +1304,14 @@ mod tests {
             &out_opts,
         )
         .unwrap();
-        let mem_res =
-            run_tiled_in_memory(&dem, &tmp.path().join("mem_out"), &opts, &out_opts).unwrap();
+        let mem_res = run_tiled_in_memory(
+            &dem,
+            &tmp.path().join("mem_out"),
+            &opts,
+            &out_opts,
+            &ExecutionControl::default(),
+        )
+        .unwrap();
 
         assert_eq!(lazy_res.depressions.len(), mem_res.depressions.len());
         assert_eq!(lazy_res.depressions.len(), 2);
@@ -1275,5 +1364,111 @@ mod tests {
             &bad_nan,
         );
         assert!(matches!(err_nan, Err(Error::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn tiled_with_control_reports_monotonic_tiles_and_honors_cancellation() {
+        use std::sync::Arc;
+
+        use crate::progress::{CancellationToken, ProgressEvent};
+
+        let _guard = COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (w, h) = (64usize, 64usize);
+        let mut z = vec![20.0f64; w * h];
+        for r in 10..20 {
+            for c in 10..20 {
+                z[r * w + c] = 15.0 + ((r as i32 - 15).abs() + (c as i32 - 15).abs()) as f64 * 0.3;
+            }
+        }
+        let mut dem = Array2D::from_vec(w, h, z).unwrap();
+        dem.set_no_data(-9999.0);
+        dem.geotransform = [100.0, 2.0, 0.0, 500.0, 0.0, -2.0];
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tif = tmp.path().join("tiled_progress.tif");
+        save_raster(&dem, &tif, None, false).unwrap();
+
+        let opts = TiledDelineationOptions {
+            tile_size: 16,
+            overlap: 4,
+            kernel_size: 1,
+            min_size: 5,
+            min_depth: 0.2,
+            interval: 0.5,
+            topology: Topology::D8,
+            use_f32: false,
+        };
+
+        // 1. Monotonic tile progress across 16 tiles (4x4).
+        let events: Arc<StdMutex<Vec<ProgressEvent>>> = Arc::new(StdMutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let ctrl = ExecutionControl::new().with_progress_fn(move |ev| {
+            captured.lock().unwrap().push(ev.clone());
+        });
+        let res = delineate_depressions_tiled_with_control(
+            &tif,
+            tmp.path().join("ok"),
+            &opts,
+            &TiledOutputOptions::default(),
+            &ctrl,
+        )
+        .unwrap();
+        assert_eq!(res.num_tiles, 16);
+
+        let recorded = events.lock().unwrap();
+        let tile_events: Vec<&ProgressEvent> =
+            recorded.iter().filter(|e| e.stage == "tile").collect();
+        assert_eq!(tile_events.len(), 16);
+        assert_eq!(recorded.first().unwrap().stage, "prepare");
+        assert_eq!(recorded.last().unwrap().stage, "complete");
+        assert_eq!(recorded.last().unwrap().fraction, 1.0);
+
+        let mut prev = -1.0f64;
+        for ev in recorded.iter() {
+            assert!(ev.fraction >= 0.0 && ev.fraction <= 1.0);
+            assert!(
+                ev.fraction >= prev,
+                "non-monotonic fraction: {} < {prev}",
+                ev.fraction
+            );
+            prev = ev.fraction;
+        }
+
+        // 2. Pre-cancelled token aborts cleanly before reading any tile.
+        LAZY_WINDOW_READS.store(0, Ordering::SeqCst);
+        let pre_tok = CancellationToken::new();
+        pre_tok.cancel();
+        let pre_out = tmp.path().join("pre_cancel");
+        let pre_err = delineate_depressions_tiled_with_control(
+            &tif,
+            &pre_out,
+            &opts,
+            &TiledOutputOptions::default(),
+            &ExecutionControl::new().with_cancel(pre_tok),
+        );
+        assert!(matches!(pre_err, Err(Error::Cancelled)));
+        assert_eq!(LAZY_WINDOW_READS.load(Ordering::SeqCst), 0);
+        assert!(!pre_out.exists());
+
+        // 3. Mid-run cancellation after first tile aborts cleanly.
+        let mid_tok = CancellationToken::new();
+        let trigger = mid_tok.clone();
+        let mid_ctrl = ExecutionControl::new()
+            .with_cancel(mid_tok)
+            .with_progress_fn(move |ev| {
+                if ev.stage == "tile" {
+                    trigger.cancel();
+                }
+            });
+        let mid_out = tmp.path().join("mid_cancel");
+        let mid_err = delineate_depressions_tiled_with_control(
+            &tif,
+            &mid_out,
+            &opts,
+            &TiledOutputOptions::default(),
+            &mid_ctrl,
+        );
+        assert!(matches!(mid_err, Err(Error::Cancelled)));
+        assert!(!mid_out.join("depressions_info.csv").exists());
     }
 }

@@ -47,6 +47,7 @@ use crate::graph::{
     build_connectivity_graph, compute_rating_curves, write_connectivity_graphml,
     write_rating_curves_csv, write_spill_paths_vector,
 };
+use crate::progress::ExecutionControl;
 use crate::raster_ops::ensure_no_path_collision;
 use crate::region::{region_basic_stats, region_group};
 use crate::slicing::{
@@ -2823,6 +2824,20 @@ pub struct InMemoryFullPipelineOptions<'a> {
     pub stream_vector: Option<&'a Path>,
 }
 
+impl Default for InMemoryFullPipelineOptions<'_> {
+    fn default() -> Self {
+        Self {
+            kernel_size: 3,
+            breach: None,
+            simulation: SimulateInundationOptions::default(),
+            routing: RoutingMode::Static,
+            forcing: InundationForcing::default(),
+            scalar_runoff_coeff: 1.0,
+            stream_vector: None,
+        }
+    }
+}
+
 /// Complete in-memory outputs from [`run_full_pipeline_in_memory`].
 pub struct InMemoryFullPipeline {
     pub sinks: InMemorySinks,
@@ -3146,9 +3161,25 @@ pub fn run_pipeline(
     out_dir: impl AsRef<Path>,
     options: &RunPipelineOptions,
 ) -> Result<RunPipelineResult> {
+    run_pipeline_with_control(in_dem, out_dir, options, &ExecutionControl::default())
+}
+
+/// Runs [`run_pipeline`] with progress reporting and cooperative cancellation via
+/// [`ExecutionControl`].
+///
+/// Reports progress across each pipeline stage (`load`, `filter`, `condition`,
+/// `extract_sinks`, `delineate`, `catchments`, `inundation`, `save_outputs`, `complete`)
+/// and checks `control.check_cancelled()` between stages so cancellation aborts cleanly
+/// with [`Error::Cancelled`].
+pub fn run_pipeline_with_control(
+    in_dem: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+    options: &RunPipelineOptions,
+    control: &ExecutionControl,
+) -> Result<RunPipelineResult> {
+    control.check_cancelled()?;
     let in_dem = in_dem.as_ref();
     let out_dir = out_dir.as_ref();
-    std::fs::create_dir_all(out_dir)?;
 
     let num_steps =
         validate_options_with_hyetograph(&options.simulation, options.hyetograph.is_some())?;
@@ -3213,6 +3244,14 @@ pub fn run_pipeline(
         crate::raster_ops::ensure_no_path_collision(opt_in, &candidate_refs)?;
     }
 
+    control.check_cancelled()?;
+    control.report(
+        "load",
+        0.05,
+        Some(format!("Loading DEM {}", in_dem.display())),
+    );
+    std::fs::create_dir_all(out_dir)?;
+
     let mut dem = if options.use_f32 {
         let d32 = load_raster::<f32>(in_dem, None)?;
         let nd32 = d32.no_data();
@@ -3242,24 +3281,62 @@ pub fn run_pipeline(
 
     // Smooth raw DEM noise FIRST, then apply culvert burning and selective breaching so a
     // median filter never smooths away a 1-cell culvert cut or breach channel.
+    control.check_cancelled()?;
     if options.kernel_size > 1 {
+        control.report(
+            "filter",
+            0.15,
+            Some(format!(
+                "Applying {}x{} median filter",
+                options.kernel_size, options.kernel_size
+            )),
+        );
         dem = median_filter(&dem, options.kernel_size)?;
     }
-    if let Some(ref culv) = options.culverts_vector {
-        let (burned, _) = burn_culverts(&dem, culv, &options.burn_culverts)?;
-        dem = burned;
-    }
-    if let Some(ref breach_opts) = options.breach {
-        dem = breach_depressions(&dem, breach_opts)?;
+    control.check_cancelled()?;
+    if options.culverts_vector.is_some() || options.breach.is_some() {
+        control.report(
+            "condition",
+            0.25,
+            Some("Applying hydro-conditioning (culverts / breaching)".into()),
+        );
+        if let Some(ref culv) = options.culverts_vector {
+            let (burned, _) = burn_culverts(&dem, culv, &options.burn_culverts)?;
+            dem = burned;
+        }
+        control.check_cancelled()?;
+        if let Some(ref breach_opts) = options.breach {
+            dem = breach_depressions(&dem, breach_opts)?;
+        }
     }
 
+    control.check_cancelled()?;
+    control.report(
+        "extract_sinks",
+        0.35,
+        Some("Extracting surface sinks".into()),
+    );
     let sinks = extract_sinks_in_memory(&dem, sim_opts.min_size, Topology::D8)?;
+
+    control.check_cancelled()?;
+    control.report(
+        "delineate",
+        0.50,
+        Some("Delineating nested depression hierarchy".into()),
+    );
     let depressions = delineate_depressions_in_memory(
         &sinks.sink,
         sim_opts.min_size,
         sim_opts.min_depth,
         sim_opts.interval,
     )?;
+
+    control.check_cancelled()?;
+    control.report(
+        "catchments",
+        0.65,
+        Some("Computing D8 flow directions and catchment hierarchy".into()),
+    );
     let rc_arr = match &options.runoff_coeff_path {
         Some(p) => Some(load_raster::<f64>(p, None)?),
         None => None,
@@ -3296,6 +3373,13 @@ pub fn run_pipeline(
             )?;
             (ch, None, recs)
         };
+
+    control.check_cancelled()?;
+    control.report(
+        "inundation",
+        0.80,
+        Some("Simulating surface inundation dynamics".into()),
+    );
     let forcing = InundationForcing {
         runoff_coeff: rc_arr.as_ref(),
         infiltration_cm_h: inf_arr.as_ref(),
@@ -3334,6 +3418,7 @@ pub fn run_pipeline(
                     &fsm_forcing,
                     &flowdirs,
                 )?;
+                control.check_cancelled()?;
                 let basins_csv = out_dir.join("fsm_basins.csv");
                 write_fsm_basins_csv(&fsm.basins, &basins_csv)?;
                 let hydrograph_csv = out_dir.join("fsm_hydrograph.csv");
@@ -3350,6 +3435,13 @@ pub fn run_pipeline(
         };
     let steps =
         compute_inundation_step_summaries(&sinks.sink, &fill_time, num_steps, sim_opts.time_step_h);
+
+    control.check_cancelled()?;
+    control.report(
+        "save_outputs",
+        0.92,
+        Some(format!("Saving outputs to {}", out_dir.display())),
+    );
 
     let (_, _, cell_area) = affine_metrics(&dem.geotransform);
     let d_nd = sinks.depth.no_data();
@@ -3498,6 +3590,7 @@ pub fn run_pipeline(
         )?;
     }
 
+    control.report("complete", 1.0, Some("Pipeline complete".into()));
     Ok(result)
 }
 
@@ -4403,5 +4496,113 @@ mod tests {
             },
         );
         assert!(err_crs.is_err(), "CRS mismatch must be rejected");
+    }
+
+    #[test]
+    fn run_pipeline_with_control_reports_monotonic_stages_and_honors_cancellation() {
+        use std::sync::{Arc, Mutex};
+
+        use crate::progress::{CancellationToken, ProgressEvent};
+
+        let dem_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_data/dem.tif");
+        let tmp = tempfile::tempdir().unwrap();
+
+        let opts = RunPipelineOptions {
+            kernel_size: 3,
+            simulation: SimulateInundationOptions {
+                min_size: 1000,
+                min_depth: 0.3,
+                interval: 0.5,
+                rain_intensity_cm_h: 5.0,
+                rain_duration_h: 10.0,
+                time_step_h: 5.0,
+                compress: false,
+            },
+            save_rasters: false,
+            export_vectors: false,
+            export_graph: false,
+            ..Default::default()
+        };
+
+        // 1. Progress events must arrive in monotonic stage order with fractions in [0.0, 1.0].
+        let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let ctrl = ExecutionControl::new().with_progress_fn(move |ev| {
+            captured.lock().unwrap().push(ev.clone());
+        });
+        let res = run_pipeline_with_control(&dem_path, tmp.path().join("ok"), &opts, &ctrl)
+            .expect("pipeline should complete");
+        assert!(res.num_depressions > 0);
+
+        let recorded = events.lock().unwrap();
+        let stages: Vec<&str> = recorded.iter().map(|e| e.stage.as_str()).collect();
+        assert_eq!(
+            stages,
+            vec![
+                "load",
+                "filter",
+                "extract_sinks",
+                "delineate",
+                "catchments",
+                "inundation",
+                "save_outputs",
+                "complete"
+            ]
+        );
+        let mut prev = -1.0f64;
+        for ev in recorded.iter() {
+            assert!(
+                ev.fraction >= 0.0 && ev.fraction <= 1.0,
+                "fraction out of range: {}",
+                ev.fraction
+            );
+            assert!(
+                ev.fraction >= prev,
+                "fractions must be monotonic: {} < {prev}",
+                ev.fraction
+            );
+            prev = ev.fraction;
+        }
+        assert_eq!(recorded.last().unwrap().fraction, 1.0);
+
+        // 2. Pre-cancelled token aborts cleanly before creating outputs.
+        let pre_tok = CancellationToken::new();
+        pre_tok.cancel();
+        let pre_dir = tmp.path().join("pre_cancelled");
+        let pre_err = run_pipeline_with_control(
+            &dem_path,
+            &pre_dir,
+            &opts,
+            &ExecutionControl::new().with_cancel(pre_tok),
+        );
+        assert!(matches!(pre_err, Err(Error::Cancelled)));
+        assert!(
+            !pre_dir.exists(),
+            "pre-cancelled pipeline must not create output directory"
+        );
+
+        // 3. Mid-run cancellation triggered from callback aborts cleanly.
+        let mid_tok = CancellationToken::new();
+        let trigger = mid_tok.clone();
+        let mid_stages: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let mid_seen = Arc::clone(&mid_stages);
+        let mid_ctrl = ExecutionControl::new()
+            .with_cancel(mid_tok)
+            .with_progress_fn(move |ev| {
+                mid_seen.lock().unwrap().push(ev.stage.clone());
+                if ev.stage == "extract_sinks" {
+                    trigger.cancel();
+                }
+            });
+        let mid_dir = tmp.path().join("mid_cancelled");
+        let mid_err = run_pipeline_with_control(&dem_path, &mid_dir, &opts, &mid_ctrl);
+        assert!(matches!(mid_err, Err(Error::Cancelled)));
+        assert!(
+            !mid_dir.join("summary.json").exists(),
+            "mid-run cancelled pipeline must not write summary.json"
+        );
+        let seen = mid_stages.lock().unwrap();
+        assert!(seen.iter().any(|s| s == "extract_sinks"));
+        assert!(!seen.iter().any(|s| s == "complete"));
     }
 }
