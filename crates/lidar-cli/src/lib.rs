@@ -22,10 +22,10 @@ use lidar::{
     csv_points_to_vector, delineate_catchment_hierarchy, delineate_catchments,
     delineate_depressions, delineate_depressions_tiled, delineate_flow_paths, delineate_mounts,
     export_inundation_frames_png, extract_sinks, flip_dem_file, gaussian_filter_file, image_to_cog,
-    join_csv_to_vector, load_raster, mean_filter_file, median_filter_file, mosaic,
-    parse_resampling, polygonize, render_dem_preview_png_bytes, render_inundation_frame_png_bytes,
-    reproject_image, resample, run_pipeline, scs_type2_hyetograph, simulate_inundation,
-    synthesize_culverts,
+    join_csv_to_vector, load_dem_for_preview, load_raster, mean_filter_file, median_filter_file,
+    mosaic, parse_resampling, polygonize, render_dem_preview_png_bytes,
+    render_inundation_frame_png_bytes, reproject_image, resample, run_pipeline,
+    scs_type2_hyetograph, simulate_inundation, synthesize_culverts,
 };
 #[cfg(feature = "download")]
 use lidar::{
@@ -1837,7 +1837,8 @@ fn dispatch(command: Commands, lidar_cmd: Option<Vec<OsString>>) -> lidar::Resul
                     "--hour must be finite and >= 0, got {h}"
                 )));
             }
-            let dem_arr = load_raster::<f64>(&dem, None)?;
+            let allow_overview = max_dim > 0 && fill_time.is_none() && depth.is_none();
+            let dem_arr = load_dem_for_preview(&dem, max_dim, allow_overview)?;
             let opts = AnimateInundationOptions {
                 water_alpha,
                 max_dimension: if max_dim == 0 { None } else { Some(max_dim) },
@@ -2103,5 +2104,50 @@ mod tests {
         ]);
         assert_eq!(code_bad_hour, 1);
         assert!(!nested_out_dir.exists());
+    }
+
+    #[test]
+    fn preview_renders_cog_to_valid_png_with_requested_max_dim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_tif = tmp.path().join("dem_1024.tif");
+        let cog_tif = tmp.path().join("dem_1024_cog.tif");
+        let out_png = tmp.path().join("preview_256.png");
+
+        let (w, h) = (1024usize, 1024usize);
+        let mut data = Vec::with_capacity(w * h);
+        for r in 0..h {
+            for c in 0..w {
+                let dx = c as f64 - 512.0;
+                let dy = r as f64 - 512.0;
+                data.push(100.0 + 0.02 * (dx * dx + dy * dy).sqrt());
+            }
+        }
+        let mut dem = lidar::Array2D::from_vec(w, h, data).unwrap();
+        dem.set_no_data(-9999.0);
+        dem.geotransform = [500_000.0, 1.0, 0.0, 4_001_024.0, 0.0, -1.0];
+        lidar::save_raster(&dem, &src_tif, None, false).unwrap();
+
+        image_to_cog(&src_tif, &cog_tif, None).unwrap();
+
+        let code = run(vec![
+            "lidar".into(),
+            "preview".into(),
+            cog_tif.as_os_str().to_os_string(),
+            "--max-dim".into(),
+            "256".into(),
+            "-o".into(),
+            out_png.as_os_str().to_os_string(),
+        ]);
+        assert_eq!(code, 0);
+        let bytes = std::fs::read(&out_png).unwrap();
+        assert!(
+            bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "preview output must be a valid PNG"
+        );
+        // PNG IHDR width/height are big-endian u32 at bytes 16..24.
+        let png_w = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+        let png_h = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+        assert_eq!(png_w, 256);
+        assert_eq!(png_h, 256);
     }
 }

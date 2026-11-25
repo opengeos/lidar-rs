@@ -24,7 +24,10 @@ use terrio::{
 
 use crate::error::{Error, Result};
 use crate::raster_ops::{ensure_no_path_collision, polygonize};
-use crate::region::{RegionProps, region_group, region_props_affine};
+use crate::region::{
+    RegionProps, region_basic_stats, region_group, region_group_slice,
+    region_props_for_single_label,
+};
 
 /// Maximum vertical level-set slices permitted per region to guard against
 /// pathologically tiny slicing intervals hanging execution.
@@ -396,7 +399,7 @@ fn level_set_region(
             break;
         }
 
-        let objects = region_props_affine(&label_objects, nb_labels, &img, bw, bh, gt);
+        let objects = region_basic_stats(&label_objects, nb_labels, &img, bw, bh, cell_area);
         for (i, obj) in objects.iter().enumerate() {
             if obj.max_depth < min_depth {
                 continue;
@@ -406,7 +409,8 @@ fn level_set_region(
 
             if parent_counts.is_empty() || parent_id == 0 {
                 unique_id += 1;
-                dep_list.push(depression_from_props(unique_id, region_id, obj));
+                let props = region_props_for_single_label(&label_objects, obj, bw, gt);
+                dep_list.push(depression_from_props(unique_id, region_id, &props));
                 parent_counts.insert(unique_id, 0);
                 nbr_indices.insert(unique_id, Vec::new());
 
@@ -438,7 +442,8 @@ fn level_set_region(
                 for child_idx in children {
                     let obj = &objects[child_idx];
                     unique_id += 1;
-                    dep_list.push(depression_from_props(unique_id, region_id, obj));
+                    let props = region_props_for_single_label(&label_objects, obj, bw, gt);
+                    dep_list.push(depression_from_props(unique_id, region_id, &props));
                     dep_list[(key - 1) as usize].children_ids.push(unique_id);
                     parent_counts.insert(unique_id, 0);
                     nbr_indices.insert(unique_id, Vec::new());
@@ -906,11 +911,6 @@ fn extract_levels(
             }
         }
 
-        let tmp_f64: Vec<f64> = img
-            .iter()
-            .map(|&v| if v > 0 && v <= lvl { v as f64 } else { 0.0 })
-            .collect();
-
         if bool_comb_tif {
             let comb_i32: Vec<i32> = img
                 .iter()
@@ -928,10 +928,11 @@ fn extract_levels(
             )?;
         }
 
-        let (lbl_objects, nb_labels) = region_group(&tmp_f64, w, h, min_size, |v| v > 0.0);
+        let (lbl_objects, nb_labels) =
+            region_group_slice(&img, w, h, min_size, |v| v > 0 && v <= lvl);
 
         // For each grouped component, find max level_img and min obj_img (matching slicing.py:669-676).
-        let k = nb_labels as usize;
+        let k = nb_labels;
         let mut max_lvl_per_reg = vec![0i32; k];
         let mut min_uid_per_reg = vec![i32::MAX; k];
         for (i, &lbl) in lbl_objects.iter().enumerate() {

@@ -60,7 +60,7 @@ pub use animation::{
     ANIMATION_BANNER_HEIGHT, AnimateInundationOptions, AnimateInundationResult, HillshadeOptions,
     animate_inundation, animate_inundation_to_bytes, animate_inundation_to_bytes_with_spill_paths,
     compute_hillshade_rgb, encode_rgb_to_png_bytes, export_inundation_frames_png,
-    render_dem_preview_png_bytes, render_inundation_frame_png_bytes,
+    load_dem_for_preview, render_dem_preview_png_bytes, render_inundation_frame_png_bytes,
 };
 pub use catchment::{
     CatchmentHierarchyOptions, CatchmentHierarchyRecord, CatchmentHierarchyResult, CatchmentRecord,
@@ -126,7 +126,7 @@ pub use raster_ops::{
     add_crs, clip_image, csv_points_to_vector, image_to_cog, join_csv_to_vector, mosaic,
     parse_resampling, polygonize, polygonize_array, reproject_image, resample,
 };
-pub use region::{RegionProps, region_group, region_props, region_props_xy};
+pub use region::{RegionProps, region_group, region_group_slice, region_props, region_props_xy};
 pub use slicing::{
     DelineateOptions, DelineateResult, InMemoryDepressions, NestedDepression,
     delineate_depressions, delineate_depressions_in_memory, write_depressions_csv,

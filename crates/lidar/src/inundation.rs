@@ -12,7 +12,7 @@
 //! `inundation_summary.csv`.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -20,22 +20,23 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use richdem::{
-    Array2D, D8X, D8Y, DemNum, FLOWDIR_NO_DATA, NO_FLOW, Topology, load_raster, save_raster,
+    Array2D, D8Flowdir, D8X, D8Y, DemNum, FLOWDIR_NO_DATA, NO_FLOW, Topology, load_raster,
+    save_raster,
 };
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use crate::catchment::{
-    CatchmentHierarchyRecord, d8_flow_directions_resolved, delineate_catchment_hierarchy_in_memory,
-    write_catchment_hierarchy_csv,
+    CatchmentHierarchyRecord, d8_flow_directions_resolved,
+    delineate_catchment_hierarchy_with_flowdirs, write_catchment_hierarchy_csv,
 };
 use crate::conditioning::{BreachOptions, BurnCulvertsOptions, breach_depressions, burn_culverts};
 use crate::error::{Error, Result};
 use crate::filling::{InMemorySinks, extract_sinks_in_memory};
 use crate::filtering::median_filter;
 use crate::fsm::{
-    FsmBasinSummary, FsmMassBalance, RoutingMode, simulate_fill_spill_merge_in_memory,
-    write_fsm_basins_csv,
+    FsmBasinSummary, FsmMassBalance, OutletSearchScratch, RoutingMode,
+    simulate_fill_spill_merge_with_flowdirs, write_fsm_basins_csv,
 };
 #[cfg(feature = "serde")]
 use crate::graph::write_connectivity_graph_json;
@@ -44,7 +45,7 @@ use crate::graph::{
     write_rating_curves_csv, write_spill_paths_vector,
 };
 use crate::raster_ops::ensure_no_path_collision;
-use crate::region::{region_group, region_props_xy};
+use crate::region::{region_basic_stats, region_group};
 use crate::slicing::{
     InMemoryDepressions, delineate_depressions_in_memory, write_depressions_csv,
     write_depressions_vector,
@@ -215,7 +216,7 @@ fn region_fill_times(
     let min_depth = options.min_depth;
     let step = options.interval.abs();
     let rain_m_h = options.rain_intensity_cm_h / 100.0;
-    let (res_x, res_y, cell_area) = metrics;
+    let (_, _, cell_area) = metrics;
     let (r0, c0, r1, c1) = task.bbox;
     let bh = r1 - r0;
     let bw = c1 - c0;
@@ -265,16 +266,7 @@ fn region_fill_times(
             break;
         }
 
-        let objects = region_props_xy(
-            &label_objects,
-            nb_labels,
-            &img,
-            bw,
-            bh,
-            res_x,
-            res_y,
-            cell_area,
-        );
+        let objects = region_basic_stats(&label_objects, nb_labels, &img, bw, bh, cell_area);
         for obj in &objects {
             if obj.max_depth < min_depth {
                 continue;
@@ -755,6 +747,35 @@ pub fn delineate_spill_flow_paths_in_memory(
     depressions: &InMemoryDepressions,
     fill_time: &Array2D<f64>,
 ) -> Result<Vec<SpillFlowPath>> {
+    delineate_spill_flow_paths_impl(dem_refined, depressions, fill_time, None)
+}
+
+/// Internal variant of [`delineate_spill_flow_paths_in_memory`] reusing precomputed
+/// resolved D8 flow directions (`d8_flow_directions_resolved`) across pipeline stages.
+pub(crate) fn delineate_spill_flow_paths_with_flowdirs(
+    dem_refined: &Array2D<f64>,
+    depressions: &InMemoryDepressions,
+    fill_time: &Array2D<f64>,
+    flowdirs: &Array2D<D8Flowdir>,
+) -> Result<Vec<SpillFlowPath>> {
+    if flowdirs.width() != dem_refined.width() || flowdirs.height() != dem_refined.height() {
+        return Err(Error::DimensionMismatch(format!(
+            "flowdirs ({}x{}) does not match DEM ({}x{})",
+            flowdirs.width(),
+            flowdirs.height(),
+            dem_refined.width(),
+            dem_refined.height()
+        )));
+    }
+    delineate_spill_flow_paths_impl(dem_refined, depressions, fill_time, Some(flowdirs))
+}
+
+fn delineate_spill_flow_paths_impl(
+    dem_refined: &Array2D<f64>,
+    depressions: &InMemoryDepressions,
+    fill_time: &Array2D<f64>,
+    precomputed_flowdirs: Option<&Array2D<D8Flowdir>>,
+) -> Result<Vec<SpillFlowPath>> {
     let w = dem_refined.width();
     let h = dem_refined.height();
     let n = w * h;
@@ -776,7 +797,14 @@ pub fn delineate_spill_flow_paths_in_memory(
         )));
     }
 
-    let flowdirs = d8_flow_directions_resolved(dem_refined)?;
+    let owned_flowdirs;
+    let flowdirs = match precomputed_flowdirs {
+        Some(f) => f,
+        None => {
+            owned_flowdirs = d8_flow_directions_resolved(dem_refined)?;
+            &owned_flowdirs
+        }
+    };
     let fdata = flowdirs.data();
     let exterior_nodata = compute_exterior_nodata_mask(fdata, w, h);
     let zdata = dem_refined.data();
@@ -808,30 +836,25 @@ pub fn delineate_spill_flow_paths_in_memory(
         }
     }
 
-    // Reusable work buffers across depressions.
-    let mut in_source = vec![false; n];
-    let mut visited_pf = vec![0u32; n];
-    let mut drains_to_source = vec![0u32; n];
-    let mut trapped_in_pit = vec![0u32; n];
-    let mut pf_gen = 0u32;
-    let mut parent_cell = vec![usize::MAX; n];
-    let mut trace_seen = vec![0u32; n];
-    let mut trace_gen = 0u32;
-    let mut heap: BinaryHeap<HeapCell> = BinaryHeap::new();
-
-    let mut raw_paths: Vec<SpillFlowPath> = Vec::new();
-
     // Process from lowest level upward so child spills are discovered deterministically.
-    let mut ordered_deps: Vec<&crate::slicing::NestedDepression> =
-        depressions.depressions.iter().collect();
+    let mut ordered_deps: Vec<&crate::slicing::NestedDepression> = depressions
+        .depressions
+        .iter()
+        .filter(|d| parent_map.contains_key(&d.id) || depressions.num_regions > 1)
+        .collect();
     ordered_deps.sort_by_key(|d| (d.level, d.id));
+    if ordered_deps.is_empty() {
+        return Ok(Vec::new());
+    }
 
-    for dep in ordered_deps {
+    let search_one = |dep: &crate::slicing::NestedDepression,
+                      scratch: &mut OutletSearchScratch|
+     -> Option<SpillFlowPath> {
         // Only delineate inter-depression spill paths for nested depressions (those enclosed
         // by a parent) OR when multiple top-level sink regions exist. A single top-level root
         // covering the entire basin spills off the DEM boundary only after everything is full.
         if !parent_map.contains_key(&dep.id) && depressions.num_regions <= 1 {
-            continue;
+            return None;
         }
 
         // Collect all descendant IDs (including dep.id) and strictly enclosing ancestor IDs.
@@ -859,7 +882,7 @@ pub fn delineate_spill_flow_paths_in_memory(
             }
         }
         if source_cells.is_empty() {
-            continue;
+            return None;
         }
 
         // Compute baseline full-fill time of `dep` as the 95th-percentile valid `fill_time`
@@ -886,27 +909,28 @@ pub fn delineate_spill_flow_paths_in_memory(
                 .collect();
         }
         if rim_times.is_empty() {
-            continue;
+            return None;
         }
         rim_times.sort_by(f64::total_cmp);
         let p95_idx = ((rim_times.len() - 1) * 95) / 100;
         let baseline_spill_time_h = rim_times[p95_idx];
 
-        pf_gen = pf_gen.wrapping_add(1);
-        if pf_gen == 0 {
-            visited_pf.fill(0);
-            drains_to_source.fill(0);
-            trapped_in_pit.fill(0);
-            pf_gen = 1;
+        scratch.pf_gen = scratch.pf_gen.wrapping_add(1);
+        if scratch.pf_gen == 0 {
+            scratch.visited_pf.fill(0);
+            scratch.drains_to_source.fill(0);
+            scratch.trapped_in_pit.fill(0);
+            scratch.pf_gen = 1;
         }
+        let pf_gen = scratch.pf_gen;
         for &idx in &source_cells {
-            in_source[idx] = true;
-            visited_pf[idx] = pf_gen;
-            parent_cell[idx] = usize::MAX;
+            scratch.in_source[idx] = true;
+            scratch.visited_pf[idx] = pf_gen;
+            scratch.parent_cell[idx] = usize::MAX;
         }
 
         // Seed min-heap with perimeter cells of M_A.
-        heap.clear();
+        scratch.heap.clear();
         for &idx in &source_cells {
             let r = idx / w;
             let c = idx % w;
@@ -916,7 +940,7 @@ pub fn delineate_spill_flow_paths_in_memory(
                 let nc = c as isize + D8X[d] as isize;
                 if nr >= 0 && nc >= 0 && nr < h as isize && nc < w as isize {
                     let nidx = (nr as usize) * w + (nc as usize);
-                    if !in_source[nidx] {
+                    if !scratch.in_source[nidx] {
                         on_perimeter = true;
                         break;
                     }
@@ -925,7 +949,7 @@ pub fn delineate_spill_flow_paths_in_memory(
             if on_perimeter {
                 let z = zdata[idx];
                 if z.is_finite() && !z.rd_eq(z_nd) {
-                    heap.push(HeapCell { elev: z, idx });
+                    scratch.heap.push(HeapCell { elev: z, idx });
                 }
             }
         }
@@ -933,15 +957,15 @@ pub fn delineate_spill_flow_paths_in_memory(
         let mut spill_elev = f64::NEG_INFINITY;
         let mut found_path: Option<(Vec<usize>, u32, f64)> = None;
 
-        while let Some(HeapCell { elev, idx: cur }) = heap.pop() {
+        while let Some(HeapCell { elev, idx: cur }) = scratch.heap.pop() {
             if elev > spill_elev {
                 spill_elev = elev;
             }
-            if !in_source[cur] {
-                trace_gen = trace_gen.wrapping_add(1);
-                if trace_gen == 0 {
-                    trace_seen.fill(0);
-                    trace_gen = 1;
+            if !scratch.in_source[cur] {
+                scratch.trace_gen = scratch.trace_gen.wrapping_add(1);
+                if scratch.trace_gen == 0 {
+                    scratch.trace_seen.fill(0);
+                    scratch.trace_gen = 1;
                 }
                 if let Some((down_trace, target_dep)) = trace_downstream_away_from_source(
                     cur,
@@ -950,24 +974,24 @@ pub fn delineate_spill_flow_paths_in_memory(
                     fdata,
                     &exterior_nodata,
                     dep_ids,
-                    &in_source,
+                    &scratch.in_source,
                     &desc_ids,
                     &ancestor_ids,
-                    &mut drains_to_source,
-                    &mut trapped_in_pit,
+                    &mut scratch.drains_to_source,
+                    &mut scratch.trapped_in_pit,
                     pf_gen,
-                    &mut trace_seen,
-                    trace_gen,
+                    &mut scratch.trace_seen,
+                    scratch.trace_gen,
                 ) {
                     // Backtrack from `cur` to the source rim cell in M_A.
                     let mut up_path = Vec::new();
                     let mut p = cur;
                     while p != usize::MAX {
                         up_path.push(p);
-                        if in_source[p] {
+                        if scratch.in_source[p] {
                             break;
                         }
-                        p = parent_cell[p];
+                        p = scratch.parent_cell[p];
                     }
                     up_path.reverse();
                     // Combine rim -> saddle (`up_path`) + saddle -> downstream (`down_trace[1..]`).
@@ -988,16 +1012,16 @@ pub fn delineate_spill_flow_paths_in_memory(
                     continue;
                 }
                 let nidx = (nr as usize) * w + (nc as usize);
-                if visited_pf[nidx] == pf_gen {
+                if scratch.visited_pf[nidx] == pf_gen {
                     continue;
                 }
                 let nz = zdata[nidx];
                 if !nz.is_finite() || nz.rd_eq(z_nd) {
                     continue;
                 }
-                visited_pf[nidx] = pf_gen;
-                parent_cell[nidx] = cur;
-                heap.push(HeapCell {
+                scratch.visited_pf[nidx] = pf_gen;
+                scratch.parent_cell[nidx] = cur;
+                scratch.heap.push(HeapCell {
                     elev: nz,
                     idx: nidx,
                 });
@@ -1006,14 +1030,12 @@ pub fn delineate_spill_flow_paths_in_memory(
 
         // Clear source flags for the next depression.
         for &idx in &source_cells {
-            in_source[idx] = false;
+            scratch.in_source[idx] = false;
         }
 
-        let Some((cell_indices, to_dep_id, s_elev)) = found_path else {
-            continue;
-        };
+        let (cell_indices, to_dep_id, s_elev) = found_path?;
         if cell_indices.len() < 2 {
-            continue;
+            return None;
         }
 
         // Ensure spill_time_h is at least the selected outlet rim cell's fill time when valid,
@@ -1047,7 +1069,7 @@ pub fn delineate_spill_flow_paths_in_memory(
         let merge_time_h = if all_submerge {
             if max_saddle_ft <= spill_time_h + 1e-6 {
                 // Saddle is already submerged when upstream fills; no visible overland channel.
-                continue;
+                return None;
             }
             Some(max_saddle_ft)
         } else {
@@ -1059,7 +1081,7 @@ pub fn delineate_spill_flow_paths_in_memory(
             .map(|idx| (idx % w, idx / w))
             .collect();
 
-        raw_paths.push(SpillFlowPath {
+        Some(SpillFlowPath {
             from_dep_id: dep.id,
             from_level: dep.level,
             to_dep_id,
@@ -1067,43 +1089,94 @@ pub fn delineate_spill_flow_paths_in_memory(
             merge_time_h,
             spill_elev: s_elev,
             cells,
-        });
-    }
+        })
+    };
 
-    // Deduplicate opposing sibling spills (A -> B and B -> A): keep only the earlier-filling
-    // (or higher-floor) upstream basin spilling into the downstream receiver.
+    #[cfg(feature = "parallel")]
+    let mut raw_paths: Vec<SpillFlowPath> = {
+        // Cap concurrent O(N) Priority-Flood scratch buffers (~25 bytes/cell on 64-bit) to a
+        // fixed memory budget (256 MiB) so large DEMs never OOM from per-thread allocations.
+        const MAX_SPILL_SCRATCH_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+        let per_scratch_bytes = n
+            .saturating_mul(
+                std::mem::size_of::<bool>()
+                    + 4 * std::mem::size_of::<u32>()
+                    + std::mem::size_of::<usize>(),
+            )
+            .max(1);
+        let max_workers = (MAX_SPILL_SCRATCH_BUDGET_BYTES / per_scratch_bytes)
+            .clamp(1, rayon::current_num_threads().min(ordered_deps.len()));
+
+        if max_workers <= 1 || ordered_deps.len() < 4 {
+            let mut scratch = OutletSearchScratch::new(n);
+            ordered_deps
+                .iter()
+                .filter_map(|&dep| search_one(dep, &mut scratch))
+                .collect()
+        } else {
+            let chunk_size = ordered_deps.len().div_ceil(max_workers);
+            ordered_deps
+                .par_chunks(chunk_size)
+                .flat_map_iter(|chunk| {
+                    let mut scratch = OutletSearchScratch::new(n);
+                    let mut local = Vec::with_capacity(chunk.len());
+                    for &dep in chunk {
+                        if let Some(p) = search_one(dep, &mut scratch) {
+                            local.push(p);
+                        }
+                    }
+                    local
+                })
+                .collect()
+        }
+    };
+    #[cfg(not(feature = "parallel"))]
+    let mut raw_paths: Vec<SpillFlowPath> = {
+        let mut scratch = OutletSearchScratch::new(n);
+        ordered_deps
+            .iter()
+            .filter_map(|&dep| search_one(dep, &mut scratch))
+            .collect()
+    };
+
+    // Deterministic order prior to sibling deduplication.
+    raw_paths.sort_by_key(|p| (p.from_level, p.from_dep_id, p.to_dep_id));
+
+    // Deduplicate opposing sibling spills (A -> B and B -> A) in O(P) via HashMap: keep only
+    // the earlier-filling (or higher-floor) upstream basin spilling into the downstream receiver.
+    let mut pair_to_idx: HashMap<(u32, u32), usize> = HashMap::with_capacity(raw_paths.len());
+    for (i, p) in raw_paths.iter().enumerate() {
+        if p.to_dep_id != 0 {
+            pair_to_idx.entry((p.from_dep_id, p.to_dep_id)).or_insert(i);
+        }
+    }
     let mut keep = vec![true; raw_paths.len()];
     for i in 0..raw_paths.len() {
         if !keep[i] || raw_paths[i].to_dep_id == 0 {
             continue;
         }
-        for j in (i + 1)..raw_paths.len() {
-            if !keep[j] {
-                continue;
-            }
-            if raw_paths[i].from_dep_id == raw_paths[j].to_dep_id
-                && raw_paths[i].to_dep_id == raw_paths[j].from_dep_id
-            {
-                let i_earlier = raw_paths[i].spill_time_h < raw_paths[j].spill_time_h - 1e-6;
-                let j_earlier = raw_paths[j].spill_time_h < raw_paths[i].spill_time_h - 1e-6;
-                if j_earlier {
+        let rev_key = (raw_paths[i].to_dep_id, raw_paths[i].from_dep_id);
+        if let Some(&j) = pair_to_idx.get(&rev_key)
+            && j > i
+            && keep[j]
+        {
+            let i_earlier = raw_paths[i].spill_time_h < raw_paths[j].spill_time_h - 1e-6;
+            let j_earlier = raw_paths[j].spill_time_h < raw_paths[i].spill_time_h - 1e-6;
+            if j_earlier {
+                keep[i] = false;
+            } else if i_earlier {
+                keep[j] = false;
+            } else {
+                let i_min = dep_by_id
+                    .get(&raw_paths[i].from_dep_id)
+                    .map_or(0.0, |d| d.min_elev);
+                let j_min = dep_by_id
+                    .get(&raw_paths[j].from_dep_id)
+                    .map_or(0.0, |d| d.min_elev);
+                if j_min > i_min {
                     keep[i] = false;
-                    break;
-                } else if i_earlier {
-                    keep[j] = false;
                 } else {
-                    let i_min = dep_by_id
-                        .get(&raw_paths[i].from_dep_id)
-                        .map_or(0.0, |d| d.min_elev);
-                    let j_min = dep_by_id
-                        .get(&raw_paths[j].from_dep_id)
-                        .map_or(0.0, |d| d.min_elev);
-                    if j_min > i_min {
-                        keep[i] = false;
-                        break;
-                    } else {
-                        keep[j] = false;
-                    }
+                    keep[j] = false;
                 }
             }
         }
@@ -1211,17 +1284,23 @@ pub fn simulate_inundation_pipeline_in_memory(
         sim_opts.min_depth,
         sim_opts.interval,
     )?;
-    let (catchment_hierarchy, catchment_records) = delineate_catchment_hierarchy_in_memory(
+    let flowdirs = d8_flow_directions_resolved(&sinks.dem_refined)?;
+    let (catchment_hierarchy, catchment_records) = delineate_catchment_hierarchy_with_flowdirs(
         &sinks.dem_refined,
         &depressions.depression_level,
         sim_opts.min_size,
+        &flowdirs,
     )?;
     let (fill_time, num_regions) =
         simulate_inundation_in_memory(&sinks.sink, &catchment_hierarchy, sim_opts)?;
     let steps =
         compute_inundation_step_summaries(&sinks.sink, &fill_time, num_steps, sim_opts.time_step_h);
-    let spill_paths =
-        delineate_spill_flow_paths_in_memory(&sinks.dem_refined, &depressions, &fill_time)?;
+    let spill_paths = delineate_spill_flow_paths_with_flowdirs(
+        &sinks.dem_refined,
+        &depressions,
+        &fill_time,
+        &flowdirs,
+    )?;
 
     Ok(InMemoryInundationPipeline {
         sinks,
@@ -1506,7 +1585,7 @@ fn region_fill_times_forced(
     let min_depth = options.min_depth;
     let step = options.interval.abs();
     let rain_m_h = options.rain_intensity_cm_h / 100.0;
-    let (res_x, res_y, cell_area) = metrics;
+    let (_, _, cell_area) = metrics;
     let (r0, c0, r1, c1) = task.bbox;
     let bh = r1 - r0;
     let bw = c1 - c0;
@@ -1565,16 +1644,7 @@ fn region_fill_times_forced(
             break;
         }
 
-        let objects = region_props_xy(
-            &label_objects,
-            nb_labels,
-            &img,
-            bw,
-            bh,
-            res_x,
-            res_y,
-            cell_area,
-        );
+        let objects = region_basic_stats(&label_objects, nb_labels, &img, bw, bh, cell_area);
         for obj in &objects {
             if obj.max_depth < min_depth {
                 continue;
@@ -1982,10 +2052,12 @@ pub fn run_full_pipeline_in_memory(
         sim_opts.min_depth,
         sim_opts.interval,
     )?;
-    let (catchment_hierarchy, catchment_records) = delineate_catchment_hierarchy_in_memory(
+    let flowdirs = d8_flow_directions_resolved(&sinks.dem_refined)?;
+    let (catchment_hierarchy, catchment_records) = delineate_catchment_hierarchy_with_flowdirs(
         &sinks.dem_refined,
         &depressions.depression_level,
         sim_opts.min_size,
+        &flowdirs,
     )?;
 
     let (fill_time, num_regions, spill_paths, fsm_basins, fsm_mass_balance) = match options.routing
@@ -1997,16 +2069,22 @@ pub fn run_full_pipeline_in_memory(
                 sim_opts,
                 &options.forcing,
             )?;
-            let sp = delineate_spill_flow_paths_in_memory(&sinks.dem_refined, &depressions, &ft)?;
+            let sp = delineate_spill_flow_paths_with_flowdirs(
+                &sinks.dem_refined,
+                &depressions,
+                &ft,
+                &flowdirs,
+            )?;
             (ft, nr, sp, None, None)
         }
         RoutingMode::FillSpillMerge => {
-            let fsm = simulate_fill_spill_merge_in_memory(
+            let fsm = simulate_fill_spill_merge_with_flowdirs(
                 &sinks.dem_refined,
                 &sinks.sink,
                 &depressions,
                 sim_opts,
                 &options.forcing,
+                &flowdirs,
             )?;
             (
                 fsm.fill_time,
@@ -2293,10 +2371,12 @@ pub fn run_pipeline(
         sim_opts.min_depth,
         sim_opts.interval,
     )?;
-    let (catchment_hierarchy, catchment_records) = delineate_catchment_hierarchy_in_memory(
+    let flowdirs = d8_flow_directions_resolved(&sinks.dem_refined)?;
+    let (catchment_hierarchy, catchment_records) = delineate_catchment_hierarchy_with_flowdirs(
         &sinks.dem_refined,
         &depressions.depression_level,
         sim_opts.min_size,
+        &flowdirs,
     )?;
 
     let rc_arr = match &options.runoff_coeff_path {
@@ -2317,38 +2397,43 @@ pub fn run_pipeline(
         antecedent_depth: ant_arr.as_ref(),
         hyetograph: options.hyetograph.as_deref(),
     };
-    let (fill_time, spill_paths, fsm_basins, fsm_basins_csv, fsm_mass_balance) = match options
-        .routing
-    {
-        RoutingMode::Static => {
-            let (ft, _num_sim_regions) = simulate_inundation_with_forcing_in_memory(
-                &sinks.sink,
-                &catchment_hierarchy,
-                sim_opts,
-                &forcing,
-            )?;
-            let sp = delineate_spill_flow_paths_in_memory(&sinks.dem_refined, &depressions, &ft)?;
-            (ft, sp, None, None, None)
-        }
-        RoutingMode::FillSpillMerge => {
-            let fsm = simulate_fill_spill_merge_in_memory(
-                &sinks.dem_refined,
-                &sinks.sink,
-                &depressions,
-                sim_opts,
-                &forcing,
-            )?;
-            let basins_csv = out_dir.join("fsm_basins.csv");
-            write_fsm_basins_csv(&fsm.basins, &basins_csv)?;
-            (
-                fsm.fill_time,
-                fsm.spill_paths,
-                Some(fsm.basins),
-                Some(basins_csv),
-                Some(fsm.mass_balance),
-            )
-        }
-    };
+    let (fill_time, spill_paths, fsm_basins, fsm_basins_csv, fsm_mass_balance) =
+        match options.routing {
+            RoutingMode::Static => {
+                let (ft, _num_sim_regions) = simulate_inundation_with_forcing_in_memory(
+                    &sinks.sink,
+                    &catchment_hierarchy,
+                    sim_opts,
+                    &forcing,
+                )?;
+                let sp = delineate_spill_flow_paths_with_flowdirs(
+                    &sinks.dem_refined,
+                    &depressions,
+                    &ft,
+                    &flowdirs,
+                )?;
+                (ft, sp, None, None, None)
+            }
+            RoutingMode::FillSpillMerge => {
+                let fsm = simulate_fill_spill_merge_with_flowdirs(
+                    &sinks.dem_refined,
+                    &sinks.sink,
+                    &depressions,
+                    sim_opts,
+                    &forcing,
+                    &flowdirs,
+                )?;
+                let basins_csv = out_dir.join("fsm_basins.csv");
+                write_fsm_basins_csv(&fsm.basins, &basins_csv)?;
+                (
+                    fsm.fill_time,
+                    fsm.spill_paths,
+                    Some(fsm.basins),
+                    Some(basins_csv),
+                    Some(fsm.mass_balance),
+                )
+            }
+        };
     let steps =
         compute_inundation_step_summaries(&sinks.sink, &fill_time, num_steps, sim_opts.time_step_h);
 
@@ -2575,13 +2660,15 @@ pub fn simulate_inundation(
 
     let ft_data = fill_time.data();
     let mut steps = Vec::with_capacity(n_steps);
-    let mut flood_buf = vec![0u32; w * h];
+    let mut frame_arr = Array2D::from_vec(w, h, vec![0u32; w * h])?;
+    frame_arr.copy_metadata_from(&sink);
+    frame_arr.set_no_data(0);
 
     for (i, frame_path) in frame_paths.iter().enumerate() {
         let step_num = i + 1;
         let t_hours = (step_num as f64) * options.time_step_h;
         let mut inundated_cells = 0usize;
-        for (dst, &ft) in flood_buf.iter_mut().zip(ft_data.iter()) {
+        for (dst, &ft) in frame_arr.data_mut().iter_mut().zip(ft_data.iter()) {
             if ft >= 0.0 && ft.is_finite() && ft <= t_hours {
                 *dst = 1;
                 inundated_cells += 1;
@@ -2589,9 +2676,6 @@ pub fn simulate_inundation(
                 *dst = 0;
             }
         }
-        let mut frame_arr = Array2D::from_vec(w, h, flood_buf.clone())?;
-        frame_arr.copy_metadata_from(&sink);
-        frame_arr.set_no_data(0);
         save_raster(
             &frame_arr,
             frame_path,
