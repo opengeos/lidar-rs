@@ -41,7 +41,11 @@ where
         times.push(t0.elapsed().as_secs_f64() * 1000.0);
     }
     times.sort_by(f64::total_cmp);
-    let median_ms = times[runs / 2];
+    let median_ms = if runs.is_multiple_of(2) {
+        (times[runs / 2 - 1] + times[runs / 2]) / 2.0
+    } else {
+        times[runs / 2]
+    };
     let min_ms = times[0];
     let mcells_per_s = if median_ms > 0.0 {
         (cells as f64 / 1e6) / (median_ms / 1000.0)

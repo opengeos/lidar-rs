@@ -115,11 +115,11 @@ pub use fsm::{
 #[cfg(feature = "serde")]
 pub use graph::write_connectivity_graph_json;
 pub use graph::{
-    ConnectivityGraph, GraphEdge, GraphNode, RatingCurvePoint, build_connectivity_graph,
-    compute_rating_curves, connectivity_graph_edges_to_csv_string,
-    connectivity_graph_to_graphml_string, rating_curves_to_csv_string,
-    write_connectivity_graph_edges_csv, write_connectivity_graphml, write_rating_curves_csv,
-    write_spill_paths_vector,
+    ConnectivityGraph, GraphEdge, GraphNode, RatingCurvePoint, RatingCurvesFromDemOptions,
+    build_connectivity_graph, compute_rating_curves, compute_rating_curves_from_dem,
+    connectivity_graph_edges_to_csv_string, connectivity_graph_to_graphml_string,
+    rating_curves_to_csv_string, write_connectivity_graph_edges_csv, write_connectivity_graphml,
+    write_rating_curves_csv, write_spill_paths_vector,
 };
 pub use inundation::{
     ForcingInput, GreenAmptParams, InMemoryFullPipeline, InMemoryFullPipelineOptions,
@@ -135,7 +135,8 @@ pub use inundation::{
     scs_hyetograph, scs_type2_hyetograph, simulate_inundation, simulate_inundation_advanced,
     simulate_inundation_in_memory, simulate_inundation_pipeline_in_memory,
     simulate_inundation_with_forcing_in_memory,
-    simulate_inundation_with_weighted_catchment_in_memory, write_inundation_summary_csv,
+    simulate_inundation_with_weighted_catchment_in_memory, uniform_runoff_coeff_raster_for_cn,
+    write_inundation_summary_csv,
 };
 pub use merge_tree::{
     MergeTreeNode, MergeTreeOptions, MergeTreeResult, delineate_depressions_merge_tree_in_memory,

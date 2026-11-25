@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use richdem::{Array2D, DemNum};
+use richdem::{Array2D, DemNum, Topology, load_raster};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use terrio::crs::SpatialRef;
@@ -19,8 +19,10 @@ use terrio::{
 
 use crate::catchment::CatchmentHierarchyRecord;
 use crate::error::{Error, Result};
+use crate::filling::extract_sinks_in_memory;
+use crate::filtering::median_filter;
 use crate::inundation::{SpillFlowPath, validate_grid_alignment};
-use crate::slicing::{InMemoryDepressions, NestedDepression};
+use crate::slicing::{InMemoryDepressions, NestedDepression, delineate_depressions_in_memory};
 
 /// One elevation sample on a depression's stage-storage-area rating curve.
 #[derive(Debug, Clone, PartialEq)]
@@ -166,6 +168,69 @@ pub fn compute_rating_curves(
     }
 
     Ok(curves)
+}
+
+/// Options controlling [`compute_rating_curves_from_dem`].
+#[derive(Debug, Clone)]
+pub struct RatingCurvesFromDemOptions {
+    /// Treat input raster as a pre-extracted sink elevation raster (default `false`).
+    pub is_sink: bool,
+    /// Median filter kernel size when `is_sink == false` (`<= 1` skips smoothing; default `3`).
+    pub kernel_size: usize,
+    /// Minimum depression area in pixels (default `1000`).
+    pub min_size: usize,
+    /// Minimum depression depth (default `0.3`).
+    pub min_depth: f64,
+    /// Vertical level-set slicing interval (default `0.3`).
+    pub interval: f64,
+    /// Optional stage sampling interval for rating curves (defaults to `interval.abs()`).
+    pub curve_interval: Option<f64>,
+    /// Connectivity topology for sink extraction (default `Topology::D8`).
+    pub topology: Topology,
+}
+
+impl Default for RatingCurvesFromDemOptions {
+    fn default() -> Self {
+        Self {
+            is_sink: false,
+            kernel_size: 3,
+            min_size: 1000,
+            min_depth: 0.3,
+            interval: 0.3,
+            curve_interval: None,
+            topology: Topology::D8,
+        }
+    }
+}
+
+/// Computes stage-storage-area rating curves directly from a DEM (or pre-extracted sink)
+/// raster file, returning `(num_depressions, rating_curve_points)`.
+pub fn compute_rating_curves_from_dem(
+    in_dem: impl AsRef<Path>,
+    options: &RatingCurvesFromDemOptions,
+) -> Result<(usize, Vec<RatingCurvePoint>)> {
+    let sink = if options.is_sink {
+        load_raster::<f64>(in_dem, None)?
+    } else {
+        let raw = load_raster::<f64>(in_dem, None)?;
+        let dem = if options.kernel_size > 1 {
+            median_filter(&raw, options.kernel_size)?
+        } else {
+            raw
+        };
+        extract_sinks_in_memory(&dem, options.min_size, options.topology)?.sink
+    };
+    let deps = delineate_depressions_in_memory(
+        &sink,
+        options.min_size,
+        options.min_depth,
+        options.interval,
+    )?;
+    let step = options
+        .curve_interval
+        .unwrap_or_else(|| options.interval.abs());
+    let points = compute_rating_curves(&sink, &deps, step)?;
+    Ok((deps.depressions.len(), points))
 }
 
 /// Writes stage-storage-area rating curves to CSV.

@@ -19,25 +19,24 @@ use lidar::pointcloud::{
     lidar_to_dtm, read_lidar, write_lidar,
 };
 use lidar::{
-    AnimateInundationOptions, Array2D, BreachMode, BreachOptions, BurnCulvertsOptions,
+    AnimateInundationOptions, BreachMode, BreachOptions, BurnCulvertsOptions,
     CatchmentHierarchyOptions, DelineateCatchmentsOptions, DelineateFlowPathsOptions,
     DelineateOptions, ExecutionControl, ExtractSinksOptions, ForcingInput, HillshadeOptions,
-    InMemoryFullPipelineOptions, RoutingMode, RunPipelineOptions,
+    InMemoryFullPipelineOptions, RatingCurvesFromDemOptions, RoutingMode, RunPipelineOptions,
     SimulateInundationAdvancedOptions, SimulateInundationOptions, SynthesizeCulvertsOptions,
     TiledDelineationOptions, TiledOutputOptions, Topology, add_crs, animate_inundation,
-    breach_depressions_file, burn_culverts_file, clip_image, compute_rating_curves,
+    breach_depressions_file, burn_culverts_file, clip_image, compute_rating_curves_from_dem,
     connectivity_graph_to_graphml_string, csv_points_to_vector, delineate_catchment_hierarchy,
-    delineate_catchments, delineate_depressions, delineate_depressions_in_memory,
-    delineate_depressions_tiled_with_control, delineate_flow_paths, delineate_mounts,
-    export_inundation_frames_png, extract_sinks, extract_sinks_in_memory, flip_dem_file,
-    gaussian_filter_file, image_to_cog, join_csv_to_vector, load_dem_for_preview, load_raster,
-    mean_filter_file, median_filter, median_filter_file, mosaic, parse_resampling, polygonize,
+    delineate_catchments, delineate_depressions, delineate_depressions_tiled_with_control,
+    delineate_flow_paths, delineate_mounts, export_inundation_frames_png, extract_sinks,
+    flip_dem_file, gaussian_filter_file, image_to_cog, join_csv_to_vector, load_dem_for_preview,
+    load_raster, mean_filter_file, median_filter_file, mosaic, parse_resampling, polygonize,
     rating_curves_to_csv_string, render_dem_preview_png_bytes, render_inundation_frame_png_bytes,
     reproject_image, resample, run_full_pipeline_in_memory, run_pipeline_with_control, save_raster,
     scs_curve_number_runoff, scs_curve_number_runoff_scalar, scs_curve_number_runoff_with_ia,
     scs_type2_hyetograph, simulate_inundation, simulate_inundation_advanced, synthesize_culverts,
-    write_connectivity_graph_edges_csv, write_connectivity_graph_json, write_connectivity_graphml,
-    write_rating_curves_csv,
+    uniform_runoff_coeff_raster_for_cn, write_connectivity_graph_edges_csv,
+    write_connectivity_graph_json, write_connectivity_graphml, write_rating_curves_csv,
 };
 #[cfg(feature = "download")]
 use lidar::{
@@ -229,7 +228,7 @@ impl CliGraphFormat {
 
 /// Shared tunable CSF, PMF, SMRF, and ROR parameters exposed on ground classification,
 /// DTM, and CHM subcommands.
-#[derive(Args, Clone, Debug, Default)]
+#[derive(Args, Clone, Debug)]
 struct GroundFilterArgs {
     /// CSF cloth resolution (particle spacing in CRS units, default 1.0)
     #[arg(long)]
@@ -276,6 +275,28 @@ struct GroundFilterArgs {
     /// Minimum neighbor count within --ror-radius for ROR (default 2)
     #[arg(long, default_value_t = 2)]
     ror_min_neighbors: usize,
+}
+
+impl Default for GroundFilterArgs {
+    fn default() -> Self {
+        Self {
+            cloth_resolution: None,
+            rigidness: None,
+            class_threshold: None,
+            slope_smooth: None,
+            pmf_max_window: None,
+            pmf_slope: None,
+            pmf_initial_distance: None,
+            pmf_max_distance: None,
+            smrf_cell_size: None,
+            smrf_slope: None,
+            smrf_window: None,
+            smrf_threshold: None,
+            smrf_scalar: None,
+            ror_radius: None,
+            ror_min_neighbors: 2,
+        }
+    }
 }
 
 impl GroundFilterArgs {
@@ -462,39 +483,6 @@ fn make_progress_control(verbosity: Verbosity) -> ExecutionControl {
             *guard = Some((ev.stage.clone(), now));
         }
     })
-}
-
-fn build_uniform_runoff_raster_for_cn(
-    dem_path: &Path,
-    cn_value: f64,
-    precip_mm: f64,
-) -> lidar::Result<Array2D<f64>> {
-    let (_, rc_scalar) = scs_curve_number_runoff_scalar(cn_value, precip_mm, 0.2)?;
-
-    // Read DEM metadata without loading full pixels when supported by lazy driver.
-    let (width, height, geotransform, projection) = if let Some(p_str) = dem_path.to_str()
-        && let Ok(lazy) = terrio::open_raster_lazy(p_str)
-    {
-        let crs = lazy.crs();
-        let proj = crs.to_wkt().or_else(|| crs.to_proj4()).unwrap_or_default();
-        (lazy.width(), lazy.height(), lazy.geo_transform(), proj)
-    } else {
-        let dem = load_raster::<f64>(dem_path, None)?;
-        (
-            dem.width(),
-            dem.height(),
-            dem.geotransform,
-            dem.projection.clone(),
-        )
-    };
-    let n = width.checked_mul(height).ok_or_else(|| {
-        lidar::Error::DimensionMismatch(format!("raster dimensions overflow ({width}x{height})"))
-    })?;
-    let mut rc_arr = Array2D::from_vec(width, height, vec![rc_scalar; n])?;
-    rc_arr.geotransform = geotransform;
-    rc_arr.projection = projection;
-    rc_arr.set_no_data(-9999.0);
-    Ok(rc_arr)
 }
 
 fn print_json(value: &impl serde::Serialize) -> lidar::Result<()> {
@@ -1055,7 +1043,7 @@ enum Commands {
         #[arg(long)]
         breach_max_depth: Option<f64>,
         /// Optional selective breaching maximum path length in cells (defaults to 50 when --breach-max-depth is set; pass 0 for unlimited)
-        #[arg(long, requires = "breach_max_depth")]
+        #[arg(long)]
         breach_max_length: Option<u32>,
         /// Fill remaining unbreached depressions after selective/constrained breaching (supports =true/=false to override --config)
         #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
@@ -1069,7 +1057,7 @@ enum Commands {
         /// Optional NRCS Curve Number (0..=100) raster (GeoTIFF) converted to runoff coefficient via TR-55
         #[arg(long, conflicts_with_all = ["runoff_coeff", "cn"])]
         curve_number: Option<PathBuf>,
-        /// Optional uniform NRCS Curve Number (0..=100) scalar converted to runoff coefficient via TR-55
+        /// Optional uniform NRCS Curve Number in (0, 100] converted to runoff coefficient via TR-55
         #[arg(long, conflicts_with_all = ["runoff_coeff", "curve_number"])]
         cn: Option<f64>,
         /// Optional spatially variable infiltration loss raster (GeoTIFF, cm/h)
@@ -2272,12 +2260,14 @@ fn dispatch(
                 .or(cfg.duration)
                 .unwrap_or(if scs_type2_mm.is_some() { 24.0 } else { 50.0 });
             let time_step = time_step.or(cfg.time_step).unwrap_or(DEFAULT_TIME_STEP_H);
-            let cfg_breach_mode = cfg
-                .breach_mode
-                .as_deref()
-                .map(parse_breach_mode_str)
-                .transpose()?;
-            let breach_mode = breach_mode.or(cfg_breach_mode);
+            let breach_mode = match breach_mode {
+                Some(m) => Some(m),
+                None => cfg
+                    .breach_mode
+                    .as_deref()
+                    .map(parse_breach_mode_str)
+                    .transpose()?,
+            };
             let breach_max_depth = breach_max_depth.or(cfg.breach_max_depth);
             let breach_max_length = breach_max_length.or(cfg.breach_max_length);
             let breach_fill_remaining = breach_fill_remaining
@@ -2287,12 +2277,15 @@ fn dispatch(
             let infiltration = infiltration.or(cfg.infiltration);
             let antecedent_depth = antecedent_depth.or(cfg.antecedent_depth);
             let streams = streams.or(cfg.streams);
-            let cfg_routing = cfg
-                .routing
-                .as_deref()
-                .map(parse_routing_mode_str)
-                .transpose()?;
-            let routing = routing.or(cfg_routing).unwrap_or(CliRoutingMode::Static);
+            let routing = match routing {
+                Some(r) => r,
+                None => cfg
+                    .routing
+                    .as_deref()
+                    .map(parse_routing_mode_str)
+                    .transpose()?
+                    .unwrap_or(CliRoutingMode::Static),
+            };
             let use_f32 = use_f32.or(cfg.use_f32).unwrap_or(false);
             let no_rasters = no_rasters.or(cfg.no_rasters).unwrap_or(false);
             let no_vectors = no_vectors.or(cfg.no_vectors).unwrap_or(false);
@@ -2321,7 +2314,7 @@ fn dispatch(
 
             if breach_max_length.is_some() && breach_max_depth.is_none() && breach_mode.is_none() {
                 return Err(lidar::Error::InvalidArgument(
-                    "breach_max_length requires breach_max_depth or breach_mode".into(),
+                    "--breach-max-length requires --breach-max-depth or --breach-mode".into(),
                 ));
             }
             let hyetograph = scs_type2_mm
@@ -2347,38 +2340,43 @@ fn dispatch(
                 None
             };
             let routing_mode: RoutingMode = routing.into();
+            let mut candidate_outputs = vec![
+                out_dir.join("depressions.csv"),
+                out_dir.join("catchments.csv"),
+                out_dir.join("inundation_curve.csv"),
+                out_dir.join("summary.json"),
+            ];
+            if !no_rasters {
+                for name in [
+                    "depth.tif",
+                    "depression_id.tif",
+                    "depression_level.tif",
+                    "catchment_hir.tif",
+                    "fill_time.tif",
+                ] {
+                    candidate_outputs.push(out_dir.join(name));
+                }
+            }
+            if !no_vectors {
+                candidate_outputs.push(out_dir.join("depressions.gpkg"));
+                candidate_outputs.push(out_dir.join("spill_paths.gpkg"));
+            }
+            if !no_graph {
+                candidate_outputs.push(out_dir.join("rating_curves.csv"));
+                candidate_outputs.push(out_dir.join("connectivity_graph.graphml"));
+                candidate_outputs.push(out_dir.join("connectivity_graph.json"));
+            }
+            if routing_mode == RoutingMode::FillSpillMerge {
+                candidate_outputs.push(out_dir.join("fsm_basins.csv"));
+                candidate_outputs.push(out_dir.join("fsm_hydrograph.csv"));
+            }
+            if let Some(ref cfg_path) = config {
+                for cand in &candidate_outputs {
+                    ensure_no_cli_path_collision(cfg_path, cand)?;
+                }
+            }
             let _cn_tmp_file;
             let resolved_runoff_coeff = if let Some(cn_path) = curve_number {
-                let mut candidate_outputs = vec![
-                    out_dir.join("depressions.csv"),
-                    out_dir.join("catchments.csv"),
-                    out_dir.join("inundation_curve.csv"),
-                    out_dir.join("summary.json"),
-                ];
-                if !no_rasters {
-                    for name in [
-                        "depth.tif",
-                        "depression_id.tif",
-                        "depression_level.tif",
-                        "catchment_hir.tif",
-                        "fill_time.tif",
-                    ] {
-                        candidate_outputs.push(out_dir.join(name));
-                    }
-                }
-                if !no_vectors {
-                    candidate_outputs.push(out_dir.join("depressions.gpkg"));
-                    candidate_outputs.push(out_dir.join("spill_paths.gpkg"));
-                }
-                if !no_graph {
-                    candidate_outputs.push(out_dir.join("rating_curves.csv"));
-                    candidate_outputs.push(out_dir.join("connectivity_graph.graphml"));
-                    candidate_outputs.push(out_dir.join("connectivity_graph.json"));
-                }
-                if routing_mode == RoutingMode::FillSpillMerge {
-                    candidate_outputs.push(out_dir.join("fsm_basins.csv"));
-                    candidate_outputs.push(out_dir.join("fsm_hydrograph.csv"));
-                }
                 for cand in &candidate_outputs {
                     ensure_no_cli_path_collision(&cn_path, cand)?;
                 }
@@ -2395,7 +2393,7 @@ fn dispatch(
                 Some(tmp_path)
             } else if let Some(cn_val) = cn {
                 let precip_mm = scs_type2_mm.unwrap_or(rain_intensity * duration * 10.0);
-                let rc_arr = build_uniform_runoff_raster_for_cn(&input, cn_val, precip_mm)?;
+                let rc_arr = uniform_runoff_coeff_raster_for_cn(&input, cn_val, precip_mm)?;
                 let tmp = tempfile::Builder::new()
                     .prefix("lidar-cn-scalar-")
                     .suffix(".tif")
@@ -2566,7 +2564,7 @@ fn dispatch(
                     "frame_count": paths.len(),
                     "frames": paths,
                 }))?;
-            } else {
+            } else if !verbosity.is_quiet() {
                 println!(
                     "Exported {} PNG frame(s) to {}",
                     paths.len(),
@@ -2589,7 +2587,7 @@ fn dispatch(
             )?;
             if json {
                 print_json(&res)?;
-            } else {
+            } else if !verbosity.is_quiet() {
                 println!(
                     "Delineated {} catchment(s):\n  watershed: {}\n  vector:    {}\n  csv:       {}",
                     res.records.len(),
@@ -2618,7 +2616,7 @@ fn dispatch(
             )?;
             if json {
                 print_json(&res)?;
-            } else {
+            } else if !verbosity.is_quiet() {
                 println!(
                     "Delineated {} flow path(s):\n  vector: {}\n  csv:    {}",
                     res.records.len(),
@@ -2642,7 +2640,7 @@ fn dispatch(
             )?;
             if json {
                 print_json(&res)?;
-            } else {
+            } else if !verbosity.is_quiet() {
                 println!(
                     "Delineated catchment hierarchy ({} feature(s) across {} level(s)):\n  raster: {}\n  merged: {}\n  csv:    {}",
                     res.records.len(),
@@ -2700,7 +2698,7 @@ fn dispatch(
                         fsm_mass_balance: None,
                     };
                     print_json(&adv)?;
-                } else {
+                } else if !verbosity.is_quiet() {
                     println!(
                         "Simulated {} timestep(s) across {} region(s):\n  fill_time: {}\n  summary:   {}",
                         res.steps.len(),
@@ -2731,7 +2729,7 @@ fn dispatch(
                 let adv = simulate_inundation_advanced(&sink, &catchment, &out_dir, &adv_opts)?;
                 if json {
                     print_json(&adv)?;
-                } else {
+                } else if !verbosity.is_quiet() {
                     println!(
                         "Simulated {} timestep(s) across {} region(s):\n  fill_time: {}\n  summary:   {}",
                         adv.simulation.steps.len(),
@@ -2793,7 +2791,7 @@ fn dispatch(
             let res = animate_inundation(&dem, &flood_dir, &output, &opts)?;
             if json {
                 print_json(&res)?;
-            } else {
+            } else if !verbosity.is_quiet() {
                 println!(
                     "Rendered {} frame(s) ({}x{}) to {}",
                     res.frame_count,
@@ -2862,7 +2860,7 @@ fn dispatch(
                 let items = query_3dep_products(&reg, &dl_opts)?;
                 if json {
                     print_json(&items)?;
-                } else {
+                } else if !verbosity.is_quiet() {
                     let total_mb: f64 =
                         items.iter().filter_map(|i| i.size_bytes).sum::<u64>() as f64 / 1e6;
                     println!(
@@ -2887,7 +2885,7 @@ fn dispatch(
                 let res = download_federal_data(&reg, &out_dir, &bundle_opts)?;
                 if json {
                     print_json(&res)?;
-                } else {
+                } else if !verbosity.is_quiet() {
                     println!(
                         "Downloaded federal data into {} (bbox: {}):",
                         out_dir.display(),
@@ -2958,7 +2956,7 @@ fn dispatch(
             let table = fetch_noaa_atlas14(lat, lon, output.as_deref(), &dl_opts)?;
             if json {
                 print_json(&table)?;
-            } else {
+            } else if !verbosity.is_quiet() {
                 println!(
                     "NOAA Atlas 14 PDS precipitation depths ({}) at lat={:.4}, lon={:.4}:",
                     table.units, table.lat, table.lon
@@ -2994,7 +2992,7 @@ fn dispatch(
                     "output": output,
                     "crossing_count": n,
                 }))?;
-            } else {
+            } else if !verbosity.is_quiet() {
                 println!(
                     "Synthesized {n} culvert crossing(s) to {}",
                     output.display()
@@ -3104,7 +3102,7 @@ fn dispatch(
                     "output": out_path,
                     "bytes": png_bytes.len(),
                 }))?;
-            } else {
+            } else if !verbosity.is_quiet() {
                 println!(
                     "Rendered preview PNG ({} bytes) to {}",
                     png_bytes.len(),
@@ -3222,39 +3220,37 @@ fn dispatch(
             if let Some(ref out_path) = output {
                 ensure_no_cli_path_collision(&input, out_path)?;
             }
-            let sink = if is_sink {
-                load_raster::<f64>(&input, None)?
-            } else {
-                let raw = load_raster::<f64>(&input, None)?;
-                let dem = if kernel > 1 {
-                    median_filter(&raw, kernel)?
-                } else {
-                    raw
-                };
-                extract_sinks_in_memory(&dem, min_size, topology.into())?.sink
-            };
-            let deps = delineate_depressions_in_memory(&sink, min_size, min_depth, interval)?;
-            let step = curve_interval.unwrap_or_else(|| interval.abs());
-            let points = compute_rating_curves(&sink, &deps, step)?;
+            let (num_depressions, points) = compute_rating_curves_from_dem(
+                &input,
+                &RatingCurvesFromDemOptions {
+                    is_sink,
+                    kernel_size: kernel,
+                    min_size,
+                    min_depth,
+                    interval,
+                    curve_interval,
+                    topology: topology.into(),
+                },
+            )?;
             if let Some(out_path) = output {
                 write_rating_curves_csv(&points, &out_path)?;
                 if json {
                     print_json(&json!({
                         "output": out_path,
-                        "num_depressions": deps.depressions.len(),
+                        "num_depressions": num_depressions,
                         "num_points": points.len(),
                     }))?;
                 } else if !verbosity.is_quiet() {
                     println!(
                         "Wrote {} rating curve sample(s) across {} depression(s) to {}",
                         points.len(),
-                        deps.depressions.len(),
+                        num_depressions,
                         out_path.display()
                     );
                 }
             } else if json {
                 print_json(&json!({
-                    "num_depressions": deps.depressions.len(),
+                    "num_depressions": num_depressions,
                     "num_points": points.len(),
                     "points": points,
                 }))?;
@@ -3279,6 +3275,9 @@ fn dispatch(
         } => {
             if let Some(ref out_path) = output {
                 ensure_no_cli_path_collision(&input, out_path)?;
+                if let Some(ref streams_path) = streams {
+                    ensure_no_cli_path_collision(streams_path, out_path)?;
+                }
             }
             let dem = load_raster::<f64>(&input, None)?;
             let pipe = run_full_pipeline_in_memory(
@@ -3434,6 +3433,10 @@ fn run_as_inner(args: Vec<OsString>, lidar_cmd: Option<Vec<OsString>>) -> i32 {
             return code;
         }
     };
+    if cli.verbose && cli.quiet {
+        eprintln!("error: --verbose and --quiet cannot be used together");
+        return 2;
+    }
     let verbosity = Verbosity::from_flags(cli.verbose, cli.quiet);
     match dispatch(cli.command, lidar_cmd, verbosity) {
         Ok(()) => 0,
@@ -3495,19 +3498,20 @@ mod tests {
 
     #[test]
     fn pipeline_breach_max_length_requires_breach_max_depth() {
-        usage::with_clap_stack(|| {
-            assert!(
-                Cli::try_parse_from([
-                    "lidar",
-                    "pipeline",
-                    "dem.tif",
-                    "out",
-                    "--breach-max-length",
-                    "25",
-                ])
-                .is_err()
-            );
+        // Without --breach-max-depth or --breach-mode (and without config), dispatch rejects --breach-max-length.
+        assert_eq!(
+            run(vec![
+                "lidar".into(),
+                "pipeline".into(),
+                "dem.tif".into(),
+                "out".into(),
+                "--breach-max-length".into(),
+                "25".into(),
+            ]),
+            1
+        );
 
+        usage::with_clap_stack(|| {
             let cli = Cli::try_parse_from([
                 "lidar",
                 "pipeline",
@@ -4090,6 +4094,21 @@ mod tests {
                 ])
                 .is_err()
             );
+            // Split positions (`-v <subcmd> -q`) must also be rejected cleanly.
+            assert_eq!(
+                run(vec![
+                    "lidar".into(),
+                    "-v".into(),
+                    "cn-to-runoff".into(),
+                    "--cn".into(),
+                    "80".into(),
+                    "--precip-mm".into(),
+                    "100".into(),
+                    "-q".into(),
+                ]),
+                2
+            );
+            assert_eq!(GroundFilterArgs::default().ror_min_neighbors, 2);
 
             // completions supports bash, zsh, fish, powershell, elvish
             for sh in ["bash", "zsh", "fish", "powershell", "elvish"] {
@@ -4391,6 +4410,62 @@ mod tests {
             ]),
             1
         );
+
+        // 5. Config with breach_max_depth + CLI --breach-max-length + CLI --routing overriding config routing
+        let breach_cfg_out = tmp.path().join("pipe_breach_cfg");
+        let breach_cfg = tmp.path().join("breach.toml");
+        std::fs::write(
+            &breach_cfg,
+            format!(
+                "input = {:?}\nout_dir = {:?}\nbreach_max_depth = 0.5\nrouting = \"not_parsed_when_cli_overrides\"\ninterval = 0.5\nduration = 10.0\ntime_step = 5.0\nno_rasters = true\nno_vectors = true\nno_graph = true\n",
+                dem_path.to_str().unwrap(),
+                breach_cfg_out.to_str().unwrap(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            run(vec![
+                "lidar".into(),
+                "pipeline".into(),
+                "--config".into(),
+                breach_cfg.as_os_str().to_os_string(),
+                "--breach-max-length".into(),
+                "25".into(),
+                "--routing".into(),
+                "static".into(),
+                "-q".into(),
+            ]),
+            0
+        );
+        assert!(breach_cfg_out.join("summary.json").exists());
+
+        // 6. --config path colliding with an enabled output file in out_dir must fail before writing
+        let cfg_collide_dir = tmp.path().join("pipe_cfg_collide");
+        std::fs::create_dir_all(&cfg_collide_dir).unwrap();
+        let colliding_cfg = cfg_collide_dir.join("summary.json");
+        std::fs::write(
+            &colliding_cfg,
+            serde_json::to_string(&json!({
+                "input": dem_path,
+                "out_dir": cfg_collide_dir,
+                "no_rasters": true,
+                "no_vectors": true,
+                "no_graph": true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&colliding_cfg).unwrap();
+        assert_eq!(
+            run(vec![
+                "lidar".into(),
+                "pipeline".into(),
+                "--config".into(),
+                colliding_cfg.as_os_str().to_os_string(),
+            ]),
+            1
+        );
+        assert_eq!(std::fs::read_to_string(&colliding_cfg).unwrap(), before);
     }
 
     #[test]
@@ -4494,5 +4569,25 @@ mod tests {
                 &txt[..txt.len().min(80)]
             );
         }
+
+        // connectivity-graph -o colliding with --streams must fail before writing
+        let streams_dummy = tmp.path().join("streams.geojson");
+        std::fs::write(
+            &streams_dummy,
+            "{\"type\":\"FeatureCollection\",\"features\":[]}",
+        )
+        .unwrap();
+        assert_eq!(
+            run(vec![
+                "lidar".into(),
+                "connectivity-graph".into(),
+                dem_path.as_os_str().to_os_string(),
+                "--streams".into(),
+                streams_dummy.as_os_str().to_os_string(),
+                "-o".into(),
+                streams_dummy.as_os_str().to_os_string(),
+            ]),
+            1
+        );
     }
 }

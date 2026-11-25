@@ -912,6 +912,7 @@ fn run_tiled_in_memory<T: DemNum>(
         0.95,
         Some(format!("Merging {num_tiles} tile(s) and writing outputs")),
     );
+    control.check_cancelled()?;
 
     let stitched = match stitched_mtx {
         Some(m) => Some(
@@ -1047,6 +1048,9 @@ pub fn delineate_depressions_tiled_with_control(
     crate::raster_ops::ensure_no_path_collision(in_dem, &out_paths)?;
     control.check_cancelled()?;
     std::fs::create_dir_all(out_dir)?;
+    // Recheck collisions after `out_dir` exists so non-canonical paths like
+    // `<new_dir>/../dem.tif` resolve via canonicalization before any writes.
+    crate::raster_ops::ensure_no_path_collision(in_dem, &out_paths)?;
 
     // Out-of-core windowed path via `terrio::open_raster_lazy`:
     // - If `open_raster_lazy` succeeds AND `lazy.reads_by_window()` is true, read each padded
@@ -1125,6 +1129,7 @@ pub fn delineate_depressions_tiled_with_control(
                     0.95,
                     Some(format!("Merging {num_tiles} tile(s) and writing outputs")),
                 );
+                control.check_cancelled()?;
 
                 let stitched =
                     match stitched_mtx {
@@ -1428,7 +1433,7 @@ mod tests {
 
         let mut prev = -1.0f64;
         for ev in recorded.iter() {
-            assert!(ev.fraction >= 0.0 && ev.fraction <= 1.0);
+            assert!((0.0..=1.0).contains(&ev.fraction));
             assert!(
                 ev.fraction >= prev,
                 "non-monotonic fraction: {} < {prev}",

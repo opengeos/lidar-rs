@@ -1361,6 +1361,9 @@ pub fn scs_curve_number_runoff_scalar(
         )));
     }
     let s = 25_400.0 / cn - 254.0;
+    if s <= 0.0 {
+        return Ok((precip_mm, 1.0));
+    }
     let ia = ia_ratio * s;
     if !s.is_finite() || !ia.is_finite() || precip_mm <= ia {
         Ok((0.0, 0.0))
@@ -1406,6 +1409,9 @@ pub fn scs_curve_number_runoff_with_ia(
             }
             let c = v.min(100.0);
             let s = 25_400.0 / c - 254.0;
+            if s <= 0.0 {
+                return 1.0;
+            }
             let ia = ia_ratio * s;
             if !s.is_finite() || !ia.is_finite() || precip_mm <= ia {
                 0.0
@@ -1419,6 +1425,41 @@ pub fn scs_curve_number_runoff_with_ia(
     out.copy_metadata_from(cn);
     out.set_no_data(OUT_NODATA);
     Ok(out)
+}
+
+/// Builds a spatially uniform effective runoff-coefficient raster aligned to `dem_path`
+/// from a scalar NRCS Curve Number `cn_value` in `(0, 100]` and storm depth `precip_mm > 0`.
+pub fn uniform_runoff_coeff_raster_for_cn(
+    dem_path: impl AsRef<Path>,
+    cn_value: f64,
+    precip_mm: f64,
+) -> Result<Array2D<f64>> {
+    let dem_path = dem_path.as_ref();
+    let (_, rc_scalar) = scs_curve_number_runoff_scalar(cn_value, precip_mm, 0.2)?;
+
+    let (width, height, geotransform, projection) = if let Some(p_str) = dem_path.to_str()
+        && let Ok(lazy) = terrio::open_raster_lazy(p_str)
+    {
+        let crs = lazy.crs();
+        let proj = crs.to_wkt().or_else(|| crs.to_proj4()).unwrap_or_default();
+        (lazy.width(), lazy.height(), lazy.geo_transform(), proj)
+    } else {
+        let dem = load_raster::<f64>(dem_path, None)?;
+        (
+            dem.width(),
+            dem.height(),
+            dem.geotransform,
+            dem.projection.clone(),
+        )
+    };
+    let n = width.checked_mul(height).ok_or_else(|| {
+        Error::DimensionMismatch(format!("raster dimensions overflow ({width}x{height})"))
+    })?;
+    let mut rc_arr = Array2D::from_vec(width, height, vec![rc_scalar; n])?;
+    rc_arr.geotransform = geotransform;
+    rc_arr.projection = projection;
+    rc_arr.set_no_data(-9999.0);
+    Ok(rc_arr)
 }
 
 /// Converts an NRCS Curve Number (`CN` in `(0, 100]`) raster and storm precipitation
@@ -3305,7 +3346,23 @@ pub fn run_pipeline_with_control(
         0.05,
         Some(format!("Loading DEM {}", in_dem.display())),
     );
+    control.check_cancelled()?;
     std::fs::create_dir_all(out_dir)?;
+    // Recheck collisions after `out_dir` exists so non-canonical paths like
+    // `<new_dir>/../dem.tif` resolve via canonicalization before any writes.
+    crate::raster_ops::ensure_no_path_collision(in_dem, &candidate_refs)?;
+    for opt_in in [
+        options.culverts_vector.as_deref(),
+        options.runoff_coeff_path.as_deref(),
+        options.infiltration_path.as_deref(),
+        options.antecedent_depth_path.as_deref(),
+        options.stream_vector.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        crate::raster_ops::ensure_no_path_collision(opt_in, &candidate_refs)?;
+    }
 
     let mut dem = if options.use_f32 {
         let d32 = load_raster::<f32>(in_dem, None)?;
@@ -3497,6 +3554,7 @@ pub fn run_pipeline_with_control(
         0.92,
         Some(format!("Saving outputs to {}", out_dir.display())),
     );
+    control.check_cancelled()?;
 
     let (_, _, cell_area) = affine_metrics(&dem.geotransform);
     let d_nd = sinks.depth.no_data();
@@ -4607,7 +4665,7 @@ mod tests {
         let mut prev = -1.0f64;
         for ev in recorded.iter() {
             assert!(
-                ev.fraction >= 0.0 && ev.fraction <= 1.0,
+                (0.0..=1.0).contains(&ev.fraction),
                 "fraction out of range: {}",
                 ev.fraction
             );
@@ -4678,6 +4736,14 @@ mod tests {
         let rc_arr = scs_curve_number_runoff_with_ia(&cn, 100.0, 0.05).unwrap();
         assert!((rc_arr.data()[0] - expected_rc).abs() < 1e-12);
         assert_eq!(rc_arr.data()[1], rc_arr.no_data());
+
+        // CN = 100 (impervious, S = 0) with tiny precip_mm must not underflow (precip_mm - ia)^2
+        let (q_tiny, rc_tiny) = scs_curve_number_runoff_scalar(100.0, 1e-200, 0.2).unwrap();
+        assert_eq!(q_tiny, 1e-200);
+        assert_eq!(rc_tiny, 1.0);
+        let cn100 = Array2D::from_vec(1, 1, vec![100.0]).unwrap();
+        let rc100 = scs_curve_number_runoff_with_ia(&cn100, 1e-200, 0.2).unwrap();
+        assert_eq!(rc100.data()[0], 1.0);
 
         // Reject negative ia_ratio and out-of-range CN
         assert!(scs_curve_number_runoff_scalar(80.0, 100.0, -0.1).is_err());
