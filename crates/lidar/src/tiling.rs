@@ -28,6 +28,8 @@ pub struct TiledDelineationOptions {
     /// Core (non-overlapping) tile width and height in pixels (default `2048`).
     pub tile_size: usize,
     /// Overlap halo added around each side of a tile in pixels (default `128`).
+    /// Note: seam deduplication memory and merge time scale with the number of sink pixels
+    /// falling inside tile overlap bands, so keep `overlap` proportional to expected basin width.
     pub overlap: usize,
     /// Optional median filter kernel size (`<= 1` skips smoothing; default `3`).
     pub kernel_size: usize,
@@ -125,12 +127,18 @@ fn extract_tile_f64<T: DemNum>(src: &Array2D<T>, win: TileWindow) -> Result<Arra
 }
 
 struct TileRegionOutput {
-    /// Global `(row, col)` of the lowest-elevation cell in this sink region (used for global deduplication across seams).
+    /// Global `(row, col)` of the lowest-elevation cell in this sink region.
     min_cell: (usize, usize),
     /// Total pixel count of this sink region inside the tile (larger = less truncated).
     total_cells: usize,
-    /// Whether this tile copy's centroid falls inside the tile's non-overlapping core.
-    core_owned: bool,
+    /// Whether any pixel of this tile copy lies inside the tile's non-overlapping core.
+    intersects_core: bool,
+    /// Whether any pixel of this tile copy touches an internal padded tile boundary
+    /// (meaning the basin may be clipped by this tile's halo).
+    touches_internal_pad_edge: bool,
+    /// Global linear cell indices (`gr * full_w + gc`) for regions that overlap a tile seam
+    /// halo band, used for exact pixel-overlap deduplication across neighboring tiles.
+    seam_cells: Vec<usize>,
     /// Complete nested depression hierarchy for this sink region.
     depressions: Vec<NestedDepression>,
 }
@@ -138,6 +146,8 @@ struct TileRegionOutput {
 fn process_one_tile(
     tile: Array2D<f64>,
     win: TileWindow,
+    full_w: usize,
+    full_h: usize,
     options: &TiledDelineationOptions,
 ) -> Result<Vec<TileRegionOutput>> {
     let smoothed = if options.kernel_size > 1 {
@@ -156,12 +166,6 @@ fn process_one_tile(
         return Ok(Vec::new());
     }
 
-    // Compute pixel centroid and global minimum-elevation cell for each top-level sink region.
-    // Keeping complete regions whose centroid falls inside this tile's non-overlapping core
-    // preserves parent-child hierarchy integrity for depressions that fit within the overlap halo.
-    // Global deduplication by `min_cell` removes duplicates when both neighbouring tiles see the
-    // same lowest cell; basins wider than `overlap` can still be clipped at a tile edge, so
-    // callers should set `overlap` larger than the expected maximum basin width.
     let tw = deps.depression_id.width();
     let th = deps.depression_id.height();
     let id_data = deps.depression_id.data();
@@ -172,17 +176,44 @@ fn process_one_tile(
         .iter()
         .map(|d| (d.id, d.region_id))
         .collect();
+
+    // Seam band inside this tile: any cell within `overlap` pixels of an internal core edge
+    // can also be observed by a neighboring tile's halo.
+    let ov = options.overlap;
+    let inner_r0 = if win.core_r0 > 0 {
+        win.core_r0.saturating_add(ov)
+    } else {
+        0
+    };
+    let inner_r1 = if win.core_r1 < full_h {
+        win.core_r1.saturating_sub(ov)
+    } else {
+        full_h
+    };
+    let inner_c0 = if win.core_c0 > 0 {
+        win.core_c0.saturating_add(ov)
+    } else {
+        0
+    };
+    let inner_c1 = if win.core_c1 < full_w {
+        win.core_c1.saturating_sub(ov)
+    } else {
+        full_w
+    };
+
     struct RegAcc {
-        sum_r: f64,
-        sum_c: f64,
         count: usize,
         min_elev: f64,
         min_cell: (usize, usize),
+        intersects_core: bool,
+        touches_internal_pad_edge: bool,
+        seam_cells: Vec<usize>,
     }
     let mut reg_acc: HashMap<u32, RegAcc> = HashMap::new();
     for r in 0..th {
         let off = r * tw;
         let gr = win.pad_r0 + r;
+        let on_pad_r = (r == 0 && win.pad_r0 > 0) || (r + 1 == th && win.pad_r1 < full_h);
         for c in 0..tw {
             let did = id_data[off + c];
             if did > 0
@@ -191,20 +222,29 @@ fn process_one_tile(
                 let gc = win.pad_c0 + c;
                 let z = sink_data[off + c];
                 let e = reg_acc.entry(rid).or_insert(RegAcc {
-                    sum_r: 0.0,
-                    sum_c: 0.0,
                     count: 0,
                     min_elev: f64::INFINITY,
                     min_cell: (gr, gc),
+                    intersects_core: false,
+                    touches_internal_pad_edge: false,
+                    seam_cells: Vec::new(),
                 });
-                e.sum_r += gr as f64;
-                e.sum_c += gc as f64;
                 e.count += 1;
-                if z.is_finite()
-                    && !z.rd_eq(sink_nd)
-                    && (z < e.min_elev
-                        || ((z - e.min_elev).abs() <= 1e-12 && (gr, gc) < e.min_cell))
-                {
+                if gr >= win.core_r0 && gr < win.core_r1 && gc >= win.core_c0 && gc < win.core_c1 {
+                    e.intersects_core = true;
+                }
+                let on_pad_c = (c == 0 && win.pad_c0 > 0) || (c + 1 == tw && win.pad_c1 < full_w);
+                if on_pad_r || on_pad_c {
+                    e.touches_internal_pad_edge = true;
+                }
+                // Only cells in this tile's seam band can appear inside a neighboring tile's
+                // padded window; interior-core cells are never shared across tiles.
+                if gr < inner_r0 || gr >= inner_r1 || gc < inner_c0 || gc >= inner_c1 {
+                    e.seam_cells.push(gr * full_w + gc);
+                }
+                // Row-major scan visits `(gr, gc)` in strictly ascending order, so strict `<`
+                // deterministically retains the earliest pixel on elevation ties.
+                if z.is_finite() && !z.rd_eq(sink_nd) && z < e.min_elev {
                     e.min_elev = z;
                     e.min_cell = (gr, gc);
                 }
@@ -212,34 +252,27 @@ fn process_one_tile(
         }
     }
 
-    let mut reg_meta: HashMap<u32, ((usize, usize), usize, bool)> = HashMap::new();
-    for (rid, acc) in reg_acc {
-        if acc.count == 0 {
-            continue;
-        }
-        let gr = acc.sum_r / acc.count as f64;
-        let gc = acc.sum_c / acc.count as f64;
-        let core_owned = gr >= win.core_r0 as f64
-            && gr < win.core_r1 as f64
-            && gc >= win.core_c0 as f64
-            && gc < win.core_c1 as f64;
-        reg_meta.insert(rid, (acc.min_cell, acc.count, core_owned));
-    }
-
     let mut by_reg: HashMap<u32, Vec<NestedDepression>> = HashMap::new();
     for d in deps.depressions {
-        if reg_meta.contains_key(&d.region_id) {
+        if reg_acc.contains_key(&d.region_id) {
             by_reg.entry(d.region_id).or_default().push(d);
         }
     }
 
     let mut out = Vec::with_capacity(by_reg.len());
     for (rid, reg_deps) in by_reg {
-        let (min_cell, total_cells, core_owned) = reg_meta[&rid];
+        let Some(acc) = reg_acc.remove(&rid) else {
+            continue;
+        };
+        if acc.count == 0 {
+            continue;
+        }
         out.push(TileRegionOutput {
-            min_cell,
-            total_cells,
-            core_owned,
+            min_cell: acc.min_cell,
+            total_cells: acc.count,
+            intersects_core: acc.intersects_core,
+            touches_internal_pad_edge: acc.touches_internal_pad_edge,
+            seam_cells: acc.seam_cells,
             depressions: reg_deps,
         });
     }
@@ -281,7 +314,7 @@ fn run_tiled_generic<T: DemNum>(
     let num_tiles = windows.len();
     let run_one = |win: TileWindow| -> Result<Vec<TileRegionOutput>> {
         let tile = extract_tile_f64(dem, win)?;
-        process_one_tile(tile, win, options)
+        process_one_tile(tile, win, w, h, options)
     };
 
     #[cfg(feature = "parallel")]
@@ -296,31 +329,100 @@ fn run_tiled_generic<T: DemNum>(
         .map(run_one)
         .collect::<Result<Vec<_>>>()?;
 
-    // Global deduplication across tile seams keyed by each sink region's lowest pixel within
-    // the padded tile: require at least one core-owned observation to emit a group, while
-    // selecting the largest (least-clipped) copy observed across all overlapping tiles.
-    let mut best_by_min_cell: HashMap<(usize, usize), (bool, TileRegionOutput)> = HashMap::new();
+    // Global deduplication across tile seams:
+    // - Regions strictly inside a tile interior (`seam_cells.is_empty()`) cannot overlap any
+    //   neighbor tile and are kept directly.
+    // - Regions overlapping a tile seam halo band are clustered via Union-Find whenever two tile
+    //   copies share any global pixel or share the same `min_cell`. Within each cluster we require
+    //   at least one copy to intersect its tile core (rejecting spurious halo-only edge artifacts)
+    //   and retain the best copy (preferring unclipped copies, then largest pixel count).
+    let mut dedup_regions: Vec<TileRegionOutput> = Vec::new();
+    let mut seam_regions: Vec<TileRegionOutput> = Vec::new();
     for tile_regions in per_tile {
         for reg in tile_regions {
-            match best_by_min_cell.entry(reg.min_cell) {
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert((reg.core_owned, reg));
+            if reg.seam_cells.is_empty() {
+                if reg.intersects_core {
+                    dedup_regions.push(reg);
                 }
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    let (any_core, best) = e.get_mut();
-                    *any_core |= reg.core_owned;
-                    if reg.total_cells > best.total_cells {
-                        *best = reg;
-                    }
-                }
+            } else {
+                seam_regions.push(reg);
             }
         }
     }
-    let mut dedup_regions: Vec<TileRegionOutput> = best_by_min_cell
-        .into_values()
-        .filter_map(|(any_core, reg)| any_core.then_some(reg))
-        .collect();
-    dedup_regions.sort_by_key(|r| r.min_cell);
+
+    if !seam_regions.is_empty() {
+        let m = seam_regions.len();
+        let mut parent: Vec<usize> = (0..m).collect();
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+        let total_seam_cells: usize = seam_regions.iter().map(|r| r.seam_cells.len()).sum();
+        let mut cell_owner: HashMap<usize, usize> = HashMap::with_capacity(total_seam_cells);
+        let mut min_cell_owner: HashMap<(usize, usize), usize> = HashMap::with_capacity(m);
+        for (i, reg) in seam_regions.iter().enumerate() {
+            if let Some(&prev) = min_cell_owner.get(&reg.min_cell) {
+                let ra = find(&mut parent, prev);
+                let rb = find(&mut parent, i);
+                if ra != rb {
+                    parent[rb] = ra;
+                }
+            } else {
+                min_cell_owner.insert(reg.min_cell, i);
+            }
+            for &gidx in &reg.seam_cells {
+                if let Some(&prev) = cell_owner.get(&gidx) {
+                    let ra = find(&mut parent, prev);
+                    let rb = find(&mut parent, i);
+                    if ra != rb {
+                        parent[rb] = ra;
+                    }
+                } else {
+                    cell_owner.insert(gidx, i);
+                }
+            }
+        }
+
+        // For each cluster root, track `(any_intersects_core, best_member_idx)`.
+        let mut clusters: HashMap<usize, (bool, usize)> = HashMap::new();
+        for (i, reg) in seam_regions.iter().enumerate() {
+            let root = find(&mut parent, i);
+            clusters
+                .entry(root)
+                .and_modify(|(any_core, best_idx)| {
+                    *any_core |= reg.intersects_core;
+                    let best = &seam_regions[*best_idx];
+                    let cand_rank = (!reg.touches_internal_pad_edge, reg.total_cells);
+                    let best_rank = (!best.touches_internal_pad_edge, best.total_cells);
+                    if cand_rank > best_rank
+                        || (cand_rank == best_rank && reg.min_cell < best.min_cell)
+                    {
+                        *best_idx = i;
+                    }
+                })
+                .or_insert((reg.intersects_core, i));
+        }
+
+        let mut winners: Vec<usize> = clusters
+            .into_values()
+            .filter_map(|(any_core, idx)| any_core.then_some(idx))
+            .collect();
+        winners.sort_unstable();
+        let mut keep = vec![false; m];
+        for idx in winners {
+            keep[idx] = true;
+        }
+        for (reg, is_kept) in seam_regions.into_iter().zip(keep) {
+            if is_kept {
+                dedup_regions.push(reg);
+            }
+        }
+    }
+
+    dedup_regions.sort_by_key(|r| (r.min_cell, r.total_cells));
 
     // Reassign globally unique sequential IDs, parent_ids, children_ids, and region_ids.
     let mut merged = Vec::new();
@@ -387,6 +489,31 @@ pub fn delineate_depressions_tiled(
         return Err(Error::InvalidArgument(format!(
             "tile_size must be >= 16, got {}",
             options.tile_size
+        )));
+    }
+    if options.kernel_size > 1025 {
+        return Err(Error::InvalidArgument(format!(
+            "kernel_size must be <= 1025, got {}",
+            options.kernel_size
+        )));
+    }
+    if options.kernel_size > 1 && options.overlap < options.kernel_size / 2 {
+        return Err(Error::InvalidArgument(format!(
+            "overlap ({}) must be >= kernel_size / 2 ({}) when kernel_size > 1",
+            options.overlap,
+            options.kernel_size / 2
+        )));
+    }
+    if !options.min_depth.is_finite() || options.min_depth < 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "min_depth must be finite and >= 0, got {}",
+            options.min_depth
+        )));
+    }
+    if !options.interval.is_finite() || options.interval == 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "interval must be finite and non-zero, got {}",
+            options.interval
         )));
     }
     let in_dem = in_dem.as_ref();

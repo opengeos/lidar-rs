@@ -17,11 +17,14 @@ use richdem::{Array2D, DemNum, array2d_to_dataset, load_raster, save_raster};
 use serde::{Deserialize, Serialize};
 use terrio::crs::SpatialRef;
 use terrio::ops::polygonize::{PolygonizeOptions, polygonize as terrio_polygonize};
-use terrio::{Feature, FieldDef, FieldType, FieldValue, GeometryType, Layer, VectorWriteOptions};
+use terrio::vector::Ring;
+use terrio::{
+    Feature, FieldDef, FieldType, FieldValue, Geometry, GeometryType, Layer, VectorWriteOptions,
+};
 
 use crate::error::{Error, Result};
 use crate::raster_ops::{ensure_no_path_collision, polygonize};
-use crate::region::{RegionProps, region_group, region_props_xy};
+use crate::region::{RegionProps, region_group, region_props_affine};
 
 /// Maximum vertical level-set slices permitted per region to guard against
 /// pathologically tiny slicing intervals hanging execution.
@@ -254,6 +257,7 @@ fn level_set_region(
     min_size: usize,
     min_depth: f64,
     interval: f64,
+    gt: &[f64; 6],
     res_x: f64,
     res_y: f64,
     cell_area: f64,
@@ -263,7 +267,6 @@ fn level_set_region(
 
     let mut min_elev = f64::INFINITY;
     let mut max_elev = f64::NEG_INFINITY;
-    let mut sum_elev = 0.0f64;
     let mut valid_count = 0usize;
     for &v in &img {
         if v.is_finite() {
@@ -273,12 +276,17 @@ fn level_set_region(
             if v > max_elev {
                 max_elev = v;
             }
-            sum_elev += v;
             valid_count += 1;
         }
     }
     if valid_count == 0 {
         return Ok((level_img, Vec::new()));
+    }
+    let mut sum_above_min = 0.0f64;
+    for &v in &img {
+        if v.is_finite() {
+            sum_above_min += v - min_elev;
+        }
     }
 
     let step = interval.abs();
@@ -296,23 +304,32 @@ fn level_set_region(
         if max_depth < min_depth {
             return Ok((level_img, Vec::new()));
         }
-        let cells = bh * bw;
+        let cells = valid_count;
         let area = cells as f64 * cell_area;
-        let mean_depth = (max_elev * valid_count as f64 - sum_elev) / valid_count as f64;
+        let mean_depth = ((max_elev - min_elev) * valid_count as f64 - sum_above_min).max(0.0)
+            / valid_count as f64;
         let volume = mean_depth * area;
         let (perimeter, major_axis, minor_axis, elongatedness, orientation) = if bh == 1 {
-            let maj = bw as f64 * res_x;
-            let min = res_y;
+            let maj = valid_count as f64 * res_x;
+            let min = (cell_area / res_x).min(res_y);
             let perim = 2.0 * (maj + min);
             (perim, maj, min, maj / min, 0.0)
         } else {
-            let maj = bh as f64 * res_y;
-            let min = res_x;
+            let maj = valid_count as f64 * res_y;
+            let min = (cell_area / res_y).min(res_x);
             let perim = 2.0 * (maj + min);
             (perim, maj, min, maj / min, 90.0)
         };
+        let area_bbox_ratio = valid_count as f64 / (bh * bw) as f64;
         let (circularity, depth_diam_ratio, hypsometric_integral, rim_slope_deg, artifact_flag) =
-            extended_morphometrics(area, perimeter, mean_depth, max_depth, elongatedness, 1.0);
+            extended_morphometrics(
+                area,
+                perimeter,
+                mean_depth,
+                max_depth,
+                elongatedness,
+                area_bbox_ratio,
+            );
         let dep = NestedDepression {
             id: 1,
             level: 1,
@@ -331,7 +348,7 @@ fn level_set_region(
             elongatedness,
             eccentricity: 1.0,
             orientation,
-            area_bbox_ratio: 1.0,
+            area_bbox_ratio,
             parent_id: 0,
             circularity,
             depth_diam_ratio,
@@ -357,7 +374,13 @@ fn level_set_region(
     let mut slice_idx = 0usize;
     loop {
         let elev = max_elev - (slice_idx as f64) * step;
-        if slice_idx > 0 && elev <= min_elev {
+        if slice_idx > 0
+            && (if min_depth > 0.0 {
+                elev <= min_elev
+            } else {
+                elev < min_elev
+            })
+        {
             break;
         }
         slice_idx += 1;
@@ -373,16 +396,7 @@ fn level_set_region(
             break;
         }
 
-        let objects = region_props_xy(
-            &label_objects,
-            nb_labels,
-            &img,
-            bw,
-            bh,
-            res_x,
-            res_y,
-            cell_area,
-        );
+        let objects = region_props_affine(&label_objects, nb_labels, &img, bw, bh, gt);
         for (i, obj) in objects.iter().enumerate() {
             if obj.max_depth < min_depth {
                 continue;
@@ -569,7 +583,41 @@ pub fn write_depressions_vector(
     )?;
 
     let dep_map: HashMap<u32, &NestedDepression> = depressions.iter().map(|d| (d.id, d)).collect();
-    let mut layer = Layer::new("depressions".to_string()).with_geom_type(GeometryType::Polygon);
+    // Dissolve polygon parts sharing the same depression ID into one feature so multi-part
+    // parent rims never duplicate `area`/`volume` attributes in vector exports.
+    let mut polys_by_id: BTreeMap<u32, Vec<(Ring, Vec<Ring>)>> = BTreeMap::new();
+    for feat in poly_layer.features {
+        let did = match feat.attributes.first() {
+            Some(FieldValue::Integer(i)) if *i > 0 => *i as u32,
+            Some(FieldValue::Float(f)) if *f > 0.0 && f.is_finite() => *f as u32,
+            _ => continue,
+        };
+        if !dep_map.contains_key(&did) {
+            continue;
+        }
+        match feat.geometry {
+            Some(Geometry::Polygon {
+                exterior,
+                interiors,
+            }) => {
+                polys_by_id
+                    .entry(did)
+                    .or_default()
+                    .push((exterior, interiors));
+            }
+            Some(Geometry::MultiPolygon(polys)) => {
+                polys_by_id.entry(did).or_default().extend(polys);
+            }
+            _ => {}
+        }
+    }
+
+    let has_multipart = polys_by_id.values().any(|parts| parts.len() > 1);
+    let mut layer = Layer::new("depressions".to_string()).with_geom_type(if has_multipart {
+        GeometryType::MultiPolygon
+    } else {
+        GeometryType::Polygon
+    });
     layer.crs = poly_layer.crs.clone();
     if layer.crs.is_none()
         && !depression_id.projection.is_empty()
@@ -606,18 +654,25 @@ pub fn write_depressions_vector(
         layer.schema.add_field(FieldDef::new(name, ftype));
     }
 
-    for feat in poly_layer.features {
-        let did = match feat.attributes.first() {
-            Some(FieldValue::Integer(i)) if *i > 0 => *i as u32,
-            Some(FieldValue::Float(f)) if *f > 0.0 && f.is_finite() => *f as u32,
-            _ => continue,
-        };
+    for (did, mut parts) in polys_by_id {
         let Some(d) = dep_map.get(&did) else {
             continue;
         };
+        if parts.is_empty() {
+            continue;
+        }
+        let geometry = if has_multipart {
+            Some(Geometry::MultiPolygon(parts))
+        } else {
+            let (exterior, interiors) = parts.remove(0);
+            Some(Geometry::Polygon {
+                exterior,
+                interiors,
+            })
+        };
         layer.features.push(Feature {
             fid: (layer.features.len() + 1) as u64,
-            geometry: feat.geometry,
+            geometry,
             attributes: vec![
                 FieldValue::Integer(d.id as i64),
                 FieldValue::Integer(d.parent_id as i64),
@@ -747,7 +802,8 @@ pub fn delineate_depressions_in_memory(
             }
         }
         let (local_obj, local_deps) = level_set_region(
-            &sub_img, bw, bh, region_id, min_size, min_depth, interval, res_x, res_y, cell_area,
+            &sub_img, bw, bh, region_id, min_size, min_depth, interval, &gt, res_x, res_y,
+            cell_area,
         )?;
         Ok((idx, bbox, local_obj, local_deps))
     };
@@ -1067,7 +1123,9 @@ mod tests {
                 sub[r * bw + (c + 6)] = 10.0 + (r + c) as f64 * 0.1;
             }
         }
-        let (obj, deps) = level_set_region(&sub, bw, bh, 1, 2, 0.0, 0.2, 1.0, 1.0, 1.0).unwrap();
+        let gt = [0.0, 1.0, 0.0, bh as f64, 0.0, -1.0];
+        let (obj, deps) =
+            level_set_region(&sub, bw, bh, 1, 2, 0.0, 0.2, &gt, 1.0, 1.0, 1.0).unwrap();
         assert_eq!(deps.len(), 2);
         assert!(obj[0] > 0 && obj[6] > 0 && obj[0] != obj[6]);
     }
