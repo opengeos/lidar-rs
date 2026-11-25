@@ -29,19 +29,61 @@ assert.ok(info.max > info.min);
 const medBytes = lidar.medianFilter(demBytes, "dem.tif", 3);
 assert.ok(medBytes.length > 1000);
 
+const meanBytes = lidar.meanFilter(demBytes, "dem.tif", 3);
+assert.ok(meanBytes.length > 1000);
+const meanInfo = JSON.parse(lidar.rasterInfo(meanBytes, "mean.tif"));
+assert.equal(meanInfo.width, 400);
+assert.equal(meanInfo.height, 400);
+
+const gaussBytes = lidar.gaussianFilter(demBytes, "dem.tif", 1.0);
+assert.ok(gaussBytes.length > 1000);
+
+const flippedBytes = lidar.flipDem(demBytes, "dem.tif", 100.0);
+assert.ok(flippedBytes.length > 1000);
+const flippedInfo = JSON.parse(lidar.rasterInfo(flippedBytes, "dem_flip.tif"));
+assert.ok(flippedInfo.min >= 99.9, `expected flipped min >= 100, got ${flippedInfo.min}`);
+
 const hs = lidar.hillshadeRgba(medBytes, "median.tif", 135, 45, 1.0);
 assert.equal(hs.length, 400 * 400 * 4);
 
 const cogBytes = lidar.imageToCog(demBytes, "dem.tif", "DEFLATE");
 assert.ok(cogBytes.length > 1000);
 
-// 2. Extract sinks + nested depressions + catchments
+function firstPolygonCoord(geom) {
+  if (geom.type === "Polygon") return geom.coordinates[0][0];
+  if (geom.type === "MultiPolygon") return geom.coordinates[0][0][0];
+  throw new Error(`unexpected geometry type: ${geom.type}`);
+}
+
+function assertWgs84Coord([lon, lat], label) {
+  assert.ok(
+    lon >= -95 && lon <= -92 && lat >= 45 && lat <= 48,
+    `${label}: expected Minnesota WGS 84 [lon, lat] in [-95..-92, 45..48], got [${lon}, ${lat}]`,
+  );
+}
+
+// 2. Extract sinks + nested depressions + catchments + polygonizeToGeojson
 const sinks = lidar.extractSinks(medBytes, "median.tif", 1000);
 const sinkDeps = JSON.parse(sinks.depressionsJson());
 assert.ok(sinkDeps.length >= 1, "expected at least 1 sink");
 const sinkGeo = JSON.parse(sinks.geojson());
 assert.equal(sinkGeo.type, "FeatureCollection");
+assert.equal(sinkGeo.crs, undefined, "RFC 7946 GeoJSON should omit deprecated crs member");
 assert.ok(sinkGeo.features.length >= 1);
+assertWgs84Coord(firstPolygonCoord(sinkGeo.features[0].geometry), "sinks.geojson");
+for (const key of ["region_id", "area", "volume", "avg_depth", "max_depth", "min_elev", "max_elev"]) {
+  assert.equal(
+    typeof sinkGeo.features[0].properties[key],
+    "number",
+    `sinks.geojson missing numeric property ${key}`,
+  );
+}
+
+const polyGeo = JSON.parse(lidar.polygonizeToGeojson(sinks.regionTif(), "region.tif", "region_id"));
+assert.equal(polyGeo.type, "FeatureCollection");
+assert.equal(polyGeo.crs, undefined, "polygonizeToGeojson should omit deprecated crs member");
+assert.ok(polyGeo.features.length >= 1);
+assertWgs84Coord(firstPolygonCoord(polyGeo.features[0].geometry), "polygonizeToGeojson");
 
 const cats = lidar.delineateCatchments(
   sinks.refinedDemTif(),
@@ -57,6 +99,12 @@ const deps = lidar.delineateDepressions(sinks.sinkTif(), "sink.tif", 1000, 0.3, 
 assert.ok(deps.maxLevel >= 2, `expected nested levels >= 2, got ${deps.maxLevel}`);
 const nestedDeps = JSON.parse(deps.depressionsJson());
 assert.ok(nestedDeps.length >= 2);
+const depsGeoStandalone = JSON.parse(deps.geojson());
+assert.equal(depsGeoStandalone.crs, undefined);
+assert.ok(depsGeoStandalone.features.length >= 2);
+assertWgs84Coord(firstPolygonCoord(depsGeoStandalone.features[0].geometry), "deps.geojson");
+assert.equal(typeof depsGeoStandalone.features[0].properties.level, "number");
+assert.equal(typeof depsGeoStandalone.features[0].properties.volume, "number");
 sinks.free();
 deps.free();
 
@@ -92,17 +140,92 @@ assert.equal(ftVals.length, 400 * 400);
 assert.ok(ftVals.some((v) => v >= 0 && Number.isFinite(v)));
 assert.ok(sim.fillTimeTif().length > 100);
 assert.ok(sim.catchmentHirTif().length > 100);
-assert.equal(JSON.parse(sim.depressionsGeojson()).type, "FeatureCollection");
+assert.ok(sim.sinkTif().length > 100);
+assert.ok(sim.levelTif().length > 100);
+const depGeo = JSON.parse(sim.depressionsGeojson());
+assert.equal(depGeo.type, "FeatureCollection");
+assert.equal(depGeo.crs, undefined, "depressionsGeojson must omit deprecated crs member");
+assert.ok(depGeo.features.length >= 2, "expected multiple depression polygon features");
+const [depLon, depLat] = firstPolygonCoord(depGeo.features[0].geometry);
+assertWgs84Coord([depLon, depLat], "sim.depressionsGeojson");
+for (const key of [
+  "id",
+  "level",
+  "parent_id",
+  "region_id",
+  "area",
+  "volume",
+  "avg_depth",
+  "max_depth",
+  "min_elev",
+  "max_elev",
+  "circularity",
+]) {
+  assert.equal(
+    typeof depGeo.features[0].properties[key],
+    "number",
+    `depressionsGeojson missing numeric property ${key}`,
+  );
+}
 const spillPaths = JSON.parse(sim.spillPathsJson());
 assert.ok(spillPaths.length >= 3, `expected >= 3 spill paths, got ${spillPaths.length}`);
 const spillGeo = JSON.parse(sim.spillPathsGeojson());
 assert.equal(spillGeo.type, "FeatureCollection");
 assert.equal(spillGeo.features.length, spillPaths.length);
-const [firstLon, firstLat] = spillGeo.features[0].geometry.coordinates[0];
-assert.ok(
-  firstLon >= -180 && firstLon <= 180 && firstLat >= -90 && firstLat <= 90,
-  `expected WGS 84 lon/lat coordinates, got [${firstLon}, ${firstLat}]`,
-);
+
+function polygonBounds(geom) {
+  const rings =
+    geom.type === "Polygon"
+      ? geom.coordinates
+      : geom.type === "MultiPolygon"
+        ? geom.coordinates.flat()
+        : [];
+  let minLon = Infinity;
+  let maxLon = -Infinity;
+  let minLat = Infinity;
+  let maxLat = -Infinity;
+  for (const ring of rings) {
+    for (const [lon, lat] of ring) {
+      if (lon < minLon) minLon = lon;
+      if (lon > maxLon) maxLon = lon;
+      if (lat < minLat) minLat = lat;
+      if (lat > maxLat) maxLat = lat;
+    }
+  }
+  return { minLon, maxLon, minLat, maxLat };
+}
+
+const depBoundsById = new Map();
+for (const feat of depGeo.features) {
+  const id = feat.properties.id;
+  const b = polygonBounds(feat.geometry);
+  const prev = depBoundsById.get(id);
+  if (prev) {
+    prev.minLon = Math.min(prev.minLon, b.minLon);
+    prev.maxLon = Math.max(prev.maxLon, b.maxLon);
+    prev.minLat = Math.min(prev.minLat, b.minLat);
+    prev.maxLat = Math.max(prev.maxLat, b.maxLat);
+  } else {
+    depBoundsById.set(id, b);
+  }
+}
+
+const degTol = 0.0002;
+for (const spillFeat of spillGeo.features) {
+  const [startLon, startLat] = spillFeat.geometry.coordinates[0];
+  assertWgs84Coord([startLon, startLat], "sim.spillPathsGeojson");
+  const fromId = spillFeat.properties.from_dep_id;
+  const bbox = depBoundsById.get(fromId);
+  assert.ok(bbox, `expected depression polygon for spill from_dep_id=${fromId}`);
+  assert.ok(
+    startLon >= bbox.minLon - degTol &&
+      startLon <= bbox.maxLon + degTol &&
+      startLat >= bbox.minLat - degTol &&
+      startLat <= bbox.maxLat + degTol,
+    `spill start [${startLon}, ${startLat}] for dep ${fromId} outside depression bbox ` +
+      `[${bbox.minLon}, ${bbox.minLat}, ${bbox.maxLon}, ${bbox.maxLat}]`,
+  );
+}
 
 const gif = sim.encodeGif(150, true, 200, true);
 const header = new TextDecoder().decode(gif.slice(0, 6));
@@ -183,5 +306,58 @@ assert.ok(
 );
 assert.ok(simFsm.fsmBasinsCsv().startsWith("dep_id,parent_id,level,"));
 simFsm.free();
+
+// 8. SCS Type II hyetograph + runoff_coeff + GIF encoding & invalid parameter validation
+const simScs = lidar.simulateInundationAdvanced(
+  demBytes,
+  "dem.tif",
+  3,
+  1000,
+  0.3,
+  0.3,
+  5.0,
+  12.0,
+  2.0,
+  0.0,
+  0.7,
+  120.0,
+  "static",
+);
+assert.equal(simScs.runoffCoeff, 0.7);
+assert.equal(simScs.numSteps, 6);
+const scsGif = simScs.encodeGif(120, false, 160, true);
+assert.equal(new TextDecoder().decode(scsGif.slice(0, 6)), "GIF89a");
+assert.ok(scsGif.length > 500);
+const scsPng = simScs.renderFramePng(3, true, true, true);
+assert.equal(scsPng[0], 0x89);
+simScs.free();
+
+for (const [label, args] of [
+  ["negative breach_max_depth", [-0.5, 1.0, undefined, undefined]],
+  ["NaN breach_max_depth", [Number.NaN, 1.0, undefined, undefined]],
+  ["negative scs_type2_mm", [undefined, 1.0, -25.0, undefined]],
+  ["NaN scs_type2_mm", [undefined, 1.0, Number.NaN, undefined]],
+  ["zero runoff_coeff", [undefined, 0.0, undefined, undefined]],
+  ["runoff_coeff > 1", [undefined, 1.2, undefined, undefined]],
+  ["NaN runoff_coeff", [undefined, Number.NaN, undefined, undefined]],
+  ["invalid routing mode", [undefined, 1.0, undefined, "not_a_mode"]],
+]) {
+  assert.throws(
+    () =>
+      lidar.simulateInundationAdvanced(
+        demBytes,
+        "dem.tif",
+        3,
+        1000,
+        0.3,
+        0.3,
+        5.0,
+        10.0,
+        2.0,
+        ...args,
+      ),
+    `expected simulateInundationAdvanced to reject ${label}`,
+  );
+}
 
 console.log("ALL lidar-js WASM TESTS PASSED!");

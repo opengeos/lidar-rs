@@ -13,12 +13,12 @@ use lidar::pointcloud::{
 };
 use lidar::{
     AnimateInundationOptions, Array2D, Bbox, BreachMode, BreachOptions, BurnCulvertsOptions,
-    CatchmentHierarchyOptions, DelineateCatchmentsOptions, DelineateFlowPathsOptions,
-    DelineateOptions, DemProduct, DownloadOptions, ExtractSinksOptions, FederalBundleOptions,
-    FsmBasinSummary, FsmMassBalance, HillshadeOptions, InundationForcing, NestedDepression,
-    NoaaAtlas14Table, Region, RoutingMode, RunPipelineOptions, SimulateInundationOptions,
-    SinkDepression, SynthesizeCulvertsOptions, TiledDelineationOptions, TnmProductItem, Topology,
-    WbdLevel,
+    CatchmentHierarchyOptions, CatchmentHierarchyRecord, ConnectivityGraph,
+    DelineateCatchmentsOptions, DelineateFlowPathsOptions, DelineateOptions, DemProduct,
+    DownloadOptions, ExtractSinksOptions, FederalBundleOptions, FsmBasinSummary, FsmMassBalance,
+    GraphEdge, GraphNode, HillshadeOptions, InundationForcing, NestedDepression, NoaaAtlas14Table,
+    Region, RoutingMode, RunPipelineOptions, SimulateInundationOptions, SinkDepression,
+    SynthesizeCulvertsOptions, TiledDelineationOptions, TnmProductItem, Topology, WbdLevel,
 };
 
 fn to_py_err(e: lidar::Error) -> PyErr {
@@ -41,7 +41,10 @@ fn parse_topology(topo: &str) -> PyResult<Topology> {
 fn from_py_array2(arr: PyReadonlyArray2<'_, f64>, no_data: Option<f64>) -> PyResult<Array2D<f64>> {
     let view = arr.as_array();
     let (h, w) = (view.nrows(), view.ncols());
-    let data: Vec<f64> = view.iter().copied().collect();
+    let data: Vec<f64> = view
+        .as_slice()
+        .map(|s| s.to_vec())
+        .unwrap_or_else(|| view.iter().copied().collect());
     let mut a = Array2D::from_vec(w, h, data).map_err(|e| to_py_err(e.into()))?;
     a.set_no_data(no_data.unwrap_or(f64::NAN));
     Ok(a)
@@ -192,6 +195,83 @@ fn nested_dep_to_dict<'py>(py: Python<'py>, d: &NestedDepression) -> PyResult<Bo
     Ok(dict)
 }
 
+fn catchment_hierarchy_record_to_dict<'py>(
+    py: Python<'py>,
+    r: &CatchmentHierarchyRecord,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("level", r.level)?;
+    d.set_item("level_fid", r.level_fid)?;
+    d.set_item("count", r.count)?;
+    d.set_item("area", r.area)?;
+    d.set_item("cat_area", r.cat_area)?;
+    d.set_item("dep_to_cat_ratio", r.dep_to_cat_ratio)?;
+    d.set_item("min_elev", r.min_elev)?;
+    d.set_item("max_elev", r.max_elev)?;
+    d.set_item("range", r.range)?;
+    d.set_item("mean_elev", r.mean_elev)?;
+    d.set_item("std_elev", r.std_elev)?;
+    d.set_item("sum_elev", r.sum_elev)?;
+    d.set_item("volume", r.volume)?;
+    d.set_item("mean_depth", r.mean_depth)?;
+    Ok(d)
+}
+
+fn graph_node_to_dict<'py>(py: Python<'py>, n: &GraphNode) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("id", n.id)?;
+    d.set_item("parent_id", n.parent_id)?;
+    d.set_item("level", n.level)?;
+    d.set_item("region_id", n.region_id)?;
+    d.set_item("area", n.area)?;
+    d.set_item("volume", n.volume)?;
+    d.set_item("avg_depth", n.avg_depth)?;
+    d.set_item("max_depth", n.max_depth)?;
+    d.set_item("min_elev", n.min_elev)?;
+    d.set_item("max_elev", n.max_elev)?;
+    d.set_item("circularity", n.circularity)?;
+    d.set_item("hypsometric_integral", n.hypsometric_integral)?;
+    d.set_item("cat_area", n.cat_area)?;
+    d.set_item("fill_time_h", n.fill_time_h)?;
+    d.set_item("fill_runoff_mm", n.fill_runoff_mm)?;
+    Ok(d)
+}
+
+fn graph_edge_to_dict<'py>(py: Python<'py>, e: &GraphEdge) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("from_id", e.from_id)?;
+    d.set_item("to_id", e.to_id)?;
+    d.set_item("edge_type", &e.edge_type)?;
+    d.set_item("spill_time_h", e.spill_time_h)?;
+    d.set_item("spill_runoff_mm", e.spill_runoff_mm)?;
+    d.set_item("merge_time_h", e.merge_time_h)?;
+    d.set_item("spill_elev", e.spill_elev)?;
+    d.set_item("length_m", e.length_m)?;
+    d.set_item("start_xy", e.start_xy.map(|xy| (xy[0], xy[1])))?;
+    d.set_item("end_xy", e.end_xy.map(|xy| (xy[0], xy[1])))?;
+    d.set_item("dist_to_stream", e.dist_to_stream)?;
+    Ok(d)
+}
+
+fn connectivity_graph_to_dict<'py>(
+    py: Python<'py>,
+    g: &ConnectivityGraph,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("rain_intensity_cm_h", g.rain_intensity_cm_h)?;
+    let nodes = PyList::empty(py);
+    for n in &g.nodes {
+        nodes.append(graph_node_to_dict(py, n)?)?;
+    }
+    d.set_item("nodes", nodes)?;
+    let edges = PyList::empty(py);
+    for e in &g.edges {
+        edges.append(graph_edge_to_dict(py, e)?)?;
+    }
+    d.set_item("edges", edges)?;
+    Ok(d)
+}
+
 fn opt_path_to_py(p: Option<&PathBuf>) -> Option<String> {
     p.map(|path| path.to_string_lossy().into_owned())
 }
@@ -290,22 +370,24 @@ fn mean_filter_file<'py>(
     kernel_size: usize,
     out_file: Option<&str>,
     no_data: Option<f64>,
-) -> PyResult<Bound<'py, PyArray2<f64>>> {
+) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
     let in_dem = in_dem.to_string();
     let out_file = out_file.map(str::to_string);
     let out = py
-        .detach(move || {
-            if no_data.is_none() {
-                lidar::mean_filter_file(&in_dem, kernel_size, out_file.as_deref().map(Path::new))
+        .detach(move || -> lidar::Result<Option<Array2D<f64>>> {
+            let has_out = out_file.is_some();
+            let arr = if no_data.is_none() {
+                lidar::mean_filter_file(&in_dem, kernel_size, out_file.as_deref().map(Path::new))?
             } else {
                 let hist = format!("mean_filter(kernel_size={kernel_size})");
                 run_file_filter(&in_dem, out_file.as_deref(), no_data, &hist, |dem| {
                     lidar::mean_filter(dem, kernel_size)
-                })
-            }
+                })?
+            };
+            Ok(if has_out { None } else { Some(arr) })
         })
         .map_err(to_py_err)?;
-    to_py_array2(py, out)
+    out.map(|a| to_py_array2(py, a)).transpose()
 }
 
 #[pyfunction]
@@ -316,22 +398,24 @@ fn median_filter_file<'py>(
     kernel_size: usize,
     out_file: Option<&str>,
     no_data: Option<f64>,
-) -> PyResult<Bound<'py, PyArray2<f64>>> {
+) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
     let in_dem = in_dem.to_string();
     let out_file = out_file.map(str::to_string);
     let out = py
-        .detach(move || {
-            if no_data.is_none() {
-                lidar::median_filter_file(&in_dem, kernel_size, out_file.as_deref().map(Path::new))
+        .detach(move || -> lidar::Result<Option<Array2D<f64>>> {
+            let has_out = out_file.is_some();
+            let arr = if no_data.is_none() {
+                lidar::median_filter_file(&in_dem, kernel_size, out_file.as_deref().map(Path::new))?
             } else {
                 let hist = format!("median_filter(kernel_size={kernel_size})");
                 run_file_filter(&in_dem, out_file.as_deref(), no_data, &hist, |dem| {
                     lidar::median_filter(dem, kernel_size)
-                })
-            }
+                })?
+            };
+            Ok(if has_out { None } else { Some(arr) })
         })
         .map_err(to_py_err)?;
-    to_py_array2(py, out)
+    out.map(|a| to_py_array2(py, a)).transpose()
 }
 
 #[pyfunction]
@@ -342,22 +426,24 @@ fn gaussian_filter_file<'py>(
     sigma: f64,
     out_file: Option<&str>,
     no_data: Option<f64>,
-) -> PyResult<Bound<'py, PyArray2<f64>>> {
+) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
     let in_dem = in_dem.to_string();
     let out_file = out_file.map(str::to_string);
     let out = py
-        .detach(move || {
-            if no_data.is_none() {
-                lidar::gaussian_filter_file(&in_dem, sigma, out_file.as_deref().map(Path::new))
+        .detach(move || -> lidar::Result<Option<Array2D<f64>>> {
+            let has_out = out_file.is_some();
+            let arr = if no_data.is_none() {
+                lidar::gaussian_filter_file(&in_dem, sigma, out_file.as_deref().map(Path::new))?
             } else {
                 let hist = format!("gaussian_filter(sigma={sigma})");
                 run_file_filter(&in_dem, out_file.as_deref(), no_data, &hist, |dem| {
                     lidar::gaussian_filter(dem, sigma)
-                })
-            }
+                })?
+            };
+            Ok(if has_out { None } else { Some(arr) })
         })
         .map_err(to_py_err)?;
-    to_py_array2(py, out)
+    out.map(|a| to_py_array2(py, a)).transpose()
 }
 
 #[pyfunction]
@@ -368,26 +454,29 @@ fn flip_dem_file<'py>(
     delta: f64,
     out_file: Option<&str>,
     no_data: Option<f64>,
-) -> PyResult<Bound<'py, PyArray2<f64>>> {
+) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
     let in_dem = in_dem.to_string();
     let out_file = out_file.map(str::to_string);
     let out = py
-        .detach(move || {
-            if no_data.is_none() {
-                lidar::flip_dem_file(&in_dem, delta, out_file.as_deref().map(Path::new))
+        .detach(move || -> lidar::Result<Option<Array2D<f64>>> {
+            let has_out = out_file.is_some();
+            let arr = if no_data.is_none() {
+                lidar::flip_dem_file(&in_dem, delta, out_file.as_deref().map(Path::new))?
             } else {
                 let hist = format!("flip_dem(delta={delta})");
                 run_file_filter(&in_dem, out_file.as_deref(), no_data, &hist, |dem| {
                     lidar::flip_dem(dem, delta)
-                })
-            }
+                })?
+            };
+            Ok(if has_out { None } else { Some(arr) })
         })
         .map_err(to_py_err)?;
-    to_py_array2(py, out)
+    out.map(|a| to_py_array2(py, a)).transpose()
 }
 
 #[pyfunction]
 #[pyo3(signature = (in_dem, min_size, out_dir, filled_dem=None, topology="D8", keep_files=true, compress=false))]
+#[allow(clippy::too_many_arguments)]
 fn extract_sinks<'py>(
     py: Python<'py>,
     in_dem: &str,
@@ -502,7 +591,8 @@ fn delineate_depressions<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (in_dem, min_size, min_height, interval, out_dir, bool_shp=false, compress=false))]
+#[pyo3(signature = (in_dem, min_size, min_height, interval, out_dir, bool_shp=false, compress=false, export_gpkg=false, bool_comb_tif=false))]
+#[allow(clippy::too_many_arguments)]
 fn delineate_mounts<'py>(
     py: Python<'py>,
     in_dem: &str,
@@ -512,14 +602,16 @@ fn delineate_mounts<'py>(
     out_dir: &str,
     bool_shp: bool,
     compress: bool,
+    export_gpkg: bool,
+    bool_comb_tif: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let opts = DelineateOptions {
         min_size,
         min_depth: min_height,
         interval,
         bool_level_shp: bool_shp,
-        bool_comb_tif: false,
-        export_gpkg: false,
+        bool_comb_tif,
+        export_gpkg,
         compress,
     };
     let in_dem = in_dem.to_string();
@@ -545,7 +637,15 @@ fn delineate_mounts<'py>(
         "shapefile_path",
         res.mounts.shapefile_path.to_string_lossy().as_ref(),
     )?;
+    dict.set_item("gpkg_path", opt_path_to_py(res.mounts.gpkg_path.as_ref()))?;
     dict.set_item("csv_path", res.mounts.csv_path.to_string_lossy().as_ref())?;
+    let level_shps: Vec<String> = res
+        .mounts
+        .level_shapefiles
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    dict.set_item("level_shapefiles", level_shps)?;
     dict.set_item("max_level", res.mounts.max_level)?;
     dict.set_item("num_regions", res.mounts.num_regions)?;
 
@@ -919,22 +1019,7 @@ fn delineate_catchment_hierarchy<'py>(
     dict.set_item("level_shapefiles", lvl_shps)?;
     let recs = PyList::empty(py);
     for r in &res.records {
-        let d = PyDict::new(py);
-        d.set_item("level", r.level)?;
-        d.set_item("level_fid", r.level_fid)?;
-        d.set_item("count", r.count)?;
-        d.set_item("area", r.area)?;
-        d.set_item("cat_area", r.cat_area)?;
-        d.set_item("dep_to_cat_ratio", r.dep_to_cat_ratio)?;
-        d.set_item("min_elev", r.min_elev)?;
-        d.set_item("max_elev", r.max_elev)?;
-        d.set_item("range", r.range)?;
-        d.set_item("mean_elev", r.mean_elev)?;
-        d.set_item("std_elev", r.std_elev)?;
-        d.set_item("sum_elev", r.sum_elev)?;
-        d.set_item("volume", r.volume)?;
-        d.set_item("mean_depth", r.mean_depth)?;
-        recs.append(d)?;
+        recs.append(catchment_hierarchy_record_to_dict(py, r)?)?;
     }
     dict.set_item("records", recs)?;
     Ok(dict)
@@ -1132,7 +1217,7 @@ fn breach_depressions_array<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (in_dem, out_dem, mode="selective", max_depth=None, max_length=None, fill_remaining=false, compress=false))]
+#[pyo3(signature = (in_dem, out_dem, mode="selective", max_depth=None, max_length=None, fill_remaining=false, compress=false, no_data=None))]
 #[allow(clippy::too_many_arguments)]
 fn breach_depressions(
     py: Python<'_>,
@@ -1143,6 +1228,7 @@ fn breach_depressions(
     max_length: Option<u32>,
     fill_remaining: bool,
     compress: bool,
+    no_data: Option<f64>,
 ) -> PyResult<String> {
     let in_dem = in_dem.to_string();
     let out_dem_s = out_dem.to_string();
@@ -1150,8 +1236,39 @@ fn breach_depressions(
     opts.fill_remaining = fill_remaining;
     opts.compress = compress;
     let out_ret = out_dem_s.clone();
-    py.detach(move || lidar::breach_depressions_file(&in_dem, &out_dem_s, &opts))
-        .map_err(to_py_err)?;
+    py.detach(move || -> lidar::Result<()> {
+        if let Some(nd) = no_data {
+            let in_path = Path::new(&in_dem);
+            let out_path = Path::new(&out_dem_s);
+            if in_path == out_path
+                || (out_path.exists()
+                    && in_path
+                        .canonicalize()
+                        .ok()
+                        .zip(out_path.canonicalize().ok())
+                        .is_some_and(|(a, b)| a == b))
+            {
+                return Err(lidar::Error::InvalidArgument(format!(
+                    "output path collides with input path: {}",
+                    out_path.display()
+                )));
+            }
+            if let Some(parent) = out_path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut dem = lidar::load_raster::<f64>(in_path, None)?;
+            dem.set_no_data(nd);
+            let out = lidar::breach_depressions(&dem, &opts)?;
+            lidar::save_raster(&out, out_path, Some("breach_depressions"), opts.compress)?;
+            Ok(())
+        } else {
+            lidar::breach_depressions_file(&in_dem, &out_dem_s, &opts)?;
+            Ok(())
+        }
+    })
+    .map_err(to_py_err)?;
     Ok(out_ret)
 }
 
@@ -1402,6 +1519,20 @@ fn simulate_inundation_array<'py>(
         py_rc.append(d)?;
     }
     dict.set_item("rating_curves", py_rc)?;
+    dict.set_item(
+        "connectivity_graph",
+        connectivity_graph_to_dict(py, &pipe.connectivity_graph)?,
+    )?;
+    dict.set_item(
+        "connectivity_graphml",
+        lidar::connectivity_graph_to_graphml_string(&pipe.connectivity_graph),
+    )?;
+    dict.set_item("inundation_curve_csv", &pipe.inundation_curve_csv)?;
+    let py_cat_recs = PyList::empty(py);
+    for r in &pipe.catchment_records {
+        py_cat_recs.append(catchment_hierarchy_record_to_dict(py, r)?)?;
+    }
+    dict.set_item("catchment_records", py_cat_recs)?;
     dict.set_item("graph_node_count", pipe.connectivity_graph.nodes.len())?;
     dict.set_item("graph_edge_count", pipe.connectivity_graph.edges.len())?;
     if let Some(ref mb) = pipe.fsm_mass_balance {
@@ -1537,7 +1668,10 @@ fn run_pipeline<'py>(
             RoutingMode::FillSpillMerge => "fsm",
         },
     )?;
-    dict.set_item("fsm_basins_csv", opt_path_to_py(res.fsm_basins_csv.as_ref()))?;
+    dict.set_item(
+        "fsm_basins_csv",
+        opt_path_to_py(res.fsm_basins_csv.as_ref()),
+    )?;
     if let Some(ref mb) = res.fsm_mass_balance {
         dict.set_item("fsm_mass_balance", fsm_mass_balance_to_dict(py, mb)?)?;
     } else {
@@ -1598,9 +1732,9 @@ fn parse_py_region(
         (Some((x0, y0, x1, y1)), None, None) => {
             Ok(Region::Bbox(Bbox::new(x0, y0, x1, y1).map_err(to_py_err)?))
         }
-        (None, Some(code), None) => Ok(Region::Huc(
-            Region::validate_huc(&code).map_err(to_py_err)?,
-        )),
+        (None, Some(code), None) => {
+            Ok(Region::Huc(Region::validate_huc(&code).map_err(to_py_err)?))
+        }
         (None, None, Some(path)) => Ok(Region::VectorFile(PathBuf::from(path))),
         _ => Err(PyValueError::new_err(
             "specify exactly one of bbox, huc, or region",
@@ -1608,10 +1742,7 @@ fn parse_py_region(
     }
 }
 
-fn tnm_item_to_dict<'py>(
-    py: Python<'py>,
-    it: &TnmProductItem,
-) -> PyResult<Bound<'py, PyDict>> {
+fn tnm_item_to_dict<'py>(py: Python<'py>, it: &TnmProductItem) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     d.set_item("grid_key", &it.grid_key)?;
     d.set_item("title", &it.title)?;
@@ -1621,7 +1752,12 @@ fn tnm_item_to_dict<'py>(
     d.set_item("format", &it.format)?;
     d.set_item(
         "bbox",
-        (it.bbox.min_lon, it.bbox.min_lat, it.bbox.max_lon, it.bbox.max_lat),
+        (
+            it.bbox.min_lon,
+            it.bbox.min_lat,
+            it.bbox.max_lon,
+            it.bbox.max_lat,
+        ),
     )?;
     Ok(d)
 }
@@ -1727,7 +1863,12 @@ fn download_3dep_dem<'py>(
     let d = PyDict::new(py);
     d.set_item(
         "bbox",
-        (res.bbox.min_lon, res.bbox.min_lat, res.bbox.max_lon, res.bbox.max_lat),
+        (
+            res.bbox.min_lon,
+            res.bbox.min_lat,
+            res.bbox.max_lon,
+            res.bbox.max_lat,
+        ),
     )?;
     let prods = PyList::empty(py);
     for it in &res.products {
@@ -1915,7 +2056,8 @@ fn download_federal_data<'py>(
     )?;
     d.set_item(
         "dem_mosaic_path",
-        res.dem_mosaic_path.map(|p| p.to_string_lossy().into_owned()),
+        res.dem_mosaic_path
+            .map(|p| p.to_string_lossy().into_owned()),
     )?;
     d.set_item(
         "nhd_path",

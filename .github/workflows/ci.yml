@@ -49,16 +49,34 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master; toolchain set by input
         with:
           toolchain: stable
+          components: clippy, rustfmt
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - name: Build and test Python package
+        with:
+          workspaces: python
+      - name: Verify Python license files and version parity
+        run: |
+          diff -u LICENSE python/LICENSE
+          diff -u NOTICE python/NOTICE
+          python -c '
+          import pathlib, tomllib
+          root_v = tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"]
+          py_v = tomllib.loads(pathlib.Path("python/Cargo.toml").read_text())["package"]["version"]
+          assert root_v == py_v, f"version mismatch: root={root_v} vs python={py_v}"
+          '
+      - name: Format check (python)
+        run: cargo fmt --manifest-path python/Cargo.toml -- --check
+      - name: Clippy (python)
+        run: cargo clippy --manifest-path python/Cargo.toml --all-targets -- -D warnings
+      - name: Build, lint, and test Python package
         working-directory: python
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install maturin pytest numpy
+          pip install maturin pytest numpy ruff
+          ruff check python tests
           maturin develop --release
           pytest -v
 
@@ -85,6 +103,8 @@ jobs:
         run: cargo fmt --manifest-path js/Cargo.toml -- --check
       - name: Clippy (wasm32)
         run: cargo clippy --manifest-path js/Cargo.toml --locked --target wasm32-unknown-unknown -- -D warnings
+      - name: Check Playground JS syntax
+        run: node --check docs/javascripts/playground.js
       - name: Build and test Node.js WASM bundle
         working-directory: js
         run: |
@@ -93,3 +113,46 @@ jobs:
       - name: Build browser WASM bundle
         working-directory: js
         run: wasm-pack build --target web --release --out-dir pkg -- --locked
+
+  audit:
+    name: Security audit (cargo audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+        with:
+          tool: cargo-audit
+      - name: Audit lockfiles (with .cargo/audit.toml exceptions)
+        run: |
+          cargo audit
+          cargo audit --no-fetch --file js/Cargo.lock
+      - name: Verify ignored advisories match exact upstream crates and versions
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          for lock in Cargo.lock js/Cargo.lock; do
+            report=$(cargo audit --no-fetch --json --file "$GITHUB_WORKSPACE/$lock" || true)
+            unexpected=$(printf '%s' "$report" | jq -c '[
+              .vulnerabilities.list[]
+              | {id: .advisory.id, pkg: .package.name, ver: .package.version}
+              | select(
+                  ((.pkg == "ruzstd" and .ver == "0.8.3") and (.id == "RUSTSEC-2026-0344"))
+                  or
+                  ((.pkg == "zip" and .ver == "8.6.0") and (
+                    .id == "RUSTSEC-2026-0367" or
+                    .id == "RUSTSEC-2026-0368" or
+                    .id == "RUSTSEC-2026-0369" or
+                    .id == "RUSTSEC-2026-0429" or
+                    .id == "RUSTSEC-2026-0545" or
+                    .id == "RUSTSEC-2026-0546" or
+                    .id == "RUSTSEC-2026-0547" or
+                    .id == "RUSTSEC-2026-0548"
+                  ))
+                  | not
+                )
+            ]')
+            if [ "$unexpected" != "[]" ]; then
+              echo "Unexpected vulnerabilities in $lock: $unexpected" >&2
+              exit 1
+            fi
+          done

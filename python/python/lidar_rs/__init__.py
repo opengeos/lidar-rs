@@ -35,7 +35,9 @@ def MeanFilter(
     res = _lidar_rs.mean_filter_file(
         _as_path_str(in_dem), kernel_size, out_str, no_data
     )
-    return out_str if out_str is not None else res
+    if out_str is not None:
+        return out_str
+    return res
 
 
 def MedianFilter(
@@ -56,7 +58,9 @@ def MedianFilter(
     res = _lidar_rs.median_filter_file(
         _as_path_str(in_dem), kernel_size, out_str, no_data
     )
-    return out_str if out_str is not None else res
+    if out_str is not None:
+        return out_str
+    return res
 
 
 def GaussianFilter(
@@ -77,7 +81,9 @@ def GaussianFilter(
     res = _lidar_rs.gaussian_filter_file(
         _as_path_str(in_dem), float(sigma), out_str, no_data
     )
-    return out_str if out_str is not None else res
+    if out_str is not None:
+        return out_str
+    return res
 
 
 def FlipDEM(
@@ -96,7 +102,9 @@ def FlipDEM(
         return _lidar_rs.flip_dem_array(arr, float(delta), no_data)
     out_str = _as_path_str(out_file) if out_file is not None else None
     res = _lidar_rs.flip_dem_file(_as_path_str(dem), float(delta), out_str, no_data)
-    return out_str if out_str is not None else res
+    if out_str is not None:
+        return out_str
+    return res
 
 
 def extract_sinks(
@@ -187,6 +195,8 @@ def delineate_mounts(
     out_dir: str | os.PathLike[str],
     bool_shp: bool = False,
     compress: bool = False,
+    export_gpkg: bool = False,
+    bool_comb_tif: bool = False,
 ) -> dict[str, Any]:
     """Delineate nested hierarchy of elevated features (mounts)."""
     return _lidar_rs.delineate_mounts(
@@ -197,6 +207,8 @@ def delineate_mounts(
         _as_path_str(out_dir),
         bool_shp,
         compress,
+        export_gpkg,
+        bool_comb_tif,
     )
 
 
@@ -240,7 +252,8 @@ def mosaic(
         if path.is_file():
             inputs = [str(path)]
         elif path.is_dir():
-            ext_lower = ext.lower()
+            ext_norm = ext if ext.startswith(".") else f".{ext}"
+            ext_lower = ext_norm.lower()
             inputs = sorted(
                 str(p)
                 for p in path.iterdir()
@@ -669,6 +682,10 @@ def breach_depressions(
 ) -> str | np.ndarray:
     """Breach depressions using Lindsay (2016) on a GeoTIFF path or 2D NumPy array."""
     if isinstance(in_dem, np.ndarray):
+        if out_dem is not None:
+            raise ValueError(
+                "out_dem is not supported for NumPy array input; pass a raster file path or omit out_dem"
+            )
         arr = np.ascontiguousarray(in_dem, dtype=np.float64)
         return _lidar_rs.breach_depressions_array(
             arr, mode, max_depth, max_length, bool(fill_remaining), no_data
@@ -684,6 +701,7 @@ def breach_depressions(
             max_length,
             bool(fill_remaining),
             bool(compress),
+            no_data,
         )
     )
 
@@ -1159,62 +1177,62 @@ gaussian_filter = GaussianFilter
 flip_dem = FlipDEM
 
 __all__ = [
-    "__version__",
+    "CatchmentHierarchy",
+    "DelineateCatchments",
+    "DelineateDepressions",
+    "DelineateFlowPaths",
+    "DelineateMounts",
+    "ExtractSinks",
+    "FlipDEM",
+    "GaussianFilter",
     "MeanFilter",
     "MedianFilter",
-    "GaussianFilter",
-    "FlipDEM",
-    "ExtractSinks",
-    "DelineateDepressions",
-    "DelineateMounts",
-    "DelineateCatchments",
-    "DelineateFlowPaths",
-    "CatchmentHierarchy",
-    "SimulateInundation",
     "PlayAnimation",
-    "mean_filter",
-    "median_filter",
-    "gaussian_filter",
-    "flip_dem",
-    "extract_sinks",
-    "extract_sinks_array",
+    "SimulateInundation",
+    "__version__",
+    "add_crs",
+    "animate_inundation",
+    "breach_depressions",
+    "burn_culverts",
+    "clip_image",
+    "convert_lidar",
+    "csv_points_to_shp",
+    "csv_to_shp",
+    "delineate_catchment_hierarchy",
+    "delineate_catchments",
     "delineate_depressions",
     "delineate_depressions_array",
     "delineate_depressions_tiled",
-    "delineate_mounts",
-    "delineate_catchments",
     "delineate_flow_paths",
-    "delineate_catchment_hierarchy",
-    "simulate_inundation",
-    "simulate_inundation_array",
-    "run_pipeline",
-    "breach_depressions",
-    "burn_culverts",
-    "synthesize_culverts",
-    "query_3dep_products",
+    "delineate_mounts",
     "download_3dep_dem",
-    "download_wbd",
+    "download_federal_data",
     "download_nhd",
     "download_nwi",
     "download_roads",
-    "fetch_noaa_atlas14",
-    "download_federal_data",
-    "scs_curve_number_runoff",
-    "scs_type2_hyetograph",
-    "animate_inundation",
+    "download_wbd",
     "export_inundation_frames_png",
-    "polygonize",
-    "mosaic",
-    "reproject_image",
-    "resample",
-    "clip_image",
+    "extract_sinks",
+    "extract_sinks_array",
+    "fetch_noaa_atlas14",
+    "flip_dem",
+    "gaussian_filter",
     "image_to_cog",
-    "add_crs",
     "join_tables",
-    "csv_to_shp",
-    "csv_points_to_shp",
-    "convert_lidar",
+    "lidar_to_chm",
     "lidar_to_dsm",
     "lidar_to_dtm",
-    "lidar_to_chm",
+    "mean_filter",
+    "median_filter",
+    "mosaic",
+    "polygonize",
+    "query_3dep_products",
+    "reproject_image",
+    "resample",
+    "run_pipeline",
+    "scs_curve_number_runoff",
+    "scs_type2_hyetograph",
+    "simulate_inundation",
+    "simulate_inundation_array",
+    "synthesize_culverts",
 ]

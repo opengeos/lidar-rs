@@ -400,6 +400,7 @@ def test_synthesize_culverts_and_federal_validation(tmp_path: Path):
 
 
 def test_python_cli_and_mcp_server():
+    import contextlib
     import json
     import queue
     import subprocess
@@ -467,10 +468,8 @@ def test_python_cli_and_mcp_server():
             obj = json.loads(line)
             replies[obj["id"]] = obj
     finally:
-        try:
+        with contextlib.suppress(OSError):
             proc.stdin.close()
-        except Exception:
-            pass
         try:
             exit_code = proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
@@ -493,3 +492,269 @@ def test_python_cli_and_mcp_server():
     imgs = [c for c in replies[4]["result"]["content"] if c["type"] == "image"]
     assert len(imgs) == 1 and imgs[0]["mimeType"] == "image/png"
     assert imgs[0]["data"].startswith("iVBORw0KGgo")
+
+
+def test_file_filters_return_modes_and_non_contiguous(tmp_path: Path):
+    dem = TEST_DATA / "dem.tif"
+    mean_out = tmp_path / "mean.tif"
+    gauss_out = tmp_path / "gauss.tif"
+    flip_out = tmp_path / "flip.tif"
+
+    assert lidar_rs.MeanFilter(dem, kernel_size=3, out_file=mean_out) == str(mean_out)
+    assert lidar_rs.GaussianFilter(dem, sigma=1.0, out_file=gauss_out) == str(gauss_out)
+    assert lidar_rs.FlipDEM(dem, delta=50.0, out_file=flip_out) == str(flip_out)
+    assert mean_out.exists() and gauss_out.exists() and flip_out.exists()
+
+    # Low-level file wrapper returns None when out_file is set (no wasted NumPy allocation)
+    assert (
+        lidar_rs._lidar_rs.mean_filter_file(str(dem), 3, str(tmp_path / "m2.tif"), None)
+        is None
+    )
+    assert (
+        lidar_rs._lidar_rs.median_filter_file(
+            str(dem), 3, str(tmp_path / "med2.tif"), None
+        )
+        is None
+    )
+    assert (
+        lidar_rs._lidar_rs.gaussian_filter_file(
+            str(dem), 1.0, str(tmp_path / "g2.tif"), None
+        )
+        is None
+    )
+    assert (
+        lidar_rs._lidar_rs.flip_dem_file(
+            str(dem), 100.0, str(tmp_path / "f2.tif"), None
+        )
+        is None
+    )
+
+    # File-to-array mode returns ndarray
+    mean_arr = lidar_rs.MeanFilter(dem, kernel_size=3)
+    assert isinstance(mean_arr, np.ndarray)
+    assert mean_arr.shape == (400, 400)
+
+    # Non-contiguous (Fortran-ordered) array passed directly to Rust exercises from_py_array2 fallback
+    base = np.arange(64, dtype=np.float64).reshape((8, 8))
+    f_order = np.asfortranarray(base)
+    assert not f_order.flags.c_contiguous
+    c_out = lidar_rs._lidar_rs.mean_filter_array(base, 3, None)
+    f_out = lidar_rs._lidar_rs.mean_filter_array(f_order, 3, None)
+    np.testing.assert_allclose(c_out, f_out)
+
+
+def test_delineate_mounts_snake_case_and_gpkg(tmp_path: Path):
+    dsm = TEST_DATA / "dsm.tif"
+    res = lidar_rs.delineate_mounts(
+        dsm,
+        min_size=1000,
+        min_height=0.3,
+        interval=0.3,
+        out_dir=tmp_path,
+        bool_shp=True,
+        export_gpkg=True,
+        bool_comb_tif=True,
+    )
+    assert Path(res["flipped_dem_path"]).exists()
+    assert Path(res["depression_id_path"]).exists()
+    assert Path(res["depression_level_path"]).exists()
+    assert res["gpkg_path"] is not None and Path(res["gpkg_path"]).exists()
+    assert len(res["level_shapefiles"]) >= 1
+    assert all(Path(p).exists() for p in res["level_shapefiles"])
+    assert len(res["depressions"]) >= 2
+
+
+def test_raster_and_vector_operations_extended(tmp_path: Path):
+    import json
+    import shutil
+
+    dem = TEST_DATA / "dem.tif"
+    sinks_dir = tmp_path / "sinks"
+    sinks = lidar_rs.extract_sinks(dem, min_size=1000, out_dir=sinks_dir)
+    region_tif = sinks["region_path"]
+    regions_csv = sinks["csv_path"]
+
+    # polygonize
+    poly_gj = tmp_path / "regions.geojson"
+    n_poly = lidar_rs.polygonize(region_tif, poly_gj, field_name="id")
+    assert n_poly >= 1 and poly_gj.exists()
+
+    # join_tables
+    joined_gpkg = tmp_path / "joined.gpkg"
+    n_joined = lidar_rs.join_tables(
+        poly_gj, regions_csv, joined_gpkg, vec_col="id", csv_col="region_id"
+    )
+    assert n_joined >= 1 and joined_gpkg.exists()
+
+    # mosaic from directory with ext without leading dot ("tif")
+    tiles_dir = tmp_path / "tiles"
+    tiles_dir.mkdir()
+    shutil.copy2(dem, tiles_dir / "tile_a.tif")
+    shutil.copy2(dem, tiles_dir / "tile_b.tif")
+    mosaic_out = tmp_path / "mosaic_out.tif"
+    lidar_rs.mosaic(tiles_dir, mosaic_out, ext="tif")
+    assert mosaic_out.exists()
+
+    # reproject_image
+    reproj_out = tmp_path / "dem_4326.tif"
+    lidar_rs.reproject_image(dem, reproj_out, dst_crs="EPSG:4326", resampling="nearest")
+    assert reproj_out.exists()
+
+    # add_crs (non-destructive output copy)
+    crs_out = tmp_path / "dem_with_crs.tif"
+    lidar_rs.add_crs(dem, 32614, output=crs_out)
+    assert crs_out.exists()
+
+    # clip_image using polygonized sink footprint mask
+    clipped_out = tmp_path / "clipped.tif"
+    lidar_rs.clip_image(dem, poly_gj, clipped_out)
+    assert clipped_out.exists()
+
+    # burn_culverts using a LineString spanning the first polygon's bounding box
+    gj_data = json.loads(poly_gj.read_text())
+    ring = gj_data["features"][0]["geometry"]["coordinates"][0]
+    xs = [pt[0] for pt in ring]
+    ys = [pt[1] for pt in ring]
+    mid_y = 0.5 * (min(ys) + max(ys))
+    culvert_gj = tmp_path / "culvert.geojson"
+    culvert_doc = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {"id": 1},
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [[min(xs), mid_y], [max(xs), mid_y]],
+                },
+            }
+        ],
+    }
+    if "crs" in gj_data:
+        culvert_doc["crs"] = gj_data["crs"]
+    culvert_gj.write_text(json.dumps(culvert_doc))
+    burned_out = tmp_path / "dem_burned.tif"
+    carved = lidar_rs.burn_culverts(dem, culvert_gj, burned_out)
+    assert carved >= 1 and burned_out.exists()
+
+
+def test_breach_depressions_file_and_validation(tmp_path: Path):
+    dem = TEST_DATA / "dem.tif"
+    out_breach = tmp_path / "breached.tif"
+    ret = lidar_rs.breach_depressions(
+        dem,
+        out_breach,
+        mode="selective",
+        max_depth=0.5,
+        max_length=15,
+        no_data=-9999.0,
+    )
+    assert ret == str(out_breach)
+    assert out_breach.exists()
+
+    with pytest.raises(ValueError, match="out_dem is not supported"):
+        lidar_rs.breach_depressions(np.zeros((8, 8), dtype=np.float64), out_dem=out_breach)
+
+    with pytest.raises(ValueError, match="out_dem is required"):
+        lidar_rs.breach_depressions(dem)
+
+
+def test_simulate_inundation_array_forcing_and_graph():
+    dem_arr = lidar_rs.MedianFilter(TEST_DATA / "dem.tif", kernel_size=3)
+    rc_arr = np.full_like(dem_arr, 0.8)
+    inf_arr = np.full_like(dem_arr, 0.5)
+    ant_arr = np.full_like(dem_arr, 0.02)
+    hyeto = lidar_rs.scs_type2_hyetograph(120.0, duration_h=10.0, time_step_h=2.0)
+
+    res = lidar_rs.simulate_inundation_array(
+        dem_arr,
+        kernel_size=1,
+        min_size=1000,
+        min_depth=0.3,
+        interval=0.3,
+        rain_intensity_cm_h=5.0,
+        rain_duration_h=10.0,
+        time_step_h=2.0,
+        runoff_coeff_arr=rc_arr,
+        infiltration_arr=inf_arr,
+        antecedent_depth_arr=ant_arr,
+        hyetograph=hyeto,
+    )
+    graph = res["connectivity_graph"]
+    assert isinstance(graph, dict)
+    assert len(graph["nodes"]) == res["graph_node_count"] >= 2
+    assert len(graph["edges"]) == res["graph_edge_count"] >= 1
+    assert "id" in graph["nodes"][0] and "volume" in graph["nodes"][0]
+    assert "from_id" in graph["edges"][0] and "edge_type" in graph["edges"][0]
+    assert "<graphml" in res["connectivity_graphml"]
+    assert res["inundation_curve_csv"].startswith("step,time_hours,runoff_mm,")
+    assert len(res["catchment_records"]) >= 1
+    assert "cat_area" in res["catchment_records"][0]
+
+
+def test_pointcloud_las_roundtrip(tmp_path: Path):
+    import struct
+
+    # Write a minimal valid LAS 1.2 (Point Data Record Format 0) file with ground + canopy points
+    las_path = tmp_path / "synthetic.las"
+    pts: list[tuple[float, float, float, int]] = []
+    for row in range(6):
+        for col in range(6):
+            pts.append((float(col), float(row), 10.0 + 0.1 * col, 2))  # ground (class 2)
+    pts.append((2.5, 2.5, 18.0, 5))  # canopy (class 5)
+
+    scale = 0.001
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    zs = [p[2] for p in pts]
+    header = bytearray(227)
+    header[0:4] = b"LASF"
+    struct.pack_into("<BB", header, 24, 1, 2)  # version 1.2
+    struct.pack_into("<H", header, 94, 227)  # header size
+    struct.pack_into("<I", header, 96, 227)  # offset to point data
+    struct.pack_into("<I", header, 100, 0)  # number of VLRs
+    struct.pack_into("<B", header, 104, 0)  # point data format 0
+    struct.pack_into("<H", header, 105, 20)  # point record length
+    struct.pack_into("<I", header, 107, len(pts))  # number of points
+    struct.pack_into("<I", header, 111, len(pts))  # points by return 1
+    struct.pack_into("<ddd", header, 131, scale, scale, scale)
+    struct.pack_into("<ddd", header, 155, 0.0, 0.0, 0.0)
+    struct.pack_into(
+        "<dddddd", header, 179, max(xs), min(xs), max(ys), min(ys), max(zs), min(zs)
+    )
+
+    records = bytearray()
+    for x, y, z, cls in pts:
+        records += struct.pack(
+            "<iiiHBBbBH",
+            round(x / scale),
+            round(y / scale),
+            round(z / scale),
+            100,  # intensity
+            0b00001001,  # return 1 of 1
+            cls,
+            0,  # scan angle
+            0,  # user data
+            0,  # point source id
+        )
+    las_path.write_bytes(bytes(header) + bytes(records))
+
+    laz_path = tmp_path / "synthetic.laz"
+    count = lidar_rs.convert_lidar(las_path, laz_path)
+    assert count == len(pts) and laz_path.exists()
+
+    dsm_path = tmp_path / "dsm.tif"
+    cols, rows = lidar_rs.lidar_to_dsm(laz_path, dsm_path, resolution=1.0)
+    assert cols >= 5 and rows >= 5 and dsm_path.exists()
+
+    dtm_path = tmp_path / "dtm.tif"
+    d_cols, d_rows = lidar_rs.lidar_to_dtm(
+        laz_path, dtm_path, resolution=1.0, ground_method="preclassified"
+    )
+    assert d_cols >= 5 and d_rows >= 5 and dtm_path.exists()
+
+    chm_path = tmp_path / "chm.tif"
+    c_cols, c_rows = lidar_rs.lidar_to_chm(
+        laz_path, chm_path, resolution=1.0, ground_method="preclassified"
+    )
+    assert c_cols >= 5 and c_rows >= 5 and chm_path.exists()

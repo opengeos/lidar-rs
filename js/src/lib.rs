@@ -4,20 +4,25 @@
 //! byte buffers (`Uint8Array`) with zero filesystem or GDAL dependencies, for browsers
 //! and Node.js. Core hydrology and delineation algorithms live in `crates/lidar`.
 
+use std::collections::HashMap;
+
 use richdem::{Array2D, DemNum, Topology, array2d_to_dataset, dataset_to_dynamic};
 use serde::Serialize;
 use terrio::formats::RasterDriver;
 use terrio::memory::{open_raster_bytes, write_raster_bytes, write_vector_bytes};
 use terrio::ops::polygonize::{PolygonizeOptions, polygonize as terrio_polygonize};
-use terrio::{RasterWriteOptions, VectorWriteOptions};
+use terrio::{
+    Feature, FieldDef, FieldType, FieldValue, GeometryType, Layer, RasterWriteOptions,
+    VectorWriteOptions,
+};
 use wasm_bindgen::prelude::*;
 
 use lidar::{
     ANIMATION_BANNER_HEIGHT, AnimateInundationOptions, BreachMode, BreachOptions, HillshadeOptions,
-    InMemoryFullPipelineOptions, InundationForcing, RoutingMode, SimulateInundationOptions,
-    SpillFlowPath, animate_inundation_to_bytes_with_spill_paths,
-    breach_depressions as core_breach_depressions, compute_hillshade_rgb,
-    connectivity_graph_to_graphml_string, delineate_catchments_in_memory,
+    InMemoryFullPipelineOptions, InundationForcing, NestedDepression, RoutingMode,
+    SimulateInundationOptions, SinkDepression, SpillFlowPath,
+    animate_inundation_to_bytes_with_spill_paths, breach_depressions as core_breach_depressions,
+    compute_hillshade_rgb, connectivity_graph_to_graphml_string, delineate_catchments_in_memory,
     delineate_depressions_in_memory, delineate_mounts_in_memory, extract_sink_labels_from_raster,
     extract_sinks_in_memory, flip_dem as core_flip_dem, fsm_basins_to_csv_string,
     gaussian_filter as core_gaussian_filter, mean_filter as core_mean_filter,
@@ -46,7 +51,39 @@ fn read_array2d_f64(bytes: &[u8], filename: &str) -> Result<Array2D<f64>, JsValu
 
 fn write_array2d_tif<T: DemNum>(arr: &Array2D<T>, name: &str) -> Result<Vec<u8>, JsValue> {
     let ds = array2d_to_dataset(arr).map_err(to_js_err)?;
-    write_raster_bytes(&ds, name, &RasterWriteOptions::default()).map_err(to_js_err)
+    let opts = RasterWriteOptions {
+        compression: Some("DEFLATE".to_string()),
+        ..Default::default()
+    };
+    write_raster_bytes(&ds, name, &opts).map_err(to_js_err)
+}
+
+/// Reprojects a vector layer to RFC 7946 WGS 84 (`EPSG:4326`) when its source CRS is known
+/// and reprojection succeeds, omitting the deprecated `crs` member once reprojected. Falls
+/// back cleanly to the original layer when the input raster has no CRS metadata or uses an
+/// unrecognized local CRS.
+fn reproject_layer_to_wgs84_if_known(mut layer: Layer, fallback_projection: &str) -> Layer {
+    if layer.crs.is_none() {
+        let trimmed = fallback_projection.trim();
+        if !trimmed.is_empty()
+            && let Ok(srs) = terrio::crs::SpatialRef::parse(trimmed)
+        {
+            srs.apply_to_layer(&mut layer);
+        }
+    }
+    let src_srs = terrio::crs::SpatialRef::from_layer(&layer);
+    if !src_srs.is_unknown() {
+        if src_srs.epsg == Some(4326) {
+            // RFC 7946 omits the deprecated `crs` member for WGS 84 coordinates.
+            layer.crs = None;
+        } else if let Ok(wgs84) = terrio::crs::SpatialRef::from_epsg(4326)
+            && let Ok(mut reprojected) = terrio::vector::reproject_layer(&layer, &wgs84)
+        {
+            reprojected.crs = None;
+            return reprojected;
+        }
+    }
+    layer
 }
 
 fn polygonize_array_to_geojson<T: DemNum>(
@@ -63,9 +100,189 @@ fn polygonize_array_to_geojson<T: DemNum>(
         mask: None,
     };
     let layer = terrio_polygonize(&ds, &opts).map_err(to_js_err)?;
+    let layer = reproject_layer_to_wgs84_if_known(layer, &arr.projection);
     let bytes = write_vector_bytes(&[layer], "features.geojson", &VectorWriteOptions::default())
         .map_err(to_js_err)?;
     String::from_utf8(bytes).map_err(to_js_err)
+}
+
+fn feature_positive_id(feat: &Feature) -> Option<u32> {
+    match feat.attributes.first() {
+        Some(FieldValue::Integer(i)) if *i > 0 => u32::try_from(*i).ok(),
+        Some(FieldValue::Float(f)) if *f > 0.0 && f.is_finite() => Some(*f as u32),
+        _ => None,
+    }
+}
+
+fn polygonize_with_attributes_to_geojson<A, FId, FAttrs>(
+    id_raster: &Array2D<i32>,
+    layer_name: &str,
+    id_field_name: &str,
+    fields: &[(&str, FieldType)],
+    items: &[A],
+    item_id: FId,
+    build_attrs: FAttrs,
+) -> Result<String, JsValue>
+where
+    FId: Fn(&A) -> u32,
+    FAttrs: Fn(&A) -> Vec<FieldValue>,
+{
+    let ds = array2d_to_dataset(id_raster).map_err(to_js_err)?;
+    let poly_layer = terrio_polygonize(
+        &ds,
+        &PolygonizeOptions {
+            band: 0,
+            field_name: id_field_name.to_string(),
+            layer_name: layer_name.to_string(),
+            connectedness8: false,
+            ignore_nodata: false,
+            mask: None,
+        },
+    )
+    .map_err(to_js_err)?;
+
+    let item_map: HashMap<u32, &A> = items.iter().map(|item| (item_id(item), item)).collect();
+    let mut layer = Layer::new(layer_name.to_string()).with_geom_type(GeometryType::Polygon);
+    layer.crs = poly_layer.crs.clone();
+    for &(name, ftype) in fields {
+        layer.schema.add_field(FieldDef::new(name, ftype));
+    }
+
+    for feat in poly_layer.features {
+        let Some(id) = feature_positive_id(&feat) else {
+            continue;
+        };
+        let Some(item) = item_map.get(&id) else {
+            continue;
+        };
+        layer.features.push(Feature {
+            fid: (layer.features.len() + 1) as u64,
+            geometry: feat.geometry,
+            attributes: build_attrs(item),
+        });
+    }
+
+    let layer = reproject_layer_to_wgs84_if_known(layer, &id_raster.projection);
+    let filename = format!("{layer_name}.geojson");
+    let bytes = write_vector_bytes(&[layer], &filename, &VectorWriteOptions::default())
+        .map_err(to_js_err)?;
+    String::from_utf8(bytes).map_err(to_js_err)
+}
+
+fn polygonize_sinks_to_geojson(
+    region: &Array2D<i32>,
+    depressions: &[SinkDepression],
+) -> Result<String, JsValue> {
+    const FIELDS: &[(&str, FieldType)] = &[
+        ("region_id", FieldType::Integer),
+        ("count", FieldType::Integer),
+        ("area", FieldType::Float),
+        ("volume", FieldType::Float),
+        ("avg_depth", FieldType::Float),
+        ("max_depth", FieldType::Float),
+        ("min_elev", FieldType::Float),
+        ("max_elev", FieldType::Float),
+        ("perimeter", FieldType::Float),
+        ("major_axis", FieldType::Float),
+        ("minor_axis", FieldType::Float),
+        ("elongatedness", FieldType::Float),
+        ("eccentricity", FieldType::Float),
+        ("orientation", FieldType::Float),
+        ("area_bbox_ratio", FieldType::Float),
+    ];
+    polygonize_with_attributes_to_geojson(
+        region,
+        "sinks",
+        "region_id",
+        FIELDS,
+        depressions,
+        |d| d.region_id,
+        |d| {
+            vec![
+                FieldValue::Integer(d.region_id as i64),
+                FieldValue::Integer(d.count as i64),
+                FieldValue::Float(d.area),
+                FieldValue::Float(d.volume),
+                FieldValue::Float(d.avg_depth),
+                FieldValue::Float(d.max_depth),
+                FieldValue::Float(d.min_elev),
+                FieldValue::Float(d.max_elev),
+                FieldValue::Float(d.perimeter),
+                FieldValue::Float(d.major_axis),
+                FieldValue::Float(d.minor_axis),
+                FieldValue::Float(d.elongatedness),
+                FieldValue::Float(d.eccentricity),
+                FieldValue::Float(d.orientation),
+                FieldValue::Float(d.area_bbox_ratio),
+            ]
+        },
+    )
+}
+
+fn polygonize_depressions_to_geojson(
+    depression_id: &Array2D<i32>,
+    depressions: &[NestedDepression],
+) -> Result<String, JsValue> {
+    const FIELDS: &[(&str, FieldType)] = &[
+        ("id", FieldType::Integer),
+        ("parent_id", FieldType::Integer),
+        ("level", FieldType::Integer),
+        ("region_id", FieldType::Integer),
+        ("count", FieldType::Integer),
+        ("area", FieldType::Float),
+        ("volume", FieldType::Float),
+        ("avg_depth", FieldType::Float),
+        ("max_depth", FieldType::Float),
+        ("min_elev", FieldType::Float),
+        ("max_elev", FieldType::Float),
+        ("perimeter", FieldType::Float),
+        ("major_axis", FieldType::Float),
+        ("minor_axis", FieldType::Float),
+        ("elongatedness", FieldType::Float),
+        ("eccentricity", FieldType::Float),
+        ("orientation", FieldType::Float),
+        ("area_bbox_ratio", FieldType::Float),
+        ("circularity", FieldType::Float),
+        ("depth_diam_ratio", FieldType::Float),
+        ("hypsometric_integral", FieldType::Float),
+        ("rim_slope_deg", FieldType::Float),
+        ("artifact_flag", FieldType::Integer),
+    ];
+    polygonize_with_attributes_to_geojson(
+        depression_id,
+        "depressions",
+        "id",
+        FIELDS,
+        depressions,
+        |d| d.id,
+        |d| {
+            vec![
+                FieldValue::Integer(d.id as i64),
+                FieldValue::Integer(d.parent_id as i64),
+                FieldValue::Integer(d.level as i64),
+                FieldValue::Integer(d.region_id as i64),
+                FieldValue::Integer(d.count as i64),
+                FieldValue::Float(d.area),
+                FieldValue::Float(d.volume),
+                FieldValue::Float(d.avg_depth),
+                FieldValue::Float(d.max_depth),
+                FieldValue::Float(d.min_elev),
+                FieldValue::Float(d.max_elev),
+                FieldValue::Float(d.perimeter),
+                FieldValue::Float(d.major_axis),
+                FieldValue::Float(d.minor_axis),
+                FieldValue::Float(d.elongatedness),
+                FieldValue::Float(d.eccentricity),
+                FieldValue::Float(d.orientation),
+                FieldValue::Float(d.area_bbox_ratio),
+                FieldValue::Float(d.circularity),
+                FieldValue::Float(d.depth_diam_ratio),
+                FieldValue::Float(d.hypsometric_integral),
+                FieldValue::Float(d.rim_slope_deg),
+                FieldValue::Integer(i64::from(d.artifact_flag)),
+            ]
+        },
+    )
 }
 
 fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
@@ -325,6 +542,7 @@ pub fn polygonize_to_geojson(
         mask: None,
     };
     let layer = terrio_polygonize(&ds, &opts).map_err(to_js_err)?;
+    let layer = reproject_layer_to_wgs84_if_known(layer, "");
     let out = write_vector_bytes(&[layer], "features.geojson", &VectorWriteOptions::default())
         .map_err(to_js_err)?;
     String::from_utf8(out).map_err(to_js_err)
@@ -397,7 +615,7 @@ pub fn extract_sinks(
     let refined_dem_tif = write_array2d_tif(&mem.dem_refined, "dem_refined.tif")?;
     let depth_tif = write_array2d_tif(&mem.depth, "depth.tif")?;
     let region_tif = write_array2d_tif(&mem.region, "region.tif")?;
-    let geojson = polygonize_array_to_geojson(&mem.region, "region_id")?;
+    let geojson = polygonize_sinks_to_geojson(&mem.region, &mem.depressions)?;
     let depth_rgba = colorize_f64_rgba(&mem.depth, true, false, false);
     Ok(SinksOutput {
         width: dem.width(),
@@ -473,7 +691,7 @@ fn marshal_depressions(
     let depressions_json = serde_json::to_string(&mem.depressions).map_err(to_js_err)?;
     let id_tif = write_array2d_tif(&mem.depression_id, id_name)?;
     let level_tif = write_array2d_tif(&mem.depression_level, level_name)?;
-    let geojson = polygonize_array_to_geojson(&mem.depression_id, "id")?;
+    let geojson = polygonize_depressions_to_geojson(&mem.depression_id, &mem.depressions)?;
     let level_rgba = colorize_i32_rgba(&mem.depression_level);
     Ok(DepressionsOutput {
         width: mem.depression_id.width(),
@@ -660,6 +878,11 @@ pub struct InundationOutput {
     scaled_hyetograph: Option<Vec<(f64, f64)>>,
     dem_refined: Array2D<f64>,
     fill_time: Array2D<f64>,
+    catchment_hierarchy: Array2D<f64>,
+    sink: Array2D<f64>,
+    depression_level: Array2D<i32>,
+    depression_id: Array2D<i32>,
+    depressions: Vec<NestedDepression>,
     spill_paths: Vec<SpillFlowPath>,
     depressions_json: String,
     catchment_hierarchy_json: String,
@@ -670,17 +893,10 @@ pub struct InundationOutput {
     connectivity_graph_json: String,
     connectivity_graphml: String,
     inundation_curve_csv: String,
-    fill_time_tif: Vec<u8>,
-    catchment_hir_tif: Vec<u8>,
-    sink_tif: Vec<u8>,
-    level_tif: Vec<u8>,
-    depressions_geojson: String,
     hillshade_rgba: Vec<u8>,
     depth_rgba: Vec<u8>,
     level_rgba: Vec<u8>,
     fill_time_rgba: Vec<u8>,
-    fill_time_values: Vec<f64>,
-    depression_id_values: Vec<i32>,
     fsm_mass_balance_json: String,
     fsm_basins_json: String,
     fsm_basins_csv: String,
@@ -739,24 +955,24 @@ impl InundationOutput {
         )
     }
     #[wasm_bindgen(js_name = fillTimeTif)]
-    pub fn fill_time_tif(&self) -> Vec<u8> {
-        self.fill_time_tif.clone()
+    pub fn fill_time_tif(&self) -> Result<Vec<u8>, JsValue> {
+        write_array2d_tif(&self.fill_time, "fill_time.tif")
     }
     #[wasm_bindgen(js_name = catchmentHirTif)]
-    pub fn catchment_hir_tif(&self) -> Vec<u8> {
-        self.catchment_hir_tif.clone()
+    pub fn catchment_hir_tif(&self) -> Result<Vec<u8>, JsValue> {
+        write_array2d_tif(&self.catchment_hierarchy, "catchment_hir.tif")
     }
     #[wasm_bindgen(js_name = sinkTif)]
-    pub fn sink_tif(&self) -> Vec<u8> {
-        self.sink_tif.clone()
+    pub fn sink_tif(&self) -> Result<Vec<u8>, JsValue> {
+        write_array2d_tif(&self.sink, "sink.tif")
     }
     #[wasm_bindgen(js_name = levelTif)]
-    pub fn level_tif(&self) -> Vec<u8> {
-        self.level_tif.clone()
+    pub fn level_tif(&self) -> Result<Vec<u8>, JsValue> {
+        write_array2d_tif(&self.depression_level, "depression_level.tif")
     }
     #[wasm_bindgen(js_name = depressionsGeojson)]
-    pub fn depressions_geojson(&self) -> String {
-        self.depressions_geojson.clone()
+    pub fn depressions_geojson(&self) -> Result<String, JsValue> {
+        polygonize_depressions_to_geojson(&self.depression_id, &self.depressions)
     }
     #[wasm_bindgen(js_name = hillshadeRgba)]
     pub fn hillshade_rgba(&self) -> Vec<u8> {
@@ -777,12 +993,23 @@ impl InundationOutput {
     /// Full-precision (`Float64Array`) per-cell fill times in hours (`-1.0` for dry/NoData).
     #[wasm_bindgen(js_name = fillTimeValues)]
     pub fn fill_time_values(&self) -> Vec<f64> {
-        self.fill_time_values.clone()
+        let ft_nd = self.fill_time.no_data();
+        self.fill_time
+            .data()
+            .iter()
+            .map(|&v| {
+                if v.is_finite() && !v.rd_eq(ft_nd) && v >= 0.0 {
+                    v
+                } else {
+                    -1.0
+                }
+            })
+            .collect()
     }
     /// Per-cell depression ID grid (`Int32Array`, `0` outside depressions) for interactive click-to-inspect.
     #[wasm_bindgen(js_name = depressionIdValues)]
     pub fn depression_id_values(&self) -> Vec<i32> {
-        self.depression_id_values.clone()
+        self.depression_id.data().to_vec()
     }
     /// Effective runoff coefficient used in the simulation (`(0, 1]`).
     #[wasm_bindgen(getter, js_name = runoffCoeff)]
@@ -920,13 +1147,24 @@ impl InundationOutput {
             )));
         }
 
+        let total_duration_h = (self.num_steps as f64) * self.time_step_h;
+        let eff_intensity_cm_h = if self.scaled_hyetograph.is_some() && total_duration_h > 0.0 {
+            let cum_mm = lidar::cumulative_runoff_mm(
+                total_duration_h,
+                self.rain_intensity_cm_h * self.runoff_coeff,
+                self.scaled_hyetograph.as_deref(),
+            );
+            cum_mm / (total_duration_h * 10.0)
+        } else {
+            self.rain_intensity_cm_h * self.runoff_coeff
+        };
         let anim_opts = AnimateInundationOptions {
             frame_delay_ms,
             ping_pong,
             loops: 0,
             max_dimension: if max_dim > 0 { Some(max_dim) } else { None },
             time_step_h: Some(self.time_step_h),
-            rain_intensity_cm_h: Some(self.rain_intensity_cm_h),
+            rain_intensity_cm_h: Some(eff_intensity_cm_h),
             ..Default::default()
         };
         let paths: &[SpillFlowPath] = if show_spill_paths.unwrap_or(true) {
@@ -1014,14 +1252,26 @@ pub fn simulate_inundation_advanced(
         _ => RoutingMode::Static,
     };
     let raw_dem = read_array2d_f64(dem_bytes, filename)?;
-    let breach = breach_max_depth
-        .filter(|&md| md > 0.0)
-        .map(|md| BreachOptions {
-            mode: BreachMode::Selective,
-            max_depth: Some(md),
-            max_length: Some(40),
-            ..Default::default()
-        });
+    let breach = match breach_max_depth {
+        Some(md) => {
+            if !md.is_finite() || md < 0.0 {
+                return Err(to_js_err(format!(
+                    "breach_max_depth must be finite and >= 0, got {md}"
+                )));
+            }
+            if md > 0.0 {
+                Some(BreachOptions {
+                    mode: BreachMode::Selective,
+                    max_depth: Some(md),
+                    max_length: Some(40),
+                    ..Default::default()
+                })
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
     let rc_arr = if (runoff_coeff - 1.0).abs() > 1e-12 {
         let mut a = Array2D::from_vec(
             raw_dem.width(),
@@ -1030,15 +1280,25 @@ pub fn simulate_inundation_advanced(
         )
         .map_err(to_js_err)?;
         a.copy_metadata_from(&raw_dem);
+        a.set_no_data(f64::NAN);
         Some(a)
     } else {
         None
     };
     let hyeto = match scs_type2_mm {
-        Some(mm) if mm > 0.0 => {
-            Some(scs_type2_hyetograph(mm, rain_duration_h, time_step_h).map_err(to_js_err)?)
+        Some(mm) => {
+            if !mm.is_finite() || mm < 0.0 {
+                return Err(to_js_err(format!(
+                    "scs_type2_mm must be finite and >= 0, got {mm}"
+                )));
+            }
+            if mm > 0.0 {
+                Some(scs_type2_hyetograph(mm, rain_duration_h, time_step_h).map_err(to_js_err)?)
+            } else {
+                None
+            }
         }
-        _ => None,
+        None => None,
     };
     let scaled_hyetograph: Option<Vec<(f64, f64)>> = hyeto.as_ref().map(|h| {
         h.iter()
@@ -1093,32 +1353,12 @@ pub fn simulate_inundation_advanced(
     let level_rgba = colorize_i32_rgba(&pipe.depressions.depression_level);
     let fill_time_rgba = colorize_f64_rgba(&pipe.fill_time, false, true, true);
 
-    let ft_nd = pipe.fill_time.no_data();
-    let fill_time_values: Vec<f64> = pipe
-        .fill_time
-        .data()
-        .iter()
-        .map(|&v| {
-            if v.is_finite() && !v.rd_eq(ft_nd) && v >= 0.0 {
-                v
-            } else {
-                -1.0
-            }
-        })
-        .collect();
-    let depression_id_values: Vec<i32> = pipe.depressions.depression_id.data().to_vec();
-
     let depressions_json =
         serde_json::to_string(&pipe.depressions.depressions).map_err(to_js_err)?;
     let catchment_hierarchy_json =
         serde_json::to_string(&pipe.catchment_records).map_err(to_js_err)?;
     let steps_json = serde_json::to_string(&pipe.steps).map_err(to_js_err)?;
     let spill_paths_json = serde_json::to_string(&pipe.spill_paths).map_err(to_js_err)?;
-    let fill_time_tif = write_array2d_tif(&pipe.fill_time, "fill_time.tif")?;
-    let catchment_hir_tif = write_array2d_tif(&pipe.catchment_hierarchy, "catchment_hir.tif")?;
-    let sink_tif = write_array2d_tif(&pipe.sinks.sink, "sink.tif")?;
-    let level_tif = write_array2d_tif(&pipe.depressions.depression_level, "depression_level.tif")?;
-    let depressions_geojson = polygonize_array_to_geojson(&pipe.depressions.depression_id, "id")?;
 
     Ok(InundationOutput {
         width: raw_dem.width(),
@@ -1133,6 +1373,11 @@ pub fn simulate_inundation_advanced(
         scaled_hyetograph,
         dem_refined: pipe.sinks.dem_refined,
         fill_time: pipe.fill_time,
+        catchment_hierarchy: pipe.catchment_hierarchy,
+        sink: pipe.sinks.sink,
+        depression_level: pipe.depressions.depression_level,
+        depression_id: pipe.depressions.depression_id,
+        depressions: pipe.depressions.depressions,
         spill_paths: pipe.spill_paths,
         depressions_json,
         catchment_hierarchy_json,
@@ -1143,17 +1388,10 @@ pub fn simulate_inundation_advanced(
         connectivity_graph_json,
         connectivity_graphml,
         inundation_curve_csv,
-        fill_time_tif,
-        catchment_hir_tif,
-        sink_tif,
-        level_tif,
-        depressions_geojson,
         hillshade_rgba,
         depth_rgba,
         level_rgba,
         fill_time_rgba,
-        fill_time_values,
-        depression_id_values,
         fsm_mass_balance_json,
         fsm_basins_json,
         fsm_basins_csv,

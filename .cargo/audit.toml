@@ -1,0 +1,32 @@
+# Advisory exceptions for `cargo audit`.
+#
+# Every advisory listed here comes strictly from `wbraster 0.2.1` (the latest
+# published crates.io release, pulled transitively by `terrio 0.9.0`; `terrio`
+# itself already uses `zip 9.8.1` and `ruzstd 0.9.1`). None of these code paths
+# are reachable in `lidar-rs`:
+# - `wbraster` never calls `ZipArchive::extract` or `ZipStreamReader::extract`,
+#   and only enables the `deflate` feature (not `aes-crypto` or `legacy-zip`).
+# - `wbraster`'s Zarr reader is unreachable without `TERRIO_WBRASTER_FALLBACK=YES`.
+# - Matches upstream `opengeos/terrio`'s `.cargo/audit.toml`; the `wasm32` build
+#   (`js/Cargo.toml`) enables `terrio` with `default-features = false, features = ["geotiff"]`
+#   (no Zarr or zip sensor bundles).
+#
+# Remove these entries once `terrio` upgrades past `wbraster 0.2.1` (or drops
+# `wbraster`). The `audit` CI job enforces that these exact advisories only
+# appear on `zip@8.6.0` and `ruzstd@0.8.3` so any other crate, version, or new
+# advisory fails CI immediately.
+
+[advisories]
+ignore = [
+    # ruzstd 0.8.3 (via wbraster 0.2.1): unreachable Zarr decompression path
+    "RUSTSEC-2026-0344",
+    # zip 8.6.0 (via wbraster 0.2.1): unreachable extract / AES / legacy-zip paths
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+    "RUSTSEC-2026-0429",
+    "RUSTSEC-2026-0545",
+    "RUSTSEC-2026-0546",
+    "RUSTSEC-2026-0547",
+    "RUSTSEC-2026-0548",
+]
