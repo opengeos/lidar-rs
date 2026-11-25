@@ -2906,8 +2906,9 @@ pub struct SimulateInundationAdvancedOptions {
     pub simulation: SimulateInundationOptions,
     /// Hydrologic routing strategy (`RoutingMode::Static` by default, or `RoutingMode::FillSpillMerge`).
     pub routing: RoutingMode,
-    /// Optional refined DEM raster path (`dem.tif`) used for `RoutingMode::FillSpillMerge` overland routing.
-    /// Must be `None` when `routing == RoutingMode::Static`.
+    /// Refined DEM raster path (`dem.tif`) required when `routing == RoutingMode::FillSpillMerge`
+    /// so upland runoff outside depressions is routed accurately. Must be `None` when
+    /// `routing == RoutingMode::Static`.
     pub dem_path: Option<PathBuf>,
     /// Optional SCS Type II design storm total precipitation in millimeters.
     pub scs_type2_mm: Option<f64>,
@@ -2961,6 +2962,28 @@ fn load_forcing_input(
     }
 }
 
+/// Collects existing `flood_*.tif(f)` paths inside `out_dir` so they can be checked against
+/// caller inputs before cleanup and safely removed without touching protected input files.
+fn existing_flood_frames(out_dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(out_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file()
+                && let Some(name) = p.file_name().and_then(|n| n.to_str())
+            {
+                let lower = name.to_ascii_lowercase();
+                if lower.starts_with("flood_")
+                    && (lower.ends_with(".tif") || lower.ends_with(".tiff"))
+                {
+                    found.push(p);
+                }
+            }
+        }
+    }
+    found
+}
+
 /// Removes stale `flood_*.tif(f)` frames, writes `fill_time.tif`, each `flood_<step>.tif` frame,
 /// and `inundation_summary.csv` into `out_dir`.
 fn write_inundation_frames_and_summary(
@@ -2975,20 +2998,8 @@ fn write_inundation_frames_and_summary(
     let summary_csv_path = out_dir.join("inundation_summary.csv");
     // Remove stale flood_*.tif(f) frames from any prior run in out_dir so rerun outputs
     // with a different step count cannot interleave with old frames.
-    if let Ok(entries) = std::fs::read_dir(out_dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_file()
-                && let Some(name) = p.file_name().and_then(|n| n.to_str())
-            {
-                let lower = name.to_ascii_lowercase();
-                if lower.starts_with("flood_")
-                    && (lower.ends_with(".tif") || lower.ends_with(".tiff"))
-                {
-                    let _ = std::fs::remove_file(&p);
-                }
-            }
-        }
+    for p in existing_flood_frames(out_dir) {
+        let _ = std::fs::remove_file(&p);
     }
 
     save_raster(
@@ -3084,10 +3095,14 @@ pub fn simulate_inundation(
         .map(|k| out_dir.join(format!("flood_{k:0digits$}.tif")))
         .collect();
 
-    let mut protected: Vec<&Path> = Vec::with_capacity(frame_paths.len() + 2);
+    let stale_frames = existing_flood_frames(out_dir);
+    let mut protected: Vec<&Path> = Vec::with_capacity(frame_paths.len() + stale_frames.len() + 2);
     protected.push(&fill_time_path);
     protected.push(&summary_csv_path);
     for p in &frame_paths {
+        protected.push(p.as_path());
+    }
+    for p in &stale_frames {
         protected.push(p.as_path());
     }
     ensure_no_path_collision(in_sink, &protected)?;
@@ -3110,16 +3125,29 @@ pub fn simulate_inundation(
 /// Simulates surface inundation dynamics with optional dynamic Fill-Spill-Merge routing,
 /// SCS Type II design storm hyetograph, and spatially variable or uniform scalar forcing
 /// (runoff coefficient, infiltration, antecedent water depth).
+///
+/// `in_catchment` is used for `RoutingMode::Static` routing. When
+/// `options.routing == RoutingMode::FillSpillMerge`, D8 catchments and overland spill
+/// routes are computed directly from the required `options.dem_path` refined DEM raster.
 pub fn simulate_inundation_advanced(
     in_sink: impl AsRef<Path>,
     in_catchment: impl AsRef<Path>,
     out_dir: impl AsRef<Path>,
     options: &SimulateInundationAdvancedOptions,
 ) -> Result<SimulateInundationAdvancedResult> {
-    if options.dem_path.is_some() && options.routing == RoutingMode::Static {
-        return Err(Error::InvalidArgument(
-            "--dem is only supported with --routing fsm".into(),
-        ));
+    match options.routing {
+        RoutingMode::Static if options.dem_path.is_some() => {
+            return Err(Error::InvalidArgument(
+                "--dem is only supported with --routing fsm".into(),
+            ));
+        }
+        RoutingMode::FillSpillMerge if options.dem_path.is_none() => {
+            return Err(Error::InvalidArgument(
+                "--dem is required when routing is FillSpillMerge so upland runoff outside depressions is routed accurately"
+                    .into(),
+            ));
+        }
+        _ => {}
     }
     let sim_opts = &options.simulation;
     let n_steps = validate_options_with_hyetograph(sim_opts, options.scs_type2_mm.is_some())?;
@@ -3141,13 +3169,17 @@ pub fn simulate_inundation_advanced(
         .map(|k| out_dir.join(format!("flood_{k:0digits$}.tif")))
         .collect();
 
-    let mut protected: Vec<&Path> = Vec::with_capacity(frame_paths.len() + 3);
+    let stale_frames = existing_flood_frames(out_dir);
+    let mut protected: Vec<&Path> = Vec::with_capacity(frame_paths.len() + stale_frames.len() + 3);
     protected.push(&fill_time_path);
     protected.push(&summary_csv_path);
     if options.routing == RoutingMode::FillSpillMerge {
         protected.push(&fsm_csv_path);
     }
     for p in &frame_paths {
+        protected.push(p.as_path());
+    }
+    for p in &stale_frames {
         protected.push(p.as_path());
     }
     ensure_no_path_collision(in_sink, &protected)?;
@@ -3197,10 +3229,13 @@ pub fn simulate_inundation_advanced(
             (ft, nr, None, None)
         }
         RoutingMode::FillSpillMerge => {
-            let dem_refined = match options.dem_path.as_deref() {
-                Some(p) => load_raster::<f64>(p, None)?,
-                None => sink.clone(),
-            };
+            let dem_path = options.dem_path.as_deref().ok_or_else(|| {
+                Error::InvalidArgument(
+                    "--dem is required when routing is FillSpillMerge so upland runoff outside depressions is routed accurately"
+                        .into(),
+                )
+            })?;
+            let dem_refined = load_raster::<f64>(dem_path, None)?;
             let deps = delineate_depressions_in_memory(
                 &sink,
                 sim_opts.min_size,

@@ -279,6 +279,9 @@ pub fn read_lidar_windowed(path: impl AsRef<Path>, opts: &LidarReadOptions) -> R
             "min_z ({lo}) must be <= max_z ({hi})"
         )));
     }
+    if opts.max_points == Some(0) {
+        return Err(Error::InvalidArgument("max_points must be > 0".into()));
+    }
     let filter = PointFilter {
         bounds: opts.bounds,
         z_range: match (opts.min_z, opts.max_z) {
@@ -369,6 +372,20 @@ pub fn classify_ground(cloud: &PointCloud, method: GroundFilterMethod) -> Result
     }
 }
 
+/// Normalizes a capitalized `"Classification"` dimension to `"classification"` when
+/// lowercase `"classification"` is absent so `terrio` filters preserve existing classes.
+fn normalize_classification_dim(cloud: &PointCloud) -> std::borrow::Cow<'_, PointCloud> {
+    if cloud.dim("classification").is_none() && cloud.dim("Classification").is_some() {
+        let mut cloned = cloud.clone();
+        if let Some(dim) = cloned.dim_mut("Classification") {
+            dim.name = "classification".to_string();
+        }
+        std::borrow::Cow::Owned(cloned)
+    } else {
+        std::borrow::Cow::Borrowed(cloud)
+    }
+}
+
 /// Removes points classified as ASPRS low noise (`7`) or high noise (`18`).
 fn strip_noise_classes(cloud: &PointCloud) -> PointCloud {
     let Some(dim) = cloud
@@ -398,12 +415,18 @@ pub fn filter_outliers_elm(
     threshold: f64,
     remove_noise: bool,
 ) -> Result<PointCloud> {
+    if !cell.is_finite() || cell <= 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "cell must be finite and > 0, got {cell}"
+        )));
+    }
     if !threshold.is_finite() || threshold < 0.0 {
         return Err(Error::InvalidArgument(format!(
             "threshold must be finite and >= 0, got {threshold}"
         )));
     }
-    let classified = terrio_elm(cloud, cell, threshold, 7)?;
+    let normalized = normalize_classification_dim(cloud);
+    let classified = terrio_elm(&normalized, cell, threshold, 7)?;
     if remove_noise {
         Ok(strip_noise_classes(&classified))
     } else {
@@ -439,7 +462,8 @@ pub fn filter_outliers_statistical(
         class: 7,
         ..Default::default()
     };
-    let classified = terrio_outlier(cloud, &opts)?;
+    let normalized = normalize_classification_dim(cloud);
+    let classified = terrio_outlier(&normalized, &opts)?;
     if remove_noise {
         Ok(strip_noise_classes(&classified))
     } else {

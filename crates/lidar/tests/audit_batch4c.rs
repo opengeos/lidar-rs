@@ -2,7 +2,9 @@
 //! FlatGeobuf, LERC, tiles), PDAL-equivalent point-cloud filters (SMRF, ELM, SOR, HAG),
 //! and COPC/LAS spatial & point-cap windowing.
 
+#[cfg(feature = "pointcloud")]
 use lidar::load_raster;
+#[cfg(feature = "pointcloud")]
 use lidar::pointcloud::{
     Dimension, GroundFilterMethod, LidarReadOptions, LidarToDtmOptions, PointCloud,
     PointWriteOptions, ReturnKind, Values, classify_ground, filter_outliers_elm,
@@ -10,6 +12,7 @@ use lidar::pointcloud::{
     write_lidar,
 };
 
+#[cfg(feature = "pointcloud")]
 fn make_forest_cloud() -> PointCloud {
     let mut xs = Vec::new();
     let mut ys = Vec::new();
@@ -55,6 +58,7 @@ fn make_forest_cloud() -> PointCloud {
     )
 }
 
+#[cfg(feature = "pointcloud")]
 #[test]
 fn smrf_ground_classification_and_dtm_chm_separate_ground_from_canopy() {
     assert_eq!(
@@ -141,6 +145,7 @@ fn smrf_ground_classification_and_dtm_chm_separate_ground_from_canopy() {
     );
 }
 
+#[cfg(feature = "pointcloud")]
 #[test]
 fn elm_and_statistical_outlier_filters_strip_low_and_high_noise_and_clean_dtm() {
     let mut xs = Vec::new();
@@ -274,6 +279,53 @@ fn simulate_inundation_advanced_rejects_dem_with_static_routing() {
 }
 
 #[test]
+fn simulate_inundation_advanced_requires_dem_with_fsm_routing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_data/sink.tif");
+    let out_dir = tmp.path().join("sim_fsm_missing_dem");
+    let opts = lidar::SimulateInundationAdvancedOptions {
+        routing: lidar::RoutingMode::FillSpillMerge,
+        dem_path: None,
+        ..Default::default()
+    };
+    let err = lidar::simulate_inundation_advanced(&sink_path, &sink_path, &out_dir, &opts)
+        .expect_err("FSM routing without --dem must fail");
+    assert!(
+        err.to_string().contains("--dem"),
+        "expected error mentioning --dem, got: {err}"
+    );
+}
+
+#[test]
+fn simulate_inundation_rejects_input_colliding_with_stale_flood_frame() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink_src =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_data/sink.tif");
+    let out_dir = tmp.path().join("sim_stale_collision");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    // Place an input raster inside out_dir named like a stale flood frame from a longer prior run.
+    let stale_named_input = out_dir.join("flood_999.tif");
+    std::fs::copy(&sink_src, &stale_named_input).unwrap();
+    let opts = lidar::SimulateInundationOptions {
+        rain_duration_h: 2.0,
+        time_step_h: 1.0,
+        ..Default::default()
+    };
+    let err = lidar::simulate_inundation(&stale_named_input, &sink_src, &out_dir, &opts)
+        .expect_err("input file matching stale flood_*.tif in out_dir must fail before cleanup");
+    assert!(
+        err.to_string().contains("overwrite") || err.to_string().contains("flood_999.tif"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        stale_named_input.exists(),
+        "protected input file must not be deleted on collision"
+    );
+}
+
+#[cfg(feature = "pointcloud")]
+#[test]
 fn normalize_hag_delaunay_and_nn_compute_accurate_heights_above_ground() {
     let mut xs = Vec::new();
     let mut ys = Vec::new();
@@ -329,6 +381,7 @@ fn normalize_hag_delaunay_and_nn_compute_accurate_heights_above_ground() {
     );
 }
 
+#[cfg(feature = "pointcloud")]
 #[test]
 fn read_lidar_windowed_filters_spatial_bounds_max_points_and_z_range() {
     let cloud = make_forest_cloud();
@@ -381,7 +434,7 @@ fn read_lidar_windowed_filters_spatial_bounds_max_points_and_z_range() {
         thinned.len()
     );
 
-    // Invalid bounds and resolution must return errors.
+    // Invalid bounds, resolution, and zero max_points must return errors.
     assert!(
         read_lidar_windowed(
             &las_path,
@@ -402,6 +455,59 @@ fn read_lidar_windowed_filters_spatial_bounds_max_points_and_z_range() {
         )
         .is_err()
     );
+    assert!(
+        read_lidar_windowed(
+            &las_path,
+            &LidarReadOptions {
+                max_points: Some(0),
+                ..Default::default()
+            }
+        )
+        .is_err()
+    );
+}
+
+#[cfg(feature = "pointcloud")]
+#[test]
+fn elm_and_sor_validate_parameters_and_normalize_capitalized_classification_dim() {
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    let mut zs = Vec::new();
+    let mut cls = Vec::new();
+    for r in 0..10 {
+        for c in 0..10 {
+            xs.push(500_000.0 + c as f64);
+            ys.push(4_000_000.0 + r as f64);
+            zs.push(100.0);
+            cls.push(2u8);
+        }
+    }
+    // Pre-tagged ASPRS class 18 high noise stored under capitalized "Classification".
+    xs.push(500_005.0);
+    ys.push(4_000_005.0);
+    zs.push(250.0);
+    cls.push(18u8);
+
+    let cloud = PointCloud::new(
+        vec![
+            Dimension::new("x", Values::F64(xs)),
+            Dimension::new("y", Values::F64(ys)),
+            Dimension::new("z", Values::F64(zs)),
+            Dimension::new("Classification", Values::U8(cls)),
+        ],
+        terrio::crs::SpatialRef::parse("EPSG:32615").unwrap(),
+    );
+
+    // ELM rejects non-positive or non-finite cell sizes.
+    assert!(filter_outliers_elm(&cloud, 0.0, 1.0, true).is_err());
+    assert!(filter_outliers_elm(&cloud, -5.0, 1.0, true).is_err());
+    assert!(filter_outliers_elm(&cloud, f64::NAN, 1.0, true).is_err());
+
+    // Both ELM and SOR normalize capitalized "Classification" and strip pre-tagged class 18 noise.
+    let elm_clean = filter_outliers_elm(&cloud, 10.0, 1.0, true).unwrap();
+    assert_eq!(elm_clean.len(), 100);
+    let sor_clean = filter_outliers_statistical(&cloud, 8, 2.0, true).unwrap();
+    assert_eq!(sor_clean.len(), 100);
 }
 
 #[cfg(feature = "parquet")]

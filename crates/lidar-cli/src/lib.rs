@@ -894,7 +894,7 @@ enum Commands {
         /// Hydrologic routing mode (static = independent level-set timing, fsm = dynamic Fill-Spill-Merge cascade mass-balance)
         #[arg(long, value_enum, default_value_t = CliRoutingMode::Static)]
         routing: CliRoutingMode,
-        /// Optional refined DEM raster (e.g. dem.tif) for --routing fsm overland routing (defaults to sink raster if omitted)
+        /// Required when --routing fsm; refined DEM raster (e.g. dem.tif) used to compute D8 catchments and overland routing
         #[arg(long)]
         dem: Option<PathBuf>,
         /// Optional SCS Type II design storm total precipitation in mm (overrides constant rainfall)
@@ -1770,8 +1770,42 @@ fn dispatch(command: Commands, lidar_cmd: Option<Vec<OsString>>) -> lidar::Resul
             } else {
                 None
             };
+            let routing_mode: RoutingMode = routing.into();
             let _cn_tmp_file;
             let resolved_runoff_coeff = if let Some(cn_path) = curve_number {
+                let mut candidate_outputs = vec![
+                    out_dir.join("depressions.csv"),
+                    out_dir.join("catchments.csv"),
+                    out_dir.join("inundation_curve.csv"),
+                    out_dir.join("summary.json"),
+                ];
+                if !no_rasters {
+                    for name in [
+                        "depth.tif",
+                        "depression_id.tif",
+                        "depression_level.tif",
+                        "catchment_hir.tif",
+                        "fill_time.tif",
+                    ] {
+                        candidate_outputs.push(out_dir.join(name));
+                    }
+                }
+                if !no_vectors {
+                    candidate_outputs.push(out_dir.join("depressions.gpkg"));
+                    candidate_outputs.push(out_dir.join("spill_paths.gpkg"));
+                }
+                if !no_graph {
+                    candidate_outputs.push(out_dir.join("rating_curves.csv"));
+                    candidate_outputs.push(out_dir.join("connectivity_graph.graphml"));
+                    candidate_outputs.push(out_dir.join("connectivity_graph.json"));
+                }
+                if routing_mode == RoutingMode::FillSpillMerge {
+                    candidate_outputs.push(out_dir.join("fsm_basins.csv"));
+                    candidate_outputs.push(out_dir.join("fsm_hydrograph.csv"));
+                }
+                for cand in &candidate_outputs {
+                    ensure_no_cli_path_collision(&cn_path, cand)?;
+                }
                 let precip_mm = scs_type2_mm.unwrap_or(rain_intensity * duration * 10.0);
                 let cn_arr = load_raster::<f64>(&cn_path, None)?;
                 let rc_arr = scs_curve_number_runoff(&cn_arr, precip_mm)?;
@@ -1800,7 +1834,7 @@ fn dispatch(command: Commands, lidar_cmd: Option<Vec<OsString>>) -> lidar::Resul
                     time_step_h: time_step,
                     compress,
                 },
-                routing: routing.into(),
+                routing: routing_mode,
                 runoff_coeff_path: resolved_runoff_coeff,
                 infiltration_path: infiltration,
                 antecedent_depth_path: antecedent_depth,
@@ -2064,7 +2098,13 @@ fn dispatch(command: Commands, lidar_cmd: Option<Vec<OsString>>) -> lidar::Resul
             if !has_advanced {
                 let res = simulate_inundation(&sink, &catchment, &out_dir, &opts)?;
                 if json {
-                    print_json(&res)?;
+                    let adv = lidar::SimulateInundationAdvancedResult {
+                        simulation: res,
+                        routing: RoutingMode::Static,
+                        fsm_basins_csv: None,
+                        fsm_mass_balance: None,
+                    };
+                    print_json(&adv)?;
                 } else {
                     println!(
                         "Simulated {} timestep(s) across {} region(s):\n  fill_time: {}\n  summary:   {}",
@@ -2095,11 +2135,7 @@ fn dispatch(command: Commands, lidar_cmd: Option<Vec<OsString>>) -> lidar::Resul
                 };
                 let adv = simulate_inundation_advanced(&sink, &catchment, &out_dir, &adv_opts)?;
                 if json {
-                    if adv.routing == RoutingMode::FillSpillMerge {
-                        print_json(&adv)?;
-                    } else {
-                        print_json(&adv.simulation)?;
-                    }
+                    print_json(&adv)?;
                 } else {
                     println!(
                         "Simulated {} timestep(s) across {} region(s):\n  fill_time: {}\n  summary:   {}",
@@ -3105,7 +3141,7 @@ mod tests {
         );
         assert!(pipe_dir.join("summary.json").exists());
 
-        // 3. simulate-inundation with --routing fsm, --runoff-coeff scalar, --scs-type2-mm
+        // 3. simulate-inundation with --routing fsm, --dem, --runoff-coeff scalar, --scs-type2-mm
         let sink_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_data/sink.tif");
         let sim_dir = tmp.path().join("sim_fsm");
         assert_eq!(
@@ -3117,6 +3153,8 @@ mod tests {
                 sim_dir.as_os_str().to_os_string(),
                 "--routing".into(),
                 "fsm".into(),
+                "--dem".into(),
+                dem_path.as_os_str().to_os_string(),
                 "--runoff-coeff".into(),
                 "0.75".into(),
                 "--infiltration".into(),
@@ -3150,6 +3188,40 @@ mod tests {
                 "static".into(),
                 "--dem".into(),
                 dem_path.as_os_str().to_os_string(),
+            ]),
+            1
+        );
+
+        // 5. simulate-inundation with --routing fsm without --dem must return an error
+        let missing_dem_dir = tmp.path().join("sim_fsm_no_dem");
+        assert_eq!(
+            run(vec![
+                "lidar".into(),
+                "simulate-inundation".into(),
+                sink_path.as_os_str().to_os_string(),
+                sink_path.as_os_str().to_os_string(),
+                missing_dem_dir.as_os_str().to_os_string(),
+                "--routing".into(),
+                "fsm".into(),
+            ]),
+            1
+        );
+
+        // 6. pipeline --curve-number colliding with an output path in out_dir must fail before writing
+        let collide_dir = tmp.path().join("pipe_cn_collide");
+        std::fs::create_dir_all(&collide_dir).unwrap();
+        let colliding_cn = collide_dir.join("fill_time.tif");
+        std::fs::copy(&cn_path, &colliding_cn).unwrap();
+        assert_eq!(
+            run(vec![
+                "lidar".into(),
+                "pipeline".into(),
+                dem_path.as_os_str().to_os_string(),
+                collide_dir.as_os_str().to_os_string(),
+                "--curve-number".into(),
+                colliding_cn.as_os_str().to_os_string(),
+                "--no-vectors".into(),
+                "--no-graph".into(),
             ]),
             1
         );

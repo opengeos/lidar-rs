@@ -1821,8 +1821,11 @@
     const outSpill = isMounts
       ? null
       : (player.spillPaths || []).find((s) => s.from_dep_id === d.id);
-    const effMmH = player.rainIntensity * player.runoffCoeff * 10.0;
-    const spillRunoff = outSpill ? `${(outSpill.spill_time_h * effMmH).toFixed(1)} mm` : "N/A";
+    const spillRunoffMm = outSpill ? cumulativeRunoffAt(player, outSpill.spill_time_h) : null;
+    const spillRunoff =
+      spillRunoffMm !== null && Number.isFinite(spillRunoffMm)
+        ? `${spillRunoffMm.toFixed(1)} mm`
+        : "N/A";
     const childrenStr =
       Array.isArray(d.children_ids) && d.children_ids.length > 0 ? d.children_ids.join(", ") : "None";
     const parentStr = d.parent_id > 0 ? `#${d.parent_id}` : "Root";
@@ -2259,20 +2262,50 @@
   }
 
   function parseInundationCurveRunoff(csv) {
-    const map = new Map();
-    map.set(0, 0);
-    if (!csv || typeof csv !== "string") return map;
+    const byStep = new Map();
+    byStep.set(0, 0);
+    const curve = [{ t: 0, mm: 0 }];
+    if (!csv || typeof csv !== "string") return { byStep, curve };
     const lines = csv.trim().split(/\r?\n/);
     for (let i = 1; i < lines.length; i++) {
       const parts = lines[i].split(",");
       if (parts.length < 3) continue;
       const stepNum = parseInt(parts[0], 10);
+      const timeHours = parseFloat(parts[1]);
       const runoffMm = parseFloat(parts[2]);
       if (Number.isFinite(stepNum) && Number.isFinite(runoffMm)) {
-        map.set(stepNum, runoffMm);
+        byStep.set(stepNum, runoffMm);
+      }
+      if (Number.isFinite(timeHours) && Number.isFinite(runoffMm)) {
+        curve.push({ t: timeHours, mm: runoffMm });
       }
     }
-    return map;
+    curve.sort((a, b) => a.t - b.t);
+    return { byStep, curve };
+  }
+
+  function cumulativeRunoffAt(playerState, tHours) {
+    if (!playerState || !Number.isFinite(tHours) || tHours < 0) return null;
+    if (
+      playerState.scsType2Mm > 0 &&
+      Array.isArray(playerState.runoffCurve) &&
+      playerState.runoffCurve.length > 0
+    ) {
+      const pts = playerState.runoffCurve;
+      if (tHours <= pts[0].t) return pts[0].mm;
+      for (let i = 1; i < pts.length; i++) {
+        if (tHours <= pts[i].t) {
+          const prev = pts[i - 1];
+          const curr = pts[i];
+          const dt = curr.t - prev.t;
+          if (dt <= 0) return curr.mm;
+          const frac = (tHours - prev.t) / dt;
+          return prev.mm + frac * (curr.mm - prev.mm);
+        }
+      }
+      return pts[pts.length - 1].mm;
+    }
+    return tHours * playerState.rainIntensity * playerState.runoffCoeff * 10.0;
   }
 
   function initPlayer(
@@ -2378,6 +2411,7 @@
       runoffCoeff,
       scsType2Mm: extraOpts.scsType2Mm || 0,
       runoffByStep: extraOpts.runoffByStep || null,
+      runoffCurve: extraOpts.runoffCurve || null,
       areaUnit,
       elevUnit: elevUnit || "",
       frameBuf: new Uint8ClampedArray(width * height * 4),
@@ -2705,7 +2739,7 @@
           typeof sim.ratingCurvesJson === "function" ? JSON.parse(sim.ratingCurvesJson()) : [];
         const steps = JSON.parse(sim.stepsJson());
         const spillPaths = JSON.parse(sim.spillPathsJson());
-        const runoffByStep =
+        const parsedRunoff =
           typeof sim.inundationCurveCsv === "function"
             ? parseInundationCurveRunoff(sim.inundationCurveCsv())
             : null;
@@ -2763,7 +2797,8 @@
           {
             kind: "inundation",
             scsType2Mm: scsType2Mm || 0,
-            runoffByStep,
+            runoffByStep: parsedRunoff ? parsedRunoff.byStep : null,
+            runoffCurve: parsedRunoff ? parsedRunoff.curve : null,
           },
         );
 

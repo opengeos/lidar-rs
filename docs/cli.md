@@ -128,7 +128,8 @@ lidar delineate-depressions out/sink.tif out \
 lidar delineate-mounts dsm.tif out_mounts \
   --min-size 1000 --min-height 0.3 --interval 0.3 --level-shp --comb-tif --gpkg
 
-# Catchments, overland flow paths, catchment hierarchy, and inundation simulation (static or FSM + forcing)
+# Catchments, overland flow paths, catchment hierarchy, and inundation simulation
+# (static routing uses catchment_hir.tif; --routing fsm requires --dem to compute D8 catchments directly)
 lidar delineate-catchments out/dem.tif out/region.tif out/catchments
 lidar delineate-flow-paths out/dem_filled.tif out/region.tif out/flowpath.shp --rain-intensity 5 --refined-dem out/dem.tif
 lidar catchment-hierarchy out/dem.tif out/shp-level out/catchment_hir.tif
