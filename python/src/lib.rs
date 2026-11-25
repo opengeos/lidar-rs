@@ -2,23 +2,27 @@
 
 use std::path::{Path, PathBuf};
 
-use numpy::ndarray::Array2;
-use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
+use numpy::ndarray::{Array1, Array2, Array3};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+use terrio::crs::SpatialRef;
 
 use lidar::pointcloud::{
-    GridMethod, GridStat, GroundFilterMethod, LidarToDsmOptions, LidarToDtmOptions, ReturnKind,
+    CsfOptions, Dimension, GridMethod, GridStat, GroundClassifyOptions, GroundFilterMethod,
+    LidarReadOptions, LidarToDsmOptions, LidarToDtmOptions, PmfOptions, PointCloud,
+    PointWriteOptions, ReturnKind, SmrfOptions, Values,
 };
 use lidar::{
     AnimateInundationOptions, Array2D, Bbox, BreachMode, BreachOptions, BurnCulvertsOptions,
     CatchmentHierarchyOptions, CatchmentHierarchyRecord, ConnectivityGraph,
     DelineateCatchmentsOptions, DelineateFlowPathsOptions, DelineateOptions, DemProduct,
     DownloadOptions, ExtractSinksOptions, FederalBundleOptions, FsmBasinSummary, FsmMassBalance,
-    GraphEdge, GraphNode, HillshadeOptions, InundationForcing, NestedDepression, NoaaAtlas14Table,
-    Region, RoutingMode, RunPipelineOptions, SimulateInundationOptions, SinkDepression,
-    SynthesizeCulvertsOptions, TiledDelineationOptions, TnmProductItem, Topology, WbdLevel,
+    GraphEdge, GraphNode, HillshadeOptions, InMemoryDepressions, InundationForcing,
+    NestedDepression, NoaaAtlas14Table, Region, RoutingMode, RunPipelineOptions,
+    SimulateInundationOptions, SinkDepression, SpillFlowPath, SynthesizeCulvertsOptions,
+    TiledDelineationOptions, TnmProductItem, Topology, WbdLevel,
 };
 
 fn to_py_err(e: lidar::Error) -> PyErr {
@@ -67,26 +71,150 @@ fn to_py_array2_i32<'py>(
     Ok(nd.into_pyarray(py))
 }
 
-fn from_py_array2_with_cell(
+fn to_py_array1_f64<'py>(py: Python<'py>, data: Vec<f64>) -> Bound<'py, PyArray1<f64>> {
+    Array1::from_vec(data).into_pyarray(py)
+}
+
+fn to_py_array1_u8<'py>(py: Python<'py>, data: Vec<u8>) -> Bound<'py, PyArray1<u8>> {
+    Array1::from_vec(data).into_pyarray(py)
+}
+
+fn to_py_array1_u16<'py>(py: Python<'py>, data: Vec<u16>) -> Bound<'py, PyArray1<u16>> {
+    Array1::from_vec(data).into_pyarray(py)
+}
+
+fn to_py_array3_u8<'py>(
+    py: Python<'py>,
+    h: usize,
+    w: usize,
+    c: usize,
+    data: Vec<u8>,
+) -> PyResult<Bound<'py, PyArray3<u8>>> {
+    let nd = Array3::from_shape_vec((h, w, c), data)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    Ok(nd.into_pyarray(py))
+}
+
+fn validate_geotransform(gt: [f64; 6]) -> PyResult<[f64; 6]> {
+    if !gt.iter().all(|v| v.is_finite()) {
+        return Err(PyValueError::new_err(
+            "geotransform elements must all be finite",
+        ));
+    }
+    let det = (gt[1] * gt[5] - gt[2] * gt[4]).abs();
+    if !det.is_finite() || det <= 0.0 {
+        return Err(PyValueError::new_err(
+            "geotransform must have a non-zero determinant (pixel_w * pixel_h - rot_x * rot_y != 0)",
+        ));
+    }
+    Ok(gt)
+}
+
+fn geotransform_to_py(gt: [f64; 6]) -> (f64, f64, f64, f64, f64, f64) {
+    (gt[0], gt[1], gt[2], gt[3], gt[4], gt[5])
+}
+
+fn crs_to_py(projection: &str) -> Option<String> {
+    let trimmed = projection.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn from_py_array2_spatial(
     arr: PyReadonlyArray2<'_, f64>,
     no_data: Option<f64>,
     cell_size: f64,
+    geotransform: Option<[f64; 6]>,
+    crs: Option<&str>,
 ) -> PyResult<Array2D<f64>> {
-    if !cell_size.is_finite() || cell_size <= 0.0 {
-        return Err(PyValueError::new_err(format!(
-            "cell_size must be finite and > 0, got {cell_size}"
-        )));
-    }
     let mut a = from_py_array2(arr, no_data)?;
-    a.geotransform = [
-        0.0,
-        cell_size,
-        0.0,
-        (a.height() as f64) * cell_size,
-        0.0,
-        -cell_size,
-    ];
+    if let Some(gt) = geotransform {
+        a.geotransform = validate_geotransform(gt)?;
+    } else {
+        if !cell_size.is_finite() || cell_size <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "cell_size must be finite and > 0, got {cell_size}"
+            )));
+        }
+        a.geotransform = [
+            0.0,
+            cell_size,
+            0.0,
+            (a.height() as f64) * cell_size,
+            0.0,
+            -cell_size,
+        ];
+    }
+    if let Some(c) = crs {
+        let trimmed = c.trim();
+        if !trimmed.is_empty() {
+            a.projection = trimmed.to_string();
+        }
+    }
     Ok(a)
+}
+
+fn from_py_array2_i32_spatial(
+    arr: PyReadonlyArray2<'_, i32>,
+    cell_size: f64,
+    geotransform: Option<[f64; 6]>,
+    crs: Option<&str>,
+) -> PyResult<Array2D<i32>> {
+    let view = arr.as_array();
+    let (h, w) = (view.nrows(), view.ncols());
+    let data: Vec<i32> = view
+        .as_slice()
+        .map(|s| s.to_vec())
+        .unwrap_or_else(|| view.iter().copied().collect());
+    let mut a = Array2D::from_vec(w, h, data).map_err(|e| to_py_err(e.into()))?;
+    a.set_no_data(0);
+    if let Some(gt) = geotransform {
+        a.geotransform = validate_geotransform(gt)?;
+    } else {
+        if !cell_size.is_finite() || cell_size <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "cell_size must be finite and > 0, got {cell_size}"
+            )));
+        }
+        a.geotransform = [
+            0.0,
+            cell_size,
+            0.0,
+            (a.height() as f64) * cell_size,
+            0.0,
+            -cell_size,
+        ];
+    }
+    if let Some(c) = crs {
+        let trimmed = c.trim();
+        if !trimmed.is_empty() {
+            a.projection = trimmed.to_string();
+        }
+    }
+    Ok(a)
+}
+
+fn xy_to_row_col(gt: &[f64; 6], xy: [f64; 2]) -> Option<(usize, usize)> {
+    let det = gt[1] * gt[5] - gt[2] * gt[4];
+    if !det.is_finite() || det.abs() <= 1e-18 {
+        return None;
+    }
+    let dx = xy[0] - gt[0];
+    let dy = xy[1] - gt[3];
+    let col_f = (dx * gt[5] - dy * gt[2]) / det - 0.5;
+    let row_f = (gt[1] * dy - gt[4] * dx) / det - 0.5;
+    if !col_f.is_finite() || !row_f.is_finite() {
+        return None;
+    }
+    let col = col_f.round() as i64;
+    let row = row_f.round() as i64;
+    if row < 0 || col < 0 {
+        return None;
+    }
+    Some((row as usize, col as usize))
 }
 
 fn parse_breach_mode(mode: &str) -> PyResult<BreachMode> {
@@ -229,6 +357,7 @@ fn graph_node_to_dict<'py>(py: Python<'py>, n: &GraphNode) -> PyResult<Bound<'py
     d.set_item("max_depth", n.max_depth)?;
     d.set_item("min_elev", n.min_elev)?;
     d.set_item("max_elev", n.max_elev)?;
+    d.set_item("spill_elev", n.max_elev)?;
     d.set_item("circularity", n.circularity)?;
     d.set_item("hypsometric_integral", n.hypsometric_integral)?;
     d.set_item("cat_area", n.cat_area)?;
@@ -237,7 +366,11 @@ fn graph_node_to_dict<'py>(py: Python<'py>, n: &GraphNode) -> PyResult<Bound<'py
     Ok(d)
 }
 
-fn graph_edge_to_dict<'py>(py: Python<'py>, e: &GraphEdge) -> PyResult<Bound<'py, PyDict>> {
+fn graph_edge_to_dict<'py>(
+    py: Python<'py>,
+    e: &GraphEdge,
+    gt: Option<&[f64; 6]>,
+) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     d.set_item("from_id", e.from_id)?;
     d.set_item("to_id", e.to_id)?;
@@ -249,6 +382,12 @@ fn graph_edge_to_dict<'py>(py: Python<'py>, e: &GraphEdge) -> PyResult<Bound<'py
     d.set_item("length_m", e.length_m)?;
     d.set_item("start_xy", e.start_xy.map(|xy| (xy[0], xy[1])))?;
     d.set_item("end_xy", e.end_xy.map(|xy| (xy[0], xy[1])))?;
+    let rc = match (e.start_xy, gt) {
+        (Some(xy), Some(g)) => xy_to_row_col(g, xy),
+        _ => None,
+    };
+    d.set_item("pour_row", rc.map(|(r, _)| r))?;
+    d.set_item("pour_col", rc.map(|(_, c)| c))?;
     d.set_item("dist_to_stream", e.dist_to_stream)?;
     Ok(d)
 }
@@ -256,6 +395,7 @@ fn graph_edge_to_dict<'py>(py: Python<'py>, e: &GraphEdge) -> PyResult<Bound<'py
 fn connectivity_graph_to_dict<'py>(
     py: Python<'py>,
     g: &ConnectivityGraph,
+    gt: Option<&[f64; 6]>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     d.set_item("rain_intensity_cm_h", g.rain_intensity_cm_h)?;
@@ -266,10 +406,416 @@ fn connectivity_graph_to_dict<'py>(
     d.set_item("nodes", nodes)?;
     let edges = PyList::empty(py);
     for e in &g.edges {
-        edges.append(graph_edge_to_dict(py, e)?)?;
+        edges.append(graph_edge_to_dict(py, e, gt)?)?;
     }
     d.set_item("edges", edges)?;
     Ok(d)
+}
+
+fn dict_get_or<'py, T>(d: &Bound<'py, PyDict>, key: &str, default: T) -> PyResult<T>
+where
+    for<'a> T: pyo3::FromPyObject<'a, 'py>,
+{
+    match d.get_item(key)? {
+        Some(v) if !v.is_none() => v.extract::<T>().map_err(|e| {
+            let py_err: PyErr = e.into();
+            PyValueError::new_err(format!("invalid field '{key}': {py_err}"))
+        }),
+        _ => Ok(default),
+    }
+}
+
+fn dict_to_nested_dep(d: &Bound<'_, PyDict>) -> PyResult<NestedDepression> {
+    let id: u32 = d
+        .get_item("id")?
+        .ok_or_else(|| PyValueError::new_err("depression dict missing required key 'id'"))?
+        .extract()?;
+    Ok(NestedDepression {
+        id,
+        level: dict_get_or(d, "level", 1u32)?,
+        count: dict_get_or(d, "count", 0usize)?,
+        area: dict_get_or(d, "area", 0.0f64)?,
+        volume: dict_get_or(d, "volume", 0.0f64)?,
+        avg_depth: dict_get_or(d, "avg_depth", 0.0f64)?,
+        max_depth: dict_get_or(d, "max_depth", 0.0f64)?,
+        min_elev: dict_get_or(d, "min_elev", 0.0f64)?,
+        max_elev: dict_get_or(d, "max_elev", 0.0f64)?,
+        children_ids: dict_get_or(d, "children_ids", Vec::<u32>::new())?,
+        region_id: dict_get_or(d, "region_id", 1u32)?,
+        perimeter: dict_get_or(d, "perimeter", 0.0f64)?,
+        major_axis: dict_get_or(d, "major_axis", 0.0f64)?,
+        minor_axis: dict_get_or(d, "minor_axis", 0.0f64)?,
+        elongatedness: dict_get_or(d, "elongatedness", 0.0f64)?,
+        eccentricity: dict_get_or(d, "eccentricity", 0.0f64)?,
+        orientation: dict_get_or(d, "orientation", 0.0f64)?,
+        area_bbox_ratio: dict_get_or(d, "area_bbox_ratio", 0.0f64)?,
+        parent_id: dict_get_or(d, "parent_id", 0u32)?,
+        circularity: dict_get_or(d, "circularity", 0.0f64)?,
+        depth_diam_ratio: dict_get_or(d, "depth_diam_ratio", 0.0f64)?,
+        hypsometric_integral: dict_get_or(d, "hypsometric_integral", 0.0f64)?,
+        rim_slope_deg: dict_get_or(d, "rim_slope_deg", 0.0f64)?,
+        artifact_flag: dict_get_or(d, "artifact_flag", false)?,
+    })
+}
+
+fn dict_to_catchment_record(d: &Bound<'_, PyDict>) -> PyResult<CatchmentHierarchyRecord> {
+    Ok(CatchmentHierarchyRecord {
+        level: dict_get_or(d, "level", 1u32)?,
+        level_fid: dict_get_or(d, "level_fid", 1u32)?,
+        count: dict_get_or(d, "count", 0usize)?,
+        area: dict_get_or(d, "area", 0.0f64)?,
+        cat_area: dict_get_or(d, "cat_area", 0.0f64)?,
+        dep_to_cat_ratio: dict_get_or(d, "dep_to_cat_ratio", 0.0f64)?,
+        min_elev: dict_get_or(d, "min_elev", 0.0f64)?,
+        max_elev: dict_get_or(d, "max_elev", 0.0f64)?,
+        range: dict_get_or(d, "range", 0.0f64)?,
+        mean_elev: dict_get_or(d, "mean_elev", 0.0f64)?,
+        std_elev: dict_get_or(d, "std_elev", 0.0f64)?,
+        sum_elev: dict_get_or(d, "sum_elev", 0.0f64)?,
+        volume: dict_get_or(d, "volume", 0.0f64)?,
+        mean_depth: dict_get_or(d, "mean_depth", 0.0f64)?,
+    })
+}
+
+fn dict_to_spill_path(d: &Bound<'_, PyDict>) -> PyResult<SpillFlowPath> {
+    Ok(SpillFlowPath {
+        from_dep_id: dict_get_or(d, "from_dep_id", 0u32)?,
+        from_level: dict_get_or(d, "from_level", 1u32)?,
+        to_dep_id: dict_get_or(d, "to_dep_id", 0u32)?,
+        spill_time_h: dict_get_or(d, "spill_time_h", 0.0f64)?,
+        merge_time_h: dict_get_or(d, "merge_time_h", None)?,
+        spill_elev: dict_get_or(d, "spill_elev", 0.0f64)?,
+        cells: dict_get_or(d, "cells", Vec::<(usize, usize)>::new())?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_ground_options(
+    ground_class: u8,
+    cloth_resolution: Option<f64>,
+    rigidness: Option<usize>,
+    class_threshold: Option<f64>,
+    slope_smooth: Option<bool>,
+    iterations: Option<usize>,
+    time_step: Option<f64>,
+    max_window_size: Option<f64>,
+    initial_distance: Option<f64>,
+    max_distance: Option<f64>,
+    cell_size: Option<f64>,
+    slope: Option<f64>,
+    window_radius: Option<f64>,
+    elevation_threshold: Option<f64>,
+    elevation_scalar: Option<f64>,
+) -> PyResult<(CsfOptions, PmfOptions, SmrfOptions)> {
+    let mut csf = CsfOptions {
+        ground_class,
+        ..Default::default()
+    };
+    if let Some(v) = cloth_resolution {
+        if !v.is_finite() || v <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "cloth_resolution must be finite and > 0, got {v}"
+            )));
+        }
+        csf.resolution = v;
+    }
+    if let Some(v) = rigidness {
+        if !(1..=3).contains(&v) {
+            return Err(PyValueError::new_err(format!(
+                "rigidness must be 1, 2, or 3, got {v}"
+            )));
+        }
+        csf.rigidness = v;
+    }
+    if let Some(v) = class_threshold {
+        if !v.is_finite() || v <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "class_threshold must be finite and > 0, got {v}"
+            )));
+        }
+        csf.threshold = v;
+    }
+    if let Some(v) = slope_smooth {
+        csf.smooth = v;
+    }
+    if let Some(v) = iterations {
+        if v == 0 {
+            return Err(PyValueError::new_err("iterations must be > 0"));
+        }
+        csf.iterations = v;
+    }
+    if let Some(v) = time_step {
+        if !v.is_finite() || v <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "time_step must be finite and > 0, got {v}"
+            )));
+        }
+        csf.step = v;
+    }
+
+    let mut pmf = PmfOptions {
+        ground_class,
+        ..Default::default()
+    };
+    if let Some(v) = max_window_size {
+        if !v.is_finite() || v <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "max_window_size must be finite and > 0, got {v}"
+            )));
+        }
+        pmf.max_window = v;
+    }
+    if let Some(v) = initial_distance {
+        if !v.is_finite() || v < 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "initial_distance must be finite and >= 0, got {v}"
+            )));
+        }
+        pmf.initial_distance = v;
+    }
+    if let Some(v) = max_distance {
+        if !v.is_finite() || v < 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "max_distance must be finite and >= 0, got {v}"
+            )));
+        }
+        pmf.max_distance = v;
+    }
+
+    let mut smrf = SmrfOptions {
+        ground_class,
+        ..Default::default()
+    };
+    if let Some(v) = window_radius {
+        if !v.is_finite() || v <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "window_radius must be finite and > 0, got {v}"
+            )));
+        }
+        smrf.window = Some(v);
+    }
+    if let Some(v) = elevation_threshold {
+        if !v.is_finite() || v < 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "elevation_threshold must be finite and >= 0, got {v}"
+            )));
+        }
+        smrf.threshold = v;
+    }
+    if let Some(v) = elevation_scalar {
+        if !v.is_finite() || v < 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "elevation_scalar must be finite and >= 0, got {v}"
+            )));
+        }
+        smrf.scalar = v;
+    }
+
+    if let Some(v) = cell_size {
+        if !v.is_finite() || v <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "cell_size must be finite and > 0, got {v}"
+            )));
+        }
+        pmf.cell = v;
+        smrf.cell = v;
+    }
+    if let Some(v) = slope {
+        if !v.is_finite() || v < 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "slope must be finite and >= 0, got {v}"
+            )));
+        }
+        pmf.slope = v;
+        smrf.slope = v;
+    }
+
+    Ok((csf, pmf, smrf))
+}
+
+fn extract_dim_f64(cloud: &PointCloud, lower: &str, upper: &str) -> PyResult<Vec<f64>> {
+    if let Some(slice) = cloud.coords(lower) {
+        return Ok(slice.to_vec());
+    }
+    cloud
+        .dim(lower)
+        .or_else(|| cloud.dim(upper))
+        .map(|d| d.to_f64())
+        .ok_or_else(|| {
+            PyRuntimeError::new_err(format!(
+                "point cloud is missing required '{lower}' dimension"
+            ))
+        })
+}
+
+fn extract_dim_u8(cloud: &PointCloud, lower: &str, upper: &str) -> Option<Vec<u8>> {
+    let dim = cloud.dim(lower).or_else(|| cloud.dim(upper))?;
+    match &dim.values {
+        Values::U8(v) => Some(v.clone()),
+        _ => Some(
+            dim.to_f64()
+                .into_iter()
+                .map(|x| x.round().clamp(0.0, u8::MAX as f64) as u8)
+                .collect(),
+        ),
+    }
+}
+
+fn extract_dim_u16(cloud: &PointCloud, lower: &str, upper: &str) -> Option<Vec<u16>> {
+    let dim = cloud.dim(lower).or_else(|| cloud.dim(upper))?;
+    match &dim.values {
+        Values::U16(v) => Some(v.clone()),
+        _ => Some(
+            dim.to_f64()
+                .into_iter()
+                .map(|x| x.round().clamp(0.0, u16::MAX as f64) as u16)
+                .collect(),
+        ),
+    }
+}
+
+fn point_cloud_crs_str(cloud: &PointCloud) -> Option<String> {
+    if cloud.crs.is_unknown() {
+        None
+    } else {
+        cloud
+            .crs
+            .authority_code()
+            .or_else(|| cloud.crs.to_wkt())
+            .filter(|s| !s.trim().is_empty())
+    }
+}
+
+fn point_cloud_to_dict<'py>(py: Python<'py>, cloud: &PointCloud) -> PyResult<Bound<'py, PyDict>> {
+    let xs = extract_dim_f64(cloud, "x", "X")?;
+    let ys = extract_dim_f64(cloud, "y", "Y")?;
+    let zs = extract_dim_f64(cloud, "z", "Z")?;
+    let count = xs.len();
+
+    let dict = PyDict::new(py);
+    dict.set_item("x", to_py_array1_f64(py, xs))?;
+    dict.set_item("y", to_py_array1_f64(py, ys))?;
+    dict.set_item("z", to_py_array1_f64(py, zs))?;
+
+    match extract_dim_u8(cloud, "classification", "Classification") {
+        Some(v) => dict.set_item("classification", to_py_array1_u8(py, v))?,
+        None => dict.set_item("classification", py.None())?,
+    }
+    match extract_dim_u16(cloud, "intensity", "Intensity") {
+        Some(v) => dict.set_item("intensity", to_py_array1_u16(py, v))?,
+        None => dict.set_item("intensity", py.None())?,
+    }
+    match extract_dim_u8(cloud, "return_number", "ReturnNumber") {
+        Some(v) => dict.set_item("return_number", to_py_array1_u8(py, v))?,
+        None => dict.set_item("return_number", py.None())?,
+    }
+    match extract_dim_u8(cloud, "number_of_returns", "NumberOfReturns") {
+        Some(v) => dict.set_item("number_of_returns", to_py_array1_u8(py, v))?,
+        None => dict.set_item("number_of_returns", py.None())?,
+    }
+    dict.set_item("crs", point_cloud_crs_str(cloud))?;
+    dict.set_item("count", count)?;
+    Ok(dict)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn arrays_to_point_cloud(
+    x: PyReadonlyArray1<'_, f64>,
+    y: PyReadonlyArray1<'_, f64>,
+    z: PyReadonlyArray1<'_, f64>,
+    classification: Option<PyReadonlyArray1<'_, u8>>,
+    intensity: Option<PyReadonlyArray1<'_, u16>>,
+    return_number: Option<PyReadonlyArray1<'_, u8>>,
+    number_of_returns: Option<PyReadonlyArray1<'_, u8>>,
+    crs: Option<&str>,
+) -> PyResult<PointCloud> {
+    let xs: Vec<f64> = x.as_array().iter().copied().collect();
+    let ys: Vec<f64> = y.as_array().iter().copied().collect();
+    let zs: Vec<f64> = z.as_array().iter().copied().collect();
+    let n = xs.len();
+    if ys.len() != n || zs.len() != n {
+        return Err(PyValueError::new_err(format!(
+            "x, y, and z must have identical lengths; got {}, {}, {}",
+            xs.len(),
+            ys.len(),
+            zs.len()
+        )));
+    }
+    let mut dims = vec![
+        Dimension::new("x", Values::F64(xs)),
+        Dimension::new("y", Values::F64(ys)),
+        Dimension::new("z", Values::F64(zs)),
+    ];
+    if let Some(arr) = classification {
+        let v: Vec<u8> = arr.as_array().iter().copied().collect();
+        if v.len() != n {
+            return Err(PyValueError::new_err(format!(
+                "classification length ({}) must match point count ({n})",
+                v.len()
+            )));
+        }
+        dims.push(Dimension::new("classification", Values::U8(v)));
+    }
+    if let Some(arr) = intensity {
+        let v: Vec<u16> = arr.as_array().iter().copied().collect();
+        if v.len() != n {
+            return Err(PyValueError::new_err(format!(
+                "intensity length ({}) must match point count ({n})",
+                v.len()
+            )));
+        }
+        dims.push(Dimension::new("intensity", Values::U16(v)));
+    }
+    if let Some(arr) = return_number {
+        let v: Vec<u8> = arr.as_array().iter().copied().collect();
+        if v.len() != n {
+            return Err(PyValueError::new_err(format!(
+                "return_number length ({}) must match point count ({n})",
+                v.len()
+            )));
+        }
+        dims.push(Dimension::new("return_number", Values::U8(v)));
+    }
+    if let Some(arr) = number_of_returns {
+        let v: Vec<u8> = arr.as_array().iter().copied().collect();
+        if v.len() != n {
+            return Err(PyValueError::new_err(format!(
+                "number_of_returns length ({}) must match point count ({n})",
+                v.len()
+            )));
+        }
+        dims.push(Dimension::new("number_of_returns", Values::U8(v)));
+    }
+    let spatial_ref = match crs.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(c) => SpatialRef::parse(c)
+            .map_err(|e| PyValueError::new_err(format!("invalid CRS '{c}': {e}")))?,
+        None => SpatialRef::default(),
+    };
+    Ok(PointCloud::new(dims, spatial_ref))
+}
+
+fn ground_classify_result_to_dict<'py>(
+    py: Python<'py>,
+    method: &str,
+    ground_class: u8,
+    output_path: Option<String>,
+    classified: &PointCloud,
+) -> PyResult<Bound<'py, PyDict>> {
+    let classes = extract_dim_u8(classified, "classification", "Classification")
+        .unwrap_or_else(|| vec![0u8; classified.len()]);
+    let total_points = classes.len();
+    let ground_points = classes.iter().filter(|&&c| c == ground_class).count();
+    let non_ground_points = total_points.saturating_sub(ground_points);
+
+    let dict = PyDict::new(py);
+    dict.set_item("method", method)?;
+    dict.set_item("total_points", total_points)?;
+    dict.set_item("ground_points", ground_points)?;
+    dict.set_item("non_ground_points", non_ground_points)?;
+    dict.set_item("ground_class", ground_class)?;
+    dict.set_item("output_path", output_path)?;
+    dict.set_item("classification", to_py_array1_u8(py, classes))?;
+    Ok(dict)
 }
 
 fn opt_path_to_py(p: Option<&PathBuf>) -> Option<String> {
@@ -831,7 +1377,7 @@ fn lidar_to_dsm(
 }
 
 #[pyfunction]
-#[pyo3(signature = (in_lidar, out_dtm, resolution=1.0, ground_method="csf", ground_class=2, radius=None, method="linear", stat="idw", window_size=5))]
+#[pyo3(signature = (in_lidar, out_dtm, resolution=1.0, ground_method="csf", ground_class=2, radius=None, method="linear", stat="idw", window_size=5, cloth_resolution=None, rigidness=None, class_threshold=None, slope_smooth=None, iterations=None, time_step=None, max_window_size=None, initial_distance=None, max_distance=None, cell_size=None, slope=None, window_radius=None, elevation_threshold=None, elevation_scalar=None))]
 #[allow(clippy::too_many_arguments)]
 fn lidar_to_dtm(
     py: Python<'_>,
@@ -844,7 +1390,38 @@ fn lidar_to_dtm(
     method: &str,
     stat: &str,
     window_size: usize,
+    cloth_resolution: Option<f64>,
+    rigidness: Option<usize>,
+    class_threshold: Option<f64>,
+    slope_smooth: Option<bool>,
+    iterations: Option<usize>,
+    time_step: Option<f64>,
+    max_window_size: Option<f64>,
+    initial_distance: Option<f64>,
+    max_distance: Option<f64>,
+    cell_size: Option<f64>,
+    slope: Option<f64>,
+    window_radius: Option<f64>,
+    elevation_threshold: Option<f64>,
+    elevation_scalar: Option<f64>,
 ) -> PyResult<(usize, usize)> {
+    let (csf, pmf, smrf) = build_ground_options(
+        ground_class,
+        cloth_resolution,
+        rigidness,
+        class_threshold,
+        slope_smooth,
+        iterations,
+        time_step,
+        max_window_size,
+        initial_distance,
+        max_distance,
+        cell_size,
+        slope,
+        window_radius,
+        elevation_threshold,
+        elevation_scalar,
+    )?;
     let opts = LidarToDtmOptions {
         resolution,
         ground_method: parse_ground_method(ground_method)?,
@@ -853,6 +1430,9 @@ fn lidar_to_dtm(
         method: GridMethod::parse(method).map_err(|e| to_py_err(e.into()))?,
         stat: GridStat::parse(stat).map_err(|e| to_py_err(e.into()))?,
         window_size,
+        csf,
+        pmf,
+        smrf,
         ..Default::default()
     };
     let in_lidar = in_lidar.to_string();
@@ -862,7 +1442,7 @@ fn lidar_to_dtm(
 }
 
 #[pyfunction]
-#[pyo3(signature = (in_lidar, out_chm, resolution=1.0, ground_method="csf", ground_class=2, radius=None, window_size=5))]
+#[pyo3(signature = (in_lidar, out_chm, resolution=1.0, ground_method="csf", ground_class=2, radius=None, window_size=5, cloth_resolution=None, rigidness=None, class_threshold=None, slope_smooth=None, iterations=None, time_step=None, max_window_size=None, initial_distance=None, max_distance=None, cell_size=None, slope=None, window_radius=None, elevation_threshold=None, elevation_scalar=None))]
 #[allow(clippy::too_many_arguments)]
 fn lidar_to_chm(
     py: Python<'_>,
@@ -873,19 +1453,284 @@ fn lidar_to_chm(
     ground_class: u8,
     radius: Option<f64>,
     window_size: usize,
+    cloth_resolution: Option<f64>,
+    rigidness: Option<usize>,
+    class_threshold: Option<f64>,
+    slope_smooth: Option<bool>,
+    iterations: Option<usize>,
+    time_step: Option<f64>,
+    max_window_size: Option<f64>,
+    initial_distance: Option<f64>,
+    max_distance: Option<f64>,
+    cell_size: Option<f64>,
+    slope: Option<f64>,
+    window_radius: Option<f64>,
+    elevation_threshold: Option<f64>,
+    elevation_scalar: Option<f64>,
 ) -> PyResult<(usize, usize)> {
+    let (csf, pmf, smrf) = build_ground_options(
+        ground_class,
+        cloth_resolution,
+        rigidness,
+        class_threshold,
+        slope_smooth,
+        iterations,
+        time_step,
+        max_window_size,
+        initial_distance,
+        max_distance,
+        cell_size,
+        slope,
+        window_radius,
+        elevation_threshold,
+        elevation_scalar,
+    )?;
     let opts = LidarToDtmOptions {
         resolution,
         ground_method: parse_ground_method(ground_method)?,
         ground_class,
         radius,
         window_size,
+        csf,
+        pmf,
+        smrf,
         ..Default::default()
     };
     let in_lidar = in_lidar.to_string();
     let out_chm = out_chm.to_string();
     py.detach(move || lidar::lidar_to_chm(&in_lidar, &out_chm, &opts))
         .map_err(to_py_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (path, bounds=None, polygon_path=None, max_points=None, min_z=None, max_z=None, classifications=None, return_kinds=None, max_level=None, resolution=None))]
+#[allow(clippy::too_many_arguments)]
+fn read_lidar<'py>(
+    py: Python<'py>,
+    path: &str,
+    bounds: Option<[f64; 4]>,
+    polygon_path: Option<&str>,
+    max_points: Option<usize>,
+    min_z: Option<f64>,
+    max_z: Option<f64>,
+    classifications: Option<Vec<u8>>,
+    return_kinds: Option<Vec<String>>,
+    max_level: Option<u32>,
+    resolution: Option<f64>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let opts = LidarReadOptions {
+        bounds,
+        max_level,
+        resolution,
+        max_points,
+        classifications: classifications.unwrap_or_default(),
+        return_kinds: parse_return_kinds_py(return_kinds)?.unwrap_or_default(),
+        min_z,
+        max_z,
+        polygon_path: polygon_path.map(PathBuf::from),
+    };
+    let path_s = path.to_string();
+    let cloud = py
+        .detach(move || lidar::read_lidar_windowed(&path_s, &opts))
+        .map_err(to_py_err)?;
+    point_cloud_to_dict(py, &cloud)
+}
+
+#[pyfunction]
+#[pyo3(signature = (path, x, y, z, classification=None, intensity=None, return_number=None, number_of_returns=None, crs=None))]
+#[allow(clippy::too_many_arguments)]
+fn write_lidar(
+    py: Python<'_>,
+    path: &str,
+    x: PyReadonlyArray1<'_, f64>,
+    y: PyReadonlyArray1<'_, f64>,
+    z: PyReadonlyArray1<'_, f64>,
+    classification: Option<PyReadonlyArray1<'_, u8>>,
+    intensity: Option<PyReadonlyArray1<'_, u16>>,
+    return_number: Option<PyReadonlyArray1<'_, u8>>,
+    number_of_returns: Option<PyReadonlyArray1<'_, u8>>,
+    crs: Option<&str>,
+) -> PyResult<usize> {
+    let cloud = arrays_to_point_cloud(
+        x,
+        y,
+        z,
+        classification,
+        intensity,
+        return_number,
+        number_of_returns,
+        crs,
+    )?;
+    let n = cloud.len();
+    let path_s = path.to_string();
+    py.detach(move || lidar::write_lidar(&cloud, &path_s, &PointWriteOptions::default()))
+        .map_err(to_py_err)?;
+    Ok(n)
+}
+
+#[pyfunction]
+#[pyo3(signature = (in_lidar, out_lidar=None, method="csf", ground_class=2, cloth_resolution=None, rigidness=None, class_threshold=None, slope_smooth=None, iterations=None, time_step=None, max_window_size=None, initial_distance=None, max_distance=None, cell_size=None, slope=None, window_radius=None, elevation_threshold=None, elevation_scalar=None))]
+#[allow(clippy::too_many_arguments)]
+fn classify_ground_file<'py>(
+    py: Python<'py>,
+    in_lidar: &str,
+    out_lidar: Option<&str>,
+    method: &str,
+    ground_class: u8,
+    cloth_resolution: Option<f64>,
+    rigidness: Option<usize>,
+    class_threshold: Option<f64>,
+    slope_smooth: Option<bool>,
+    iterations: Option<usize>,
+    time_step: Option<f64>,
+    max_window_size: Option<f64>,
+    initial_distance: Option<f64>,
+    max_distance: Option<f64>,
+    cell_size: Option<f64>,
+    slope: Option<f64>,
+    window_radius: Option<f64>,
+    elevation_threshold: Option<f64>,
+    elevation_scalar: Option<f64>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let parsed_method = parse_ground_method(method)?;
+    if parsed_method == GroundFilterMethod::Preclassified {
+        return Err(PyValueError::new_err(
+            "classify_ground method must be 'csf', 'pmf', or 'smrf'",
+        ));
+    }
+    let method_norm = match parsed_method {
+        GroundFilterMethod::Csf => "csf",
+        GroundFilterMethod::Pmf => "pmf",
+        GroundFilterMethod::Smrf => "smrf",
+        GroundFilterMethod::Preclassified => unreachable!(),
+    };
+    let (csf, pmf, smrf) = build_ground_options(
+        ground_class,
+        cloth_resolution,
+        rigidness,
+        class_threshold,
+        slope_smooth,
+        iterations,
+        time_step,
+        max_window_size,
+        initial_distance,
+        max_distance,
+        cell_size,
+        slope,
+        window_radius,
+        elevation_threshold,
+        elevation_scalar,
+    )?;
+    let opts = GroundClassifyOptions {
+        method: parsed_method,
+        csf,
+        pmf,
+        smrf,
+    };
+    let in_path = in_lidar.to_string();
+    let out_path = out_lidar.map(str::to_string);
+    let out_ret = out_path.clone();
+    let classified = py
+        .detach(move || -> lidar::Result<PointCloud> {
+            let cloud = lidar::read_lidar(&in_path)?;
+            let out_cloud = lidar::classify_ground_with_options(&cloud, &opts)?;
+            if let Some(ref dst) = out_path {
+                lidar::write_lidar(&out_cloud, dst, &PointWriteOptions::default())?;
+            }
+            Ok(out_cloud)
+        })
+        .map_err(to_py_err)?;
+    ground_classify_result_to_dict(py, method_norm, ground_class, out_ret, &classified)
+}
+
+#[pyfunction]
+#[pyo3(signature = (x, y, z, classification=None, intensity=None, return_number=None, number_of_returns=None, crs=None, out_lidar=None, method="csf", ground_class=2, cloth_resolution=None, rigidness=None, class_threshold=None, slope_smooth=None, iterations=None, time_step=None, max_window_size=None, initial_distance=None, max_distance=None, cell_size=None, slope=None, window_radius=None, elevation_threshold=None, elevation_scalar=None))]
+#[allow(clippy::too_many_arguments)]
+fn classify_ground_array<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray1<'_, f64>,
+    y: PyReadonlyArray1<'_, f64>,
+    z: PyReadonlyArray1<'_, f64>,
+    classification: Option<PyReadonlyArray1<'_, u8>>,
+    intensity: Option<PyReadonlyArray1<'_, u16>>,
+    return_number: Option<PyReadonlyArray1<'_, u8>>,
+    number_of_returns: Option<PyReadonlyArray1<'_, u8>>,
+    crs: Option<&str>,
+    out_lidar: Option<&str>,
+    method: &str,
+    ground_class: u8,
+    cloth_resolution: Option<f64>,
+    rigidness: Option<usize>,
+    class_threshold: Option<f64>,
+    slope_smooth: Option<bool>,
+    iterations: Option<usize>,
+    time_step: Option<f64>,
+    max_window_size: Option<f64>,
+    initial_distance: Option<f64>,
+    max_distance: Option<f64>,
+    cell_size: Option<f64>,
+    slope: Option<f64>,
+    window_radius: Option<f64>,
+    elevation_threshold: Option<f64>,
+    elevation_scalar: Option<f64>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let parsed_method = parse_ground_method(method)?;
+    if parsed_method == GroundFilterMethod::Preclassified {
+        return Err(PyValueError::new_err(
+            "classify_ground method must be 'csf', 'pmf', or 'smrf'",
+        ));
+    }
+    let method_norm = match parsed_method {
+        GroundFilterMethod::Csf => "csf",
+        GroundFilterMethod::Pmf => "pmf",
+        GroundFilterMethod::Smrf => "smrf",
+        GroundFilterMethod::Preclassified => unreachable!(),
+    };
+    let (csf, pmf, smrf) = build_ground_options(
+        ground_class,
+        cloth_resolution,
+        rigidness,
+        class_threshold,
+        slope_smooth,
+        iterations,
+        time_step,
+        max_window_size,
+        initial_distance,
+        max_distance,
+        cell_size,
+        slope,
+        window_radius,
+        elevation_threshold,
+        elevation_scalar,
+    )?;
+    let opts = GroundClassifyOptions {
+        method: parsed_method,
+        csf,
+        pmf,
+        smrf,
+    };
+    let cloud = arrays_to_point_cloud(
+        x,
+        y,
+        z,
+        classification,
+        intensity,
+        return_number,
+        number_of_returns,
+        crs,
+    )?;
+    let out_path = out_lidar.map(str::to_string);
+    let out_ret = out_path.clone();
+    let classified = py
+        .detach(move || -> lidar::Result<PointCloud> {
+            let out_cloud = lidar::classify_ground_with_options(&cloud, &opts)?;
+            if let Some(ref dst) = out_path {
+                lidar::write_lidar(&out_cloud, dst, &PointWriteOptions::default())?;
+            }
+            Ok(out_cloud)
+        })
+        .map_err(to_py_err)?;
+    ground_classify_result_to_dict(py, method_norm, ground_class, out_ret, &classified)
 }
 
 #[pyfunction]
@@ -1197,7 +2042,8 @@ fn export_inundation_frames_png(
 }
 
 #[pyfunction]
-#[pyo3(signature = (arr, mode="selective", max_depth=None, max_length=None, fill_remaining=false, no_data=None))]
+#[pyo3(signature = (arr, mode="selective", max_depth=None, max_length=None, fill_remaining=false, no_data=None, geotransform=None, crs=None))]
+#[allow(clippy::too_many_arguments)]
 fn breach_depressions_array<'py>(
     py: Python<'py>,
     arr: PyReadonlyArray2<'_, f64>,
@@ -1206,8 +2052,10 @@ fn breach_depressions_array<'py>(
     max_length: Option<u32>,
     fill_remaining: bool,
     no_data: Option<f64>,
+    geotransform: Option<[f64; 6]>,
+    crs: Option<&str>,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
-    let dem = from_py_array2(arr, no_data)?;
+    let dem = from_py_array2_spatial(arr, no_data, 1.0, geotransform, crs)?;
     let mut opts = BreachOptions::for_mode(parse_breach_mode(mode)?, max_depth, max_length);
     opts.fill_remaining = fill_remaining;
     let out = py
@@ -1297,7 +2145,8 @@ fn scs_type2_hyetograph(
 }
 
 #[pyfunction]
-#[pyo3(signature = (arr, min_size=1000, topology="D8", no_data=None, cell_size=1.0))]
+#[pyo3(signature = (arr, min_size=1000, topology="D8", no_data=None, cell_size=1.0, geotransform=None, crs=None))]
+#[allow(clippy::too_many_arguments)]
 fn extract_sinks_array<'py>(
     py: Python<'py>,
     arr: PyReadonlyArray2<'_, f64>,
@@ -1305,8 +2154,12 @@ fn extract_sinks_array<'py>(
     topology: &str,
     no_data: Option<f64>,
     cell_size: f64,
+    geotransform: Option<[f64; 6]>,
+    crs: Option<&str>,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let dem = from_py_array2_with_cell(arr, no_data, cell_size)?;
+    let dem = from_py_array2_spatial(arr, no_data, cell_size, geotransform, crs)?;
+    let out_gt = dem.geotransform;
+    let out_crs = crs_to_py(&dem.projection);
     let topo = parse_topology(topology)?;
     let mem = py
         .detach(move || lidar::extract_sinks_in_memory(&dem, min_size, topo))
@@ -1324,11 +2177,14 @@ fn extract_sinks_array<'py>(
         deps.append(sink_dep_to_dict(py, d)?)?;
     }
     dict.set_item("depressions", deps)?;
+    dict.set_item("geotransform", geotransform_to_py(out_gt))?;
+    dict.set_item("crs", out_crs)?;
     Ok(dict)
 }
 
 #[pyfunction]
-#[pyo3(signature = (sink_arr, min_size=1000, min_depth=0.3, interval=0.3, no_data=None, cell_size=1.0))]
+#[pyo3(signature = (sink_arr, min_size=1000, min_depth=0.3, interval=0.3, no_data=None, cell_size=1.0, geotransform=None, crs=None))]
+#[allow(clippy::too_many_arguments)]
 fn delineate_depressions_array<'py>(
     py: Python<'py>,
     sink_arr: PyReadonlyArray2<'_, f64>,
@@ -1337,8 +2193,12 @@ fn delineate_depressions_array<'py>(
     interval: f64,
     no_data: Option<f64>,
     cell_size: f64,
+    geotransform: Option<[f64; 6]>,
+    crs: Option<&str>,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let sink = from_py_array2_with_cell(sink_arr, no_data, cell_size)?;
+    let sink = from_py_array2_spatial(sink_arr, no_data, cell_size, geotransform, crs)?;
+    let out_gt = sink.geotransform;
+    let out_crs = crs_to_py(&sink.projection);
     let mem = py
         .detach(move || {
             lidar::delineate_depressions_in_memory(&sink, min_size, min_depth, interval)
@@ -1358,11 +2218,382 @@ fn delineate_depressions_array<'py>(
         deps.append(nested_dep_to_dict(py, d)?)?;
     }
     dict.set_item("depressions", deps)?;
+    dict.set_item("geotransform", geotransform_to_py(out_gt))?;
+    dict.set_item("crs", out_crs)?;
     Ok(dict)
 }
 
 #[pyfunction]
-#[pyo3(signature = (dem_arr, kernel_size=3, min_size=1000, min_depth=0.3, interval=0.3, rain_intensity_cm_h=5.0, rain_duration_h=50.0, time_step_h=1.0, runoff_coeff_arr=None, infiltration_arr=None, antecedent_depth_arr=None, hyetograph=None, breach_max_depth=None, no_data=None, cell_size=1.0, routing="static"))]
+#[pyo3(signature = (dsm_arr, min_size=1000, min_height=0.3, interval=0.3, no_data=None, cell_size=1.0, geotransform=None, crs=None))]
+#[allow(clippy::too_many_arguments)]
+fn delineate_mounts_array<'py>(
+    py: Python<'py>,
+    dsm_arr: PyReadonlyArray2<'_, f64>,
+    min_size: usize,
+    min_height: f64,
+    interval: f64,
+    no_data: Option<f64>,
+    cell_size: f64,
+    geotransform: Option<[f64; 6]>,
+    crs: Option<&str>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dsm = from_py_array2_spatial(dsm_arr, no_data, cell_size, geotransform, crs)?;
+    let out_gt = dsm.geotransform;
+    let out_crs = crs_to_py(&dsm.projection);
+    let mem = py
+        .detach(move || lidar::delineate_mounts_in_memory(&dsm, min_size, min_height, interval))
+        .map_err(to_py_err)?;
+
+    let dict = PyDict::new(py);
+    dict.set_item("depression_id", to_py_array2_i32(py, mem.depression_id)?)?;
+    dict.set_item(
+        "depression_level",
+        to_py_array2_i32(py, mem.depression_level)?,
+    )?;
+    dict.set_item("max_level", mem.max_level)?;
+    dict.set_item("num_regions", mem.num_regions)?;
+    let deps = PyList::empty(py);
+    for d in &mem.depressions {
+        deps.append(nested_dep_to_dict(py, d)?)?;
+    }
+    dict.set_item("depressions", deps)?;
+    dict.set_item("geotransform", geotransform_to_py(out_gt))?;
+    dict.set_item("crs", out_crs)?;
+    Ok(dict)
+}
+
+#[pyfunction]
+#[pyo3(signature = (dem_arr, azimuth=315.0, altitude=45.0, z_factor=1.0, cell_size=1.0, geotransform=None, no_data=None, crs=None))]
+#[allow(clippy::too_many_arguments)]
+fn compute_hillshade_array<'py>(
+    py: Python<'py>,
+    dem_arr: PyReadonlyArray2<'_, f64>,
+    azimuth: f64,
+    altitude: f64,
+    z_factor: f64,
+    cell_size: f64,
+    geotransform: Option<[f64; 6]>,
+    no_data: Option<f64>,
+    crs: Option<&str>,
+) -> PyResult<Bound<'py, PyArray3<u8>>> {
+    let dem = from_py_array2_spatial(dem_arr, no_data, cell_size, geotransform, crs)?;
+    let (h, w) = (dem.height(), dem.width());
+    let opts = HillshadeOptions {
+        azimuth_deg: azimuth,
+        elevation_deg: altitude,
+        z_factor,
+        ..Default::default()
+    };
+    let rgb = py.detach(move || lidar::compute_hillshade_rgb(&dem, &opts));
+    to_py_array3_u8(py, h, w, 3, rgb)
+}
+
+#[pyfunction]
+#[pyo3(signature = (in_dem, azimuth=315.0, altitude=45.0, z_factor=1.0, no_data=None))]
+fn compute_hillshade_file<'py>(
+    py: Python<'py>,
+    in_dem: &str,
+    azimuth: f64,
+    altitude: f64,
+    z_factor: f64,
+    no_data: Option<f64>,
+) -> PyResult<Bound<'py, PyArray3<u8>>> {
+    let in_dem = in_dem.to_string();
+    let opts = HillshadeOptions {
+        azimuth_deg: azimuth,
+        elevation_deg: altitude,
+        z_factor,
+        ..Default::default()
+    };
+    let (h, w, rgb) = py
+        .detach(move || -> lidar::Result<(usize, usize, Vec<u8>)> {
+            let mut dem = lidar::load_raster::<f64>(&in_dem, None)?;
+            if let Some(nd) = no_data {
+                dem.set_no_data(nd);
+            }
+            let (h, w) = (dem.height(), dem.width());
+            let rgb = lidar::compute_hillshade_rgb(&dem, &opts);
+            Ok((h, w, rgb))
+        })
+        .map_err(to_py_err)?;
+    to_py_array3_u8(py, h, w, 3, rgb)
+}
+
+#[pyfunction]
+#[pyo3(signature = (sink_arr, depression_id=None, depression_level=None, depressions=None, interval=0.3, min_size=1000, min_depth=0.3, no_data=None, cell_size=1.0, geotransform=None, crs=None))]
+#[allow(clippy::too_many_arguments)]
+fn compute_rating_curves<'py>(
+    py: Python<'py>,
+    sink_arr: PyReadonlyArray2<'_, f64>,
+    depression_id: Option<PyReadonlyArray2<'_, i32>>,
+    depression_level: Option<PyReadonlyArray2<'_, i32>>,
+    depressions: Option<Bound<'py, PyList>>,
+    interval: f64,
+    min_size: usize,
+    min_depth: f64,
+    no_data: Option<f64>,
+    cell_size: f64,
+    geotransform: Option<[f64; 6]>,
+    crs: Option<&str>,
+) -> PyResult<Bound<'py, PyList>> {
+    let sink = from_py_array2_spatial(sink_arr, no_data, cell_size, geotransform, crs)?;
+    let gt = sink.geotransform;
+    let proj = sink.projection.clone();
+
+    let precomputed = match (depression_id, depressions) {
+        (Some(dep_id_arr), Some(dep_list)) => {
+            let id_grid = from_py_array2_i32_spatial(dep_id_arr, cell_size, Some(gt), Some(&proj))?;
+            let lvl_grid = match depression_level {
+                Some(lvl_arr) => {
+                    from_py_array2_i32_spatial(lvl_arr, cell_size, Some(gt), Some(&proj))?
+                }
+                None => {
+                    let mut z = Array2D::new(id_grid.width(), id_grid.height(), 0i32);
+                    z.copy_metadata_from(&id_grid);
+                    z
+                }
+            };
+            let mut dep_records = Vec::with_capacity(dep_list.len());
+            let mut max_level = 0u32;
+            let mut max_region = 0u32;
+            for item in dep_list.iter() {
+                let d = item.cast::<PyDict>().map_err(|_| {
+                    PyValueError::new_err("each element of depressions must be a dict")
+                })?;
+                let rec = dict_to_nested_dep(d)?;
+                max_level = max_level.max(rec.level);
+                max_region = max_region.max(rec.region_id);
+                dep_records.push(rec);
+            }
+            Some(InMemoryDepressions {
+                depression_id: id_grid,
+                depression_level: lvl_grid,
+                depressions: dep_records,
+                max_level,
+                num_regions: max_region,
+            })
+        }
+        (None, None) => None,
+        _ => {
+            return Err(PyValueError::new_err(
+                "provide both depression_id and depressions, or omit both to delineate automatically",
+            ));
+        }
+    };
+
+    let points = py
+        .detach(move || -> lidar::Result<Vec<lidar::RatingCurvePoint>> {
+            let deps = match precomputed {
+                Some(d) => d,
+                None => {
+                    lidar::delineate_depressions_in_memory(&sink, min_size, min_depth, interval)?
+                }
+            };
+            lidar::compute_rating_curves(&sink, &deps, interval)
+        })
+        .map_err(to_py_err)?;
+
+    struct RatingCurveGroup {
+        level: u32,
+        region_id: u32,
+        stages: Vec<f64>,
+        depths: Vec<f64>,
+        areas: Vec<f64>,
+        volumes: Vec<f64>,
+    }
+    let mut order: Vec<u32> = Vec::new();
+    let mut grouped: std::collections::HashMap<u32, RatingCurveGroup> =
+        std::collections::HashMap::new();
+    for pt in points {
+        let entry = grouped.entry(pt.dep_id).or_insert_with(|| {
+            order.push(pt.dep_id);
+            RatingCurveGroup {
+                level: pt.level,
+                region_id: pt.region_id,
+                stages: Vec::new(),
+                depths: Vec::new(),
+                areas: Vec::new(),
+                volumes: Vec::new(),
+            }
+        });
+        entry.stages.push(pt.stage);
+        entry.depths.push(pt.depth);
+        entry.areas.push(pt.area);
+        entry.volumes.push(pt.volume);
+    }
+
+    let out = PyList::empty(py);
+    for dep_id in order {
+        if let Some(group) = grouped.remove(&dep_id) {
+            let d = PyDict::new(py);
+            d.set_item("id", dep_id)?;
+            d.set_item("dep_id", dep_id)?;
+            d.set_item("level", group.level)?;
+            d.set_item("region_id", group.region_id)?;
+            d.set_item("stages", group.stages)?;
+            d.set_item("depths", group.depths)?;
+            d.set_item("areas", group.areas)?;
+            d.set_item("volumes", group.volumes)?;
+            out.append(d)?;
+        }
+    }
+    Ok(out)
+}
+
+#[pyfunction]
+#[pyo3(signature = (dem_arr, min_size=1000, min_depth=0.3, interval=0.3, rain_intensity_cm_h=5.0, rain_duration_h=50.0, time_step_h=1.0, kernel_size=1, hyetograph=None, stream_vector=None, no_data=None, cell_size=1.0, geotransform=None, crs=None))]
+#[allow(clippy::too_many_arguments)]
+fn build_connectivity_graph_from_dem<'py>(
+    py: Python<'py>,
+    dem_arr: PyReadonlyArray2<'_, f64>,
+    min_size: usize,
+    min_depth: f64,
+    interval: f64,
+    rain_intensity_cm_h: f64,
+    rain_duration_h: f64,
+    time_step_h: f64,
+    kernel_size: usize,
+    hyetograph: Option<Vec<(f64, f64)>>,
+    stream_vector: Option<&str>,
+    no_data: Option<f64>,
+    cell_size: f64,
+    geotransform: Option<[f64; 6]>,
+    crs: Option<&str>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let raw_dem = from_py_array2_spatial(dem_arr, no_data, cell_size, geotransform, crs)?;
+    let gt = raw_dem.geotransform;
+    let stream_path = stream_vector.map(PathBuf::from);
+    let sim_opts = SimulateInundationOptions {
+        min_size,
+        min_depth,
+        interval,
+        rain_intensity_cm_h,
+        rain_duration_h,
+        time_step_h,
+        compress: false,
+    };
+    let graph = py
+        .detach(move || -> lidar::Result<ConnectivityGraph> {
+            let opts = lidar::InMemoryFullPipelineOptions {
+                kernel_size,
+                breach: None,
+                simulation: sim_opts,
+                routing: RoutingMode::Static,
+                forcing: InundationForcing {
+                    runoff_coeff: None,
+                    infiltration_cm_h: None,
+                    antecedent_depth: None,
+                    hyetograph: hyetograph.as_deref(),
+                },
+                scalar_runoff_coeff: 1.0,
+                stream_vector: stream_path.as_deref(),
+            };
+            let pipe = lidar::run_full_pipeline_in_memory(&raw_dem, &opts)?;
+            Ok(pipe.connectivity_graph)
+        })
+        .map_err(to_py_err)?;
+    connectivity_graph_to_dict(py, &graph, Some(&gt))
+}
+
+#[pyfunction]
+#[pyo3(signature = (depression_id, depression_level, depressions, fill_time=None, catchment_records=None, spill_paths=None, rain_intensity_cm_h=5.0, hyetograph=None, stream_vector=None, cell_size=1.0, geotransform=None, crs=None))]
+#[allow(clippy::too_many_arguments)]
+fn build_connectivity_graph_from_parts<'py>(
+    py: Python<'py>,
+    depression_id: PyReadonlyArray2<'_, i32>,
+    depression_level: Option<PyReadonlyArray2<'_, i32>>,
+    depressions: Bound<'py, PyList>,
+    fill_time: Option<PyReadonlyArray2<'_, f64>>,
+    catchment_records: Option<Bound<'py, PyList>>,
+    spill_paths: Option<Bound<'py, PyList>>,
+    rain_intensity_cm_h: f64,
+    hyetograph: Option<Vec<(f64, f64)>>,
+    stream_vector: Option<&str>,
+    cell_size: f64,
+    geotransform: Option<[f64; 6]>,
+    crs: Option<&str>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let id_grid = from_py_array2_i32_spatial(depression_id, cell_size, geotransform, crs)?;
+    let gt = id_grid.geotransform;
+    let proj = id_grid.projection.clone();
+    let lvl_grid = match depression_level {
+        Some(lvl_arr) => from_py_array2_i32_spatial(lvl_arr, cell_size, Some(gt), Some(&proj))?,
+        None => {
+            let mut z = Array2D::new(id_grid.width(), id_grid.height(), 0i32);
+            z.copy_metadata_from(&id_grid);
+            z
+        }
+    };
+    let ft_grid = match fill_time {
+        Some(ft_arr) => from_py_array2_spatial(ft_arr, None, cell_size, Some(gt), Some(&proj))?,
+        None => {
+            let mut ft = Array2D::new(id_grid.width(), id_grid.height(), f64::NAN);
+            ft.set_no_data(f64::NAN);
+            ft.geotransform = gt;
+            ft.projection = proj.clone();
+            ft
+        }
+    };
+
+    let mut dep_records = Vec::with_capacity(depressions.len());
+    let mut max_level = 0u32;
+    let mut max_region = 0u32;
+    for item in depressions.iter() {
+        let d = item
+            .cast::<PyDict>()
+            .map_err(|_| PyValueError::new_err("each element of depressions must be a dict"))?;
+        let rec = dict_to_nested_dep(d)?;
+        max_level = max_level.max(rec.level);
+        max_region = max_region.max(rec.region_id);
+        dep_records.push(rec);
+    }
+
+    let mut cat_records = Vec::new();
+    if let Some(list) = catchment_records {
+        for item in list.iter() {
+            let d = item.cast::<PyDict>().map_err(|_| {
+                PyValueError::new_err("each element of catchment_records must be a dict")
+            })?;
+            cat_records.push(dict_to_catchment_record(d)?);
+        }
+    }
+
+    let mut spill_records = Vec::new();
+    if let Some(list) = spill_paths {
+        for item in list.iter() {
+            let d = item
+                .cast::<PyDict>()
+                .map_err(|_| PyValueError::new_err("each element of spill_paths must be a dict"))?;
+            spill_records.push(dict_to_spill_path(d)?);
+        }
+    }
+
+    let in_mem_deps = InMemoryDepressions {
+        depression_id: id_grid,
+        depression_level: lvl_grid,
+        depressions: dep_records,
+        max_level,
+        num_regions: max_region,
+    };
+    let stream_path = stream_vector.map(PathBuf::from);
+    let graph = py
+        .detach(move || {
+            lidar::build_connectivity_graph(
+                &in_mem_deps,
+                &cat_records,
+                &ft_grid,
+                &spill_records,
+                rain_intensity_cm_h,
+                hyetograph.as_deref(),
+                stream_path.as_deref(),
+            )
+        })
+        .map_err(to_py_err)?;
+    connectivity_graph_to_dict(py, &graph, Some(&gt))
+}
+
+#[pyfunction]
+#[pyo3(signature = (dem_arr, kernel_size=3, min_size=1000, min_depth=0.3, interval=0.3, rain_intensity_cm_h=5.0, rain_duration_h=50.0, time_step_h=1.0, runoff_coeff_arr=None, infiltration_arr=None, antecedent_depth_arr=None, hyetograph=None, breach_max_depth=None, no_data=None, cell_size=1.0, routing="static", geotransform=None, crs=None))]
 #[allow(clippy::too_many_arguments)]
 fn simulate_inundation_array<'py>(
     py: Python<'py>,
@@ -1382,17 +2613,21 @@ fn simulate_inundation_array<'py>(
     no_data: Option<f64>,
     cell_size: f64,
     routing: &str,
+    geotransform: Option<[f64; 6]>,
+    crs: Option<&str>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let routing_mode = parse_routing_mode(routing)?;
-    let raw_dem = from_py_array2_with_cell(dem_arr, no_data, cell_size)?;
+    let raw_dem = from_py_array2_spatial(dem_arr, no_data, cell_size, geotransform, crs)?;
+    let out_gt = raw_dem.geotransform;
+    let out_crs = crs_to_py(&raw_dem.projection);
     let rc = runoff_coeff_arr
-        .map(|a| from_py_array2_with_cell(a, None, cell_size))
+        .map(|a| from_py_array2_spatial(a, None, cell_size, Some(out_gt), crs))
         .transpose()?;
     let inf = infiltration_arr
-        .map(|a| from_py_array2_with_cell(a, None, cell_size))
+        .map(|a| from_py_array2_spatial(a, None, cell_size, Some(out_gt), crs))
         .transpose()?;
     let ant = antecedent_depth_arr
-        .map(|a| from_py_array2_with_cell(a, None, cell_size))
+        .map(|a| from_py_array2_spatial(a, None, cell_size, Some(out_gt), crs))
         .transpose()?;
 
     let sim_opts = SimulateInundationOptions {
@@ -1492,7 +2727,7 @@ fn simulate_inundation_array<'py>(
     dict.set_item("rating_curves", py_rc)?;
     dict.set_item(
         "connectivity_graph",
-        connectivity_graph_to_dict(py, &pipe.connectivity_graph)?,
+        connectivity_graph_to_dict(py, &pipe.connectivity_graph, Some(&out_gt))?,
     )?;
     dict.set_item(
         "connectivity_graphml",
@@ -1520,6 +2755,8 @@ fn simulate_inundation_array<'py>(
     } else {
         dict.set_item("fsm_basins", py.None())?;
     }
+    dict.set_item("geotransform", geotransform_to_py(out_gt))?;
+    dict.set_item("crs", out_crs)?;
     Ok(dict)
 }
 
@@ -2095,6 +3332,12 @@ fn _lidar_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(delineate_depressions_array, m)?)?;
     m.add_function(wrap_pyfunction!(delineate_depressions_tiled, m)?)?;
     m.add_function(wrap_pyfunction!(delineate_mounts, m)?)?;
+    m.add_function(wrap_pyfunction!(delineate_mounts_array, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_hillshade_array, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_hillshade_file, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_rating_curves, m)?)?;
+    m.add_function(wrap_pyfunction!(build_connectivity_graph_from_dem, m)?)?;
+    m.add_function(wrap_pyfunction!(build_connectivity_graph_from_parts, m)?)?;
     m.add_function(wrap_pyfunction!(delineate_catchments, m)?)?;
     m.add_function(wrap_pyfunction!(delineate_flow_paths, m)?)?;
     m.add_function(wrap_pyfunction!(delineate_catchment_hierarchy, m)?)?;
@@ -2127,6 +3370,10 @@ fn _lidar_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(join_tables, m)?)?;
     m.add_function(wrap_pyfunction!(csv_to_vector, m)?)?;
     m.add_function(wrap_pyfunction!(convert_lidar, m)?)?;
+    m.add_function(wrap_pyfunction!(read_lidar, m)?)?;
+    m.add_function(wrap_pyfunction!(write_lidar, m)?)?;
+    m.add_function(wrap_pyfunction!(classify_ground_file, m)?)?;
+    m.add_function(wrap_pyfunction!(classify_ground_array, m)?)?;
     m.add_function(wrap_pyfunction!(lidar_to_dsm, m)?)?;
     m.add_function(wrap_pyfunction!(lidar_to_dtm, m)?)?;
     m.add_function(wrap_pyfunction!(lidar_to_chm, m)?)?;
