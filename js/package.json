@@ -42,9 +42,9 @@
     "NOTICE"
   ],
   "scripts": {
-    "build:web": "wasm-pack build --target web --release --out-dir pkg -- --locked",
-    "build:node": "wasm-pack build --target nodejs --release --out-dir pkg-node -- --locked",
-    "build:bundler": "wasm-pack build --target bundler --release --out-dir pkg-bundler -- --locked",
+    "build:web": "wasm-pack build --target web --release --out-dir pkg -- --locked && node -e \"const fs=require('node:fs'); fs.rmSync('pkg/.gitignore',{force:true}); const p=JSON.parse(fs.readFileSync('pkg/package.json','utf8')); p.type='module'; fs.writeFileSync('pkg/package.json',JSON.stringify(p,null,2)+'\\n');\"",
+    "build:node": "wasm-pack build --target nodejs --release --out-dir pkg-node -- --locked && node -e \"const fs=require('node:fs'); fs.rmSync('pkg-node/.gitignore',{force:true}); const p=JSON.parse(fs.readFileSync('pkg-node/package.json','utf8')); p.type='commonjs'; fs.writeFileSync('pkg-node/package.json',JSON.stringify(p,null,2)+'\\n');\"",
+    "build:bundler": "wasm-pack build --target bundler --release --out-dir pkg-bundler -- --locked && node -e \"const fs=require('node:fs'); fs.rmSync('pkg-bundler/.gitignore',{force:true}); const p=JSON.parse(fs.readFileSync('pkg-bundler/package.json','utf8')); p.type='module'; fs.writeFileSync('pkg-bundler/package.json',JSON.stringify(p,null,2)+'\\n');\"",
     "build": "npm run build:web && npm run build:node && npm run build:bundler",
     "test": "node test.mjs",
     "prepublishOnly": "npm run build && npm test"

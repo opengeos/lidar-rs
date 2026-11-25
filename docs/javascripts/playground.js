@@ -249,11 +249,27 @@
     activeJobKind = null;
     pendingGif = null;
 
-    if (worker && workerPending.size > 0) {
+    if (kind === "run" && worker && workerPending.size > 0) {
+      // Terminate the worker only for heavy simulation runs so a superseding run never queues.
       terminateWorker(createCancelledError());
       if (useWorker) {
         // Warm up a clean standby worker in the background for the next run.
         workerRequest({ type: "init", wasmUrl: WASM_URL }).catch(() => {});
+      }
+    } else if (workerPending.size > 0) {
+      // For export / GIF / treeGif jobs, signal cooperative cancellation and reject pending
+      // promises on the main thread WITHOUT terminating the worker so activeSim/activeMounts
+      // remain intact for subsequent exports and Map View loads.
+      for (const [reqId, entry] of Array.from(workerPending.entries())) {
+        workerPending.delete(reqId);
+        if (worker) {
+          try {
+            worker.postMessage({ type: "cancel", targetId: reqId });
+          } catch (_) {
+            // Ignore postMessage failure if worker already exited
+          }
+        }
+        entry.reject(createCancelledError());
       }
     }
 
@@ -1735,16 +1751,61 @@
       return ctx.getImageData(0, 0, gifW, gifH).data;
     };
 
-    const gifBytes = encodeStreamedFramesToGif(
-      schedule.length,
-      (fi) => {
-        if (treeGifCancelled) throw createCancelledError();
-        return renderFrameRgba(fi);
-      },
-      gifW,
-      gifH,
-      delayMs,
-    );
+    let gifBytes;
+    if (useWorker) {
+      setStatus(
+        `Rendering ${schedule.length} depression tree frames for Web Worker GIF encoding...`,
+      );
+      const frames = new Array(schedule.length);
+      const transfer = new Array(schedule.length);
+      for (let fi = 0; fi < schedule.length; fi++) {
+        if (treeGifCancelled || player !== playerRef || currentSimId !== simIdRef) {
+          throw createCancelledError();
+        }
+        const rgba = renderFrameRgba(fi);
+        const copy = new Uint8Array(rgba.buffer, rgba.byteOffset, rgba.byteLength).slice();
+        frames[fi] = copy.buffer;
+        transfer[fi] = copy.buffer;
+        if ((fi & 3) === 3 || fi === schedule.length - 1) {
+          const frac = 0.05 + 0.4 * ((fi + 1) / schedule.length);
+          setProgress(frac, `Rendering frame ${fi + 1}/${schedule.length}`, true);
+          await nextTick();
+        }
+      }
+      if (treeGifCancelled || player !== playerRef || currentSimId !== simIdRef) {
+        throw createCancelledError();
+      }
+      setStatus("Encoding animated depression tree GIF in Web Worker...");
+      const res = await workerRequest(
+        {
+          type: "encodeGifFrames",
+          width: gifW,
+          height: gifH,
+          delayMs,
+          frames,
+          levelColors: LEVEL_COLORS,
+        },
+        {
+          transfer,
+          onProgress: (p) => {
+            setProgress(p.fraction, "Encoding tree GIF", true);
+            if (p.message) setStatus(p.message);
+          },
+        },
+      );
+      gifBytes = res.bytes;
+    } else {
+      gifBytes = encodeStreamedFramesToGif(
+        schedule.length,
+        (fi) => {
+          if (treeGifCancelled) throw createCancelledError();
+          return renderFrameRgba(fi);
+        },
+        gifW,
+        gifH,
+        delayMs,
+      );
+    }
     if (treeGifCancelled || player !== playerRef || currentSimId !== simIdRef) return;
 
     const elapsed = performance.now() - t0;
@@ -2941,20 +3002,21 @@
     if (isMounts && styleSel) styleSel.value = "level";
 
     const hasCrs = Boolean(player && Array.isArray(player.boundsWgs84) && player.boundsWgs84.length === 4);
-    if (leafletState.unavailableReason) {
+    if (!hasCrs) {
       mapBtn.disabled = true;
       if (noteEl) {
-        noteEl.textContent = leafletState.unavailableReason;
+        noteEl.textContent =
+          "Map View unavailable: loaded raster has no recognized CRS for WGS 84 reprojection.";
         noteEl.hidden = false;
       }
       if (leafletState.activeView === "map") {
         setActiveView("canvas");
       }
-    } else if (!hasCrs) {
-      mapBtn.disabled = true;
+    } else if (leafletState.unavailableReason) {
+      // Keep Map View clickable so transient CDN or network errors can be retried without reloading.
+      mapBtn.disabled = false;
       if (noteEl) {
-        noteEl.textContent =
-          "Map View unavailable: loaded raster has no recognized CRS for WGS 84 reprojection.";
+        noteEl.textContent = leafletState.unavailableReason;
         noteEl.hidden = false;
       }
       if (leafletState.activeView === "map") {
@@ -3115,6 +3177,15 @@
         updateMapToggleAvailability();
         return;
       }
+      // Clear any prior transient Leaflet load error so clicking Map View retries cleanly.
+      if (leafletState.unavailableReason) {
+        leafletState.unavailableReason = null;
+        const noteEl = $("lp-map-note");
+        if (noteEl) {
+          noteEl.textContent = "";
+          noteEl.hidden = true;
+        }
+      }
       stopPlayer();
     }
 
@@ -3150,7 +3221,7 @@
         const msg = errMsg(err);
         if (typeof window.L === "undefined") {
           leafletState.unavailableReason =
-            "Map View unavailable: could not load Leaflet library (offline or blocked CDN).";
+            "Map View unavailable: could not load Leaflet library (click Map View to retry).";
           updateMapToggleAvailability();
         } else {
           setActiveView("canvas");
@@ -3374,7 +3445,7 @@
     treeGifCancelled = false;
     activeJobKind = "treeGif";
     setTreeGifButtonsDisabled(true);
-    setProgress(0.1, "Encoding tree GIF", true);
+    setProgress(0.1, "Encoding tree GIF", useWorker);
     try {
       await exportDepressionTreeGif();
     } catch (e) {
