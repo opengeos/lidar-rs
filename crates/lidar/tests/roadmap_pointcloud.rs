@@ -530,7 +530,7 @@ fn polygon_spatial_query_on_copc_respects_exterior_and_interior_hole() {
     // Left half of exterior [10..20] x [10..30] = 10*20 = 200 minus left half of hole [16..20] x [16..24] = 4*8 = 32 -> 168.
     assert_eq!(half.len(), 168);
 
-    // Disjoint bounds returns an empty cloud without error.
+    // Disjoint bounds returns an empty cloud preserving x/y/z schema without error.
     let empty = read_lidar_in_polygon(
         &copc_path,
         &poly_path,
@@ -541,6 +541,7 @@ fn polygon_spatial_query_on_copc_respects_exterior_and_interior_hole() {
     )
     .unwrap();
     assert!(empty.is_empty());
+    assert!(empty.dim("x").is_some() && empty.dim("y").is_some() && empty.dim("z").is_some());
 }
 
 #[test]

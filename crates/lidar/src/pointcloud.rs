@@ -10,7 +10,7 @@
 //! filtering, Height Above Ground (HAG) normalization, COPC octree LOD/spatial
 //! windowing, bare-earth DTM generation, and Canopy Height Model (CHM) creation.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -177,7 +177,8 @@ pub struct LidarToDtmOptions {
     pub resolution: f64,
     /// Ground classification strategy (`GroundFilterMethod::Csf` by default).
     pub ground_method: GroundFilterMethod,
-    /// ASPRS ground class code (default `2`).
+    /// ASPRS ground class code (default `2`). When overriding `csf.ground_class`,
+    /// `pmf.ground_class`, or `smrf.ground_class`, set this field to the same value.
     pub ground_class: u8,
     /// Search radius around each cell center; `None` uses `terrio` default.
     pub radius: Option<f64>,
@@ -305,6 +306,8 @@ pub struct LidarReadOptions {
     pub max_z: Option<f64>,
     /// Optional path to a polygon vector file (GeoJSON, Shapefile, GeoPackage, etc.) used for
     /// bbox-accelerated COPC/LAS streaming followed by exact ray-casting point-in-polygon filtering.
+    /// When either the polygon layer or the point cloud lacks CRS metadata, reprojection is skipped
+    /// and both are assumed to share the same coordinate system.
     pub polygon_path: Option<PathBuf>,
 }
 
@@ -339,69 +342,54 @@ fn ring_to_xy(ring: &terrio::vector::Ring) -> Vec<(f64, f64)> {
     ring.coords().iter().map(|c| (c.x, c.y)).collect()
 }
 
+fn polygon_from_rings(
+    exterior: &terrio::vector::Ring,
+    interiors: &[terrio::vector::Ring],
+) -> Option<Polygon2D> {
+    let ext = ring_to_xy(exterior);
+    if ext.len() < 3 {
+        return None;
+    }
+    let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
+    let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for &(x, y) in &ext {
+        if x.is_finite() && y.is_finite() {
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+    }
+    if !min_x.is_finite() || !min_y.is_finite() {
+        return None;
+    }
+    let holes: Vec<Vec<(f64, f64)>> = interiors
+        .iter()
+        .map(ring_to_xy)
+        .filter(|r| r.len() >= 3)
+        .collect();
+    Some(Polygon2D {
+        bbox: [min_x, min_y, max_x, max_y],
+        exterior: ext,
+        interiors: holes,
+    })
+}
+
 fn collect_polygons_from_geometry(geom: &Geometry, out: &mut Vec<Polygon2D>) {
     match geom {
         Geometry::Polygon {
             exterior,
             interiors,
         } => {
-            let ext = ring_to_xy(exterior);
-            if ext.len() < 3 {
-                return;
+            if let Some(poly) = polygon_from_rings(exterior, interiors) {
+                out.push(poly);
             }
-            let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
-            let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
-            for &(x, y) in &ext {
-                if x.is_finite() && y.is_finite() {
-                    min_x = min_x.min(x);
-                    min_y = min_y.min(y);
-                    max_x = max_x.max(x);
-                    max_y = max_y.max(y);
-                }
-            }
-            if !min_x.is_finite() || !min_y.is_finite() {
-                return;
-            }
-            let holes: Vec<Vec<(f64, f64)>> = interiors
-                .iter()
-                .map(ring_to_xy)
-                .filter(|r| r.len() >= 3)
-                .collect();
-            out.push(Polygon2D {
-                bbox: [min_x, min_y, max_x, max_y],
-                exterior: ext,
-                interiors: holes,
-            });
         }
         Geometry::MultiPolygon(parts) => {
             for (exterior, interiors) in parts {
-                let ext = ring_to_xy(exterior);
-                if ext.len() < 3 {
-                    continue;
+                if let Some(poly) = polygon_from_rings(exterior, interiors) {
+                    out.push(poly);
                 }
-                let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
-                let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
-                for &(x, y) in &ext {
-                    if x.is_finite() && y.is_finite() {
-                        min_x = min_x.min(x);
-                        min_y = min_y.min(y);
-                        max_x = max_x.max(x);
-                        max_y = max_y.max(y);
-                    }
-                }
-                if !min_x.is_finite() || !min_y.is_finite() {
-                    continue;
-                }
-                let holes: Vec<Vec<(f64, f64)>> = interiors
-                    .iter()
-                    .map(ring_to_xy)
-                    .filter(|r| r.len() >= 3)
-                    .collect();
-                out.push(Polygon2D {
-                    bbox: [min_x, min_y, max_x, max_y],
-                    exterior: ext,
-                    interiors: holes,
-                });
             }
         }
         Geometry::GeometryCollection(geoms) => {
@@ -545,7 +533,10 @@ struct PolygonGridIndex {
 }
 
 impl PolygonGridIndex {
-    fn new(polygons: &[Polygon2D], bbox: [f64; 4]) -> Self {
+    /// Builds a uniform grid index over `polygons`, returning `None` if total cell-polygon
+    /// entries would exceed `min(polygons.len() * 64, 1_000_000)` (e.g., many overlapping large
+    /// polygons) so callers fall back to a linear bbox-checked scan with bounded memory.
+    fn new(polygons: &[Polygon2D], bbox: [f64; 4]) -> Option<Self> {
         let dim = (polygons.len() as f64).sqrt().ceil().clamp(2.0, 256.0) as usize;
         let span_x = bbox[2] - bbox[0];
         let span_y = bbox[3] - bbox[1];
@@ -559,8 +550,10 @@ impl PolygonGridIndex {
         } else {
             (1, 0.0)
         };
-        let mut cells = vec![Vec::new(); nx * ny];
-        for (pi, poly) in polygons.iter().enumerate() {
+        let max_entries = polygons.len().saturating_mul(64).min(1_000_000);
+        let mut total_entries = 0usize;
+        let mut spans: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(polygons.len());
+        for poly in polygons {
             let cx0 = (((poly.bbox[0] - bbox[0]) * inv_dx).floor() as isize)
                 .clamp(0, nx as isize - 1) as usize;
             let cx1 = (((poly.bbox[2] - bbox[0]) * inv_dx).floor() as isize)
@@ -569,6 +562,15 @@ impl PolygonGridIndex {
                 .clamp(0, ny as isize - 1) as usize;
             let cy1 = (((poly.bbox[3] - bbox[1]) * inv_dy).floor() as isize)
                 .clamp(0, ny as isize - 1) as usize;
+            let count = (cx1 - cx0 + 1).saturating_mul(cy1 - cy0 + 1);
+            total_entries = total_entries.saturating_add(count);
+            if total_entries > max_entries {
+                return None;
+            }
+            spans.push((cx0, cx1, cy0, cy1));
+        }
+        let mut cells = vec![Vec::new(); nx * ny];
+        for (pi, (cx0, cx1, cy0, cy1)) in spans.into_iter().enumerate() {
             for cy in cy0..=cy1 {
                 let row = cy * nx;
                 for cx in cx0..=cx1 {
@@ -576,14 +578,14 @@ impl PolygonGridIndex {
                 }
             }
         }
-        Self {
+        Some(Self {
             bbox,
             nx,
             ny,
             inv_dx,
             inv_dy,
             cells,
-        }
+        })
     }
 
     #[inline]
@@ -610,8 +612,12 @@ fn filter_cloud_by_polygons(
         return Ok(cloud.clone());
     }
     let (xs, ys) = extract_xy(cloud)?;
-    let keep: Vec<bool> = if polygons.len() > 8 {
-        let index = PolygonGridIndex::new(polygons, union_bbox);
+    let grid_index = if polygons.len() > 8 {
+        PolygonGridIndex::new(polygons, union_bbox)
+    } else {
+        None
+    };
+    let keep: Vec<bool> = if let Some(index) = grid_index {
         (0..cloud.len())
             .map(|i| {
                 let x = xs[i];
@@ -723,7 +729,14 @@ pub fn read_lidar_windowed(path: impl AsRef<Path>, opts: &LidarReadOptions) -> R
                 b[3].min(pb[3]),
             ];
             if inter[0] > inter[2] || inter[1] > inter[3] {
-                return Ok(PointCloud::new(Vec::new(), cloud_crs));
+                return Ok(PointCloud::new(
+                    vec![
+                        Dimension::new("x", Values::F64(Vec::new())),
+                        Dimension::new("y", Values::F64(Vec::new())),
+                        Dimension::new("z", Values::F64(Vec::new())),
+                    ],
+                    cloud_crs,
+                ));
             }
             Some(inter)
         }
@@ -904,7 +917,8 @@ fn extract_xyz(cloud: &PointCloud) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>)> {
 ///
 /// Every point with fewer than `min_neighbors` other points within 3D Euclidean distance
 /// `radius` is stripped from the returned [`PointCloud`]. Uses a 3D spatial hash grid for
-/// expected `O(N)` neighborhood counting with early exit once `min_neighbors` is reached.
+/// expected `O(N)` neighborhood counting for bounded point density, with early exit once
+/// `min_neighbors` is reached and a KD-tree fallback for extreme coordinate spans.
 pub fn filter_outliers_ror(
     cloud: &PointCloud,
     radius: f64,
@@ -951,8 +965,10 @@ pub fn filter_outliers_ror(
     let inv_r = 1.0 / radius;
     let max_span_cells = ((max_x - min_x).max(max_y - min_y).max(max_z - min_z)) * inv_r;
 
-    // If the shifted spatial grid fits safely in i64 cell indices, run O(N) 3D spatial hashing.
-    if max_span_cells.is_finite() && max_span_cells < (i64::MAX / 4) as f64 {
+    // Keep shifted cell indices strictly below 2^52 (well inside exact f64 integer range 2^53)
+    // so floor-quantized grid coordinates never suffer floating-point rounding.
+    const MAX_EXACT_GRID_SPAN: f64 = (1u64 << 52) as f64;
+    if max_span_cells.is_finite() && max_span_cells < MAX_EXACT_GRID_SPAN {
         let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::with_capacity(n);
         let mut cell_of: Vec<Option<(i64, i64, i64)>> = Vec::with_capacity(n);
         for i in 0..n {
@@ -1834,7 +1850,7 @@ fn delaunay_triangulate_2d(pts: &[(f64, f64, f64)]) -> Vec<[usize; 3]> {
     });
     let mut last_tri: usize = 0;
 
-    let mut bad_set: HashSet<usize> = HashSet::new();
+    let mut bad_set: BTreeSet<usize> = BTreeSet::new();
     let mut queue: VecDeque<usize> = VecDeque::new();
     // Each boundary edge stores `(a, b, outer_tri, outer_adj_slot)`.
     let mut boundary: Vec<(usize, usize, Option<usize>, Option<usize>)> = Vec::new();
@@ -2210,24 +2226,7 @@ fn rasterize_tin_max(
     }
 }
 
-/// Computes a pit-free Canopy Height Model [`Array2D<f64>`] in memory using the multi-level
-/// partial TIN algorithm of Khosravipour et al. (2014).
-///
-/// Steps:
-/// 1. Apply configured outlier filters (`options.dtm`), classify ground points, and build a
-///    bare-earth DTM on the point cloud's exact extent at `options.resolution`.
-/// 2. Compute Height Above Ground (`h = max(0, z - dtm(x, y))`) for every point. Canopy returns
-///    falling over DTM NoData cells (where no valid bilinear or 3x3 neighbor exists) are excluded
-///    from the CHM TIN rather than fabricating ground elevations.
-/// 3. Construct the base CHM TIN from all normalized returns (`h >= 0.0`, no edge-length cutoff).
-/// 4. For each positive height threshold `h_k > 0.0` in `options.height_thresholds`, build a
-///    partial Delaunay TIN from returns with `h >= h_k`, skipping triangles with any 2D edge
-///    longer than `max_triangle_edge` (default `3.0 * options.resolution`), and composite the
-///    pixel-wise maximum across all surfaces.
-pub fn points_to_chm_pit_free(
-    cloud: &PointCloud,
-    options: &PitFreeChmOptions,
-) -> Result<Array2D<f64>> {
+fn validate_pit_free_chm_options(options: &PitFreeChmOptions) -> Result<LidarToDtmOptions> {
     if !options.resolution.is_finite() || options.resolution <= 0.0 {
         return Err(Error::InvalidArgument(format!(
             "resolution must be finite and > 0, got {}",
@@ -2248,10 +2247,31 @@ pub fn points_to_chm_pit_free(
             )));
         }
     }
-
     let mut dtm_opts = options.dtm.clone();
     dtm_opts.resolution = options.resolution;
     validate_dtm_options(&dtm_opts)?;
+    Ok(dtm_opts)
+}
+
+/// Computes a pit-free Canopy Height Model [`Array2D<f64>`] in memory using the multi-level
+/// partial TIN algorithm of Khosravipour et al. (2014).
+///
+/// Steps:
+/// 1. Apply configured outlier filters (`options.dtm`), classify ground points, and build a
+///    bare-earth DTM on the point cloud's exact extent at `options.resolution`.
+/// 2. Compute Height Above Ground (`h = max(0, z - dtm(x, y))`) for every point. Canopy returns
+///    falling over DTM NoData cells (where no valid bilinear or 3x3 neighbor exists) are excluded
+///    from the CHM TIN rather than fabricating ground elevations.
+/// 3. Construct the base CHM TIN from all normalized returns (`h >= 0.0`, no edge-length cutoff).
+/// 4. For each positive height threshold `h_k > 0.0` in `options.height_thresholds`, build a
+///    partial Delaunay TIN from returns with `h >= h_k`, skipping triangles with any 2D edge
+///    longer than `max_triangle_edge` (default `3.0 * options.resolution`), and composite the
+///    pixel-wise maximum across all surfaces.
+pub fn points_to_chm_pit_free(
+    cloud: &PointCloud,
+    options: &PitFreeChmOptions,
+) -> Result<Array2D<f64>> {
+    let dtm_opts = validate_pit_free_chm_options(options)?;
 
     let cleaned = if has_dtm_outlier_filters(&dtm_opts) {
         apply_dtm_outlier_filters(cloud, &dtm_opts)?
@@ -2385,6 +2405,7 @@ pub fn lidar_to_chm_pit_free(
     out_tif: impl AsRef<Path>,
     options: &PitFreeChmOptions,
 ) -> Result<Array2D<f64>> {
+    validate_pit_free_chm_options(options)?;
     let out_path = out_tif.as_ref();
     crate::raster_ops::ensure_no_path_collision(source.as_ref(), &[out_path])?;
     ensure_parent_dir(out_path)?;
@@ -2683,5 +2704,77 @@ mod tests {
             "canopy point over DTM NoData hole must remain NoData (got {})",
             chm.get(hole_c, hole_r)
         );
+    }
+
+    #[test]
+    fn ror_kdtree_fallback_polygon_grid_cap_and_fail_fast_validation() {
+        // 1. ROR KD-tree fallback matches hash-grid path when coordinate span exceeds 2^52 * radius.
+        let radius = 1e-6;
+        let cluster = [
+            (0.0, 0.0, 0.0),
+            (0.4e-6, 0.0, 0.0),
+            (0.0, 0.4e-6, 0.0),
+            (0.4e-6, 0.4e-6, 0.0),
+        ];
+        // Normal-span cloud (hash-grid path): 4 cluster points + 1 isolated point at x = 1.0.
+        let mut xs_hash: Vec<f64> = cluster.iter().map(|p| p.0).collect();
+        let mut ys_hash: Vec<f64> = cluster.iter().map(|p| p.1).collect();
+        let mut zs_hash: Vec<f64> = cluster.iter().map(|p| p.2).collect();
+        xs_hash.push(1.0);
+        ys_hash.push(0.0);
+        zs_hash.push(0.0);
+        let cloud_hash = PointCloud::new(
+            vec![
+                Dimension::new("x", Values::F64(xs_hash)),
+                Dimension::new("y", Values::F64(ys_hash)),
+                Dimension::new("z", Values::F64(zs_hash)),
+            ],
+            terrio::crs::SpatialRef::default(),
+        );
+        // Extreme-span cloud (KD-tree fallback path): span 1e12 / 1e-6 = 1e18 > 2^52.
+        let mut xs_kd: Vec<f64> = cluster.iter().map(|p| p.0).collect();
+        let mut ys_kd: Vec<f64> = cluster.iter().map(|p| p.1).collect();
+        let mut zs_kd: Vec<f64> = cluster.iter().map(|p| p.2).collect();
+        xs_kd.push(1e12);
+        ys_kd.push(0.0);
+        zs_kd.push(0.0);
+        let cloud_kd = PointCloud::new(
+            vec![
+                Dimension::new("x", Values::F64(xs_kd)),
+                Dimension::new("y", Values::F64(ys_kd)),
+                Dimension::new("z", Values::F64(zs_kd)),
+            ],
+            terrio::crs::SpatialRef::default(),
+        );
+        let out_hash = filter_outliers_ror(&cloud_hash, radius, 2).unwrap();
+        let out_kd = filter_outliers_ror(&cloud_kd, radius, 2).unwrap();
+        assert_eq!(out_hash.len(), 4);
+        assert_eq!(out_kd.len(), 4);
+        assert_eq!(out_hash.coords("x").unwrap(), out_kd.coords("x").unwrap());
+        assert_eq!(out_hash.coords("y").unwrap(), out_kd.coords("y").unwrap());
+
+        // 2. PolygonGridIndex returns None when overlapping large polygons exceed the entry cap.
+        let full_square = vec![(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)];
+        let overlapping: Vec<Polygon2D> = (0..100)
+            .map(|_| Polygon2D {
+                bbox: [0.0, 0.0, 100.0, 100.0],
+                exterior: full_square.clone(),
+                interiors: Vec::new(),
+            })
+            .collect();
+        // 100 overlapping polygons in a 10x10 grid => 10_000 entries > 100 * 64 = 6_400 => None.
+        assert!(PolygonGridIndex::new(&overlapping, [0.0, 0.0, 100.0, 100.0]).is_none());
+
+        // 3. lidar_to_chm_pit_free fails fast with InvalidArgument before reading missing input.
+        let err = lidar_to_chm_pit_free(
+            "/nonexistent/missing_input.las",
+            "/tmp/out_never_written.tif",
+            &PitFreeChmOptions {
+                resolution: -1.0,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
     }
 }
