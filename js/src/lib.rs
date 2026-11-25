@@ -86,6 +86,75 @@ fn reproject_layer_to_wgs84_if_known(mut layer: Layer, fallback_projection: &str
     layer
 }
 
+/// Computes the WGS 84 (`EPSG:4326`) bounding box `[minLon, minLat, maxLon, maxLat]`
+/// of a georeferenced raster by transforming its corners and edge midpoints.
+/// Returns `None` when the raster has no CRS metadata, an unknown CRS, or fails reprojection.
+fn compute_wgs84_bounds(
+    width: usize,
+    height: usize,
+    geotransform: &[f64; 6],
+    projection: &str,
+) -> Option<Vec<f64>> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let trimmed = projection.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let src_srs = terrio::crs::SpatialRef::parse(trimmed).ok()?;
+    if src_srs.is_unknown() {
+        return None;
+    }
+    let transformer = if src_srs.epsg == Some(4326) {
+        None
+    } else {
+        let wgs84 = terrio::crs::SpatialRef::from_epsg(4326).ok()?;
+        Some(terrio::crs::Transformer::new(&src_srs, &wgs84).ok()?)
+    };
+    let wf = width as f64;
+    let hf = height as f64;
+    let sample_pts = [
+        (0.0, 0.0),
+        (wf, 0.0),
+        (0.0, hf),
+        (wf, hf),
+        (wf * 0.5, 0.0),
+        (wf * 0.5, hf),
+        (0.0, hf * 0.5),
+        (wf, hf * 0.5),
+    ];
+    let mut min_lon = f64::INFINITY;
+    let mut min_lat = f64::INFINITY;
+    let mut max_lon = f64::NEG_INFINITY;
+    let mut max_lat = f64::NEG_INFINITY;
+    for (c, r) in sample_pts {
+        let x = geotransform[0] + c * geotransform[1] + r * geotransform[2];
+        let y = geotransform[3] + c * geotransform[4] + r * geotransform[5];
+        let (lon, lat) = if let Some(ref tr) = transformer {
+            tr.transform(x, y).ok()?
+        } else {
+            (x, y)
+        };
+        if !lon.is_finite()
+            || !lat.is_finite()
+            || !(-180.0..=180.0).contains(&lon)
+            || !(-90.0..=90.0).contains(&lat)
+        {
+            return None;
+        }
+        min_lon = min_lon.min(lon);
+        min_lat = min_lat.min(lat);
+        max_lon = max_lon.max(lon);
+        max_lat = max_lat.max(lat);
+    }
+    if min_lon <= max_lon && min_lat <= max_lat {
+        Some(vec![min_lon, min_lat, max_lon, max_lat])
+    } else {
+        None
+    }
+}
+
 fn polygonize_array_to_geojson<T: DemNum>(
     arr: &Array2D<T>,
     field_name: &str,
@@ -660,6 +729,17 @@ impl DepressionsOutput {
     pub fn projection(&self) -> String {
         self.projection.clone()
     }
+    /// Returns the raster bounding box `[minLon, minLat, maxLon, maxLat]` in WGS 84 (`EPSG:4326`),
+    /// or `undefined` when the raster lacks a recognized CRS.
+    #[wasm_bindgen(js_name = boundsWgs84)]
+    pub fn bounds_wgs84(&self) -> Option<Vec<f64>> {
+        compute_wgs84_bounds(
+            self.width,
+            self.height,
+            &self.depression_id.geotransform,
+            &self.projection,
+        )
+    }
     #[wasm_bindgen(getter, js_name = maxLevel)]
     pub fn max_level(&self) -> u32 {
         self.max_level
@@ -941,6 +1021,17 @@ impl InundationOutput {
     #[wasm_bindgen(getter)]
     pub fn projection(&self) -> String {
         self.projection.clone()
+    }
+    /// Returns the DEM bounding box `[minLon, minLat, maxLon, maxLat]` in WGS 84 (`EPSG:4326`),
+    /// or `undefined` when the DEM lacks a recognized CRS.
+    #[wasm_bindgen(js_name = boundsWgs84)]
+    pub fn bounds_wgs84(&self) -> Option<Vec<f64>> {
+        compute_wgs84_bounds(
+            self.width,
+            self.height,
+            &self.dem_refined.geotransform,
+            &self.projection,
+        )
     }
     #[wasm_bindgen(getter, js_name = maxLevel)]
     pub fn max_level(&self) -> u32 {

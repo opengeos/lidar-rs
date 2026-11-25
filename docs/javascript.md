@@ -127,18 +127,24 @@ try {
 | Function | Signature | Return Object |
 | --- | --- | --- |
 | `extractSinks` | `(bytes, filename, minSize)` | `SinksOutput` (`width`, `height`, `depressionsJson()`, `sinkTif()`, `refinedDemTif()`, `depthTif()`, `regionTif()`, `geojson()`, `depthRgba()`) |
-| `delineateDepressions` | `(sinkBytes, filename, minSize, minDepth, interval)` | `DepressionsOutput` (`width`, `height`, `maxLevel`, `numRegions`, `depressionsJson()`, `idTif()`, `levelTif()`, `geojson()`, `levelRgba()`) |
-| `delineateMounts` | `(dsmBytes, filename, minSize, minHeight, interval)` | `DepressionsOutput` (same fields as `delineateDepressions`) |
+| `delineateDepressions` | `(sinkBytes, filename, minSize, minDepth, interval)` | `DepressionsOutput` (`width`, `height`, `projection`, `maxLevel`, `numRegions`, `boundsWgs84()`, `depressionsJson()`, `idTif()`, `levelTif()`, `geojson()`, `levelRgba()`) |
+| `delineateMounts` | `(dsmBytes, filename, minSize, minHeight, interval)` | `DepressionsOutput` (same fields as `delineateDepressions`, plus `mountsJson()` and `mountIdValues()`) |
 | `delineateCatchments` | `(demBytes, sinkOrRegionBytes, demFilename, sinkFilename)` | `CatchmentsOutput` (`recordsJson()`, `watershedTif()`, `geojson()`) |
 | `simulateInundation` | `(demBytes, filename, kernelSize, minSize, minDepth, interval, rainIntensityCmH, rainDurationH, timeStepH)` | `InundationOutput` |
 | `simulateInundationAdvanced` | `(demBytes, filename, kernelSize, minSize, minDepth, interval, rainIntensityCmH, rainDurationH, timeStepH, breachMaxDepth?, runoffCoeff, scsType2Mm?, routing?)` | `InundationOutput` with optional selective breaching, runoff coefficient `C`, SCS Type II storm hyetograph, and routing mode (`"static"` or `"fsm"`) |
 
 **`InundationOutput` methods:**
 
-- **Metadata & telemetry:** `width`, `height`, `projection`, `maxLevel`, `numRegions`, `numSteps`, `runoffCoeff`
+- **Metadata & telemetry:** `width`, `height`, `projection`, `maxLevel`, `numRegions`, `numSteps`, `runoffCoeff`, `boundsWgs84()`
 - **Tabular & graph exports:** `depressionsJson()`, `catchmentHierarchyJson()`, `stepsJson()`, `inundationCurveCsv()`, `spillPathsJson()`, `spillPathsGeojson()`, `ratingCurvesJson()`, `ratingCurvesCsv()`, `connectivityGraphJson()`, `connectivityGraphml()`, `fsmMassBalanceJson()`, `fsmBasinsJson()`, `fsmBasinsCsv()`
 - **Raster & vector buffers:** `depressionsGeojson()`, `fillTimeTif()`, `catchmentHirTif()`, `sinkTif()`, `levelTif()`, `depressionIdValues()`, `fillTimeValues()`
 - **Canvas & publication rendering:** `hillshadeRgba()`, `depthRgba()`, `levelRgba()`, `fillTimeRgba()`, `renderFramePng(stepIndex, showScaleBar, showLegend, showSpillPaths?)`, `encodeGif(frameDelayMs, pingPong, maxDim, showSpillPaths?)`
+
+## TypeScript & Web Workers
+
+The `js/` package ships an npm manifest (`js/package.json` for `@opengeos/lidar-js`) and complete TypeScript definitions (`js/lidar_js.d.ts`) covering every exported function, output class, and parsed JSON/GeoJSON structure (`RasterInfo`, `NestedDepression`, `SpillFlowPath`, `RatingCurvePoint`, `ConnectivityGraph`, `FsmMassBalance`, `FsmBasinSummary`, and RFC 7946 GeoJSON FeatureCollections).
+
+For large DEMs and GIF encoding in browsers, run `lidar-js` inside a dedicated ES module Web Worker (`new Worker(url, { type: "module" })`) with transferable `ArrayBuffer` responses and instant cancellation via `worker.terminate()`. See `js/README.md` and `docs/javascripts/playground-worker.js` for a complete working example.
 
 !!! tip "Memory Management"
     `SinksOutput`, `DepressionsOutput`, `CatchmentsOutput`, and `InundationOutput` hold WebAssembly heap allocations. Call `.free()` (ideally in a `finally` block) once you have copied the buffers or strings you need.

@@ -3,7 +3,16 @@
 Run **`lidar-rs`** directly in your browser via WebAssembly: DEM smoothing, selective depression breaching, Priority-Flood sink extraction, Wu et al. (2019) nested depression/mount hierarchy delineation, single-pass D8 catchment hierarchy, surface inundation simulation, stage-storage rating curves, connectivity graphs, and PNG/GIF export all execute locally in browser memory. Files are **never uploaded** to any server.
 
 <div id="lidar-playground" markdown="0">
-  <p class="lp-status" id="lp-status">Loading lidar-rs WebAssembly module…</p>
+  <div class="lp-status-row">
+    <p class="lp-status" id="lp-status">Loading lidar-rs WebAssembly module...</p>
+    <button type="button" id="lp-cancel" class="lp-cancel-btn" hidden>Cancel</button>
+  </div>
+  <div class="lp-progress-wrap" id="lp-progress-wrap" hidden role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Processing progress">
+    <div class="lp-progress-track">
+      <div class="lp-progress-bar" id="lp-progress-bar"></div>
+    </div>
+    <span class="lp-progress-label" id="lp-progress-label"></span>
+  </div>
 
   <div class="lp-drop" id="lp-drop">
     <p><strong>Drop a DEM or DSM GeoTIFF here</strong> or <label class="lp-link">choose a file<input type="file" id="lp-file" accept=".tif,.tiff,.img,.asc" class="lp-visually-hidden"></label>.</p>
@@ -82,7 +91,25 @@ Run **`lidar-rs`** directly in your browser via WebAssembly: DEM smoothing, sele
       <h3 id="lp-player-heading">Interactive Inundation Simulation</h3>
       <div class="lp-player-grid">
         <div class="lp-player-stage">
+          <div class="lp-view-bar" id="lp-view-bar">
+            <div class="lp-view-toggle" role="tablist" aria-label="Visualization mode">
+              <button type="button" id="lp-view-canvas" class="lp-view-btn lp-view-active" role="tab" aria-selected="true">Canvas View</button>
+              <button type="button" id="lp-view-map" class="lp-view-btn" role="tab" aria-selected="false">Map View (Leaflet)</button>
+            </div>
+            <div class="lp-map-controls" id="lp-map-controls" hidden>
+              <label class="lp-map-style-wrap" id="lp-map-style-wrap">
+                Color by
+                <select id="lp-map-style" aria-label="Map polygon coloring">
+                  <option value="level" selected>Hierarchy Level</option>
+                  <option value="fill_time">Fill Time</option>
+                </select>
+              </label>
+              <button type="button" id="lp-map-fit" class="lp-icon-btn" title="Fit map to delineated features">Fit Bounds</button>
+            </div>
+            <span class="lp-hint lp-map-note" id="lp-map-note" hidden></span>
+          </div>
           <canvas id="lp-player-canvas" title="Click any depression or mount to inspect hierarchy and morphometry"></canvas>
+          <div id="lp-map-container" class="lp-map-container" hidden aria-label="Interactive georeferenced Leaflet map overlay"></div>
           <div class="lp-player-telemetry" id="lp-player-telemetry"></div>
           <div class="lp-player-bar" id="lp-player-bar">
             <button type="button" id="lp-play-btn" class="md-button md-button--primary">Pause</button>

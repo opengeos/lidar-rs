@@ -8,13 +8,59 @@ import * as lidar from "./pkg-node/lidar_js.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootCargoToml = fs.readFileSync(path.resolve(__dirname, "..", "Cargo.toml"), "utf8");
 const jsCargoToml = fs.readFileSync(path.resolve(__dirname, "Cargo.toml"), "utf8");
+const jsPackageJson = JSON.parse(fs.readFileSync(path.resolve(__dirname, "package.json"), "utf8"));
+const jsDts = fs.readFileSync(path.resolve(__dirname, "lidar_js.d.ts"), "utf8");
 const wsVersion = rootCargoToml.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
 const jsVersion = jsCargoToml.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
 assert.ok(wsVersion, "expected workspace version in root Cargo.toml");
 assert.equal(jsVersion, wsVersion, "js/Cargo.toml version must match workspace version");
+assert.equal(jsPackageJson.version, wsVersion, "js/package.json version must match workspace version");
+assert.equal(jsPackageJson.types, "./lidar_js.d.ts");
+assert.ok(jsPackageJson.exports && jsPackageJson.exports["."], "expected package.json exports");
+assert.equal(
+  jsPackageJson.exports["."].node,
+  undefined,
+  'root "." export must not shadow ESM import with CJS node target (use "./node" instead)',
+);
+assert.ok(jsPackageJson.exports["./node"], 'expected "./node" export entry in package.json');
+assert.ok(jsPackageJson.scripts?.["build:web"], "expected build:web script");
+assert.ok(jsPackageJson.scripts?.["build:node"], "expected build:node script");
+assert.ok(jsPackageJson.scripts?.["build:bundler"], "expected build:bundler script");
 
 console.log(`lidar-js version: ${lidar.version()}`);
 assert.equal(lidar.version(), wsVersion);
+
+// Verify every exported symbol and output class method/getter is documented in js/lidar_js.d.ts
+const internalExports = new Set(["__wasm", "default"]);
+for (const exportName of Object.keys(lidar)) {
+  if (internalExports.has(exportName) || exportName.startsWith("__wbg")) continue;
+  const val = lidar[exportName];
+  if (typeof val === "function") {
+    const isClass = /^[A-Z]/.test(exportName);
+    const declRe = isClass
+      ? new RegExp(`export\\s+class\\s+${exportName}\\b`)
+      : new RegExp(`export\\s+function\\s+${exportName}\\s*\\(`);
+    assert.ok(
+      declRe.test(jsDts),
+      `js/lidar_js.d.ts is missing declaration for exported ${isClass ? "class" : "function"} '${exportName}'`,
+    );
+    if (isClass && val.prototype) {
+      const classMatch = jsDts.match(
+        new RegExp(`export\\s+class\\s+${exportName}\\s*\\{([\\s\\S]*?)\\n\\}`),
+      );
+      assert.ok(classMatch, `could not extract class body for '${exportName}' in js/lidar_js.d.ts`);
+      const classBody = classMatch[1];
+      for (const propName of Object.getOwnPropertyNames(val.prototype)) {
+        if (propName === "constructor" || propName.startsWith("__")) continue;
+        const memberRe = new RegExp(`(?:readonly\\s+)?\\b${propName}\\b\\s*(?:\\(|:)`);
+        assert.ok(
+          memberRe.test(classBody),
+          `js/lidar_js.d.ts class '${exportName}' is missing member '${propName}'`,
+        );
+      }
+    }
+  }
+}
 
 const testDataDir = path.resolve(__dirname, "..", "test_data");
 const demBytes = new Uint8Array(fs.readFileSync(path.join(testDataDir, "dem.tif")));
@@ -111,6 +157,12 @@ deps.free();
 // 3. Delineate mounts from DSM
 const mounts = lidar.delineateMounts(dsmBytes, "dsm.tif", 1000, 0.3, 0.3);
 assert.ok(mounts.maxLevel >= 2);
+const mountBounds = mounts.boundsWgs84();
+assert.ok(mountBounds instanceof Float64Array, "mounts.boundsWgs84() must return Float64Array");
+assert.equal(mountBounds.length, 4);
+assertWgs84Coord([mountBounds[0], mountBounds[1]], "mounts.boundsWgs84 SW");
+assertWgs84Coord([mountBounds[2], mountBounds[3]], "mounts.boundsWgs84 NE");
+assert.ok(mountBounds[2] > mountBounds[0] && mountBounds[3] > mountBounds[1]);
 const mountList = JSON.parse(mounts.mountsJson());
 assert.ok(mountList.length >= 2);
 assert.equal(mounts.mountsJson(), mounts.depressionsJson());
@@ -135,6 +187,12 @@ const sim = lidar.simulateInundation(
   2.0,
 );
 assert.equal(sim.numSteps, 5);
+const simBounds = sim.boundsWgs84();
+assert.ok(simBounds instanceof Float64Array, "sim.boundsWgs84() must return Float64Array");
+assert.equal(simBounds.length, 4);
+assertWgs84Coord([simBounds[0], simBounds[1]], "sim.boundsWgs84 SW");
+assertWgs84Coord([simBounds[2], simBounds[3]], "sim.boundsWgs84 NE");
+assert.ok(simBounds[2] > simBounds[0] && simBounds[3] > simBounds[1]);
 const steps = JSON.parse(sim.stepsJson());
 assert.equal(steps.length, 5);
 assert.ok(steps[steps.length - 1].inundated_cells > 0);
