@@ -644,6 +644,11 @@ fn evaluate_topological_routing(
         let mut q_boundary_spill = 0.0;
         let mut spilling_count = 0usize;
 
+        // Zero all entries so non-live basins (`Waiting`/`Merged`) never retain stale values
+        // across routing passes or into storm-end snapshots.
+        q_in.fill(0.0);
+        routed_cat.fill(0.0);
+
         for &i in live_indices {
             q_in[i] = basins[i].local_eff_cat_area_m2 * rain_m_h;
             routed_cat[i] = basins[i].local_cat_area_m2;
@@ -3413,5 +3418,70 @@ mod tests {
                 "zero-capacity flat child cell {idx} must be inundated once parent gains water, got {ft}"
             );
         }
+    }
+
+    #[test]
+    fn fsm_topological_routing_resets_non_live_routed_cat_across_passes() {
+        // Verify that `evaluate_topological_routing` resets `q_in` and `routed_cat` for ALL
+        // basins (including non-live `Waiting` / `Merged` entries) across repeated routing passes
+        // so stale values never accumulate into storm-end snapshots.
+        let (dem_refined, sink, deps) = build_two_sibling_compound_dem();
+        let probe_opts = SimulateInundationOptions {
+            min_size: 10,
+            min_depth: 0.3,
+            interval: 0.3,
+            rain_intensity_cm_h: 50.0,
+            rain_duration_h: 50.0,
+            time_step_h: 1.0,
+            compress: false,
+        };
+        let probe = simulate_fill_spill_merge_in_memory(
+            &dem_refined,
+            &sink,
+            &deps,
+            &probe_opts,
+            &InundationForcing::default(),
+        )
+        .unwrap();
+
+        // Pick a storm duration between the first leaf fill time and the parent merge time,
+        // using a multi-step hyetograph to force multiple topological routing passes while the
+        // compound parent remains `Waiting` and one child is actively spilling into its sibling.
+        let mut leaf_fills: Vec<f64> = probe
+            .basins
+            .iter()
+            .filter(|b| b.level == 1)
+            .filter_map(|b| b.fill_time_h)
+            .collect();
+        leaf_fills.sort_by(f64::total_cmp);
+        assert!(leaf_fills.len() >= 2);
+        let t_mid = 0.5 * (leaf_fills[0] + leaf_fills[1]);
+        let step_dt = t_mid / 4.0;
+        let hyeto = vec![(step_dt, 50.0); 4];
+
+        let opts = SimulateInundationOptions {
+            rain_duration_h: t_mid,
+            time_step_h: step_dt,
+            ..probe_opts
+        };
+        let forcing = InundationForcing {
+            hyetograph: Some(&hyeto),
+            ..Default::default()
+        };
+        let res = simulate_fill_spill_merge_in_memory(&dem_refined, &sink, &deps, &opts, &forcing)
+            .unwrap();
+
+        assert!(res.mass_balance.mass_balance_error_m3.abs() < 1e-9);
+        let parent = res.basins.iter().find(|b| b.level > 1).unwrap();
+        assert!(
+            parent.fill_time_h.is_none(),
+            "parent should still be Waiting at t_mid"
+        );
+        assert!(
+            (parent.final_routed_cat_area_m2 - parent.local_cat_area_m2).abs() < 1e-9,
+            "Waiting parent final_routed_cat_area_m2 ({}) must equal local_cat_area_m2 ({}) with no stale accumulation",
+            parent.final_routed_cat_area_m2,
+            parent.local_cat_area_m2
+        );
     }
 }

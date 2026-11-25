@@ -227,9 +227,10 @@ pub fn convert_lidar(
     let src_str = path_to_str(src_path)?;
     let dst_str = path_to_str(dst_path)?;
 
-    // Read only the source header (O(1) memory) before converting so we neither re-decode
-    // destination formats like PLY nor mask destination write/open failures. Since
-    // `convert_lidar` applies no filtering or thinning, the converted count equals the source count.
+    // `terrio::pointcloud::convert` returns `Result<()>` without a point count. Since
+    // `convert_lidar` applies no filtering or thinning, obtain the exact count from the
+    // source header up front (`header().point_count` is exact for all terrio readers:
+    // LAS, LAZ, COPC, PLY, E57, and EPT) without loading points into RAM or reopening the output.
     let count = terrio::pointcloud::open_points(src_str)?
         .header()
         .point_count;
