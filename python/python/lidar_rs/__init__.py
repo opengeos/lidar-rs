@@ -546,6 +546,25 @@ def convert_lidar(
     )
 
 
+def _as_uint(
+    arr: ArrayLike, dtype: type[np.uint8 | np.uint16], name: str
+) -> NDArray[Any]:
+    raw = np.asarray(arr).ravel()
+    if not np.issubdtype(raw.dtype, np.integer):
+        raise ValueError(
+            f"{name} must contain integer values, got dtype {raw.dtype}"
+        )
+    info = np.iinfo(dtype)
+    if raw.size > 0:
+        lo = int(raw.min())
+        hi = int(raw.max())
+        if lo < info.min or hi > info.max:
+            raise ValueError(
+                f"{name} values must be in [{info.min}, {info.max}], got range [{lo}, {hi}]"
+            )
+    return np.ascontiguousarray(raw, dtype=dtype)
+
+
 def read_lidar(
     path: PathLikeStr,
     bounds: tuple[float, float, float, float] | Sequence[float] | None = None,
@@ -560,7 +579,7 @@ def read_lidar(
     resolution: float | None = None,
 ) -> PointCloudDict:
     """Read a LiDAR point cloud (LAS, LAZ, COPC, PLY, E57, EPT) into a NumPy-backed dictionary."""
-    norm_bounds = _normalize_bbox(bounds)
+    norm_bounds = _normalize_bbox(bounds, names=("min_x", "min_y", "max_x", "max_y"))
     return _lidar_rs.read_lidar(
         _as_path_str(path),
         norm_bounds,
@@ -591,22 +610,22 @@ def write_lidar(
     y_arr = np.ascontiguousarray(y, dtype=np.float64).ravel()
     z_arr = np.ascontiguousarray(z, dtype=np.float64).ravel()
     cls_arr = (
-        np.ascontiguousarray(classification, dtype=np.uint8).ravel()
+        _as_uint(classification, np.uint8, "classification")
         if classification is not None
         else None
     )
     int_arr = (
-        np.ascontiguousarray(intensity, dtype=np.uint16).ravel()
+        _as_uint(intensity, np.uint16, "intensity")
         if intensity is not None
         else None
     )
     rn_arr = (
-        np.ascontiguousarray(return_number, dtype=np.uint8).ravel()
+        _as_uint(return_number, np.uint8, "return_number")
         if return_number is not None
         else None
     )
     nr_arr = (
-        np.ascontiguousarray(number_of_returns, dtype=np.uint8).ravel()
+        _as_uint(number_of_returns, np.uint8, "number_of_returns")
         if number_of_returns is not None
         else None
     )
@@ -680,16 +699,16 @@ def classify_ground(
             x_arr,
             y_arr,
             z_arr,
-            np.ascontiguousarray(cls_raw, dtype=np.uint8).ravel()
+            _as_uint(cls_raw, np.uint8, "classification")
             if cls_raw is not None
             else None,
-            np.ascontiguousarray(int_raw, dtype=np.uint16).ravel()
+            _as_uint(int_raw, np.uint16, "intensity")
             if int_raw is not None
             else None,
-            np.ascontiguousarray(rn_raw, dtype=np.uint8).ravel()
+            _as_uint(rn_raw, np.uint8, "return_number")
             if rn_raw is not None
             else None,
-            np.ascontiguousarray(nr_raw, dtype=np.uint8).ravel()
+            _as_uint(nr_raw, np.uint8, "number_of_returns")
             if nr_raw is not None
             else None,
             str(crs_val) if crs_val is not None else None,
@@ -1283,8 +1302,17 @@ def compute_hillshade(
     no_data: float | None = None,
     crs: str | None = None,
 ) -> NDArray[np.uint8]:
-    """Compute an RGB shaded-relief array `(rows, cols, 3)` (`uint8`) from a DEM file or 2D spatial array."""
+    """Compute an RGB shaded-relief array `(rows, cols, 3)` (`uint8`) from a DEM file or 2D spatial array.
+
+    Note: `geotransform` and `crs` apply only to in-memory spatial array inputs; passing them
+    with a raster file path raises `ValueError` because spatial metadata is read from the file.
+    """
     if isinstance(dem, (str, os.PathLike)):
+        if geotransform is not None or crs is not None:
+            raise ValueError(
+                "geotransform and crs overrides are not supported when dem is a file path; "
+                "geotransform and CRS are read from the input raster file"
+            )
         return _lidar_rs.compute_hillshade_file(
             _as_path_str(dem),
             float(azimuth),
@@ -1684,12 +1712,14 @@ def synthesize_culverts(
 
 def _normalize_bbox(
     bbox: tuple[float, float, float, float] | Sequence[float] | None,
+    names: tuple[str, str, str, str] = ("min_lon", "min_lat", "max_lon", "max_lat"),
 ) -> tuple[float, float, float, float] | None:
     if bbox is None:
         return None
     if len(bbox) != 4:
+        labels = ", ".join(names)
         raise ValueError(
-            f"bbox must have 4 elements (min_x, min_y, max_x, max_y); got {len(bbox)}"
+            f"bbox must have 4 elements ({labels}); got {len(bbox)}"
         )
     return (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
 

@@ -537,6 +537,11 @@ def test_delineate_mounts_array_and_compute_hillshade():
     assert hs_file.shape == (400, 400, 3)
     assert hs_file.dtype == np.uint8
 
+    with pytest.raises(ValueError, match="file path"):
+        lidar_rs.compute_hillshade(TEST_DATA / "dem.tif", geotransform=gt)
+    with pytest.raises(ValueError, match="file path"):
+        lidar_rs.compute_hillshade(TEST_DATA / "dem.tif", crs="EPSG:32615")
+
 
 def test_read_write_lidar_numpy_roundtrip_and_filtering(tmp_path: Path):
     pts = _make_synthetic_point_cloud()
@@ -619,6 +624,158 @@ def test_read_write_lidar_numpy_roundtrip_and_filtering(tmp_path: Path):
     # Mismatched array lengths raise ValueError
     with pytest.raises(ValueError, match="identical lengths"):
         lidar_rs.write_lidar(tmp_path / "bad.las", pts["x"][:5], pts["y"], pts["z"])
+
+    # Out-of-range and non-integer unsigned attribute casts raise ValueError
+    with pytest.raises(ValueError, match=r"\[0, 255\]"):
+        lidar_rs.write_lidar(
+            tmp_path / "bad_u8_hi.las",
+            pts["x"][:2],
+            pts["y"][:2],
+            pts["z"][:2],
+            classification=[2, 258],
+        )
+    with pytest.raises(ValueError, match=r"\[0, 255\]"):
+        lidar_rs.write_lidar(
+            tmp_path / "bad_u8_neg.las",
+            pts["x"][:2],
+            pts["y"][:2],
+            pts["z"][:2],
+            classification=[-1, 2],
+        )
+    with pytest.raises(ValueError, match="integer"):
+        lidar_rs.write_lidar(
+            tmp_path / "bad_float.las",
+            pts["x"][:2],
+            pts["y"][:2],
+            pts["z"][:2],
+            classification=np.array([2.5, 1.0]),
+        )
+    with pytest.raises(ValueError, match=r"\[0, 65535\]"):
+        lidar_rs.write_lidar(
+            tmp_path / "bad_u16.las",
+            pts["x"][:2],
+            pts["y"][:2],
+            pts["z"][:2],
+            intensity=[100, 70_000],
+        )
+    with pytest.raises(ValueError, match=r"\[0, 255\]"):
+        lidar_rs.classify_ground(
+            {
+                "x": pts["x"][:2],
+                "y": pts["y"][:2],
+                "z": pts["z"][:2],
+                "classification": [2, 300],
+            },
+            method="csf",
+        )
+
+    # Bbox wording differentiates geographic federal queries vs Cartesian read_lidar bounds
+    with pytest.raises(ValueError, match="min_lon, min_lat, max_lon, max_lat"):
+        lidar_rs.query_3dep_products(bbox=(1.0, 2.0))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="min_x, min_y, max_x, max_y"):
+        lidar_rs.read_lidar(las_path, bounds=(1.0, 2.0))  # type: ignore[arg-type]
+
+
+def test_mask_to_geometry_and_bbox_slicing_exact_l_shape(monkeypatch: pytest.MonkeyPatch):
+    from lidar_rs._adapters import _mask_to_geometry
+
+    # L-shaped depression (id=2) with child (id=1) placed at offset (row=2..4, col=3..5)
+    dep_id = np.zeros((7, 8), dtype=np.int32)
+    dep_id[2, 3] = 1  # top-left pixel of L (child)
+    dep_id[3, 3] = 2  # middle-left pixel of L
+    dep_id[4, 3:6] = 2  # bottom horizontal arm (cols 3, 4, 5)
+    gt = (100.0, 2.0, 0.0, 214.0, 0.0, -2.0)
+
+    class _StubPolygon:
+        def __init__(self, coords: list[tuple[float, float]] | None = None) -> None:
+            self.coords = coords or []
+
+    # Direct check of _mask_to_geometry strips with row/col offset
+    sub_mask = dep_id[2:5, 3:6] > 0
+    strips = _mask_to_geometry(
+        sub_mask, gt, _StubPolygon, lambda gs: list(gs), row_offset=2, col_offset=3
+    )
+    assert len(strips) == 3
+    # Row 2, col [3, 4) -> x in [106, 108], y in [208, 210]
+    assert strips[0].coords == [
+        (106.0, 210.0),
+        (108.0, 210.0),
+        (108.0, 208.0),
+        (106.0, 208.0),
+        (106.0, 210.0),
+    ]
+    # Row 3, col [3, 4) -> x in [106, 108], y in [206, 208]
+    assert strips[1].coords == [
+        (106.0, 208.0),
+        (108.0, 208.0),
+        (108.0, 206.0),
+        (106.0, 206.0),
+        (106.0, 208.0),
+    ]
+    # Row 4, col [3, 6) -> x in [106, 112], y in [204, 206]
+    assert strips[2].coords == [
+        (106.0, 206.0),
+        (112.0, 206.0),
+        (112.0, 204.0),
+        (106.0, 204.0),
+        (106.0, 206.0),
+    ]
+
+    # End-to-end depressions_to_geodataframe with compound parent (id=2 enclosing child id=1)
+    class _StubGeoDataFrame:
+        def __init__(
+            self,
+            data: list[dict[str, Any]],
+            *,
+            geometry: list[Any],
+            crs: str | None = None,
+        ) -> None:
+            self.data = data
+            self.geometry = geometry
+            self.crs = crs
+
+    fake_gpd = types.ModuleType("geopandas")
+    fake_gpd.GeoDataFrame = _StubGeoDataFrame  # type: ignore[attr-defined]
+    fake_shapely = types.ModuleType("shapely")
+    fake_shapely_geom = types.ModuleType("shapely.geometry")
+    fake_shapely_geom.Polygon = _StubPolygon  # type: ignore[attr-defined]
+    fake_shapely_ops = types.ModuleType("shapely.ops")
+    fake_shapely_ops.unary_union = lambda geoms: list(geoms)  # type: ignore[attr-defined]
+
+    result = {
+        "depression_id": dep_id,
+        "geotransform": gt,
+        "crs": "EPSG:32615",
+        "depressions": [
+            {"id": 1, "level": 1, "children_ids": []},
+            {"id": 2, "level": 2, "children_ids": [1]},
+        ],
+    }
+    with monkeypatch.context() as mp:
+        mp.setitem(sys.modules, "geopandas", fake_gpd)
+        mp.setitem(sys.modules, "shapely", fake_shapely)
+        mp.setitem(sys.modules, "shapely.geometry", fake_shapely_geom)
+        mp.setitem(sys.modules, "shapely.ops", fake_shapely_ops)
+        gdf = lidar_rs.depressions_to_geodataframe(result)
+        # Child (id=1): single 1x1 pixel strip at row 2, col 3
+        assert isinstance(gdf.geometry[0], _StubPolygon)
+        assert gdf.geometry[0].coords == strips[0].coords
+        # Parent (id=2): compound L-shape unioning child id=1 + parent id=2 -> all 3 strips
+        assert len(gdf.geometry[1]) == 3
+        assert [p.coords for p in gdf.geometry[1]] == [s.coords for s in strips]
+
+    # When real shapely is importable, also verify exact polygon area and validity
+    try:
+        from shapely.geometry import Polygon as RealPolygon  # type: ignore[import-untyped,import-not-found]
+        from shapely.ops import unary_union as real_union  # type: ignore[import-untyped,import-not-found]
+    except ImportError:
+        return
+    geom = _mask_to_geometry(
+        sub_mask, gt, RealPolygon, real_union, row_offset=2, col_offset=3
+    )
+    assert geom.is_valid
+    # 5 pixels * (2.0 * 2.0) = 20.0 map units squared
+    assert geom.area == pytest.approx(20.0)
 
 
 def test_classify_ground_and_tunable_dtm_chm_options(tmp_path: Path):

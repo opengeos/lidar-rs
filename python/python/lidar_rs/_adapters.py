@@ -228,7 +228,15 @@ def _pixel_corner_xy(
     )
 
 
-def _mask_to_geometry(mask: NDArray[np.bool_], gt: Geotransform, polygon_cls: Any, unary_union: Any) -> Any:
+def _mask_to_geometry(
+    mask: NDArray[np.bool_],
+    gt: Geotransform,
+    polygon_cls: Any,
+    unary_union: Any,
+    *,
+    row_offset: int = 0,
+    col_offset: int = 0,
+) -> Any:
     """Convert a 2D boolean pixel mask into an exact Shapely geometry via horizontal run strips."""
     strips: list[Any] = []
     rows, cols = mask.shape
@@ -243,17 +251,45 @@ def _mask_to_geometry(mask: NDArray[np.bool_], gt: Geotransform, polygon_cls: An
         diff = np.diff(padded.astype(np.int8))
         starts = np.flatnonzero(diff == 1)
         ends = np.flatnonzero(diff == -1)
+        gr = float(r + row_offset)
+        gr1 = float(r + row_offset + 1)
         for c0, c1 in zip(starts.tolist(), ends.tolist()):
-            p00 = _pixel_corner_xy(gt, float(c0), float(r))
-            p10 = _pixel_corner_xy(gt, float(c1), float(r))
-            p11 = _pixel_corner_xy(gt, float(c1), float(r + 1))
-            p01 = _pixel_corner_xy(gt, float(c0), float(r + 1))
+            gc0 = float(c0 + col_offset)
+            gc1 = float(c1 + col_offset)
+            p00 = _pixel_corner_xy(gt, gc0, gr)
+            p10 = _pixel_corner_xy(gt, gc1, gr)
+            p11 = _pixel_corner_xy(gt, gc1, gr1)
+            p01 = _pixel_corner_xy(gt, gc0, gr1)
             strips.append(polygon_cls([p00, p10, p11, p01, p00]))
     if not strips:
         return polygon_cls()
     if len(strips) == 1:
         return strips[0]
     return unary_union(strips)
+
+
+def _compute_id_bboxes(
+    dep_id_arr: NDArray[Any],
+) -> dict[int, tuple[int, int, int, int]]:
+    """Compute `(r_min, r_max, c_min, c_max)` bounding boxes for all positive IDs in one vectorized pass."""
+    rows, cols = np.nonzero(dep_id_arr > 0)
+    if rows.size == 0:
+        return {}
+    ids = dep_id_arr[rows, cols]
+    unique_ids, inv = np.unique(ids, return_inverse=True)
+    n_ids = unique_ids.size
+    r_min = np.full(n_ids, dep_id_arr.shape[0], dtype=np.intp)
+    r_max = np.full(n_ids, -1, dtype=np.intp)
+    c_min = np.full(n_ids, dep_id_arr.shape[1], dtype=np.intp)
+    c_max = np.full(n_ids, -1, dtype=np.intp)
+    np.minimum.at(r_min, inv, rows)
+    np.maximum.at(r_max, inv, rows)
+    np.minimum.at(c_min, inv, cols)
+    np.maximum.at(c_max, inv, cols)
+    return {
+        int(uid): (int(r_min[i]), int(r_max[i]), int(c_min[i]), int(c_max[i]))
+        for i, uid in enumerate(unique_ids)
+    }
 
 
 def _descendant_ids(
@@ -305,16 +341,30 @@ def depressions_to_geodataframe(
             for d in depressions
             if "id" in d
         }
+        id_bboxes = _compute_id_bboxes(dep_id_arr)
         geometries: list[Any] = []
         records: list[dict[str, Any]] = []
         for dep in depressions:
             did = int(dep["id"])
             member_ids = _descendant_ids(did, children_map)
-            if len(member_ids) == 1:
-                mask = dep_id_arr == did
+            member_bboxes = [id_bboxes[mid] for mid in member_ids if mid in id_bboxes]
+            if not member_bboxes:
+                geometries.append(Polygon())
             else:
-                mask = np.isin(dep_id_arr, list(member_ids))
-            geometries.append(_mask_to_geometry(mask, gt, Polygon, unary_union))
+                r0 = min(b[0] for b in member_bboxes)
+                r1 = max(b[1] for b in member_bboxes)
+                c0 = min(b[2] for b in member_bboxes)
+                c1 = max(b[3] for b in member_bboxes)
+                sub = dep_id_arr[r0 : r1 + 1, c0 : c1 + 1]
+                if len(member_ids) == 1:
+                    mask = sub == did
+                else:
+                    mask = np.isin(sub, list(member_ids))
+                geometries.append(
+                    _mask_to_geometry(
+                        mask, gt, Polygon, unary_union, row_offset=r0, col_offset=c0
+                    )
+                )
             records.append(dict(dep))
         return gpd.GeoDataFrame(records, geometry=geometries, crs=resolved_crs)
 
