@@ -94,7 +94,7 @@ fn make_synthetic_dem(size: usize) -> lidar::Result<Array2D<f64>> {
     Ok(dem)
 }
 
-fn parse_args() -> (Option<usize>, usize) {
+fn parse_args() -> lidar::Result<(Option<usize>, usize)> {
     let mut size: Option<usize> = None;
     let mut iters: usize = 3;
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -102,31 +102,51 @@ fn parse_args() -> (Option<usize>, usize) {
     while i < args.len() {
         match args[i].as_str() {
             "--size" => {
-                if let Some(val) = args.get(i + 1)
-                    && let Ok(n) = val.parse::<usize>()
-                    && n >= 32
-                {
-                    size = Some(n);
+                let val = args.get(i + 1).ok_or_else(|| {
+                    lidar::Error::InvalidArgument("--size requires an integer >= 32".into())
+                })?;
+                let n = val.parse::<usize>().map_err(|_| {
+                    lidar::Error::InvalidArgument(format!(
+                        "invalid --size value '{val}': expected an integer >= 32"
+                    ))
+                })?;
+                if n < 32 {
+                    return Err(lidar::Error::InvalidArgument(format!(
+                        "--size must be >= 32, got {n}"
+                    )));
                 }
+                size = Some(n);
                 i += 2;
             }
             "--iters" => {
-                if let Some(val) = args.get(i + 1)
-                    && let Ok(n) = val.parse::<usize>()
-                    && n >= 1
-                {
-                    iters = n;
+                let val = args.get(i + 1).ok_or_else(|| {
+                    lidar::Error::InvalidArgument("--iters requires an integer >= 1".into())
+                })?;
+                let n = val.parse::<usize>().map_err(|_| {
+                    lidar::Error::InvalidArgument(format!(
+                        "invalid --iters value '{val}': expected an integer >= 1"
+                    ))
+                })?;
+                if n < 1 {
+                    return Err(lidar::Error::InvalidArgument(format!(
+                        "--iters must be >= 1, got {n}"
+                    )));
                 }
+                iters = n;
                 i += 2;
             }
-            _ => i += 1,
+            other => {
+                return Err(lidar::Error::InvalidArgument(format!(
+                    "unknown benchmark argument '{other}'; supported flags: --size <N>, --iters <N>"
+                )));
+            }
         }
     }
-    (size, iters)
+    Ok((size, iters))
 }
 
 fn main() -> lidar::Result<()> {
-    let (synth_size, iters) = parse_args();
+    let (synth_size, iters) = parse_args()?;
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("test_data");
@@ -164,29 +184,25 @@ fn main() -> lidar::Result<()> {
     };
 
     let mut rows = Vec::new();
-    let fast_iters = iters.max(3);
 
-    rows.push(bench(
-        "mean_filter (3x3, in-memory)",
-        fast_iters,
-        cells,
-        || mean_filter(&dem, 3).unwrap(),
-    ));
+    rows.push(bench("mean_filter (3x3, in-memory)", iters, cells, || {
+        mean_filter(&dem, 3).unwrap()
+    }));
     rows.push(bench(
         "median_filter (3x3, in-memory)",
-        fast_iters,
+        iters,
         cells,
         || median_filter(&dem, 3).unwrap(),
     ));
     rows.push(bench(
         "gaussian_filter (sigma=1.0, in-memory)",
-        fast_iters,
+        iters,
         cells,
         || gaussian_filter(&dem, 1.0).unwrap(),
     ));
     rows.push(bench(
         "breach_depressions (selective, in-memory)",
-        fast_iters,
+        iters,
         cells,
         || {
             breach_depressions(
@@ -198,19 +214,19 @@ fn main() -> lidar::Result<()> {
     ));
     rows.push(bench(
         "extract_sinks (in-memory, min_size=1000)",
-        fast_iters,
+        iters,
         cells,
         || extract_sinks_in_memory(&dem, 1000, Topology::D8).unwrap(),
     ));
     rows.push(bench(
         "delineate_depressions (level-set, in-memory)",
-        fast_iters,
+        iters,
         cells,
         || delineate_depressions_in_memory(&sink, 1000, 0.3, 0.3).unwrap(),
     ));
     rows.push(bench(
         "delineate_depressions_merge_tree (in-memory)",
-        fast_iters,
+        iters,
         cells,
         || {
             delineate_depressions_merge_tree_in_memory(
@@ -226,7 +242,7 @@ fn main() -> lidar::Result<()> {
     ));
     rows.push(bench(
         "delineate_catchment_hierarchy (in-memory)",
-        fast_iters,
+        iters,
         cells,
         || {
             delineate_catchment_hierarchy_in_memory(
@@ -239,7 +255,7 @@ fn main() -> lidar::Result<()> {
     ));
     rows.push(bench(
         "simulate_inundation_with_forcing (in-memory)",
-        fast_iters,
+        iters,
         cells,
         || {
             simulate_inundation_with_forcing_in_memory(

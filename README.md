@@ -107,6 +107,7 @@ lidar pipeline dem.tif out_pipe --min-size 1000 --min-depth 0.3 --interval 0.3 \
   --rain-intensity 5 --duration 50 --time-step 1 --compress
 
 # Or drive the pipeline from a TOML/JSON config file with verbose per-stage timing
+# (relative paths inside --config files resolve against the current working directory)
 lidar -v pipeline --config run.toml --cn 80
 
 # Standalone SCS Curve Number, stage-volume rating curves, and connectivity graph tools

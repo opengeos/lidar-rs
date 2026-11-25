@@ -34,9 +34,10 @@ use lidar::{
     mean_filter_file, median_filter, median_filter_file, mosaic, parse_resampling, polygonize,
     rating_curves_to_csv_string, render_dem_preview_png_bytes, render_inundation_frame_png_bytes,
     reproject_image, resample, run_full_pipeline_in_memory, run_pipeline_with_control, save_raster,
-    scs_curve_number_runoff, scs_type2_hyetograph, simulate_inundation,
-    simulate_inundation_advanced, synthesize_culverts, write_connectivity_graph_json,
-    write_connectivity_graphml, write_rating_curves_csv,
+    scs_curve_number_runoff, scs_curve_number_runoff_scalar, scs_curve_number_runoff_with_ia,
+    scs_type2_hyetograph, simulate_inundation, simulate_inundation_advanced, synthesize_culverts,
+    write_connectivity_graph_edges_csv, write_connectivity_graph_json, write_connectivity_graphml,
+    write_rating_curves_csv,
 };
 #[cfg(feature = "download")]
 use lidar::{
@@ -161,6 +162,14 @@ impl From<CliClassifyGroundMethod> for GroundFilterMethod {
     }
 }
 
+const DEFAULT_GROUND_CLASS: u8 = 2;
+const DEFAULT_KERNEL_SIZE: usize = 3;
+const DEFAULT_MIN_SIZE: usize = 1000;
+const DEFAULT_MIN_DEPTH: f64 = 0.3;
+const DEFAULT_INTERVAL: f64 = 0.3;
+const DEFAULT_RAIN_INTENSITY_CM_H: f64 = 5.0;
+const DEFAULT_TIME_STEP_H: f64 = 1.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Verbosity {
     Quiet,
@@ -231,8 +240,8 @@ struct GroundFilterArgs {
     /// CSF ground classification distance threshold from cloth in CRS vertical units (default 0.5)
     #[arg(long)]
     class_threshold: Option<f64>,
-    /// CSF steep-slope post-processing smoothing (true/false; default true)
-    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    /// CSF steep-slope post-processing smoothing (use --slope-smooth or --slope-smooth=false; default true)
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
     slope_smooth: Option<bool>,
     /// PMF maximum window size in CRS units (default 33.0)
     #[arg(long)]
@@ -455,47 +464,12 @@ fn make_progress_control(verbosity: Verbosity) -> ExecutionControl {
     })
 }
 
-fn connectivity_graph_edges_to_csv_string(graph: &lidar::ConnectivityGraph) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::from(
-        "from_id,to_id,edge_type,spill_time_h,spill_runoff_mm,merge_time_h,spill_elev,length_m,dist_to_stream\n",
-    );
-    let fmt_opt = |v: Option<f64>| -> String {
-        v.filter(|x| x.is_finite())
-            .map(|x| format!("{x:.6}"))
-            .unwrap_or_default()
-    };
-    for e in &graph.edges {
-        let _ = writeln!(
-            out,
-            "{},{},{},{},{},{},{},{:.4},{}",
-            e.from_id,
-            e.to_id,
-            e.edge_type,
-            fmt_opt(e.spill_time_h),
-            fmt_opt(e.spill_runoff_mm),
-            fmt_opt(e.merge_time_h),
-            fmt_opt(e.spill_elev),
-            e.length_m,
-            fmt_opt(e.dist_to_stream),
-        );
-    }
-    out
-}
-
 fn build_uniform_runoff_raster_for_cn(
     dem_path: &Path,
     cn_value: f64,
     precip_mm: f64,
 ) -> lidar::Result<Array2D<f64>> {
-    if !cn_value.is_finite() || cn_value <= 0.0 || cn_value > 100.0 {
-        return Err(lidar::Error::InvalidArgument(format!(
-            "--cn must be finite and in (0, 100], got {cn_value}"
-        )));
-    }
-    let single_cn = Array2D::from_vec(1, 1, vec![cn_value])?;
-    let single_rc = scs_curve_number_runoff(&single_cn, precip_mm)?;
-    let rc_scalar = single_rc.data()[0];
+    let (_, rc_scalar) = scs_curve_number_runoff_scalar(cn_value, precip_mm, 0.2)?;
 
     // Read DEM metadata without loading full pixels when supported by lazy driver.
     let (width, height, geotransform, projection) = if let Some(p_str) = dem_path.to_str()
@@ -1050,7 +1024,7 @@ enum Commands {
         /// Output directory (may be omitted when provided in --config)
         #[arg(required_unless_present = "config")]
         out_dir: Option<PathBuf>,
-        /// Optional TOML or JSON pipeline configuration file (CLI flags override config values)
+        /// Optional TOML or JSON pipeline configuration file (CLI flags override config values; relative paths inside config files resolve against the current working directory)
         #[arg(long)]
         config: Option<PathBuf>,
         /// Median filter kernel size (1 = skip filtering; default 3)
@@ -1083,9 +1057,9 @@ enum Commands {
         /// Optional selective breaching maximum path length in cells (defaults to 50 when --breach-max-depth is set; pass 0 for unlimited)
         #[arg(long, requires = "breach_max_depth")]
         breach_max_length: Option<u32>,
-        /// Fill remaining unbreached depressions after selective/constrained breaching
-        #[arg(long)]
-        breach_fill_remaining: bool,
+        /// Fill remaining unbreached depressions after selective/constrained breaching (supports =true/=false to override --config)
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+        breach_fill_remaining: Option<bool>,
         /// Optional culvert vector (.gpkg, .geojson, .shp) to burn before sink extraction
         #[arg(long)]
         culverts: Option<PathBuf>,
@@ -1113,21 +1087,21 @@ enum Commands {
         /// Optional stream network vector (.gpkg, .geojson, .shp) for distance-to-stream graph metrics
         #[arg(long)]
         streams: Option<PathBuf>,
-        /// Load DEM as f32 (halves peak RAM on large rasters)
-        #[arg(long)]
-        use_f32: bool,
-        /// Skip writing output GeoTIFF rasters (keep CSV, GeoPackage, and graph outputs)
-        #[arg(long)]
-        no_rasters: bool,
-        /// Skip writing output GeoPackage vectors
-        #[arg(long)]
-        no_vectors: bool,
-        /// Skip writing rating curves and connectivity graph
-        #[arg(long)]
-        no_graph: bool,
-        /// Compress output GeoTIFFs with DEFLATE
-        #[arg(short = 'c', long)]
-        compress: bool,
+        /// Load DEM as f32 (halves peak RAM on large rasters; supports =true/=false to override --config)
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+        use_f32: Option<bool>,
+        /// Skip writing output GeoTIFF rasters (keep CSV, GeoPackage, and graph outputs; supports =true/=false to override --config)
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+        no_rasters: Option<bool>,
+        /// Skip writing output GeoPackage vectors (supports =true/=false to override --config)
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+        no_vectors: Option<bool>,
+        /// Skip writing rating curves and connectivity graph (supports =true/=false to override --config)
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+        no_graph: Option<bool>,
+        /// Compress output GeoTIFFs with DEFLATE (supports =true/=false to override --config)
+        #[arg(short = 'c', long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+        compress: Option<bool>,
         /// Print summary as JSON
         #[arg(long)]
         json: bool,
@@ -2021,9 +1995,9 @@ fn dispatch(
             }
             let opts = GroundClassifyOptions {
                 method: method.into(),
-                csf: ground_filter.build_csf(2),
-                pmf: ground_filter.build_pmf(2),
-                smrf: ground_filter.build_smrf(2),
+                csf: ground_filter.build_csf(DEFAULT_GROUND_CLASS),
+                pmf: ground_filter.build_pmf(DEFAULT_GROUND_CLASS),
+                smrf: ground_filter.build_smrf(DEFAULT_GROUND_CLASS),
             };
             let classified = classify_ground_with_options(&cloud, &opts)?;
             write_lidar(&classified, &output, &PointWriteOptions::default())?;
@@ -2031,7 +2005,7 @@ fn dispatch(
             let ground_count = classified
                 .classification_counts()
                 .into_iter()
-                .find(|&(c, _)| c == 2)
+                .find(|&(c, _)| c == DEFAULT_GROUND_CLASS)
                 .map_or(0, |(_, n)| n);
             if json {
                 print_json(&json!({
@@ -2264,6 +2238,12 @@ fn dispatch(
             compress,
             json,
         } => {
+            if config.is_some() && std::env::var_os("LIDAR_MCP_TOOL").is_some() {
+                return Err(lidar::Error::InvalidArgument(
+                    "--config is disabled inside MCP tool invocations; pass explicit validated CLI flags instead"
+                        .into(),
+                ));
+            }
             let cfg = match config {
                 Some(ref p) => load_pipeline_config(p)?,
                 None => PipelineConfig::default(),
@@ -2280,16 +2260,18 @@ fn dispatch(
                         .into(),
                 )
             })?;
-            let kernel = kernel.or(cfg.kernel).unwrap_or(3);
-            let min_size = min_size.or(cfg.min_size).unwrap_or(1000);
-            let min_depth = min_depth.or(cfg.min_depth).unwrap_or(0.3);
-            let interval = interval.or(cfg.interval).unwrap_or(0.3);
-            let rain_intensity = rain_intensity.or(cfg.rain_intensity).unwrap_or(5.0);
+            let kernel = kernel.or(cfg.kernel).unwrap_or(DEFAULT_KERNEL_SIZE);
+            let min_size = min_size.or(cfg.min_size).unwrap_or(DEFAULT_MIN_SIZE);
+            let min_depth = min_depth.or(cfg.min_depth).unwrap_or(DEFAULT_MIN_DEPTH);
+            let interval = interval.or(cfg.interval).unwrap_or(DEFAULT_INTERVAL);
+            let rain_intensity = rain_intensity
+                .or(cfg.rain_intensity)
+                .unwrap_or(DEFAULT_RAIN_INTENSITY_CM_H);
             let scs_type2_mm = scs_type2_mm.or(cfg.scs_type2_mm);
             let duration = duration
                 .or(cfg.duration)
                 .unwrap_or(if scs_type2_mm.is_some() { 24.0 } else { 50.0 });
-            let time_step = time_step.or(cfg.time_step).unwrap_or(1.0);
+            let time_step = time_step.or(cfg.time_step).unwrap_or(DEFAULT_TIME_STEP_H);
             let cfg_breach_mode = cfg
                 .breach_mode
                 .as_deref()
@@ -2298,8 +2280,9 @@ fn dispatch(
             let breach_mode = breach_mode.or(cfg_breach_mode);
             let breach_max_depth = breach_max_depth.or(cfg.breach_max_depth);
             let breach_max_length = breach_max_length.or(cfg.breach_max_length);
-            let breach_fill_remaining =
-                breach_fill_remaining || cfg.breach_fill_remaining.unwrap_or(false);
+            let breach_fill_remaining = breach_fill_remaining
+                .or(cfg.breach_fill_remaining)
+                .unwrap_or(false);
             let culverts = culverts.or(cfg.culverts);
             let infiltration = infiltration.or(cfg.infiltration);
             let antecedent_depth = antecedent_depth.or(cfg.antecedent_depth);
@@ -2310,11 +2293,11 @@ fn dispatch(
                 .map(parse_routing_mode_str)
                 .transpose()?;
             let routing = routing.or(cfg_routing).unwrap_or(CliRoutingMode::Static);
-            let use_f32 = use_f32 || cfg.use_f32.unwrap_or(false);
-            let no_rasters = no_rasters || cfg.no_rasters.unwrap_or(false);
-            let no_vectors = no_vectors || cfg.no_vectors.unwrap_or(false);
-            let no_graph = no_graph || cfg.no_graph.unwrap_or(false);
-            let compress = compress || cfg.compress.unwrap_or(false);
+            let use_f32 = use_f32.or(cfg.use_f32).unwrap_or(false);
+            let no_rasters = no_rasters.or(cfg.no_rasters).unwrap_or(false);
+            let no_vectors = no_vectors.or(cfg.no_vectors).unwrap_or(false);
+            let no_graph = no_graph.or(cfg.no_graph).unwrap_or(false);
+            let compress = compress.or(cfg.compress).unwrap_or(false);
 
             // Resolve mutually exclusive runoff controls (CLI overrides config when a CLI flag
             // is supplied; conflicting combinations inside config are rejected).
@@ -3152,34 +3135,17 @@ fn dispatch(
             output,
             json,
         } => {
-            if !precip_mm.is_finite() || precip_mm <= 0.0 {
-                return Err(lidar::Error::InvalidArgument(format!(
-                    "--precip-mm must be finite and > 0, got {precip_mm}"
-                )));
-            }
-            if !ia_ratio.is_finite() || ia_ratio < 0.0 {
-                return Err(lidar::Error::InvalidArgument(format!(
-                    "--ia-ratio must be finite and >= 0, got {ia_ratio}"
-                )));
-            }
             if let Some(cn_val) = cn {
-                if !cn_val.is_finite() || cn_val <= 0.0 || cn_val > 100.0 {
-                    return Err(lidar::Error::InvalidArgument(format!(
-                        "--cn must be finite and in (0, 100], got {cn_val}"
-                    )));
+                if output.is_some() {
+                    return Err(lidar::Error::InvalidArgument(
+                        "--output is only supported with --cn-raster (scalar --cn prints to stdout)"
+                            .into(),
+                    ));
                 }
+                let (runoff_mm, runoff_coeff) =
+                    scs_curve_number_runoff_scalar(cn_val, precip_mm, ia_ratio)?;
                 let s_mm = 25_400.0 / cn_val - 254.0;
                 let ia_mm = ia_ratio * s_mm;
-                let runoff_coeff = if (ia_ratio - 0.2).abs() < 1e-12 {
-                    let single = Array2D::from_vec(1, 1, vec![cn_val])?;
-                    scs_curve_number_runoff(&single, precip_mm)?.data()[0]
-                } else if precip_mm <= ia_mm {
-                    0.0
-                } else {
-                    let q = (precip_mm - ia_mm).powi(2) / (precip_mm - ia_mm + s_mm);
-                    (q / precip_mm).clamp(0.0, 1.0)
-                };
-                let runoff_mm = runoff_coeff * precip_mm;
                 if json {
                     print_json(&json!({
                         "cn": cn_val,
@@ -3203,37 +3169,7 @@ fn dispatch(
                 })?;
                 ensure_no_cli_path_collision(&cn_path, &out_path)?;
                 let cn_arr = load_raster::<f64>(&cn_path, None)?;
-                let rc_arr = if (ia_ratio - 0.2).abs() < 1e-12 {
-                    scs_curve_number_runoff(&cn_arr, precip_mm)?
-                } else {
-                    const OUT_NODATA: f64 = -9999.0;
-                    let nd = cn_arr.no_data();
-                    let data: Vec<f64> = cn_arr
-                        .data()
-                        .iter()
-                        .map(|&v| {
-                            if !v.is_finite() || v.rd_eq(nd) {
-                                return OUT_NODATA;
-                            }
-                            if v <= 0.0 {
-                                return 0.0;
-                            }
-                            let c = v.min(100.0);
-                            let s = 25_400.0 / c - 254.0;
-                            let ia = ia_ratio * s;
-                            if !s.is_finite() || !ia.is_finite() || precip_mm <= ia {
-                                0.0
-                            } else {
-                                let q = (precip_mm - ia).powi(2) / (precip_mm - ia + s);
-                                (q / precip_mm).clamp(0.0, 1.0)
-                            }
-                        })
-                        .collect();
-                    let mut out = Array2D::from_vec(cn_arr.width(), cn_arr.height(), data)?;
-                    out.copy_metadata_from(&cn_arr);
-                    out.set_no_data(OUT_NODATA);
-                    out
-                };
+                let rc_arr = scs_curve_number_runoff_with_ia(&cn_arr, precip_mm, ia_ratio)?;
                 if let Some(parent) = out_path.parent()
                     && !parent.as_os_str().is_empty()
                 {
@@ -3369,14 +3305,7 @@ fn dispatch(
                 match fmt {
                     CliGraphFormat::Json => write_connectivity_graph_json(&graph, &out_path)?,
                     CliGraphFormat::Graphml => write_connectivity_graphml(&graph, &out_path)?,
-                    CliGraphFormat::Csv => {
-                        if let Some(parent) = out_path.parent()
-                            && !parent.as_os_str().is_empty()
-                        {
-                            std::fs::create_dir_all(parent)?;
-                        }
-                        std::fs::write(&out_path, connectivity_graph_edges_to_csv_string(&graph))?;
-                    }
+                    CliGraphFormat::Csv => write_connectivity_graph_edges_csv(&graph, &out_path)?,
                 }
                 if json {
                     print_json(&json!({
@@ -3406,7 +3335,7 @@ fn dispatch(
                         print!("{}", connectivity_graph_to_graphml_string(&graph));
                     }
                     CliGraphFormat::Csv => {
-                        print!("{}", connectivity_graph_edges_to_csv_string(&graph));
+                        print!("{}", graph.to_edge_csv());
                     }
                 }
             }
@@ -3803,7 +3732,7 @@ mod tests {
                 } => {
                     assert_eq!(curve_number, Some(PathBuf::from("cn.tif")));
                     assert!(matches!(breach_mode, Some(CliBreachMode::Constrained)));
-                    assert!(breach_fill_remaining);
+                    assert_eq!(breach_fill_remaining, Some(true));
                 }
                 _ => panic!("expected Pipeline"),
             }
@@ -4201,6 +4130,50 @@ mod tests {
                 _ => panic!("expected ClassifyGround"),
             }
 
+            // `--slope-smooth` with `require_equals = true` must NOT consume positional `in.laz`
+            let cli_smooth_bare = Cli::try_parse_from([
+                "lidar",
+                "classify-ground",
+                "--slope-smooth",
+                "in.laz",
+                "out.laz",
+            ])
+            .unwrap();
+            match cli_smooth_bare.command {
+                Commands::ClassifyGround {
+                    input,
+                    output,
+                    ground_filter,
+                    ..
+                } => {
+                    assert_eq!(input, PathBuf::from("in.laz"));
+                    assert_eq!(output, PathBuf::from("out.laz"));
+                    assert_eq!(ground_filter.slope_smooth, Some(true));
+                }
+                _ => panic!("expected ClassifyGround"),
+            }
+            let cli_smooth_false = Cli::try_parse_from([
+                "lidar",
+                "classify-ground",
+                "--slope-smooth=false",
+                "in.laz",
+                "out.laz",
+            ])
+            .unwrap();
+            match cli_smooth_false.command {
+                Commands::ClassifyGround {
+                    input,
+                    output,
+                    ground_filter,
+                    ..
+                } => {
+                    assert_eq!(input, PathBuf::from("in.laz"));
+                    assert_eq!(output, PathBuf::from("out.laz"));
+                    assert_eq!(ground_filter.slope_smooth, Some(false));
+                }
+                _ => panic!("expected ClassifyGround"),
+            }
+
             let cli_dtm = Cli::try_parse_from([
                 "lidar",
                 "lidar-to-dtm",
@@ -4321,8 +4294,12 @@ mod tests {
             0
         );
         assert!(toml_out.join("summary.json").exists());
+        assert!(
+            !toml_out.join("fill_time.tif").exists(),
+            "TOML no_rasters = true should skip raster export"
+        );
 
-        // CLI positional out_dir + --cn override config values
+        // CLI positional out_dir + --cn + bidirectional --no-rasters=false override config values
         assert_eq!(
             run(vec![
                 "lidar".into(),
@@ -4333,11 +4310,16 @@ mod tests {
                 toml_cfg.as_os_str().to_os_string(),
                 "--cn".into(),
                 "85".into(),
+                "--no-rasters=false".into(),
                 "-q".into(),
             ]),
             0
         );
         assert!(toml_override_out.join("summary.json").exists());
+        assert!(
+            toml_override_out.join("fill_time.tif").exists(),
+            "--no-rasters=false must override no_rasters = true from TOML config"
+        );
 
         // 2. JSON config
         let json_out = tmp.path().join("pipe_json");

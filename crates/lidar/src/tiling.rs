@@ -825,6 +825,9 @@ fn report_tile_completion(
     num_tiles: usize,
     control: &ExecutionControl,
 ) {
+    // Hold the progress mutex across increment + callback invocation so parallel tile
+    // workers deliver strictly monotonic completion fractions (1/N, 2/N, ..., N/N).
+    // Callbacks are expected to be fast and non-reentrant with respect to tiling.
     let mut completed = progress_mtx
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

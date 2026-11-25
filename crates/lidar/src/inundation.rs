@@ -1335,16 +1335,61 @@ pub struct InundationForcing<'a> {
     pub hyetograph: Option<&'a [(f64, f64)]>,
 }
 
-/// Converts an NRCS Curve Number (`CN` in `(0, 100]`) raster and storm precipitation
-/// depth (`precip_mm > 0`) into a spatially variable effective runoff-coefficient raster
-/// (`Q / P` in `[0, 1]`) using the standard NRCS TR-55 rainfall-runoff equation
-/// (`S = 25400 / CN - 254`, `Ia = 0.2 * S`).
+/// Computes scalar NRCS TR-55 storm runoff depth (mm) and effective runoff coefficient (`Q / P`)
+/// from a uniform Curve Number `cn` in `(0, 100]`, precipitation depth `precip_mm > 0`, and
+/// initial abstraction ratio `ia_ratio >= 0` (`Ia = ia_ratio * S`, standard TR-55 default `0.2`).
 ///
-/// Non-finite and NoData CN cells propagate as NoData (`-9999.0`) in the output raster.
-pub fn scs_curve_number_runoff(cn: &Array2D<f64>, precip_mm: f64) -> Result<Array2D<f64>> {
+/// Returns `(runoff_mm, runoff_coeff)`.
+pub fn scs_curve_number_runoff_scalar(
+    cn: f64,
+    precip_mm: f64,
+    ia_ratio: f64,
+) -> Result<(f64, f64)> {
+    if !cn.is_finite() || cn <= 0.0 || cn > 100.0 {
+        return Err(Error::InvalidArgument(format!(
+            "cn must be finite and in (0, 100], got {cn}"
+        )));
+    }
     if !precip_mm.is_finite() || precip_mm <= 0.0 {
         return Err(Error::InvalidArgument(format!(
             "precip_mm must be finite and > 0, got {precip_mm}"
+        )));
+    }
+    if !ia_ratio.is_finite() || ia_ratio < 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "ia_ratio must be finite and >= 0, got {ia_ratio}"
+        )));
+    }
+    let s = 25_400.0 / cn - 254.0;
+    let ia = ia_ratio * s;
+    if !s.is_finite() || !ia.is_finite() || precip_mm <= ia {
+        Ok((0.0, 0.0))
+    } else {
+        let q = (precip_mm - ia).powi(2) / (precip_mm - ia + s);
+        let rc = (q / precip_mm).clamp(0.0, 1.0);
+        Ok((rc * precip_mm, rc))
+    }
+}
+
+/// Converts an NRCS Curve Number (`CN` in `(0, 100]`) raster and storm precipitation
+/// depth (`precip_mm > 0`) into a spatially variable effective runoff-coefficient raster
+/// (`Q / P` in `[0, 1]`) using the NRCS TR-55 rainfall-runoff equation with configurable
+/// initial abstraction ratio `ia_ratio >= 0` (`S = 25400 / CN - 254`, `Ia = ia_ratio * S`).
+///
+/// Non-finite and NoData CN cells propagate as NoData (`-9999.0`) in the output raster.
+pub fn scs_curve_number_runoff_with_ia(
+    cn: &Array2D<f64>,
+    precip_mm: f64,
+    ia_ratio: f64,
+) -> Result<Array2D<f64>> {
+    if !precip_mm.is_finite() || precip_mm <= 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "precip_mm must be finite and > 0, got {precip_mm}"
+        )));
+    }
+    if !ia_ratio.is_finite() || ia_ratio < 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "ia_ratio must be finite and >= 0, got {ia_ratio}"
         )));
     }
     const OUT_NODATA: f64 = -9999.0;
@@ -1361,7 +1406,7 @@ pub fn scs_curve_number_runoff(cn: &Array2D<f64>, precip_mm: f64) -> Result<Arra
             }
             let c = v.min(100.0);
             let s = 25_400.0 / c - 254.0;
-            let ia = 0.2 * s;
+            let ia = ia_ratio * s;
             if !s.is_finite() || !ia.is_finite() || precip_mm <= ia {
                 0.0
             } else {
@@ -1374,6 +1419,16 @@ pub fn scs_curve_number_runoff(cn: &Array2D<f64>, precip_mm: f64) -> Result<Arra
     out.copy_metadata_from(cn);
     out.set_no_data(OUT_NODATA);
     Ok(out)
+}
+
+/// Converts an NRCS Curve Number (`CN` in `(0, 100]`) raster and storm precipitation
+/// depth (`precip_mm > 0`) into a spatially variable effective runoff-coefficient raster
+/// (`Q / P` in `[0, 1]`) using the standard NRCS TR-55 rainfall-runoff equation
+/// (`S = 25400 / CN - 254`, `Ia = 0.2 * S`).
+///
+/// Non-finite and NoData CN cells propagate as NoData (`-9999.0`) in the output raster.
+pub fn scs_curve_number_runoff(cn: &Array2D<f64>, precip_mm: f64) -> Result<Array2D<f64>> {
+    scs_curve_number_runoff_with_ia(cn, precip_mm, 0.2)
 }
 
 /// Official NRCS TR-55 (1986) 24-hour synthetic rainfall distribution types.
@@ -4604,5 +4659,30 @@ mod tests {
         let seen = mid_stages.lock().unwrap();
         assert!(seen.iter().any(|s| s == "extract_sinks"));
         assert!(!seen.iter().any(|s| s == "complete"));
+    }
+
+    #[test]
+    fn scs_curve_number_runoff_with_custom_ia_ratio_matches_tr55_exact() {
+        // CN = 80 => S = 25400/80 - 254 = 63.5 mm.
+        // P = 100 mm, ia_ratio = 0.05 => Ia = 3.175 mm.
+        // Q = (100 - 3.175)^2 / (100 - 3.175 + 63.5) = 96.825^2 / 160.325 = 58.4754755964...
+        let expected_q = (100.0 - 3.175_f64).powi(2) / (100.0 - 3.175 + 63.5);
+        let expected_rc = expected_q / 100.0;
+
+        let (q, rc) = scs_curve_number_runoff_scalar(80.0, 100.0, 0.05).unwrap();
+        assert!((q - expected_q).abs() < 1e-10);
+        assert!((rc - expected_rc).abs() < 1e-12);
+
+        let mut cn = Array2D::from_vec(2, 1, vec![80.0, -9999.0]).unwrap();
+        cn.set_no_data(-9999.0);
+        let rc_arr = scs_curve_number_runoff_with_ia(&cn, 100.0, 0.05).unwrap();
+        assert!((rc_arr.data()[0] - expected_rc).abs() < 1e-12);
+        assert_eq!(rc_arr.data()[1], rc_arr.no_data());
+
+        // Reject negative ia_ratio and out-of-range CN
+        assert!(scs_curve_number_runoff_scalar(80.0, 100.0, -0.1).is_err());
+        assert!(scs_curve_number_runoff_scalar(0.0, 100.0, 0.2).is_err());
+        assert!(scs_curve_number_runoff_scalar(101.0, 100.0, 0.2).is_err());
+        assert!(scs_curve_number_runoff_with_ia(&cn, 100.0, -0.1).is_err());
     }
 }

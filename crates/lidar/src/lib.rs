@@ -116,8 +116,10 @@ pub use fsm::{
 pub use graph::write_connectivity_graph_json;
 pub use graph::{
     ConnectivityGraph, GraphEdge, GraphNode, RatingCurvePoint, build_connectivity_graph,
-    compute_rating_curves, connectivity_graph_to_graphml_string, rating_curves_to_csv_string,
-    write_connectivity_graphml, write_rating_curves_csv, write_spill_paths_vector,
+    compute_rating_curves, connectivity_graph_edges_to_csv_string,
+    connectivity_graph_to_graphml_string, rating_curves_to_csv_string,
+    write_connectivity_graph_edges_csv, write_connectivity_graphml, write_rating_curves_csv,
+    write_spill_paths_vector,
 };
 pub use inundation::{
     ForcingInput, GreenAmptParams, InMemoryFullPipeline, InMemoryFullPipelineOptions,
@@ -129,9 +131,10 @@ pub use inundation::{
     format_inundation_curve_csv, green_ampt_hyetograph_losses, green_ampt_infiltration_rate_cm_h,
     load_hyetograph_csv, parse_hyetograph_csv, run_full_pipeline_in_memory, run_pipeline,
     run_pipeline_with_control, scale_forcing_by_rainfall_grid, scs_cn_incremental_hyetograph,
-    scs_curve_number_runoff, scs_hyetograph, scs_type2_hyetograph, simulate_inundation,
-    simulate_inundation_advanced, simulate_inundation_in_memory,
-    simulate_inundation_pipeline_in_memory, simulate_inundation_with_forcing_in_memory,
+    scs_curve_number_runoff, scs_curve_number_runoff_scalar, scs_curve_number_runoff_with_ia,
+    scs_hyetograph, scs_type2_hyetograph, simulate_inundation, simulate_inundation_advanced,
+    simulate_inundation_in_memory, simulate_inundation_pipeline_in_memory,
+    simulate_inundation_with_forcing_in_memory,
     simulate_inundation_with_weighted_catchment_in_memory, write_inundation_summary_csv,
 };
 pub use merge_tree::{

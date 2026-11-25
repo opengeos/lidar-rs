@@ -233,6 +233,13 @@ pub struct ConnectivityGraph {
     pub edges: Vec<GraphEdge>,
 }
 
+impl ConnectivityGraph {
+    /// Formats all graph edges as a CSV string (`from_id,to_id,edge_type,...`).
+    pub fn to_edge_csv(&self) -> String {
+        connectivity_graph_edges_to_csv_string(self)
+    }
+}
+
 #[inline]
 fn cell_center_xy(gt: &[f64; 6], col: usize, row: usize) -> [f64; 2] {
     let cf = col as f64 + 0.5;
@@ -905,6 +912,50 @@ pub fn write_connectivity_graphml(graph: &ConnectivityGraph, path: impl AsRef<Pa
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, connectivity_graph_to_graphml_string(graph))?;
+    Ok(())
+}
+
+/// Formats all edges of a [`ConnectivityGraph`] as a CSV string.
+pub fn connectivity_graph_edges_to_csv_string(graph: &ConnectivityGraph) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from(
+        "from_id,to_id,edge_type,spill_time_h,spill_runoff_mm,merge_time_h,spill_elev,length_m,dist_to_stream\n",
+    );
+    let fmt_opt = |v: Option<f64>| -> String {
+        v.filter(|x| x.is_finite())
+            .map(|x| format!("{x:.6}"))
+            .unwrap_or_default()
+    };
+    for e in &graph.edges {
+        let _ = writeln!(
+            out,
+            "{},{},{},{},{},{},{},{:.4},{}",
+            e.from_id,
+            e.to_id,
+            e.edge_type,
+            fmt_opt(e.spill_time_h),
+            fmt_opt(e.spill_runoff_mm),
+            fmt_opt(e.merge_time_h),
+            fmt_opt(e.spill_elev),
+            e.length_m,
+            fmt_opt(e.dist_to_stream),
+        );
+    }
+    out
+}
+
+/// Writes the edge table of a [`ConnectivityGraph`] to CSV.
+pub fn write_connectivity_graph_edges_csv(
+    graph: &ConnectivityGraph,
+    path: impl AsRef<Path>,
+) -> Result<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, connectivity_graph_edges_to_csv_string(graph))?;
     Ok(())
 }
 
