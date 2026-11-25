@@ -18,7 +18,7 @@ Processing regional 1-m USGS 3DEP DEMs (100M+ pixels) as full-grid `f64` arrays 
 
 ## `f32` Storage Helpers
 
-Most 3DEP GeoTIFF DEMs are distributed natively as 32-bit floats (`f32`). Loading them with `use_f32` (default `true` in Rust `TiledDelineationOptions` and Python `delineate_depressions_tiled`, opt-in `--use-f32` flag in `lidar tiled-depressions` and `lidar pipeline`, or directly via `lidar::load_dem_f32`) halves the source DEM RAM footprint (from 8 bytes/pixel to 4 bytes/pixel) while preserving exact source NoData sentinels during per-tile conversion to `f64`.
+Most 3DEP GeoTIFF DEMs are distributed natively as 32-bit floats (`f32`). Loading them with `use_f32` (default `true` in Rust `TiledDelineationOptions`, Python `delineate_depressions_tiled`, and `lidar tiled-depressions`; pass `--use-f64` in `lidar tiled-depressions` for double-precision loading, or opt in with `--use-f32` in `lidar pipeline` / call `lidar::load_dem_f32` directly) halves the source DEM RAM footprint (from 8 bytes/pixel to 4 bytes/pixel) while preserving exact source NoData sentinels during per-tile conversion to `f64`.
 
 ## Usage Examples
 
@@ -27,15 +27,15 @@ Most 3DEP GeoTIFF DEMs are distributed natively as 32-bit floats (`f32`). Loadin
     ```sh
     curl -LO https://files.opengeos.org/lidar/data/dem.tif
 
-    # Parallel overlapping tiled delineation with f32 source storage
+    # Parallel overlapping tiled delineation (f32 source storage by default; pass --use-f64 for f64)
     lidar tiled-depressions dem.tif out_tiled \
       --tile-size 200 --overlap 50 \
       --kernel 3 --min-size 1000 --min-depth 0.3 --interval 0.3 \
-      --use-f32 --json
+      --json
 
     # Large regional 1-m 3DEP DEM example
     lidar tiled-depressions regional_1m.tif out_regional \
-      --tile-size 2048 --overlap 256 --use-f32
+      --tile-size 2048 --overlap 256
     ```
 
 === "Python"

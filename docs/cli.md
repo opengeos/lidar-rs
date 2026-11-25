@@ -47,8 +47,8 @@ lidar pipeline dem.tif out_storm \
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--kernel <N>` | `3` | Median filter kernel size (`<= 1` skips smoothing) |
-| `--breach-max-depth <M>` | off | Enables selective Lindsay (2016) breaching with max depth `M` |
-| `--breach-max-length <N>` | `40` | Max breach path length in cells when `--breach-max-depth` is set |
+| `--breach-max-depth <M>` | off | Enables selective Lindsay (2016) breaching with max depth `M` (pass `0` for unlimited) |
+| `--breach-max-length <N>` | `50` | Max breach path length in cells (requires `--breach-max-depth`; pass `0` for unlimited) |
 | `--culverts <PATH>` | off | Vector file (`.gpkg`, `.geojson`, `.shp`) burned before sink extraction |
 | `--scs-type2-mm <MM>` | off | Enables an NRCS SCS Type II design storm (`--duration` defaults to `24.0` h when omitted) |
 | `--routing <MODE>` | `static` | Inundation routing mode: `static` (independent level-set) or `fsm` (dynamic Fill-Spill-Merge cascade mass-balance) |
@@ -94,10 +94,11 @@ lidar burn-culverts dem.tif sample_culverts.gpkg out/burned.tif --half-width 1 -
 ## Tiled Regional Delineation
 
 ```sh
+# Uses f32 source storage by default to halve RAM (pass --use-f64 for double precision)
 lidar tiled-depressions large_dem.tif out_tiled \
   --tile-size 2048 --overlap 256 \
   --kernel 3 --min-size 1000 --min-depth 0.3 --interval 0.3 \
-  --use-f32 --json
+  --json
 ```
 
 ## Step-by-Step Depression, Mount & Inundation Workflow

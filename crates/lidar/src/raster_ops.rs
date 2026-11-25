@@ -92,7 +92,7 @@ fn polygonize_dataset(ds: &RasterDataset, out_vector: &Path, field_name: &str) -
     Ok(count)
 }
 
-fn resolve_path_for_compare(path: &Path) -> Option<PathBuf> {
+pub(crate) fn resolve_path_for_compare(path: &Path) -> Option<PathBuf> {
     if let Ok(canon) = std::fs::canonicalize(path) {
         return Some(canon);
     }
@@ -137,6 +137,14 @@ pub(crate) fn ensure_no_path_collision(input: &Path, outputs: &[&Path]) -> Resul
 ///
 /// Mirrors `lidar.mosaic`.
 pub fn mosaic<P: AsRef<Path>>(inputs: &[P], output: impl AsRef<Path>) -> Result<()> {
+    mosaic_with_resampling(inputs, output, Resampling::Nearest)
+}
+
+pub(crate) fn mosaic_with_resampling<P: AsRef<Path>>(
+    inputs: &[P],
+    output: impl AsRef<Path>,
+    resampling: Resampling,
+) -> Result<()> {
     if inputs.is_empty() {
         return Err(Error::InvalidArgument(
             "mosaic requires at least one input raster".into(),
@@ -154,12 +162,11 @@ pub fn mosaic<P: AsRef<Path>>(inputs: &[P], output: impl AsRef<Path>) -> Result<
         .map(|p| path_to_str(p.as_ref()).map(str::to_string))
         .collect::<Result<Vec<_>>>()?;
     let out_str = path_to_str(output)?;
-    mosaic_to_path(
-        &paths,
-        &MosaicOptions::default(),
-        out_str,
-        &RasterWriteOptions::default(),
-    )?;
+    let opts = MosaicOptions {
+        resampling,
+        ..Default::default()
+    };
+    mosaic_to_path(&paths, &opts, out_str, &RasterWriteOptions::default())?;
     Ok(())
 }
 
@@ -173,6 +180,13 @@ pub fn reproject_image(
     resampling: Resampling,
     resolution: Option<(f64, f64)>,
 ) -> Result<()> {
+    if let Some((rx, ry)) = resolution
+        && (!rx.is_finite() || rx <= 0.0 || !ry.is_finite() || ry <= 0.0)
+    {
+        return Err(Error::InvalidArgument(format!(
+            "resolution must be finite and > 0, got ({rx}, {ry})"
+        )));
+    }
     let in_path = input.as_ref();
     let out_path = output.as_ref();
     ensure_no_path_collision(in_path, &[out_path])?;
@@ -297,40 +311,106 @@ fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> String {
 ///
 /// Mirrors `lidar.add_crs`.
 pub fn add_crs(input: impl AsRef<Path>, crs: &str, output: Option<&Path>) -> Result<()> {
+    let crs_trimmed = crs.trim();
+    if crs_trimmed.is_empty() {
+        return Err(Error::InvalidArgument("CRS string cannot be empty".into()));
+    }
+    let crs_norm = if crs_trimmed.chars().all(|c| c.is_ascii_digit()) {
+        format!("EPSG:{crs_trimmed}")
+    } else {
+        crs_trimmed.to_string()
+    };
+    let sref = SpatialRef::parse(&crs_norm)?;
+
     let in_path = input.as_ref();
     let in_str = path_to_str(in_path)?;
     let out_path = output.unwrap_or(in_path);
     ensure_parent_dir(out_path)?;
 
-    let crs_norm = if crs.trim().chars().all(|c| c.is_ascii_digit()) {
-        format!("EPSG:{}", crs.trim())
-    } else {
-        crs.trim().to_string()
-    };
-    let sref = SpatialRef::parse(&crs_norm)?;
     let mut ds = terrio::open_raster(in_str)?;
     ds.raster.crs = sref.to_crs_info();
 
-    let in_place = output.is_none() || out_path == in_path;
+    let in_place = output.is_none()
+        || out_path == in_path
+        || match (
+            resolve_path_for_compare(in_path),
+            resolve_path_for_compare(out_path),
+        ) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        };
     if in_place {
+        let orig_perms = std::fs::metadata(in_path).ok().map(|m| m.permissions());
         let ext = out_path
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("tif");
-        let stem = out_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("raster");
-        let tmp_path =
-            out_path.with_file_name(format!(".{stem}.lidar_tmp_{}.{ext}", std::process::id()));
-        let tmp_str = path_to_str(&tmp_path)?;
-        if let Err(e) = terrio::write_raster_dataset(&ds, tmp_str, &RasterWriteOptions::default()) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e.into());
+        let parent = out_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+        {
+            let staged = tempfile::Builder::new()
+                .prefix(".lidar_crs_")
+                .suffix(&format!(".{ext}"))
+                .tempfile_in(parent)?;
+            let staged_path = staged.into_temp_path();
+            let tmp_str = path_to_str(&staged_path)?;
+            terrio::write_raster_dataset(&ds, tmp_str, &RasterWriteOptions::default())?;
+            if let Some(perms) = orig_perms {
+                let _ = std::fs::set_permissions(&staged_path, perms);
+            }
+            staged_path
+                .persist(out_path)
+                .map_err(|e| Error::Io(e.error))?;
         }
-        if let Err(e) = std::fs::rename(&tmp_path, out_path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e.into());
+        #[cfg(not(all(feature = "download", not(target_arch = "wasm32"))))]
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(0);
+
+            struct TempFileGuard(Option<PathBuf>);
+            impl Drop for TempFileGuard {
+                fn drop(&mut self) {
+                    if let Some(p) = self.0.take() {
+                        let _ = std::fs::remove_file(p);
+                    }
+                }
+            }
+
+            let pid = std::process::id();
+            let mut tmp_path = None;
+            for _ in 0..1024 {
+                let seq = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
+                let candidate = parent.join(format!(".lidar_crs_{pid}_{seq}.{ext}"));
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&candidate)
+                {
+                    Ok(_) => {
+                        tmp_path = Some(candidate);
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            let tmp_path = tmp_path.ok_or_else(|| {
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "failed to allocate unique temporary file for add_crs",
+                ))
+            })?;
+            let mut guard = TempFileGuard(Some(tmp_path.clone()));
+            let tmp_str = path_to_str(&tmp_path)?;
+            terrio::write_raster_dataset(&ds, tmp_str, &RasterWriteOptions::default())?;
+            if let Some(perms) = orig_perms {
+                let _ = std::fs::set_permissions(&tmp_path, perms);
+            }
+            std::fs::rename(&tmp_path, out_path)?;
+            guard.0 = None;
         }
     } else {
         let out_str = path_to_str(out_path)?;
@@ -430,7 +510,7 @@ fn infer_field_type(rows: &[Vec<String>], col: usize) -> FieldType {
             if v.parse::<i64>().is_err() {
                 all_int = false;
             }
-            if v.parse::<f64>().is_err() {
+            if !v.parse::<f64>().is_ok_and(f64::is_finite) {
                 all_float = false;
             }
         }
@@ -457,16 +537,24 @@ fn parse_field_value(raw: Option<&String>, ftype: FieldType) -> FieldValue {
             .unwrap_or_else(|_| FieldValue::Text(s.to_string())),
         FieldType::Float => s
             .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
             .map(FieldValue::Float)
-            .unwrap_or_else(|_| FieldValue::Text(s.to_string())),
+            .unwrap_or_else(|| FieldValue::Text(s.to_string())),
         _ => FieldValue::Text(s.to_string()),
     }
 }
 
-fn normalize_text_join_key(raw: &str) -> String {
+fn has_leading_zero(s: &str) -> bool {
+    let unsigned = s.strip_prefix(['+', '-']).unwrap_or(s);
+    let int_part = unsigned.split(['.', 'e', 'E']).next().unwrap_or(unsigned);
+    int_part.len() > 1 && int_part.starts_with('0')
+}
+
+fn normalize_numeric_join_key(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if let Ok(i) = trimmed.parse::<i64>() {
-        return i.to_string();
+        return Some(i.to_string());
     }
     if let Ok(f) = trimmed.parse::<f64>()
         && f.is_finite()
@@ -475,9 +563,17 @@ fn normalize_text_join_key(raw: &str) -> String {
         && f < (i64::MAX as f64)
         && f.abs() <= ((1u64 << 53) as f64)
     {
-        return (f as i64).to_string();
+        return Some((f as i64).to_string());
     }
-    trimmed.to_string()
+    None
+}
+
+fn normalize_text_join_key(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if has_leading_zero(trimmed) {
+        return trimmed.to_string();
+    }
+    normalize_numeric_join_key(trimmed).unwrap_or_else(|| trimmed.to_string())
 }
 
 fn field_value_join_key(val: &FieldValue) -> Option<String> {
@@ -538,8 +634,12 @@ pub fn join_csv_to_vector(
     vec_join_col: &str,
     csv_join_col: &str,
 ) -> Result<usize> {
-    let in_vec_str = path_to_str(in_vector.as_ref())?;
+    let in_vec_path = in_vector.as_ref();
+    let in_csv_path = in_csv.as_ref();
     let out_path = out_vector.as_ref();
+    ensure_no_path_collision(in_vec_path, &[out_path])?;
+    ensure_no_path_collision(in_csv_path, &[out_path])?;
+    let in_vec_str = path_to_str(in_vec_path)?;
     ensure_parent_dir(out_path)?;
     let out_str = path_to_str(out_path)?;
 
@@ -548,7 +648,7 @@ pub fn join_csv_to_vector(
         Error::InvalidArgument(format!("vector file has no layers: {in_vec_str}"))
     })?;
 
-    let (headers, rows) = read_csv_table(in_csv.as_ref())?;
+    let (headers, rows) = read_csv_table(in_csv_path)?;
     let is_shp = out_path
         .extension()
         .and_then(|e| e.to_str())
@@ -560,8 +660,17 @@ pub fn join_csv_to_vector(
     }
     SpatialRef::from_layer(src_layer).apply_to_layer(&mut out_layer);
 
-    if headers.is_empty() || rows.is_empty() {
-        out_layer.schema = src_layer.schema.clone();
+    if headers.is_empty() {
+        let mut used_names = HashSet::new();
+        for field in src_layer.schema.fields() {
+            let mut out_field = field.clone();
+            if is_shp {
+                out_field.name = allocate_unique_field_name(&field.name, true, &mut used_names);
+            } else {
+                used_names.insert(out_field.name.to_ascii_lowercase());
+            }
+            out_layer.schema.add_field(out_field);
+        }
         out_layer.features = src_layer.features.clone();
         let n = out_layer.features.len();
         terrio::write_vector(&[out_layer], out_str, &VectorWriteOptions::default())?;
@@ -588,23 +697,24 @@ pub fn join_csv_to_vector(
     // Drop the vector join column when `csv_join_col` uses a different name
     // (matching `ExtractSinks` dropping `id` in favor of `region_id`). When both
     // join columns share the same name, keep the vector key and skip the duplicate CSV key.
+    let mut used_names: HashSet<String> = HashSet::new();
     let mut keep_vec_indices = Vec::new();
     for (idx, field) in src_layer.schema.fields().iter().enumerate() {
         if idx == vec_key_idx && !vec_join_col.eq_ignore_ascii_case(csv_join_col) {
             continue;
         }
         keep_vec_indices.push(idx);
-        out_layer.schema.add_field(field.clone());
+        let mut out_field = field.clone();
+        if is_shp {
+            out_field.name = allocate_unique_field_name(&field.name, true, &mut used_names);
+        } else {
+            used_names.insert(out_field.name.to_ascii_lowercase());
+        }
+        out_layer.schema.add_field(out_field);
     }
 
     // Add CSV fields with guaranteed unique names (truncated to 10 UTF-8 bytes for Shapefile DBF).
     let mut csv_col_types = Vec::with_capacity(headers.len());
-    let mut used_names: HashSet<String> = out_layer
-        .schema
-        .fields()
-        .iter()
-        .map(|f| f.name.to_ascii_lowercase())
-        .collect();
     let mut csv_keep_cols = Vec::new();
 
     for (ci, raw_name) in headers.iter().enumerate() {
@@ -618,11 +728,21 @@ pub fn join_csv_to_vector(
         csv_keep_cols.push(ci);
     }
 
-    // Build lookup map from normalized CSV join key to row.
+    // Build lookup maps from CSV join keys to rows.
+    // `lookup` preserves leading zeros for text columns (HUC/FIPS/GEOID codes), while
+    // `numeric_lookup` lets zero-padded CSV keys (e.g. "0123") still match numeric vector fields.
+    let vec_key_is_numeric = matches!(
+        src_layer.schema.fields()[vec_key_idx].field_type,
+        FieldType::Integer | FieldType::Float
+    );
     let mut lookup: HashMap<String, &Vec<String>> = HashMap::with_capacity(rows.len());
+    let mut numeric_lookup: HashMap<String, &Vec<String>> = HashMap::new();
     for row in &rows {
         if let Some(k) = row.get(csv_key_idx) {
             lookup.insert(normalize_text_join_key(k), row);
+            if let Some(num_key) = normalize_numeric_join_key(k) {
+                numeric_lookup.insert(num_key, row);
+            }
         }
     }
 
@@ -631,11 +751,18 @@ pub fn join_csv_to_vector(
         for &vi in &keep_vec_indices {
             attrs.push(feat.attributes.get(vi).cloned().unwrap_or(FieldValue::Null));
         }
-        let matched = feat
-            .attributes
-            .get(vec_key_idx)
-            .and_then(field_value_join_key)
-            .and_then(|k| lookup.get(&k).copied());
+        let matched = feat.attributes.get(vec_key_idx).and_then(|val| {
+            let key = field_value_join_key(val)?;
+            lookup.get(&key).copied().or_else(|| {
+                let allow_numeric_fallback = vec_key_is_numeric
+                    || matches!(val, FieldValue::Integer(_) | FieldValue::Float(_));
+                if allow_numeric_fallback {
+                    numeric_lookup.get(&key).copied()
+                } else {
+                    None
+                }
+            })
+        });
 
         for (&ci, &ftype) in csv_keep_cols.iter().zip(&csv_col_types) {
             let val = matched

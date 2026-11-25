@@ -19,24 +19,25 @@
 //! - **End-to-end bundle** (downloads all selected federal datasets, optionally mosaics/clips
 //!   the 3DEP DEM and synthesizes road-stream culverts): [`download_federal_data`]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use terrio::crs::{SpatialRef, Transformer};
+use terrio::ops::Resampling;
 use terrio::ops::topology::make_valid as terrio_make_valid;
 use terrio::ops::vector_clip::{ClipRegion, ClipTemplateOptions, clip as terrio_vector_clip};
 use terrio::{VectorOpenOptions, VectorWriteOptions};
 
 use crate::conditioning::{SynthesizeCulvertsOptions, synthesize_culverts};
 use crate::error::{Error, Result};
-use crate::raster_ops::{clip_image, mosaic};
+use crate::raster_ops::{clip_image, mosaic_with_resampling, resolve_path_for_compare};
 
 /// USGS Watershed Boundary Dataset (WBD) MapServer base URL.
 pub const USGS_WBD_BASE_URL: &str =
@@ -643,16 +644,88 @@ fn make_download_agent(timeout_secs: u64) -> ureq::Agent {
     ureq::Agent::new_with_config(config)
 }
 
-fn is_retryable_ureq_error(err: &ureq::Error) -> bool {
+pub(crate) fn is_retryable_ureq_error(err: &ureq::Error) -> bool {
     match err {
         ureq::Error::BodyExceedsLimit(_)
         | ureq::Error::BadUri(_)
+        | ureq::Error::Http(_)
         | ureq::Error::InvalidProxyUrl
         | ureq::Error::TooManyRedirects
-        | ureq::Error::RedirectFailed => false,
+        | ureq::Error::RedirectFailed
+        | ureq::Error::RequireHttpsOnly(_)
+        | ureq::Error::LargeResponseHeader(_, _)
+        | ureq::Error::Tls(_)
+        | ureq::Error::Pem(_)
+        | ureq::Error::Rustls(_) => false,
         ureq::Error::StatusCode(code) => *code == 408 || *code == 429 || *code >= 500,
         _ => true,
     }
+}
+
+fn retry_backoff_duration(base_ms: u64, attempt: usize) -> Duration {
+    let linear_ms = base_ms.saturating_mul(attempt as u64 + 1);
+    let max_jitter = (linear_ms / 4).max(1);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos() as u64);
+    let mixed = nanos
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add((attempt as u64).wrapping_mul(1_442_695_040_888_963_407));
+    Duration::from_millis(linear_ms.saturating_add(mixed % max_jitter))
+}
+
+fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TempFileGuard(Option<PathBuf>);
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            if let Some(p) = self.0.take() {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+
+    ensure_parent_dir(path)?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    // Stage via OpenOptions::create_new instead of NamedTempFile so the written JSON/metadata
+    // file honors the process umask (e.g. 0644) rather than forcing 0600 permissions.
+    let pid = std::process::id();
+    let mut opened = None;
+    for _ in 0..1024 {
+        let seq = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".lidar_tmp_{pid}_{seq}.part"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                opened = Some((candidate, file));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let (tmp_path, mut file) = opened.ok_or_else(|| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "failed to allocate unique temporary file for atomic write",
+        ))
+    })?;
+    let mut guard = TempFileGuard(Some(tmp_path.clone()));
+    file.write_all(contents)?;
+    file.flush()?;
+    drop(file);
+    std::fs::rename(&tmp_path, path)?;
+    guard.0 = None;
+    Ok(())
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<()> {
@@ -721,7 +794,7 @@ fn http_get_text(
                     return Err(Error::Http(format!("GET {url} failed: {last_err}")));
                 }
                 if attempt < max_retries {
-                    std::thread::sleep(Duration::from_millis(1200 * (attempt as u64 + 1)));
+                    std::thread::sleep(retry_backoff_duration(1200, attempt));
                 }
             }
         }
@@ -764,7 +837,7 @@ fn http_post_form_text(
                     return Err(Error::Http(format!("POST {url} failed: {last_err}")));
                 }
                 if attempt < max_retries {
-                    std::thread::sleep(Duration::from_millis(1500 * (attempt as u64 + 1)));
+                    std::thread::sleep(retry_backoff_duration(1500, attempt));
                 }
             }
         }
@@ -783,6 +856,7 @@ fn http_download_file(
     overwrite: bool,
     max_retries: usize,
 ) -> Result<PathBuf> {
+    let expected_bytes = expected_bytes.filter(|&n| n > 0);
     if !overwrite
         && dest.exists()
         && let Ok(meta) = std::fs::metadata(dest)
@@ -820,6 +894,23 @@ fn http_download_file(
                     DownloadAttemptErr::Fatal(err)
                 }
             })?;
+            let has_content_encoding = resp
+                .headers()
+                .get("content-encoding")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| {
+                    let trimmed = v.trim();
+                    !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("identity")
+                });
+            let header_content_length = if expected_bytes.is_none() && !has_content_encoding {
+                resp.headers()
+                    .get("content-length")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .filter(|&n| n > 0)
+            } else {
+                None
+            };
             let mut reader = resp.body_mut().as_reader();
             let mut buf = vec![0u8; 256 * 1024];
             let mut written: u64 = 0;
@@ -845,7 +936,8 @@ fn http_download_file(
                     "GET {url} returned empty body"
                 ))));
             }
-            if let Some(exp) = expected_bytes
+            let verify_len = expected_bytes.or(header_content_length);
+            if let Some(exp) = verify_len
                 && written != exp
             {
                 return Err(DownloadAttemptErr::Retryable(Error::Http(format!(
@@ -867,7 +959,7 @@ fn http_download_file(
                 drop(tmp_file);
                 last_err = e.to_string();
                 if attempt < max_retries {
-                    std::thread::sleep(Duration::from_millis(2000 * (attempt as u64 + 1)));
+                    std::thread::sleep(retry_backoff_duration(2000, attempt));
                 }
             }
         }
@@ -1236,12 +1328,62 @@ fn write_geojson_feature_collection(
     Ok(final_count)
 }
 
+/// Maximum recursive bisection depth for short ArcGIS OID pages when the server does not set
+/// `exceededTransferLimit: true`. Recovers silent server caps below the chunk size while bounding
+/// request amplification when a few OIDs are deleted or have null geometry.
+const MAX_NON_EXCEEDED_BISECT_DEPTH: usize = 4;
+
+/// Decides whether an ArcGIS `objectIds` chunk response was truncated by a server transfer
+/// limit and should be bisected into smaller chunks.
+///
+/// - Never bisects single-OID chunks (`chunk_len <= 1`).
+/// - Always bisects when the server explicitly sets `exceededTransferLimit: true`.
+/// - When `!exceeded` and `features_len == 0`, returns `false` so missing or null-geometry
+///   OIDs do not trigger recursive empty-chunk amplification.
+/// - When `!exceeded` and `0 < features_len < chunk_len`, bisects only while
+///   `non_exceeded_depth_left > 0`.
+pub(crate) fn should_bisect_arcgis_chunk(
+    exceeded: bool,
+    features_len: usize,
+    chunk_len: usize,
+    non_exceeded_depth_left: usize,
+) -> bool {
+    if chunk_len <= 1 {
+        return false;
+    }
+    if exceeded {
+        return true;
+    }
+    if features_len == 0 {
+        return false;
+    }
+    features_len < chunk_len && non_exceeded_depth_left > 0
+}
+
 fn fetch_arcgis_oid_chunk(
     agent: &ureq::Agent,
     query_url: &str,
     chunk: &[i64],
     out_fields: &str,
     max_retries: usize,
+) -> Result<Vec<Value>> {
+    fetch_arcgis_oid_chunk_inner(
+        agent,
+        query_url,
+        chunk,
+        out_fields,
+        max_retries,
+        MAX_NON_EXCEEDED_BISECT_DEPTH,
+    )
+}
+
+fn fetch_arcgis_oid_chunk_inner(
+    agent: &ureq::Agent,
+    query_url: &str,
+    chunk: &[i64],
+    out_fields: &str,
+    max_retries: usize,
+    non_exceeded_depth_left: usize,
 ) -> Result<Vec<Value>> {
     let oid_str = chunk
         .iter()
@@ -1276,12 +1418,37 @@ fn fetch_arcgis_oid_chunk(
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
-    if (exceeded || features.len() < chunk.len()) && chunk.len() > 1 {
+    if !exceeded && features.is_empty() {
+        return Ok(features);
+    }
+    if should_bisect_arcgis_chunk(
+        exceeded,
+        features.len(),
+        chunk.len(),
+        non_exceeded_depth_left,
+    ) {
+        let next_depth = if exceeded {
+            non_exceeded_depth_left
+        } else {
+            non_exceeded_depth_left.saturating_sub(1)
+        };
         let mid = chunk.len() / 2;
-        let mut left =
-            fetch_arcgis_oid_chunk(agent, query_url, &chunk[..mid], out_fields, max_retries)?;
-        let right =
-            fetch_arcgis_oid_chunk(agent, query_url, &chunk[mid..], out_fields, max_retries)?;
+        let mut left = fetch_arcgis_oid_chunk_inner(
+            agent,
+            query_url,
+            &chunk[..mid],
+            out_fields,
+            max_retries,
+            next_depth,
+        )?;
+        let right = fetch_arcgis_oid_chunk_inner(
+            agent,
+            query_url,
+            &chunk[mid..],
+            out_fields,
+            max_retries,
+            next_depth,
+        )?;
         left.extend(right);
         return Ok(left);
     }
@@ -1657,7 +1824,10 @@ pub(crate) fn parse_tnm_products_json(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let size_bytes = it.get("sizeInBytes").and_then(Value::as_u64);
+        let size_bytes = it
+            .get("sizeInBytes")
+            .and_then(Value::as_u64)
+            .filter(|&n| n > 0);
         let format = it
             .get("format")
             .and_then(Value::as_str)
@@ -1812,6 +1982,66 @@ pub fn download_3dep_dem(
     download_3dep_dem_resolved(&resolved, out_dir, opts, opts.overwrite)
 }
 
+fn fnv1a_hash64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+fn insert_filename_tag(filename: &str, tag: &str) -> String {
+    if let Some(dot) = filename.rfind('.')
+        && dot > 0
+    {
+        format!("{}_{tag}{}", &filename[..dot], &filename[dot..])
+    } else {
+        format!("{filename}_{tag}")
+    }
+}
+
+/// Assigns collision-free local tile filenames for `products` so parallel tile downloads never
+/// race on the same destination path. Non-colliding tiles keep their exact sanitized basename.
+pub(crate) fn assign_unique_tile_filenames(products: &[TnmProductItem]) -> Vec<String> {
+    let base_names: Vec<String> = products
+        .iter()
+        .map(|it| sanitize_tile_filename(&it.download_url, &it.grid_key))
+        .collect();
+    let mut counts: HashMap<String, usize> = HashMap::with_capacity(base_names.len());
+    for name in &base_names {
+        *counts.entry(name.to_ascii_lowercase()).or_insert(0) += 1;
+    }
+
+    let mut used: HashSet<String> = HashSet::with_capacity(base_names.len());
+    let mut out = Vec::with_capacity(base_names.len());
+    for (idx, (item, base)) in products.iter().zip(base_names).enumerate() {
+        let lower = base.to_ascii_lowercase();
+        let candidate = if counts.get(&lower).copied().unwrap_or(0) <= 1 && used.insert(lower) {
+            base
+        } else {
+            let short_hash = format!(
+                "{:08x}",
+                (fnv1a_hash64(item.download_url.as_bytes()) as u32)
+            );
+            let tagged = insert_filename_tag(&base, &short_hash);
+            if used.insert(tagged.to_ascii_lowercase()) {
+                tagged
+            } else {
+                let mut disambig = insert_filename_tag(&base, &format!("{short_hash}_{idx}"));
+                let mut extra = 1usize;
+                while !used.insert(disambig.to_ascii_lowercase()) {
+                    disambig = insert_filename_tag(&base, &format!("{short_hash}_{idx}_{extra}"));
+                    extra += 1;
+                }
+                disambig
+            }
+        };
+        out.push(candidate);
+    }
+    out
+}
+
 fn download_3dep_dem_resolved(
     resolved: &ResolvedRegion,
     out_dir: &Path,
@@ -1833,9 +2063,11 @@ fn download_3dep_dem_resolved(
         .unwrap_or_else(|| out_dir.join("tiles"));
     std::fs::create_dir_all(&tiles_dir)?;
 
+    let filenames = assign_unique_tile_filenames(&products);
+    let pairs: Vec<(&TnmProductItem, &String)> = products.iter().zip(filenames.iter()).collect();
+
     let agent = make_download_agent(opts.timeout_secs);
-    let download_one = |item: &TnmProductItem| -> Result<PathBuf> {
-        let fname = sanitize_tile_filename(&item.download_url, &item.grid_key);
+    let download_one = |(item, fname): &(&TnmProductItem, &String)| -> Result<PathBuf> {
         let dest = tiles_dir.join(fname);
         http_download_file(
             &agent,
@@ -1854,17 +2086,14 @@ fn download_3dep_dem_resolved(
             .build()
             .map_err(|e| Error::Algorithm(format!("failed creating download thread pool: {e}")))?;
         pool.install(|| {
-            products
+            pairs
                 .par_iter()
                 .map(download_one)
                 .collect::<Result<Vec<_>>>()
         })?
     };
     #[cfg(not(feature = "parallel"))]
-    let tile_paths: Vec<PathBuf> = products
-        .iter()
-        .map(download_one)
-        .collect::<Result<Vec<_>>>()?;
+    let tile_paths: Vec<PathBuf> = pairs.iter().map(download_one).collect::<Result<Vec<_>>>()?;
 
     let mosaic_path = if opts.mosaic_dem && opts.dem_product.is_raster() && !tile_paths.is_empty() {
         let final_dem = out_dir.join("dem.tif");
@@ -1907,7 +2136,7 @@ fn download_3dep_dem_resolved(
                             .tempfile_in(out_dir)?;
                         let raw_path = raw_tmp.into_temp_path();
                         let raw_pb = raw_path.to_path_buf();
-                        mosaic(&tile_paths, &raw_pb)?;
+                        mosaic_with_resampling(&tile_paths, &raw_pb, Resampling::Bilinear)?;
                         clip_image(
                             &raw_pb,
                             resolved.boundary_path.as_ref().expect("boundary path"),
@@ -1917,7 +2146,7 @@ fn download_3dep_dem_resolved(
                 } else if tile_paths.len() == 1 {
                     std::fs::copy(&tile_paths[0], &staged_pb)?;
                 } else {
-                    mosaic(&tile_paths, &staged_pb)?;
+                    mosaic_with_resampling(&tile_paths, &staged_pb, Resampling::Bilinear)?;
                 }
                 Ok(())
             })();
@@ -1926,7 +2155,7 @@ fn download_3dep_dem_resolved(
                 .persist(&final_dem)
                 .map_err(|e| Error::Io(e.error))?;
             if let Ok(meta_json) = serde_json::to_string(&expected_meta) {
-                let _ = std::fs::write(&meta_path, meta_json);
+                let _ = write_file_atomic(&meta_path, meta_json.as_bytes());
             }
         }
         Some(final_dem)
@@ -2060,6 +2289,9 @@ fn download_roads_resolved(
     let mut all_features: Vec<Value> = Vec::new();
     for &lyr in layers {
         let url = format!("{USGS_TRANSPORTATION_BASE_URL}/{lyr}/query");
+        // Use "*" because USGS Transportation layers do not share identical attribute schemas
+        // (for example, Railroads layer 29 publishes `name` and `mtfcc_code` rather than
+        // `FULL_STREET_NAME`); properties are normalized to a compact schema below.
         let fc = fetch_arcgis_paginated(&agent, &url, &base_params, "*", opts)?;
         if let Some(feats) = fc.get("features").and_then(Value::as_array) {
             for feat in feats {
@@ -2102,20 +2334,41 @@ fn download_roads_resolved(
     write_geojson_feature_collection(&merged, out_path, "usgs_roads", mask)
 }
 
+fn find_js_assignment_rhs<'a>(body: &'a str, ident: &str) -> Option<&'a str> {
+    let bytes = body.as_bytes();
+    let mut offset = 0usize;
+    while let Some(rel) = body[offset..].find(ident) {
+        let idx = offset + rel;
+        let end_ident = idx + ident.len();
+        let prev_ok =
+            idx == 0 || !(bytes[idx - 1].is_ascii_alphanumeric() || bytes[idx - 1] == b'_');
+        if prev_ok {
+            let mut pos = end_ident;
+            while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+            if pos < bytes.len() && bytes[pos] == b'=' && bytes.get(pos + 1) != Some(&b'=') {
+                return Some(&body[pos + 1..]);
+            }
+        }
+        offset = end_ident;
+    }
+    None
+}
+
 /// Parses the JavaScript-formatted `quantiles = [[...]];` response from NOAA Atlas 14 CGI.
 pub(crate) fn parse_noaa_atlas14_response(
     lat: f64,
     lon: f64,
     body: &str,
 ) -> Result<NoaaAtlas14Table> {
-    let key_idx = body.find("quantiles").ok_or_else(|| {
+    let after_eq = find_js_assignment_rhs(body, "quantiles").ok_or_else(|| {
         Error::Parse("NOAA Atlas 14 response missing 'quantiles' array (point may be outside Atlas 14 coverage)".into())
     })?;
-    let after_key = &body[key_idx..];
-    let start = after_key
+    let start = after_eq
         .find("[[")
         .ok_or_else(|| Error::Parse("NOAA Atlas 14 quantiles opening '[[' not found".into()))?;
-    let rest = &after_key[start..];
+    let rest = &after_eq[start..];
     let end = rest
         .find("]];")
         .map(|i| i + 2)
@@ -2202,10 +2455,9 @@ pub fn fetch_noaa_atlas14(
     let table = parse_noaa_atlas14_response(lat, lon, &body)?;
 
     if let Some(p) = out_json {
-        ensure_parent_dir(p)?;
         let pretty = serde_json::to_string_pretty(&table)
             .map_err(|e| Error::Parse(format!("failed serializing NOAA Atlas 14 JSON: {e}")))?;
-        std::fs::write(p, pretty)?;
+        write_file_atomic(p, pretty.as_bytes())?;
     }
     Ok(table)
 }
@@ -2255,6 +2507,90 @@ fn manifest_matches_request(
         && prev.transportation_layers == effective_transportation_layers(opts)
 }
 
+/// Removes stale per-region bundle artifacts in `out_dir` when invalidating an existing
+/// mismatched `manifest.json`, preserving `keep_boundary` (resolved canonically so relative vs
+/// absolute path spellings never delete the active boundary) and leaving tile caches untouched.
+///
+/// Only called when `manifest_path` already exists so pointing `-o` at a directory without a
+/// prior `manifest.json` never deletes unrelated user files. When `manifest.json` parses cleanly,
+/// only direct-child bundle paths in `out_dir` recorded in that prior manifest (plus DEM metadata
+/// sidecars and stale `region_huc_*.geojson` files in `out_dir`) are removed. If `manifest.json`
+/// fails to parse, only `manifest.json` itself is removed so arbitrary unverified files in
+/// `out_dir` are never deleted.
+pub(crate) fn clean_stale_bundle_outputs(
+    out_dir: &Path,
+    manifest_path: &Path,
+    keep_boundary: Option<&Path>,
+) {
+    let keep_canon = keep_boundary.and_then(resolve_path_for_compare);
+    let is_kept = |candidate: &Path| -> bool {
+        if let Some(kb) = keep_boundary
+            && candidate == kb
+        {
+            return true;
+        }
+        match (&keep_canon, resolve_path_for_compare(candidate)) {
+            (Some(k), Some(c)) => *k == c,
+            _ => false,
+        }
+    };
+    let remove_if_not_kept = |candidate: &Path| {
+        if !is_kept(candidate) {
+            let _ = std::fs::remove_file(candidate);
+        }
+    };
+
+    let parsed_prev = std::fs::read_to_string(manifest_path)
+        .ok()
+        .and_then(|txt| serde_json::from_str::<FederalBundleResult>(&txt).ok());
+
+    let out_dir_canon = std::fs::canonicalize(out_dir).ok();
+    let is_direct_child_of_out_dir = |candidate: &Path| -> bool {
+        let Some(ref od) = out_dir_canon else {
+            return false;
+        };
+        resolve_path_for_compare(candidate)
+            .and_then(|c| c.parent().map(Path::to_path_buf))
+            .is_some_and(|parent| parent == *od)
+    };
+
+    if let Some(prev) = parsed_prev {
+        for p in [
+            prev.wbd_path.as_deref(),
+            prev.dem_mosaic_path.as_deref(),
+            prev.nhd_path.as_deref(),
+            prev.nwi_path.as_deref(),
+            prev.roads_path.as_deref(),
+            prev.culverts_path.as_deref(),
+            prev.noaa_atlas14_path.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if is_direct_child_of_out_dir(p) {
+                remove_if_not_kept(p);
+            }
+        }
+        if prev.dem_mosaic_path.is_some() {
+            remove_if_not_kept(&out_dir.join(".dem.meta.json"));
+            remove_if_not_kept(&out_dir.join("dem.tif.meta.json"));
+        }
+        if let Ok(entries) = std::fs::read_dir(out_dir) {
+            for entry in entries.flatten() {
+                let fname = entry.file_name();
+                if let Some(s) = fname.to_str()
+                    && s.starts_with("region_huc_")
+                    && s.ends_with(".geojson")
+                {
+                    remove_if_not_kept(&entry.path());
+                }
+            }
+        }
+    }
+
+    remove_if_not_kept(manifest_path);
+}
+
 /// Downloads a complete bundle of open U.S. federal datasets for `region` into `out_dir`.
 ///
 /// Downloads every dataset listed in `opts.datasets` (defaulting to WBD, 3DEP DEM, NHD,
@@ -2291,9 +2627,12 @@ pub fn download_federal_data(
         manifest_matches_request(&manifest_path, &reg_key, &resolved.bbox, &opts.download);
     let mut bundle_dl_opts = opts.download.clone();
     if !cache_matches {
-        // Invalidate any stale manifest before overwriting per-region outputs so an interrupted
-        // run can never leave mixed-region files matched by the old manifest.
-        let _ = std::fs::remove_file(&manifest_path);
+        // Invalidate prior manifest-managed per-region bundle files before writing new outputs
+        // so a partial subset run for Region B can never inherit stale Region A files, without
+        // deleting unrelated user files in directories that had no prior manifest.json.
+        if manifest_path.exists() {
+            clean_stale_bundle_outputs(out_dir, &manifest_path, resolved.boundary_path.as_deref());
+        }
         bundle_dl_opts.overwrite = true;
     }
 
@@ -2416,7 +2755,7 @@ pub fn download_federal_data(
     };
     let manifest_json = serde_json::to_string_pretty(&result)
         .map_err(|e| Error::Parse(format!("failed serializing manifest JSON: {e}")))?;
-    std::fs::write(&manifest_path, manifest_json)?;
+    write_file_atomic(&manifest_path, manifest_json.as_bytes())?;
     Ok(result)
 }
 
@@ -2747,5 +3086,591 @@ mod tests {
         )
         .unwrap();
         assert_eq!(n_clip, 1);
+    }
+
+    #[test]
+    fn stale_cross_region_cache_invalidation_cleans_bundle_files_but_keeps_tiles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = tmp.path();
+        let tiles_dir = out_dir.join("tiles");
+        std::fs::create_dir_all(&tiles_dir).unwrap();
+        let cached_tile = tiles_dir.join("USGS_1M_14_x47y523.tif");
+        std::fs::write(&cached_tile, b"tile-bytes").unwrap();
+
+        let region_a = Bbox::new(-99.2, 47.0, -99.0, 47.2).unwrap();
+        let opts_a = DownloadOptions::default();
+        let manifest_path = out_dir.join("manifest.json");
+        let manifest_a = FederalBundleResult {
+            region_bbox: region_a,
+            region_key: "bbox".to_string(),
+            dem_product: opts_a.dem_product,
+            wbd_level: opts_a.wbd_level,
+            clip_to_region: opts_a.clip_to_region,
+            mosaic_dem: opts_a.mosaic_dem,
+            transportation_layers: effective_transportation_layers(&opts_a),
+            wbd_path: Some(out_dir.join("wbd.gpkg")),
+            wbd_count: 1,
+            dem_tiles: vec![cached_tile.clone()],
+            dem_mosaic_path: Some(out_dir.join("dem.tif")),
+            nhd_path: Some(out_dir.join("nhd_flowlines.gpkg")),
+            nhd_count: 1,
+            nwi_path: Some(out_dir.join("nwi_wetlands.gpkg")),
+            nwi_count: 1,
+            roads_path: Some(out_dir.join("usgs_roads.gpkg")),
+            roads_count: 1,
+            culverts_path: Some(out_dir.join("culverts.gpkg")),
+            culverts_count: 1,
+            noaa_atlas14_path: Some(out_dir.join("noaa_atlas14.json")),
+            noaa_atlas14: None,
+            manifest_path: manifest_path.clone(),
+        };
+        std::fs::write(&manifest_path, serde_json::to_string(&manifest_a).unwrap()).unwrap();
+
+        let stale_files = [
+            "wbd.gpkg",
+            "dem.tif",
+            "nhd_flowlines.gpkg",
+            "nwi_wetlands.gpkg",
+            "usgs_roads.gpkg",
+            "culverts.gpkg",
+            "noaa_atlas14.json",
+            ".dem.meta.json",
+            "dem.tif.meta.json",
+            "region_huc_10160002.geojson",
+        ];
+        for name in stale_files {
+            std::fs::write(out_dir.join(name), b"stale-region-a").unwrap();
+        }
+
+        // Run download_federal_data for a DIFFERENT region (Region B) with an empty dataset subset
+        // (simulating a partial request like [Dem] that leaves wbd.gpkg unrequested).
+        let region_b = Bbox::new(-98.2, 46.0, -98.0, 46.2).unwrap();
+        let res = download_federal_data(
+            &Region::Bbox(region_b),
+            out_dir,
+            &FederalBundleOptions {
+                datasets: Vec::new(),
+                download: DownloadOptions::default(),
+            },
+        )
+        .unwrap();
+        assert_eq!(res.region_bbox, region_b);
+
+        for name in stale_files {
+            assert!(
+                !out_dir.join(name).exists(),
+                "stale Region A file '{name}' should have been removed on cache invalidation"
+            );
+        }
+        assert!(
+            cached_tile.exists(),
+            "tile cache files must never be removed on bundle invalidation"
+        );
+        assert!(manifest_path.exists());
+        assert!(manifest_matches_request(
+            &manifest_path,
+            "bbox",
+            &region_b,
+            &DownloadOptions::default()
+        ));
+    }
+
+    #[test]
+    fn no_manifest_preserves_user_files_and_keep_boundary_is_preserved_across_path_spellings() {
+        // (a) A directory with NO prior manifest.json must never have pre-existing user files
+        // deleted when download_federal_data initializes it.
+        let user_dir = tempfile::tempdir().unwrap();
+        let user_dem = user_dir.path().join("dem.tif");
+        let user_wbd = user_dir.path().join("wbd.gpkg");
+        std::fs::write(&user_dem, b"user-owned-dem").unwrap();
+        std::fs::write(&user_wbd, b"user-owned-wbd").unwrap();
+
+        let bb = Bbox::new(-98.2, 46.0, -98.0, 46.2).unwrap();
+        download_federal_data(
+            &Region::Bbox(bb),
+            user_dir.path(),
+            &FederalBundleOptions {
+                datasets: Vec::new(),
+                download: DownloadOptions::default(),
+            },
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&user_dem).unwrap(), b"user-owned-dem");
+        assert_eq!(std::fs::read(&user_wbd).unwrap(), b"user-owned-wbd");
+
+        // (b) A mismatched valid manifest deletes ONLY paths recorded in that manifest, keeping
+        // unrecorded files in out_dir untouched.
+        let partial_dir = tempfile::tempdir().unwrap();
+        let recorded_nhd = partial_dir.path().join("nhd_flowlines.gpkg");
+        let unrecorded_user_dem = partial_dir.path().join("dem.tif");
+        std::fs::write(&recorded_nhd, b"old-nhd").unwrap();
+        std::fs::write(&unrecorded_user_dem, b"user-dem").unwrap();
+        let region_a = Bbox::new(-99.2, 47.0, -99.0, 47.2).unwrap();
+        let manifest_path = partial_dir.path().join("manifest.json");
+        let opts_a = DownloadOptions::default();
+        let partial_manifest = FederalBundleResult {
+            region_bbox: region_a,
+            region_key: "bbox".to_string(),
+            dem_product: opts_a.dem_product,
+            wbd_level: opts_a.wbd_level,
+            clip_to_region: opts_a.clip_to_region,
+            mosaic_dem: opts_a.mosaic_dem,
+            transportation_layers: effective_transportation_layers(&opts_a),
+            wbd_path: None,
+            wbd_count: 0,
+            dem_tiles: Vec::new(),
+            dem_mosaic_path: None,
+            nhd_path: Some(recorded_nhd.clone()),
+            nhd_count: 1,
+            nwi_path: None,
+            nwi_count: 0,
+            roads_path: None,
+            roads_count: 0,
+            culverts_path: None,
+            culverts_count: 0,
+            noaa_atlas14_path: None,
+            noaa_atlas14: None,
+            manifest_path: manifest_path.clone(),
+        };
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string(&partial_manifest).unwrap(),
+        )
+        .unwrap();
+        clean_stale_bundle_outputs(partial_dir.path(), &manifest_path, None);
+        assert!(
+            !recorded_nhd.exists(),
+            "manifest-recorded NHD should be removed"
+        );
+        assert!(!manifest_path.exists());
+        assert!(
+            unrecorded_user_dem.exists(),
+            "unrecorded user dem.tif must not be deleted"
+        );
+
+        // (b2) A crafted or copied manifest pointing outside out_dir must NEVER delete external
+        // files outside out_dir.
+        let external_dir = tempfile::tempdir().unwrap();
+        let external_file = external_dir.path().join("external_important.tif");
+        std::fs::write(&external_file, b"must-not-be-deleted").unwrap();
+        let crafted_dir = tempfile::tempdir().unwrap();
+        let crafted_manifest_path = crafted_dir.path().join("manifest.json");
+        let crafted_manifest = FederalBundleResult {
+            region_bbox: region_a,
+            region_key: "bbox".to_string(),
+            dem_product: opts_a.dem_product,
+            wbd_level: opts_a.wbd_level,
+            clip_to_region: opts_a.clip_to_region,
+            mosaic_dem: opts_a.mosaic_dem,
+            transportation_layers: effective_transportation_layers(&opts_a),
+            wbd_path: Some(external_file.clone()),
+            wbd_count: 1,
+            dem_tiles: Vec::new(),
+            dem_mosaic_path: Some(external_file.clone()),
+            nhd_path: None,
+            nhd_count: 0,
+            nwi_path: None,
+            nwi_count: 0,
+            roads_path: None,
+            roads_count: 0,
+            culverts_path: None,
+            culverts_count: 0,
+            noaa_atlas14_path: None,
+            noaa_atlas14: None,
+            manifest_path: crafted_manifest_path.clone(),
+        };
+        std::fs::write(
+            &crafted_manifest_path,
+            serde_json::to_string(&crafted_manifest).unwrap(),
+        )
+        .unwrap();
+        clean_stale_bundle_outputs(crafted_dir.path(), &crafted_manifest_path, None);
+        assert!(
+            external_file.exists(),
+            "manifest pointing outside out_dir must never delete external files"
+        );
+        assert!(!crafted_manifest_path.exists());
+
+        // (c) keep_boundary pointing to out_dir/wbd.gpkg or aliased via ./ must never be deleted
+        // when cleaning a valid mismatched manifest.
+        let keep_dir = tempfile::tempdir().unwrap();
+        let keep_wbd = keep_dir.path().join("wbd.gpkg");
+        let keep_huc = keep_dir.path().join("region_huc_10160002.geojson");
+        let stale_nhd = keep_dir.path().join("nhd_flowlines.gpkg");
+        let valid_manifest_path = keep_dir.path().join("manifest.json");
+        std::fs::write(&keep_wbd, b"active-boundary-wbd").unwrap();
+        std::fs::write(&keep_huc, b"active-huc-boundary").unwrap();
+        std::fs::write(&stale_nhd, b"stale-nhd").unwrap();
+        let valid_manifest = FederalBundleResult {
+            region_bbox: region_a,
+            region_key: "bbox".to_string(),
+            dem_product: opts_a.dem_product,
+            wbd_level: opts_a.wbd_level,
+            clip_to_region: opts_a.clip_to_region,
+            mosaic_dem: opts_a.mosaic_dem,
+            transportation_layers: effective_transportation_layers(&opts_a),
+            wbd_path: Some(keep_wbd.clone()),
+            wbd_count: 1,
+            dem_tiles: Vec::new(),
+            dem_mosaic_path: None,
+            nhd_path: Some(stale_nhd.clone()),
+            nhd_count: 1,
+            nwi_path: None,
+            nwi_count: 0,
+            roads_path: None,
+            roads_count: 0,
+            culverts_path: None,
+            culverts_count: 0,
+            noaa_atlas14_path: None,
+            noaa_atlas14: None,
+            manifest_path: valid_manifest_path.clone(),
+        };
+        std::fs::write(
+            &valid_manifest_path,
+            serde_json::to_string(&valid_manifest).unwrap(),
+        )
+        .unwrap();
+
+        let aliased_wbd = keep_dir.path().join(".").join("wbd.gpkg");
+        clean_stale_bundle_outputs(keep_dir.path(), &valid_manifest_path, Some(&aliased_wbd));
+        assert!(
+            keep_wbd.exists(),
+            "active wbd.gpkg boundary must be preserved"
+        );
+        assert!(
+            !stale_nhd.exists(),
+            "stale nhd recorded in valid manifest should be removed"
+        );
+        assert!(
+            !keep_huc.exists(),
+            "unkept region_huc file should be removed when valid manifest is invalidated"
+        );
+
+        // Re-create valid manifest and verify aliased region_huc_ keep_boundary is preserved.
+        std::fs::write(&keep_huc, b"active-huc-boundary").unwrap();
+        std::fs::write(
+            &valid_manifest_path,
+            serde_json::to_string(&valid_manifest).unwrap(),
+        )
+        .unwrap();
+        let aliased_huc = keep_dir
+            .path()
+            .join(".")
+            .join("region_huc_10160002.geojson");
+        clean_stale_bundle_outputs(keep_dir.path(), &valid_manifest_path, Some(&aliased_huc));
+        assert!(
+            keep_huc.exists(),
+            "active region_huc boundary must be preserved across aliased paths"
+        );
+
+        // (d) When manifest.json is corrupt/unparseable, ONLY manifest.json itself is removed so
+        // arbitrary unverified files in out_dir are never deleted.
+        let corrupt_dir = tempfile::tempdir().unwrap();
+        let unverified_dem = corrupt_dir.path().join("dem.tif");
+        let unverified_wbd = corrupt_dir.path().join("wbd.gpkg");
+        let corrupt_manifest = corrupt_dir.path().join("manifest.json");
+        std::fs::write(&unverified_dem, b"keep-dem").unwrap();
+        std::fs::write(&unverified_wbd, b"keep-wbd").unwrap();
+        std::fs::write(&corrupt_manifest, b"{not valid json").unwrap();
+        clean_stale_bundle_outputs(corrupt_dir.path(), &corrupt_manifest, None);
+        assert!(!corrupt_manifest.exists());
+        assert!(
+            unverified_dem.exists(),
+            "corrupt manifest must not delete unverified dem.tif"
+        );
+        assert!(
+            unverified_wbd.exists(),
+            "corrupt manifest must not delete unverified wbd.gpkg"
+        );
+    }
+
+    /// Reads an HTTP/1.1 request (headers up to `\r\n\r\n` plus the exact `Content-Length` body)
+    /// from `stream` before replying, avoiding Winsock TCP RST (`os error 10053`) on Windows when
+    /// closing a connection while unread POST body bytes remain in flight.
+    fn drain_http_request_body(stream: &mut std::net::TcpStream) -> String {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut req_bytes = Vec::new();
+        let mut tmp_buf = [0u8; 1024];
+        let mut header_end = None;
+        let mut content_len = 0usize;
+        loop {
+            let n = stream.read(&mut tmp_buf).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            req_bytes.extend_from_slice(&tmp_buf[..n]);
+            if header_end.is_none()
+                && let Some(pos) = req_bytes.windows(4).position(|w| w == b"\r\n\r\n")
+            {
+                header_end = Some(pos + 4);
+                let hdr = String::from_utf8_lossy(&req_bytes[..pos]);
+                for line in hdr.lines() {
+                    if let Some((k, v)) = line.split_once(':')
+                        && k.trim().eq_ignore_ascii_case("content-length")
+                    {
+                        content_len = v.trim().parse::<usize>().unwrap_or(0);
+                    }
+                }
+            }
+            if let Some(he) = header_end
+                && req_bytes.len() >= he + content_len
+            {
+                break;
+            }
+        }
+        header_end
+            .map(|he| String::from_utf8_lossy(&req_bytes[he..]).into_owned())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn tnm_size_in_bytes_zero_parses_as_none_and_content_length_verified() {
+        let json = serde_json::json!({
+            "items": [
+                {
+                    "title": "USGS 1 Meter 14 x47y523 ZeroSize",
+                    "publicationDate": "2024-01-01",
+                    "downloadURL": "https://example.org/zero.tif",
+                    "sizeInBytes": 0,
+                    "format": "GeoTIFF",
+                    "boundingBox": {"minX": -99.3, "minY": 47.0, "maxX": -99.1, "maxY": 47.2}
+                },
+                {
+                    "title": "USGS 1 Meter 14 x48y523 KnownSize",
+                    "publicationDate": "2024-01-01",
+                    "downloadURL": "https://example.org/known.tif",
+                    "sizeInBytes": 4096,
+                    "format": "GeoTIFF",
+                    "boundingBox": {"minX": -99.3, "minY": 47.0, "maxX": -99.1, "maxY": 47.2}
+                }
+            ]
+        });
+        let items = parse_tnm_products_json(&json, None, false);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].size_bytes, None);
+        assert_eq!(items[1].size_bytes, Some(4096));
+
+        // Verify http_download_file enforces Content-Length when expected_bytes is None and retries
+        // on a truncated transfer.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = drain_http_request_body(&mut stream);
+                if attempt == 0 {
+                    // Claim 16 bytes but send only 5 bytes before closing.
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\nhello",
+                    );
+                } else {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\n0123456789abcdef",
+                    );
+                }
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("tile.tif");
+        let agent = make_download_agent(10);
+        let url = format!("http://{addr}/tile.tif");
+        let saved = http_download_file(&agent, &url, &dest, None, true, 1).unwrap();
+        server.join().unwrap();
+        assert_eq!(std::fs::read(&saved).unwrap(), b"0123456789abcdef");
+    }
+
+    #[test]
+    fn arcgis_oid_bisection_avoids_empty_amplification_and_recovers_sub_1000_caps() {
+        // Never bisect empty chunks when exceeded is false.
+        assert!(!should_bisect_arcgis_chunk(false, 0, 50, 4));
+        // Full chunk never bisects.
+        assert!(!should_bisect_arcgis_chunk(false, 50, 50, 4));
+        // Short page below 1000 bisects while non-exceeded budget remains, then stops at 0.
+        assert!(should_bisect_arcgis_chunk(false, 250, 500, 4));
+        assert!(!should_bisect_arcgis_chunk(false, 250, 500, 0));
+        // Explicit exceededTransferLimit always bisects for chunk_len > 1 even at budget 0.
+        assert!(should_bisect_arcgis_chunk(true, 10, 50, 0));
+        assert!(!should_bisect_arcgis_chunk(true, 0, 1, 4));
+
+        // Live local HTTP check: (1) empty chunk of 20 OIDs sends exactly 1 request; (2) silent
+        // cap at 2 features per request (without exceededTransferLimit) bisects and recovers all 4.
+        let empty_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let empty_addr = empty_listener.local_addr().unwrap();
+        let empty_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let empty_hits_srv = empty_hits.clone();
+        let empty_srv = std::thread::spawn(move || {
+            let (mut stream, _) = empty_listener.accept().unwrap();
+            empty_hits_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = drain_http_request_body(&mut stream);
+            let body = r#"{"type":"FeatureCollection","features":[]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        });
+        let agent = make_agent(10);
+        let empty_oids: Vec<i64> = (1..=20).collect();
+        let empty_res = fetch_arcgis_oid_chunk(
+            &agent,
+            &format!("http://{empty_addr}/query"),
+            &empty_oids,
+            "*",
+            0,
+        )
+        .unwrap();
+        empty_srv.join().unwrap();
+        assert!(empty_res.is_empty());
+        assert_eq!(empty_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Silent cap at 2 features per response for 4 requested OIDs -> initial request gets 2,
+        // bisects into 2 + 2, and recovers all 4 features.
+        let cap_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cap_addr = cap_listener.local_addr().unwrap();
+        let cap_srv = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = cap_listener.accept().unwrap();
+                let body_part = drain_http_request_body(&mut stream);
+                let oids: Vec<i64> = body_part
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix("objectIds="))
+                    .unwrap_or("")
+                    .split("%2C")
+                    .filter_map(|s| s.parse::<i64>().ok())
+                    .collect();
+                let capped: Vec<Value> = oids
+                    .into_iter()
+                    .take(2)
+                    .map(|id| serde_json::json!({"type": "Feature", "id": id, "properties": {"id": id}, "geometry": null}))
+                    .collect();
+                let body = serde_json::json!({"type": "FeatureCollection", "features": capped})
+                    .to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+            }
+        });
+        let cap_res = fetch_arcgis_oid_chunk(
+            &agent,
+            &format!("http://{cap_addr}/query"),
+            &[1, 2, 3, 4],
+            "*",
+            0,
+        )
+        .unwrap();
+        cap_srv.join().unwrap();
+        assert_eq!(cap_res.len(), 4);
+    }
+
+    #[test]
+    fn bilinear_mosaic_masks_nodata_seam_without_blending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tile_a = tmp.path().join("tile_a.tif");
+        let tile_b = tmp.path().join("tile_b.tif");
+        let mosaic_out = tmp.path().join("mosaic.tif");
+
+        let nd = -9999.0_f64;
+        // Left tile: valid 100.0 on columns 0..3, NoData (-9999.0) on right seam column 3.
+        let mut data_a = vec![100.0_f64; 4 * 4];
+        for r in 0..4 {
+            data_a[r * 4 + 3] = nd;
+        }
+        let mut arr_a = richdem::Array2D::from_vec(4, 4, data_a).unwrap();
+        arr_a.set_no_data(nd);
+        arr_a.geotransform = [500_000.0, 1.0, 0.0, 4_500_004.0, 0.0, -1.0];
+        arr_a.projection = "EPSG:32615".to_string();
+        richdem::save_raster(&arr_a, &tile_a, None, false).unwrap();
+
+        // Right tile shifted by 0.5 px (forces bilinear resampling) with NoData on its left edge.
+        let mut data_b = vec![120.0_f64; 4 * 4];
+        for r in 0..4 {
+            data_b[r * 4] = nd;
+        }
+        let mut arr_b = richdem::Array2D::from_vec(4, 4, data_b).unwrap();
+        arr_b.set_no_data(nd);
+        arr_b.geotransform = [500_002.5, 1.0, 0.0, 4_500_004.0, 0.0, -1.0];
+        arr_b.projection = "EPSG:32615".to_string();
+        richdem::save_raster(&arr_b, &tile_b, None, false).unwrap();
+
+        mosaic_with_resampling(&[&tile_a, &tile_b], &mosaic_out, Resampling::Bilinear).unwrap();
+        let mosaicked = richdem::load_raster::<f64>(&mosaic_out, None).unwrap();
+        let out_nd = mosaicked.no_data();
+        let mut valid_count = 0usize;
+        for &v in mosaicked.data() {
+            if !v.is_finite() || (v - out_nd).abs() < 1e-6 {
+                continue;
+            }
+            valid_count += 1;
+            assert!(
+                (99.0..=121.0).contains(&v),
+                "bilinear mosaic blended NoData (-9999.0) into valid pixel: {v}"
+            );
+        }
+        assert!(valid_count > 0);
+    }
+
+    #[test]
+    fn retry_classification_tile_filename_disambiguation_and_noaa_comment_parsing() {
+        assert!(is_retryable_ureq_error(&ureq::Error::HostNotFound));
+        assert!(!is_retryable_ureq_error(&ureq::Error::BadUri("bad".into())));
+        assert!(!is_retryable_ureq_error(&ureq::Error::Tls("cert failed")));
+        assert!(!is_retryable_ureq_error(&ureq::Error::StatusCode(400)));
+        assert!(!is_retryable_ureq_error(&ureq::Error::StatusCode(404)));
+        assert!(is_retryable_ureq_error(&ureq::Error::StatusCode(408)));
+        assert!(is_retryable_ureq_error(&ureq::Error::StatusCode(429)));
+        assert!(is_retryable_ureq_error(&ureq::Error::StatusCode(503)));
+
+        let bb = Bbox::new(-99.3, 47.0, -99.1, 47.2).unwrap();
+        let products = vec![
+            TnmProductItem {
+                grid_key: "14_x47y523".into(),
+                title: "A".into(),
+                publication_date: "2023-01-01".into(),
+                download_url: "https://example.org/a/tile.tif".into(),
+                size_bytes: None,
+                format: "GeoTIFF".into(),
+                bbox: bb,
+            },
+            TnmProductItem {
+                grid_key: "14_x48y523".into(),
+                title: "B".into(),
+                publication_date: "2023-01-01".into(),
+                download_url: "https://example.org/b/tile.tif".into(),
+                size_bytes: None,
+                format: "GeoTIFF".into(),
+                bbox: bb,
+            },
+            TnmProductItem {
+                grid_key: "14_x49y523".into(),
+                title: "C".into(),
+                publication_date: "2023-01-01".into(),
+                download_url: "https://example.org/c/unique.tif".into(),
+                size_bytes: None,
+                format: "GeoTIFF".into(),
+                bbox: bb,
+            },
+        ];
+        let names = assign_unique_tile_filenames(&products);
+        assert_eq!(names.len(), 3);
+        assert_ne!(names[0], names[1]);
+        assert!(names[0].ends_with(".tif") && names[1].ends_with(".tif"));
+        assert_eq!(names[2], "unique.tif");
+
+        // Comment mentioning "quantiles" and prefixed "upper_quantiles" must not hijack parsing.
+        let body = "// Note: quantiles are reported in metric mm; see [[0]]\n\
+                    upper_quantiles = [['999.0']];\n\
+                    quantiles = [['12.5', '18.0']];\n";
+        let tbl = parse_noaa_atlas14_response(47.0, -99.0, body).unwrap();
+        assert!((tbl.depth_mm("5-min", 1).unwrap() - 12.5).abs() < 1e-6);
+        assert!((tbl.depth_mm("5-min", 2).unwrap() - 18.0).abs() < 1e-6);
     }
 }

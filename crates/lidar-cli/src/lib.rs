@@ -114,7 +114,8 @@ impl From<CliGroundMethod> for GroundFilterMethod {
 }
 
 fn parse_u8_list(s: &str) -> lidar::Result<Vec<u8>> {
-    s.split(',')
+    let parsed: Vec<u8> = s
+        .split(',')
         .filter(|part| !part.trim().is_empty())
         .map(|part| {
             part.trim().parse::<u8>().map_err(|_| {
@@ -123,7 +124,13 @@ fn parse_u8_list(s: &str) -> lidar::Result<Vec<u8>> {
                 ))
             })
         })
-        .collect()
+        .collect::<lidar::Result<Vec<_>>>()?;
+    if parsed.is_empty() {
+        return Err(lidar::Error::InvalidArgument(
+            "ASPRS classification code list cannot be empty".into(),
+        ));
+    }
+    Ok(parsed)
 }
 
 fn parse_return_kinds(s: &str) -> lidar::Result<Vec<ReturnKind>> {
@@ -525,12 +532,12 @@ enum Commands {
         /// Simulation time step in hours
         #[arg(long, default_value_t = 1.0)]
         time_step: f64,
-        /// Optional selective breaching maximum depth (enables Lindsay 2016 pre-conditioning)
+        /// Optional selective breaching maximum depth (enables Lindsay 2016 pre-conditioning; pass 0 for unlimited)
         #[arg(long)]
         breach_max_depth: Option<f64>,
-        /// Optional selective breaching maximum path length in cells
-        #[arg(long, default_value_t = 40)]
-        breach_max_length: u32,
+        /// Optional selective breaching maximum path length in cells (defaults to 50 when --breach-max-depth is set; pass 0 for unlimited)
+        #[arg(long, requires = "breach_max_depth")]
+        breach_max_length: Option<u32>,
         /// Optional culvert vector (.gpkg, .geojson, .shp) to burn before sink extraction
         #[arg(long)]
         culverts: Option<PathBuf>,
@@ -595,8 +602,11 @@ enum Commands {
         /// Vertical level-set slicing interval
         #[arg(short = 'i', long, default_value_t = 0.3)]
         interval: f64,
-        /// Load DEM in f32 precision to reduce peak memory
-        #[arg(long)]
+        /// Load DEM in f64 precision instead of the default f32 precision
+        #[arg(long, conflicts_with = "use_f32")]
+        use_f64: bool,
+        /// Load DEM in f32 precision (default; kept for backward compatibility)
+        #[arg(long, hide = true)]
         use_f32: bool,
         /// Print summary as JSON
         #[arg(long)]
@@ -881,7 +891,11 @@ enum Commands {
         json: bool,
     },
     /// Run a Model Context Protocol (MCP) server over stdin/stdout for AI agents
-    Mcp,
+    Mcp {
+        /// Cooperative guardrail restricting MCP tool path arguments to the given directory before invocation (repeatable; pair with OS sandboxing for kernel-level isolation)
+        #[arg(long = "allow-dir", value_name = "DIR")]
+        allow_dir: Vec<PathBuf>,
+    },
 }
 
 fn dispatch(command: Commands, lidar_cmd: Option<Vec<OsString>>) -> lidar::Result<()> {
@@ -1277,11 +1291,19 @@ fn dispatch(command: Commands, lidar_cmd: Option<Vec<OsString>>) -> lidar::Resul
             let hyetograph = scs_type2_mm
                 .map(|mm| scs_type2_hyetograph(mm, duration, time_step))
                 .transpose()?;
-            let breach = breach_max_depth.map(|md| BreachOptions {
-                mode: BreachMode::Selective,
-                max_depth: Some(md),
-                max_length: Some(breach_max_length),
-                ..Default::default()
+            let breach = breach_max_depth.map(|md| {
+                let mut opts = BreachOptions::for_mode(
+                    BreachMode::Selective,
+                    if md == 0.0 { None } else { Some(md) },
+                    breach_max_length,
+                );
+                if md == 0.0 {
+                    opts.max_depth = None;
+                }
+                if breach_max_length == Some(0) {
+                    opts.max_length = None;
+                }
+                opts
             });
             let opts = RunPipelineOptions {
                 kernel_size: kernel,
@@ -1363,7 +1385,8 @@ fn dispatch(command: Commands, lidar_cmd: Option<Vec<OsString>>) -> lidar::Resul
             min_size,
             min_depth,
             interval,
-            use_f32,
+            use_f64,
+            use_f32: _,
             json,
         } => {
             let opts = TiledDelineationOptions {
@@ -1373,7 +1396,7 @@ fn dispatch(command: Commands, lidar_cmd: Option<Vec<OsString>>) -> lidar::Resul
                 min_size,
                 min_depth,
                 interval,
-                use_f32,
+                use_f32: !use_f64,
                 ..Default::default()
             };
             let res = delineate_depressions_tiled(&input, &out_dir, &opts)?;
@@ -1807,10 +1830,12 @@ fn dispatch(command: Commands, lidar_cmd: Option<Vec<OsString>>) -> lidar::Resul
                     )));
                 }
             }
-            if let Some(parent) = out_path.parent()
-                && !parent.as_os_str().is_empty()
+            if let Some(h) = hour
+                && (!h.is_finite() || h < 0.0)
             {
-                std::fs::create_dir_all(parent)?;
+                return Err(lidar::Error::InvalidArgument(format!(
+                    "--hour must be finite and >= 0, got {h}"
+                )));
             }
             let dem_arr = load_raster::<f64>(&dem, None)?;
             let opts = AnimateInundationOptions {
@@ -1847,6 +1872,11 @@ fn dispatch(command: Commands, lidar_cmd: Option<Vec<OsString>>) -> lidar::Resul
             } else {
                 render_dem_preview_png_bytes(&dem_arr, None, &opts)?
             };
+            if let Some(parent) = out_path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)?;
+            }
             std::fs::write(&out_path, &png_bytes)?;
             println!(
                 "Rendered preview PNG ({} bytes) to {}",
@@ -1873,7 +1903,7 @@ fn dispatch(command: Commands, lidar_cmd: Option<Vec<OsString>>) -> lidar::Resul
                 println!("{}", report.to_text());
             }
         }
-        Commands::Mcp => {
+        Commands::Mcp { allow_dir } => {
             if std::env::var_os("LIDAR_MCP_TOOL").is_some() {
                 return Err(lidar::Error::InvalidArgument(
                     "refusing to start recursive `lidar mcp` inside an MCP tool subprocess".into(),
@@ -1883,7 +1913,7 @@ fn dispatch(command: Commands, lidar_cmd: Option<Vec<OsString>>) -> lidar::Resul
                 Some(c) => c,
                 None => mcp::this_binary()?,
             };
-            mcp::serve(cmd)?;
+            mcp::serve_with_allowed_dirs(cmd, allow_dir)?;
         }
     }
 
@@ -1935,5 +1965,143 @@ fn run_as_inner(args: Vec<OsString>, lidar_cmd: Option<Vec<OsString>>) -> i32 {
             eprintln!("error: {e}");
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tiled_depressions_defaults_to_f32_and_accepts_f64_or_compat_f32() {
+        usage::with_clap_stack(|| {
+            let cli =
+                Cli::try_parse_from(["lidar", "tiled-depressions", "dem.tif", "out"]).unwrap();
+            match cli.command {
+                Commands::TiledDepressions {
+                    use_f64, use_f32, ..
+                } => {
+                    assert!(!use_f64);
+                    assert!(!use_f32);
+                }
+                _ => panic!("expected TiledDepressions"),
+            }
+
+            let cli_compat =
+                Cli::try_parse_from(["lidar", "tiled-depressions", "dem.tif", "out", "--use-f32"])
+                    .unwrap();
+            match cli_compat.command {
+                Commands::TiledDepressions { use_f64, .. } => assert!(!use_f64),
+                _ => panic!("expected TiledDepressions"),
+            }
+
+            let cli_f64 =
+                Cli::try_parse_from(["lidar", "tiled-depressions", "dem.tif", "out", "--use-f64"])
+                    .unwrap();
+            match cli_f64.command {
+                Commands::TiledDepressions { use_f64, .. } => assert!(use_f64),
+                _ => panic!("expected TiledDepressions"),
+            }
+
+            assert!(
+                Cli::try_parse_from([
+                    "lidar",
+                    "tiled-depressions",
+                    "dem.tif",
+                    "out",
+                    "--use-f32",
+                    "--use-f64",
+                ])
+                .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn pipeline_breach_max_length_requires_breach_max_depth() {
+        usage::with_clap_stack(|| {
+            assert!(
+                Cli::try_parse_from([
+                    "lidar",
+                    "pipeline",
+                    "dem.tif",
+                    "out",
+                    "--breach-max-length",
+                    "25",
+                ])
+                .is_err()
+            );
+
+            let cli = Cli::try_parse_from([
+                "lidar",
+                "pipeline",
+                "dem.tif",
+                "out",
+                "--breach-max-depth",
+                "1.5",
+                "--breach-max-length",
+                "0",
+            ])
+            .unwrap();
+            match cli.command {
+                Commands::Pipeline {
+                    breach_max_depth,
+                    breach_max_length,
+                    ..
+                } => {
+                    assert_eq!(breach_max_depth, Some(1.5));
+                    assert_eq!(breach_max_length, Some(0));
+                }
+                _ => panic!("expected Pipeline"),
+            }
+        });
+    }
+
+    #[test]
+    fn parse_u8_list_and_return_kinds_reject_empty_input() {
+        assert!(parse_u8_list("").is_err());
+        assert!(parse_u8_list("  ,  ").is_err());
+        assert_eq!(parse_u8_list("2, 6").unwrap(), vec![2, 6]);
+
+        assert!(parse_return_kinds("").is_err());
+        assert!(parse_return_kinds(" , ").is_err());
+        assert_eq!(
+            parse_return_kinds("first,only").unwrap(),
+            vec![ReturnKind::First, ReturnKind::Only]
+        );
+    }
+
+    #[test]
+    fn preview_rejects_invalid_hour_and_avoids_creating_output_dir_on_missing_dem() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing_dem = tmp.path().join("does_not_exist.tif");
+        let nested_out_dir = tmp.path().join("nested_out");
+        let out_png = nested_out_dir.join("preview.png");
+
+        let code = run(vec![
+            "lidar".into(),
+            "preview".into(),
+            missing_dem.as_os_str().to_os_string(),
+            "-o".into(),
+            out_png.as_os_str().to_os_string(),
+        ]);
+        assert_eq!(code, 1);
+        assert!(
+            !nested_out_dir.exists(),
+            "preview must not create output parent directories when input DEM fails to load"
+        );
+
+        let code_bad_hour = run(vec![
+            "lidar".into(),
+            "preview".into(),
+            missing_dem.as_os_str().to_os_string(),
+            "--fill-time".into(),
+            missing_dem.as_os_str().to_os_string(),
+            "--hour=-1".into(),
+            "-o".into(),
+            out_png.as_os_str().to_os_string(),
+        ]);
+        assert_eq!(code_bad_hour, 1);
+        assert!(!nested_out_dir.exists());
     }
 }

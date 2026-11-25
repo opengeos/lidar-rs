@@ -15,10 +15,11 @@
 //!   can visually inspect DEMs, depressions, and flood inundation maps directly.
 //! - Curated MCP `prompts` guide agents through end-to-end watershed hydrology and LiDAR workflows.
 
+use std::any::TypeId;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{BufRead, Read, Write};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -35,6 +36,9 @@ const VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
 /// Maximum combined bytes of command output (stderr + stdout + notices) returned to the agent.
 const MAX_OUTPUT: usize = 100_000;
+
+/// Maximum JSON-RPC request line size accepted from stdin (4 MiB).
+const MAX_REQUEST_LINE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Maximum PNG size in bytes attached as MCP image content for `preview` (8 MiB).
 const MAX_IMAGE: u64 = 8 << 20;
@@ -133,6 +137,8 @@ pub struct Server {
     running: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     /// Shared concurrency cap across all single and batched tool calls in this session.
     limiter: Arc<ConcurrencyLimiter>,
+    /// Optional canonicalized directory allowlist restricting path arguments passed via MCP tools.
+    allowed_dirs: Arc<Vec<PathBuf>>,
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -144,8 +150,24 @@ impl Server {
             send,
             running: Arc::default(),
             limiter: Arc::new(ConcurrencyLimiter::new(MAX_CONCURRENT_TOOLS)),
+            allowed_dirs: Arc::new(Vec::new()),
             workers: Vec::new(),
         }
+    }
+
+    /// Restricts path arguments passed via MCP tool calls to reside under one of `allowed_dirs`.
+    ///
+    /// This is a cooperative argument-validation guardrail for local MCP agents (validating and
+    /// canonicalizing paths prior to spawning tool subprocesses), not an OS-enforced sandbox
+    /// against concurrent local filesystem symlink races. Deployments requiring kernel-enforced
+    /// filesystem isolation should pair this with OS sandboxing (such as Landlock or containers).
+    pub fn with_allowed_dirs(mut self, allowed_dirs: Vec<PathBuf>) -> Self {
+        let canonical = allowed_dirs
+            .into_iter()
+            .map(|d| std::fs::canonicalize(&d).unwrap_or(d))
+            .collect();
+        self.allowed_dirs = Arc::new(canonical);
+        self
     }
 
     /// Cancels every still-running tool process and joins worker threads (called on client EOF).
@@ -231,7 +253,7 @@ impl Server {
         let Some(method) = method_val.as_str() else {
             return Some(error(&reply_id, INVALID_REQUEST, "method must be a string"));
         };
-        if method == "notifications/cancelled" {
+        if raw_id.is_none() && method == "notifications/cancelled" {
             let request = obj
                 .get("params")
                 .and_then(|p| p.get("requestId"))
@@ -246,6 +268,7 @@ impl Server {
                 cancel.store(true, Ordering::Relaxed);
                 self.limiter.cv.notify_all();
             }
+            return None;
         }
         // Notifications (no id) produce no reply.
         let id = raw_id?;
@@ -256,12 +279,28 @@ impl Server {
                 "id must be a string or a number",
             ));
         }
+        let mut calls = calls;
+        if let Some((_, ids)) = calls.as_mut()
+            && !ids.insert(id.to_string())
+        {
+            return Some(error(
+                &id,
+                INVALID_REQUEST,
+                "a request id repeated within a batch",
+            ));
+        }
         let params = obj.get("params").cloned().unwrap_or(Value::Null);
         let ok_reply = |r: Value| json!({"jsonrpc": "2.0", "id": id, "result": r});
         if method == "tools/call" {
             return Some(match parse_tool_call(&params) {
                 Err((code, message)) => error(&id, code, &message),
                 Ok((name, args)) => {
+                    if !self.allowed_dirs.is_empty()
+                        && let Err((code, message)) =
+                            validate_allowed_dirs(&name, &args, &self.allowed_dirs)
+                    {
+                        return Some(error(&id, code, &message));
+                    }
                     if self
                         .running
                         .lock()
@@ -275,14 +314,7 @@ impl Server {
                         ));
                     }
                     match calls {
-                        Some((calls, ids)) => {
-                            if !ids.insert(id.to_string()) {
-                                return Some(error(
-                                    &id,
-                                    INVALID_REQUEST,
-                                    "a request id repeated within a batch",
-                                ));
-                            }
+                        Some((calls, _)) => {
                             calls.push((id, name, args));
                         }
                         None => self.spawn(id, name, args),
@@ -399,27 +431,152 @@ impl Server {
 }
 
 /// Validates and extracts `(tool_name, cli_args)` from `tools/call` parameters.
+///
+/// Per the MCP specification, `arguments` is optional: omitted, `null`, or empty `{}` arguments
+/// are accepted as an empty `args` list, whereas non-object `arguments`, non-empty objects missing
+/// `"args"`, non-string `"args"` elements, or embedded NUL bytes return `INVALID_PARAMS`.
 pub(crate) fn parse_tool_call(params: &Value) -> Result<(String, Vec<OsString>), RpcError> {
-    let name = params
+    let params_obj = params
+        .as_object()
+        .ok_or((INVALID_PARAMS, "params must be an object".to_string()))?;
+    let name = params_obj
         .get("name")
         .and_then(Value::as_str)
         .ok_or((INVALID_PARAMS, "name is required".to_string()))?;
     if !command_names().iter().any(|c| c == name) {
         return Err((INVALID_PARAMS, format!("unknown tool '{name}'")));
     }
-    let args = match params.get("arguments").and_then(|a| a.get("args")) {
-        None | Some(Value::Null) => Vec::new(),
-        Some(Value::Array(items)) => items
-            .iter()
-            .map(|v| v.as_str().map(OsString::from))
-            .collect::<Option<Vec<_>>>()
-            .ok_or((
-                INVALID_PARAMS,
-                "args must be an array of strings".to_string(),
-            ))?,
-        Some(_) => return Err((INVALID_PARAMS, "args must be an array of strings".into())),
+    let items = match params_obj.get("arguments") {
+        None | Some(Value::Null) => return Ok((name.to_string(), Vec::new())),
+        Some(Value::Object(map)) if map.is_empty() => return Ok((name.to_string(), Vec::new())),
+        Some(Value::Object(map)) => map.get("args").and_then(Value::as_array).ok_or((
+            INVALID_PARAMS,
+            "arguments.args must be an array of strings".to_string(),
+        ))?,
+        Some(_) => return Err((INVALID_PARAMS, "arguments must be an object".to_string())),
     };
+    let mut args = Vec::with_capacity(items.len());
+    for v in items {
+        let Some(s) = v.as_str() else {
+            return Err((
+                INVALID_PARAMS,
+                "arguments.args must be an array of strings".to_string(),
+            ));
+        };
+        if s.contains('\0') {
+            return Err((
+                INVALID_PARAMS,
+                "arguments.args entries must not contain NUL bytes".to_string(),
+            ));
+        }
+        args.push(OsString::from(s));
+    }
     Ok((name.to_string(), args))
+}
+
+fn resolve_path_for_allowlist(path: &Path, depth: usize) -> std::io::Result<PathBuf> {
+    if depth > 16 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "too many levels of symbolic links",
+        ));
+    }
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut resolved = PathBuf::new();
+    for comp in abs.components() {
+        match comp {
+            Component::Prefix(p) => resolved.push(p.as_os_str()),
+            Component::RootDir => resolved.push(Component::RootDir.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(c) => {
+                resolved.push(c);
+                if let Ok(canon) = std::fs::canonicalize(&resolved) {
+                    resolved = canon;
+                } else if let Ok(target) = std::fs::read_link(&resolved) {
+                    let base = resolved.parent().unwrap_or_else(|| Path::new("/"));
+                    resolved = resolve_path_for_allowlist(&base.join(target), depth + 1)?;
+                }
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// Ensures every `PathBuf` argument parsed by Clap for subcommand `name` resolves inside at least
+/// one directory in `allowed_dirs`.
+///
+/// Cooperative argument-validation guardrail for local MCP agents: validates and canonicalizes
+/// path arguments before spawning the tool subprocess. Because child commands open paths by name,
+/// kernel-enforced sandboxing (such as Landlock or container mounts) is still required to defend
+/// against concurrent local filesystem symlink races.
+pub(crate) fn validate_allowed_dirs(
+    name: &str,
+    args: &[OsString],
+    allowed_dirs: &[PathBuf],
+) -> Result<(), RpcError> {
+    if allowed_dirs.is_empty() {
+        return Ok(());
+    }
+    let Some(cmd) = commands().find(|c| c.get_name() == name) else {
+        return Err((INVALID_PARAMS, format!("unknown tool '{name}'")));
+    };
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push(OsString::from(name));
+    argv.extend(args.iter().cloned());
+
+    let matches = with_clap_stack(move || {
+        let path_ids: Vec<String> = cmd
+            .get_arguments()
+            .filter(|a| a.get_value_parser().type_id() == TypeId::of::<PathBuf>())
+            .map(|a| a.get_id().as_str().to_string())
+            .collect();
+        match cmd.try_get_matches_from(argv) {
+            Ok(m) => {
+                let mut paths = Vec::new();
+                for id in path_ids {
+                    if let Some(vals) = m.get_many::<PathBuf>(&id) {
+                        paths.extend(vals.cloned());
+                    }
+                }
+                Ok(paths)
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                ) =>
+            {
+                Ok(Vec::new())
+            }
+            Err(e) => Err((INVALID_PARAMS, e.to_string())),
+        }
+    })?;
+
+    for p in matches {
+        let resolved = resolve_path_for_allowlist(&p, 0).map_err(|e| {
+            (
+                INVALID_PARAMS,
+                format!("could not resolve path '{}': {e}", p.display()),
+            )
+        })?;
+        if !allowed_dirs.iter().any(|dir| resolved.starts_with(dir)) {
+            return Err((
+                INVALID_PARAMS,
+                format!(
+                    "path '{}' is outside the allowed directories configured via --allow-dir",
+                    p.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Executes `lidar <name> <args>`, returning `None` if cancelled before completion.
@@ -442,19 +599,32 @@ fn call_preview(lidar: &[OsString], mut args: Vec<OsString>, cancel: &AtomicBool
     let failed =
         |text: String| Some(json!({"content": [{"type": "text", "text": text}], "isError": true}));
 
-    // Detect if the caller passed `-o` / `--output` (handling `--` terminator cleanly).
+    // Detect if the caller passed `-o` / `--output`, a dangling `-o`/`--output`, or a
+    // help/version/usage meta-flag where injecting a temporary `-o` would break invocation.
     let mut explicit_output: Option<PathBuf> = None;
+    let mut skip_temp_output = false;
     let mut i = 0usize;
     while i < args.len() {
         let s = args[i].to_string_lossy();
         if s == "--" {
             break;
         }
+        if matches!(
+            s.as_ref(),
+            "-h" | "--help" | "-V" | "--version" | "--json-usage"
+        ) {
+            skip_temp_output = true;
+            i += 1;
+            continue;
+        }
         if s == "-o" || s == "--output" {
             if let Some(val) = args.get(i + 1) {
                 explicit_output = Some(PathBuf::from(val));
+                i += 2;
+            } else {
+                skip_temp_output = true;
+                i += 1;
             }
-            i += 2;
             continue;
         }
         if let Some(val) = s.strip_prefix("--output=") {
@@ -467,22 +637,26 @@ fn call_preview(lidar: &[OsString], mut args: Vec<OsString>, cancel: &AtomicBool
         i += 1;
     }
 
-    let temp_output = match explicit_output {
-        Some(p) if p.as_os_str() == "-" => {
-            return failed(
-                "preview cannot send PNG bytes as tool text: pass -o FILE, or omit -o to receive image content"
-                    .into(),
-            );
-        }
-        Some(_) => None,
-        None => {
-            let dir = match tempfile::Builder::new().prefix("lidar-preview-").tempdir() {
-                Ok(d) => d,
-                Err(e) => return failed(format!("could not create temporary directory: {e}")),
-            };
-            let p = dir.path().join("preview.png");
-            args.splice(0..0, [OsString::from("-o"), p.clone().into_os_string()]);
-            Some((p, dir))
+    let temp_output = if skip_temp_output {
+        None
+    } else {
+        match explicit_output {
+            Some(p) if p.as_os_str() == "-" => {
+                return failed(
+                    "preview cannot send PNG bytes as tool text: pass -o FILE, or omit -o to receive image content"
+                        .into(),
+                );
+            }
+            Some(_) => None,
+            None => {
+                let dir = match tempfile::Builder::new().prefix("lidar-preview-").tempdir() {
+                    Ok(d) => d,
+                    Err(e) => return failed(format!("could not create temporary directory: {e}")),
+                };
+                let p = dir.path().join("preview.png");
+                args.splice(0..0, [OsString::from("-o"), p.clone().into_os_string()]);
+                Some((p, dir))
+            }
         }
     };
 
@@ -646,6 +820,9 @@ fn run_child(
         }
         if cancel.load(Ordering::Relaxed) {
             drop(guard);
+            // Do not join stdout/stderr reader threads here: if a launcher left a grandchild
+            // holding inherited pipe descriptors, joining would block cancellation and hold
+            // the concurrency permit indefinitely.
             return Ok(None);
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -672,8 +849,91 @@ fn read_bounded(mut r: impl Read + Send + 'static) -> std::io::Result<JoinHandle
     })
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum BoundedLine {
+    Eof,
+    Line(String),
+    TooLarge,
+}
+
+fn read_bounded_line(reader: &mut impl BufRead, max_bytes: usize) -> std::io::Result<BoundedLine> {
+    let mut buf = Vec::new();
+    let mut too_large = false;
+    loop {
+        let chunk = match reader.fill_buf() {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if chunk.is_empty() {
+            if buf.is_empty() && !too_large {
+                return Ok(BoundedLine::Eof);
+            }
+            break;
+        }
+        if let Some(nl_pos) = chunk.iter().position(|&b| b == b'\n') {
+            if !too_large {
+                if buf.len() + nl_pos > max_bytes {
+                    too_large = true;
+                    buf.clear();
+                } else {
+                    buf.extend_from_slice(&chunk[..nl_pos]);
+                }
+            }
+            reader.consume(nl_pos + 1);
+            break;
+        }
+        let len = chunk.len();
+        if !too_large {
+            if buf.len() + len > max_bytes {
+                too_large = true;
+                buf.clear();
+            } else {
+                buf.extend_from_slice(chunk);
+            }
+        }
+        reader.consume(len);
+    }
+    if too_large {
+        return Ok(BoundedLine::TooLarge);
+    }
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    let line = String::from_utf8(buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok(BoundedLine::Line(line))
+}
+
 /// Serves MCP over stdin and stdout (one JSON-RPC message per line) until EOF.
+#[allow(dead_code)]
 pub fn serve(lidar: Vec<OsString>) -> std::io::Result<()> {
+    serve_with_allowed_dirs(lidar, Vec::new())
+}
+
+/// Serves MCP over stdin and stdout until EOF, optionally restricting tool path arguments to
+/// reside under one of `allowed_dirs`.
+pub fn serve_with_allowed_dirs(
+    lidar: Vec<OsString>,
+    allowed_dirs: Vec<PathBuf>,
+) -> std::io::Result<()> {
+    let mut canonical_dirs = Vec::with_capacity(allowed_dirs.len());
+    for dir in allowed_dirs {
+        let canon = std::fs::canonicalize(&dir).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("invalid --allow-dir '{}': {e}", dir.display()),
+            )
+        })?;
+        if !canon.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("--allow-dir '{}' is not a directory", dir.display()),
+            ));
+        }
+        canonical_dirs.push(canon);
+    }
+
     let (send, replies) = std::sync::mpsc::channel::<String>();
     let writer = std::thread::spawn(move || -> std::io::Result<()> {
         let mut out = std::io::stdout().lock();
@@ -683,15 +943,30 @@ pub fn serve(lidar: Vec<OsString>) -> std::io::Result<()> {
         }
         Ok(())
     });
-    let mut server = Server::new(lidar, send.clone());
+    let mut server = Server::new(lidar, send.clone()).with_allowed_dirs(canonical_dirs);
     let read = (|| {
-        for line in std::io::stdin().lock().lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Some(reply) = server.handle(&line) {
-                let _ = send.send(reply);
+        let mut stdin = std::io::stdin().lock();
+        loop {
+            match read_bounded_line(&mut stdin, MAX_REQUEST_LINE_BYTES)? {
+                BoundedLine::Eof => break,
+                BoundedLine::TooLarge => {
+                    let _ = send.send(
+                        error(
+                            &Value::Null,
+                            INVALID_REQUEST,
+                            "JSON-RPC message exceeds maximum size limit",
+                        )
+                        .to_string(),
+                    );
+                }
+                BoundedLine::Line(line) => {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    if let Some(reply) = server.handle(&line) {
+                        let _ = send.send(reply);
+                    }
+                }
             }
         }
         Ok(())
@@ -848,6 +1123,26 @@ fn get_prompt(params: &Value) -> Result<Value, RpcError> {
         "delineate-depressions" => {
             let dem = req_arg("dem_path")?;
             let out = req_arg("out_dir")?;
+            let info_args = serde_json::to_string(&[dem.as_str(), "--json", "--stats"])
+                .unwrap_or_else(|_| "[]".to_string());
+            let pipe_args = serde_json::to_string(&[
+                dem.as_str(),
+                out.as_str(),
+                "--routing",
+                "fsm",
+                "--compress",
+                "--json",
+            ])
+            .unwrap_or_else(|_| "[]".to_string());
+            let fill_time = format!("{out}/fill_time.tif");
+            let preview_args = serde_json::to_string(&[
+                dem.as_str(),
+                "--fill-time",
+                fill_time.as_str(),
+                "--scale-bar",
+                "--legend",
+            ])
+            .unwrap_or_else(|_| "[]".to_string());
             Ok(json!({
                 "description": "Inspect a DEM and run the lidar-rs nested depression and inundation pipeline.",
                 "messages": [{
@@ -856,10 +1151,10 @@ fn get_prompt(params: &Value) -> Result<Value, RpcError> {
                         "type": "text",
                         "text": format!(
                             "Analyze surface depressions and inundation for DEM `{dem}` and write outputs to `{out}`:\n\
-                             1. Call `info` with `[\"{dem}\", \"--json\", \"--stats\"]` to inspect CRS, pixel size, dimensions, NoData, and elevation range.\n\
+                             1. Call `info` with `{info_args}` to inspect CRS, pixel size, dimensions, NoData, and elevation range.\n\
                              2. Choose physically appropriate `--min-size`, `--min-depth`, and `--interval` values based on pixel resolution and terrain relief.\n\
-                             3. Run `pipeline` with `[\"{dem}\", \"{out}\", \"--routing\", \"fsm\", \"--compress\", \"--json\"]` plus your chosen thresholds.\n\
-                             4. Visually inspect the result with `preview` on `{dem}` overlaid with `--fill-time {out}/fill_time.tif --scale-bar --legend` (omit `-o` to view inline).\n\
+                             3. Run `pipeline` with `{pipe_args}` plus your chosen thresholds.\n\
+                             4. Visually inspect the result with `preview` using `{preview_args}` (omit `-o` to view inline).\n\
                              5. Summarize depression count, maximum nesting level, total storage volume, spill path count, and FSM mass balance."
                         )
                     }
@@ -872,6 +1167,29 @@ fn get_prompt(params: &Value) -> Result<Value, RpcError> {
             let out = req_arg("out_dir")?;
             let product = opt_arg("dem_product", "1m");
             let flag = download_region_flag(&region);
+            let fed_dir = format!("{out}/federal");
+            let dry_run_args = serde_json::to_string(&[
+                flag,
+                region.as_str(),
+                "-o",
+                fed_dir.as_str(),
+                "--dem-product",
+                product.as_str(),
+                "--dry-run",
+            ])
+            .unwrap_or_else(|_| "[]".to_string());
+            let dl_args = serde_json::to_string(&[
+                flag,
+                region.as_str(),
+                "-o",
+                fed_dir.as_str(),
+                "--dem-product",
+                product.as_str(),
+                "--datasets",
+                "all",
+                "--json",
+            ])
+            .unwrap_or_else(|_| "[]".to_string());
             Ok(json!({
                 "description": "Download federal watershed data and run hydro-conditioned Fill-Spill-Merge modeling.",
                 "messages": [{
@@ -880,8 +1198,8 @@ fn get_prompt(params: &Value) -> Result<Value, RpcError> {
                         "type": "text",
                         "text": format!(
                             "Run an end-to-end watershed Fill-Spill-Merge study for region `{region}` in `{out}` using USGS 3DEP `{product}`:\n\
-                             1. Call `download` with `[\"{flag}\", \"{region}\", \"-o\", \"{out}/federal\", \"--dem-product\", \"{product}\", \"--dry-run\"]` first to check tile count and download size (use `--huc` for HUC codes, `--bbox` for WGS 84 bounds, or `--region` for polygon files).\n\
-                             2. Run `download` with `[\"{flag}\", \"{region}\", \"-o\", \"{out}/federal\", \"--dem-product\", \"{product}\", \"--datasets\", \"all\", \"--json\"]` to obtain 3DEP DEM, WBD, NHD, NWI, roads/railways, synthesized culverts, and NOAA Atlas 14 design storms.\n\
+                             1. Call `download` with `{dry_run_args}` first to check tile count and download size (use `--huc` for HUC codes, `--bbox` for WGS 84 bounds, or `--region` for polygon files).\n\
+                             2. Run `download` with `{dl_args}` to obtain 3DEP DEM, WBD, NHD, NWI, roads/railways, synthesized culverts, and NOAA Atlas 14 design storms.\n\
                              3. Inspect `{out}/federal/dem.tif` with `info` (`--json`). If it is in a geographic CRS (e.g., 10m/30m EPSG:4269), reproject it with `reproject` to match `{out}/federal/culverts.gpkg`.\n\
                              4. Extract the 100-year 24-hour depth from `{out}/federal/noaa_atlas14.json` and run `pipeline` with `--routing fsm --culverts {out}/federal/culverts.gpkg --streams {out}/federal/nhd_flowlines.gpkg --scs-type2-mm <DEPTH> --compress --json` into `{out}/fsm_100yr`.\n\
                              5. Call `preview` with `--fill-time {out}/fsm_100yr/fill_time.tif --scale-bar --legend` and summarize watershed storage retention and connectivity."
@@ -894,6 +1212,8 @@ fn get_prompt(params: &Value) -> Result<Value, RpcError> {
             let pc = req_arg("pointcloud_path")?;
             let out = req_arg("out_dir")?;
             let res = opt_arg("resolution", "1.0");
+            let info_args = serde_json::to_string(&[pc.as_str(), "--json"])
+                .unwrap_or_else(|_| "[]".to_string());
             Ok(json!({
                 "description": "Generate bare-earth DTM, DSM, and Canopy Height Model from a LiDAR point cloud.",
                 "messages": [{
@@ -902,7 +1222,7 @@ fn get_prompt(params: &Value) -> Result<Value, RpcError> {
                         "type": "text",
                         "text": format!(
                             "Process LiDAR point cloud `{pc}` into `{out}` at resolution `{res}`:\n\
-                             1. Call `info` with `[\"{pc}\", \"--json\"]` to check CRS, point count, bounds, and existing ASPRS classifications.\n\
+                             1. Call `info` with `{info_args}` to check CRS, point count, bounds, and existing ASPRS classifications.\n\
                              2. Generate bare-earth DTM (`lidar-to-dtm`), DSM (`lidar-to-dsm`), and CHM (`lidar-to-chm`) in `{out}` at `--resolution {res}`.\n\
                              3. Verify each output raster with `info --json --stats` and visually inspect the DTM with `preview` (`--scale-bar`)."
                         )
@@ -1255,5 +1575,251 @@ mod tests {
         assert!(clipped.len() <= MAX_OUTPUT);
         assert!(clipped.ends_with(&format!("of {} bytes)", long.len())));
         assert_eq!(clip("abc".into(), 3, 1), "a");
+    }
+
+    #[test]
+    fn parse_tool_call_enforces_object_arguments_args_array_and_no_nuls() {
+        // Omitted, null, or empty `{}` arguments are accepted per MCP optional-arguments spec.
+        assert_eq!(
+            parse_tool_call(&json!({"name": "info"})).unwrap(),
+            ("info".to_string(), Vec::new())
+        );
+        assert_eq!(
+            parse_tool_call(&json!({"name": "info", "arguments": null})).unwrap(),
+            ("info".to_string(), Vec::new())
+        );
+        assert_eq!(
+            parse_tool_call(&json!({"name": "info", "arguments": {}})).unwrap(),
+            ("info".to_string(), Vec::new())
+        );
+        // Non-object arguments, non-empty objects missing "args", non-array args, and NUL bytes
+        // must all be rejected with INVALID_PARAMS.
+        assert_eq!(
+            parse_tool_call(&json!({"name": "info", "arguments": "bad"}))
+                .unwrap_err()
+                .0,
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            parse_tool_call(&json!({"name": "info", "arguments": {"input": "/a.tif"}}))
+                .unwrap_err()
+                .0,
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            parse_tool_call(&json!({"name": "info", "arguments": {"args": null}}))
+                .unwrap_err()
+                .0,
+            INVALID_PARAMS
+        );
+        // Embedded NUL byte must be rejected.
+        assert_eq!(
+            parse_tool_call(&json!({"name": "info", "arguments": {"args": ["a\0b"]}}))
+                .unwrap_err()
+                .0,
+            INVALID_PARAMS
+        );
+        // Valid call passes.
+        let (name, args) =
+            parse_tool_call(&json!({"name": "info", "arguments": {"args": ["--json"]}})).unwrap();
+        assert_eq!(name, "info");
+        assert_eq!(args, vec![OsString::from("--json")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn call_preview_skips_temp_output_for_help_version_and_dangling_o() {
+        let cancel = AtomicBool::new(false);
+        let echo_cmd = vec![
+            OsString::from("sh"),
+            OsString::from("-c"),
+            OsString::from("printf '%s|' \"$@\""),
+            OsString::from("sh"),
+        ];
+        for flag in ["-h", "--help", "-V", "--version", "--json-usage", "-o"] {
+            let res = call_preview(&echo_cmd, vec![OsString::from(flag)], &cancel).unwrap();
+            let text = res["content"][0]["text"].as_str().unwrap();
+            assert!(
+                !text.contains("lidar-preview-"),
+                "call_preview injected temp -o for {flag}: {text}"
+            );
+            assert!(
+                res["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|c| c["type"] != "image"),
+                "meta-flag {flag} must not attach image content"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_rejects_duplicate_ids_for_non_tool_calls_and_cancelled_with_id() {
+        let s = &mut server();
+        let batch = json!([
+            {"jsonrpc": "2.0", "id": 7, "method": "ping"},
+            {"jsonrpc": "2.0", "id": 7, "method": "ping"},
+        ]);
+        let replies: Vec<Value> =
+            serde_json::from_str(&s.handle(&batch.to_string()).expect("batch reply")).unwrap();
+        assert_eq!(replies.len(), 2);
+        assert!(replies[0]["result"].is_object());
+        assert_eq!(replies[1]["error"]["code"], INVALID_REQUEST);
+
+        // notifications/cancelled with an id is a request (not a notification) -> METHOD_NOT_FOUND.
+        let r = request(
+            s,
+            "notifications/cancelled",
+            json!({"requestId": "anything"}),
+        );
+        assert_eq!(r["error"]["code"], METHOD_NOT_FOUND);
+    }
+
+    #[test]
+    fn read_bounded_line_enforces_size_limit_and_recovers() {
+        let mut cursor = std::io::Cursor::new(b"short\n0123456789abcdef\nafter\n".as_slice());
+        assert_eq!(
+            read_bounded_line(&mut cursor, 10).unwrap(),
+            BoundedLine::Line("short".to_string())
+        );
+        assert_eq!(
+            read_bounded_line(&mut cursor, 10).unwrap(),
+            BoundedLine::TooLarge
+        );
+        assert_eq!(
+            read_bounded_line(&mut cursor, 10).unwrap(),
+            BoundedLine::Line("after".to_string())
+        );
+        assert_eq!(
+            read_bounded_line(&mut cursor, 10).unwrap(),
+            BoundedLine::Eof
+        );
+    }
+
+    #[test]
+    fn get_prompt_escapes_windows_backslashes_and_quotes_as_valid_json() {
+        let s = &mut server();
+        let dem = r#"C:\Users\Alice\my "dem".tif"#;
+        let out = r#"C:\Users\Alice\out "dir""#;
+        let got = request(
+            s,
+            "prompts/get",
+            json!({
+                "name": "delineate-depressions",
+                "arguments": {"dem_path": dem, "out_dir": out}
+            }),
+        );
+        let text = got["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        let expected_info = serde_json::to_string(&[dem, "--json", "--stats"]).unwrap();
+        assert!(text.contains(&expected_info), "text was:\n{text}");
+        let parsed: Vec<String> = serde_json::from_str(&expected_info).unwrap();
+        assert_eq!(parsed[0], dem);
+    }
+
+    #[test]
+    fn allow_dir_restricts_paths_including_traversal_and_symlinks() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let inside_file = allowed.path().join("dem.tif");
+        let outside_file = outside.path().join("secret.tif");
+        std::fs::write(&inside_file, b"ok").unwrap();
+        std::fs::write(&outside_file, b"no").unwrap();
+
+        let allow_canon = vec![std::fs::canonicalize(allowed.path()).unwrap()];
+
+        // Allowed existing file and non-existent nested output inside allowed dir succeed.
+        assert!(
+            validate_allowed_dirs(
+                "info",
+                &[inside_file.as_os_str().to_os_string()],
+                &allow_canon
+            )
+            .is_ok()
+        );
+        let nested_out = allowed.path().join("sub").join("out.tif");
+        assert!(
+            validate_allowed_dirs(
+                "mean-filter",
+                &[
+                    inside_file.as_os_str().to_os_string(),
+                    nested_out.as_os_str().to_os_string(),
+                ],
+                &allow_canon
+            )
+            .is_ok()
+        );
+
+        // File outside allowed dir is rejected.
+        assert_eq!(
+            validate_allowed_dirs(
+                "info",
+                &[outside_file.as_os_str().to_os_string()],
+                &allow_canon
+            )
+            .unwrap_err()
+            .0,
+            INVALID_PARAMS
+        );
+
+        // Parent traversal escaping allowed dir is rejected.
+        let traversal = allowed
+            .path()
+            .join("..")
+            .join(outside.path().file_name().unwrap())
+            .join("secret.tif");
+        assert_eq!(
+            validate_allowed_dirs(
+                "info",
+                &[traversal.as_os_str().to_os_string()],
+                &allow_canon
+            )
+            .unwrap_err()
+            .0,
+            INVALID_PARAMS
+        );
+
+        // Symlink inside allowed dir pointing outside is rejected on Unix.
+        #[cfg(unix)]
+        {
+            let link = allowed.path().join("escape_link.tif");
+            std::os::unix::fs::symlink(&outside_file, &link).unwrap();
+            assert_eq!(
+                validate_allowed_dirs("info", &[link.as_os_str().to_os_string()], &allow_canon)
+                    .unwrap_err()
+                    .0,
+                INVALID_PARAMS
+            );
+        }
+
+        // Server::handle enforces allow_dir and returns INVALID_PARAMS.
+        let mut s = server().with_allowed_dirs(vec![allowed.path().to_path_buf()]);
+        let r = request(
+            &mut s,
+            "tools/call",
+            json!({
+                "name": "info",
+                "arguments": {"args": [outside_file.to_str().unwrap()]}
+            }),
+        );
+        assert_eq!(r["error"]["code"], INVALID_PARAMS);
+
+        // Help/version meta-flags are permitted, while invalid flags fail closed with INVALID_PARAMS.
+        assert!(validate_allowed_dirs("info", &[OsString::from("--help")], &allow_canon).is_ok());
+        assert_eq!(
+            validate_allowed_dirs(
+                "info",
+                &[
+                    OsString::from("--bogus-flag"),
+                    outside_file.as_os_str().to_os_string(),
+                ],
+                &allow_canon
+            )
+            .unwrap_err()
+            .0,
+            INVALID_PARAMS
+        );
     }
 }
