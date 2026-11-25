@@ -408,12 +408,29 @@ fn collect_polygons_from_geometry(geom: &Geometry, out: &mut Vec<Polygon2D>) {
     }
 }
 
-fn load_polygons_and_bbox(polygon_vector_path: &Path) -> Result<(Vec<Polygon2D>, [f64; 4])> {
+fn load_polygons_and_bbox(
+    polygon_vector_path: &Path,
+    target_crs: &terrio::crs::SpatialRef,
+) -> Result<(Vec<Polygon2D>, [f64; 4])> {
     let poly_str = path_to_str(polygon_vector_path)?;
     let vds = terrio::open_vector(poly_str, &VectorOpenOptions::default())?;
     let mut polygons = Vec::new();
     for layer in &vds.layers {
-        for feat in &layer.features {
+        let src_srs = terrio::crs::SpatialRef::from_layer(layer);
+        let reprojected;
+        let effective_layer =
+            if !src_srs.is_unknown() && !target_crs.is_unknown() && !src_srs.same_as(target_crs) {
+                reprojected = terrio::vector::reproject_layer(layer, target_crs).map_err(|e| {
+                    Error::InvalidArgument(format!(
+                        "failed to reproject polygon layer '{}' to point cloud CRS: {e}",
+                        layer.name
+                    ))
+                })?;
+                &reprojected
+            } else {
+                layer
+            };
+        for feat in &effective_layer.features {
             if let Some(ref geom) = feat.geometry {
                 collect_polygons_from_geometry(geom, &mut polygons);
             }
@@ -511,21 +528,116 @@ fn point_in_polygon(px: f64, py: f64, poly: &Polygon2D) -> bool {
     true
 }
 
-fn filter_cloud_by_polygons(cloud: &PointCloud, polygons: &[Polygon2D]) -> Result<PointCloud> {
+/// Lightweight 2D uniform grid spatial index over polygon bounding boxes for fast
+/// point-in-polygon queries when a clip layer contains many polygons (`polygons.len() > 8`).
+struct PolygonGridIndex {
+    bbox: [f64; 4],
+    nx: usize,
+    ny: usize,
+    inv_dx: f64,
+    inv_dy: f64,
+    cells: Vec<Vec<usize>>,
+}
+
+impl PolygonGridIndex {
+    fn new(polygons: &[Polygon2D], bbox: [f64; 4]) -> Self {
+        let dim = (polygons.len() as f64).sqrt().ceil().clamp(2.0, 256.0) as usize;
+        let span_x = bbox[2] - bbox[0];
+        let span_y = bbox[3] - bbox[1];
+        let (nx, inv_dx) = if span_x > 0.0 && span_x.is_finite() {
+            (dim, dim as f64 / span_x)
+        } else {
+            (1, 0.0)
+        };
+        let (ny, inv_dy) = if span_y > 0.0 && span_y.is_finite() {
+            (dim, dim as f64 / span_y)
+        } else {
+            (1, 0.0)
+        };
+        let mut cells = vec![Vec::new(); nx * ny];
+        for (pi, poly) in polygons.iter().enumerate() {
+            let cx0 = (((poly.bbox[0] - bbox[0]) * inv_dx).floor() as isize)
+                .clamp(0, nx as isize - 1) as usize;
+            let cx1 = (((poly.bbox[2] - bbox[0]) * inv_dx).floor() as isize)
+                .clamp(0, nx as isize - 1) as usize;
+            let cy0 = (((poly.bbox[1] - bbox[1]) * inv_dy).floor() as isize)
+                .clamp(0, ny as isize - 1) as usize;
+            let cy1 = (((poly.bbox[3] - bbox[1]) * inv_dy).floor() as isize)
+                .clamp(0, ny as isize - 1) as usize;
+            for cy in cy0..=cy1 {
+                let row = cy * nx;
+                for cx in cx0..=cx1 {
+                    cells[row + cx].push(pi);
+                }
+            }
+        }
+        Self {
+            bbox,
+            nx,
+            ny,
+            inv_dx,
+            inv_dy,
+            cells,
+        }
+    }
+
+    #[inline]
+    fn contains(&self, px: f64, py: f64, polygons: &[Polygon2D]) -> bool {
+        if px < self.bbox[0] || px > self.bbox[2] || py < self.bbox[1] || py > self.bbox[3] {
+            return false;
+        }
+        let cx = (((px - self.bbox[0]) * self.inv_dx).floor() as isize)
+            .clamp(0, self.nx as isize - 1) as usize;
+        let cy = (((py - self.bbox[1]) * self.inv_dy).floor() as isize)
+            .clamp(0, self.ny as isize - 1) as usize;
+        self.cells[cy * self.nx + cx]
+            .iter()
+            .any(|&pi| point_in_polygon(px, py, &polygons[pi]))
+    }
+}
+
+fn filter_cloud_by_polygons(
+    cloud: &PointCloud,
+    polygons: &[Polygon2D],
+    union_bbox: [f64; 4],
+) -> Result<PointCloud> {
     if cloud.is_empty() {
         return Ok(cloud.clone());
     }
     let (xs, ys) = extract_xy(cloud)?;
-    let keep: Vec<bool> = (0..cloud.len())
-        .map(|i| {
-            let x = xs[i];
-            let y = ys[i];
-            x.is_finite()
-                && y.is_finite()
-                && polygons.iter().any(|poly| point_in_polygon(x, y, poly))
-        })
-        .collect();
+    let keep: Vec<bool> = if polygons.len() > 8 {
+        let index = PolygonGridIndex::new(polygons, union_bbox);
+        (0..cloud.len())
+            .map(|i| {
+                let x = xs[i];
+                let y = ys[i];
+                x.is_finite() && y.is_finite() && index.contains(x, y, polygons)
+            })
+            .collect()
+    } else {
+        (0..cloud.len())
+            .map(|i| {
+                let x = xs[i];
+                let y = ys[i];
+                x.is_finite()
+                    && y.is_finite()
+                    && polygons.iter().any(|poly| point_in_polygon(x, y, poly))
+            })
+            .collect()
+    };
     Ok(cloud.select(&keep))
+}
+
+/// Uniformly thins `cloud` to at most `max_points` points.
+fn cap_point_cloud(cloud: &PointCloud, max_points: usize) -> PointCloud {
+    let n = cloud.len();
+    if n <= max_points {
+        return cloud.clone();
+    }
+    let indices: Vec<usize> = (0..max_points)
+        .map(|k| ((k as u128 * n as u128) / max_points as u128) as usize)
+        .collect();
+    cloud.take(&indices)
 }
 
 /// Reads a LiDAR point cloud with COPC octree LOD (`max_level`, `resolution`), spatial
@@ -533,9 +645,12 @@ fn filter_cloud_by_polygons(cloud: &PointCloud, polygons: &[Polygon2D]) -> Resul
 /// point cap (`max_points`), and attribute filters (`classifications`, `return_kinds`,
 /// `min_z`, `max_z`).
 ///
-/// When `opts.polygon_path` is set, the polygon's 2D bounding box is intersected with
-/// `opts.bounds` and forwarded into `PointFilter::bounds` so COPC octree readers only fetch
-/// chunks overlapping the polygon extent before exact ray-casting point-in-polygon filtering.
+/// When `opts.polygon_path` is set, polygon layers whose CRS differs from the point cloud CRS
+/// are automatically reprojected into the point cloud's CRS. The polygon's 2D bounding box is
+/// intersected with `opts.bounds` and forwarded into `PointFilter::bounds` so COPC octree
+/// readers only fetch chunks overlapping the polygon extent before exact ray-casting
+/// point-in-polygon filtering. Any `max_points` cap is applied after polygon clipping so small
+/// polygons are not starved by bbox-level thinning.
 pub fn read_lidar_windowed(path: impl AsRef<Path>, opts: &LidarReadOptions) -> Result<PointCloud> {
     if let Some([x0, y0, x1, y1]) = opts.bounds {
         if !x0.is_finite() || !y0.is_finite() || !x1.is_finite() || !y1.is_finite() {
@@ -581,8 +696,12 @@ pub fn read_lidar_windowed(path: impl AsRef<Path>, opts: &LidarReadOptions) -> R
         return Err(Error::InvalidArgument("max_points must be > 0".into()));
     }
 
+    let p = path_to_str(path.as_ref())?;
+    let mut reader = terrio::pointcloud::open_points(p)?;
+    let cloud_crs = reader.crs().clone();
+
     let loaded_polygons = match &opts.polygon_path {
-        Some(poly_path) => Some(load_polygons_and_bbox(poly_path)?),
+        Some(poly_path) => Some(load_polygons_and_bbox(poly_path, &cloud_crs)?),
         None => None,
     };
 
@@ -598,9 +717,7 @@ pub fn read_lidar_windowed(path: impl AsRef<Path>, opts: &LidarReadOptions) -> R
                 b[3].min(pb[3]),
             ];
             if inter[0] > inter[2] || inter[1] > inter[3] {
-                let p = path_to_str(path.as_ref())?;
-                let reader = terrio::pointcloud::open_points(p)?;
-                return Ok(PointCloud::new(Vec::new(), reader.crs().clone()));
+                return Ok(PointCloud::new(Vec::new(), cloud_crs));
             }
             Some(inter)
         }
@@ -617,17 +734,27 @@ pub fn read_lidar_windowed(path: impl AsRef<Path>, opts: &LidarReadOptions) -> R
         classes: opts.classifications.clone(),
         returns: opts.return_kinds.clone(),
     };
+    // Defer `max_points` thinning until after exact polygon clipping so small polygons are not
+    // starved when the reader thins across the larger bounding box.
+    let reader_max_points = if loaded_polygons.is_some() {
+        None
+    } else {
+        opts.max_points.map(|n| n as u64)
+    };
     let read_opts = PointReadOptions {
         filter,
         max_level: opts.max_level,
         resolution: opts.resolution,
-        max_points: opts.max_points.map(|n| n as u64),
+        max_points: reader_max_points,
     };
-    let p = path_to_str(path.as_ref())?;
-    let mut reader = terrio::pointcloud::open_points(p)?;
     let cloud = reader.read(&read_opts)?;
-    if let Some((polygons, _)) = loaded_polygons {
-        filter_cloud_by_polygons(&cloud, &polygons)
+    if let Some((polygons, union_bbox)) = loaded_polygons {
+        let clipped = filter_cloud_by_polygons(&cloud, &polygons, union_bbox)?;
+        if let Some(cap) = opts.max_points {
+            Ok(cap_point_cloud(&clipped, cap))
+        } else {
+            Ok(clipped)
+        }
     } else {
         Ok(cloud)
     }
@@ -1576,6 +1703,18 @@ fn orient2d(ax: f64, ay: f64, bx: f64, by: f64, cx: f64, cy: f64) -> f64 {
     (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
 }
 
+/// Deterministic splitmix64 perturbation in `[-1.0, 1.0]` for symbolic tie-breaking of
+/// collinear and co-circular point configurations during Bowyer-Watson triangulation.
+#[inline]
+fn deterministic_jitter(seed: u64) -> f64 {
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    let unit = ((z >> 11) as f64) * (1.0 / ((1u64 << 53) as f64));
+    unit * 2.0 - 1.0
+}
+
 /// Returns `true` if point `p` lies strictly inside the circumcircle of CCW triangle
 /// `(a, b, c)` in normalized coordinates.
 #[inline]
@@ -1593,7 +1732,7 @@ fn in_circumcircle_strict(a: (f64, f64), b: (f64, f64), c: (f64, f64), p: (f64, 
 
     let det = adx * (bdy * cd2 - bd2 * cdy) - ady * (bdx * cd2 - bd2 * cdx)
         + ad2 * (bdx * cdy - bdy * cdx);
-    det > 1e-12
+    det > 0.0
 }
 
 #[derive(Clone, Copy)]
@@ -1658,10 +1797,16 @@ fn delaunay_triangulate_2d(pts: &[(f64, f64, f64)]) -> Vec<[usize; 3]> {
     let cy = 0.5 * (min_y + max_y);
     let inv_span = 1.0 / span;
 
-    // Normalized coordinates in [-0.5, 0.5] plus 3 super-triangle vertices at n, n+1, n+2.
+    // Normalized coordinates in [-0.5, 0.5] with deterministic sub-nanometer symbolic jitter
+    // (~1e-11) used exclusively for triangulation predicates so regular scan-line / integer
+    // grid points are never dropped as collinear or co-circular. Original unperturbed coordinates
+    // in `pts` are still used for triangle edge-length checks and barycentric z-interpolation.
+    const JITTER_SCALE: f64 = 1e-11;
     let mut coords: Vec<(f64, f64)> = Vec::with_capacity(n + 3);
-    for &(x, y, _) in pts {
-        coords.push(((x - cx) * inv_span, (y - cy) * inv_span));
+    for (i, &(x, y, _)) in pts.iter().enumerate() {
+        let jx = deterministic_jitter((i as u64).wrapping_mul(2).wrapping_add(1)) * JITTER_SCALE;
+        let jy = deterministic_jitter((i as u64).wrapping_mul(2).wrapping_add(2)) * JITTER_SCALE;
+        coords.push(((x - cx) * inv_span + jx, (y - cy) * inv_span + jy));
     }
     coords.push((-10.0, -10.0));
     coords.push((10.0, -10.0));
@@ -1704,7 +1849,7 @@ fn delaunay_triangulate_2d(pts: &[(f64, f64, f64)]) -> Vec<[usize; 3]> {
                 let b = tv[(k + 2) % 3];
                 let (ax, ay) = coords[a];
                 let (bx, by) = coords[b];
-                if orient2d(ax, ay, bx, by, px, py) < -1e-13
+                if orient2d(ax, ay, bx, by, px, py) < 0.0
                     && let Some(next) = tris[cur].adj[k]
                     && tris[next].alive
                 {
@@ -1732,9 +1877,9 @@ fn delaunay_triangulate_2d(pts: &[(f64, f64, f64)]) -> Vec<[usize; 3]> {
                 let (ax, ay) = coords[a];
                 let (bx, by) = coords[b];
                 let (cx0, cy0) = coords[c];
-                if orient2d(ax, ay, bx, by, px, py) >= -1e-12
-                    && orient2d(bx, by, cx0, cy0, px, py) >= -1e-12
-                    && orient2d(cx0, cy0, ax, ay, px, py) >= -1e-12
+                if orient2d(ax, ay, bx, by, px, py) >= 0.0
+                    && orient2d(bx, by, cx0, cy0, px, py) >= 0.0
+                    && orient2d(cx0, cy0, ax, ay, px, py) >= 0.0
                 {
                     candidate = Some(ti);
                     break;
@@ -1780,7 +1925,7 @@ fn delaunay_triangulate_2d(pts: &[(f64, f64, f64)]) -> Vec<[usize; 3]> {
                     let b = tv[(k + 2) % 3];
                     let (ax, ay) = coords[a];
                     let (bx, by) = coords[b];
-                    if orient2d(ax, ay, bx, by, px, py) <= 1e-14
+                    if orient2d(ax, ay, bx, by, px, py) <= 0.0
                         && let Some(outer) = nb
                         && tris[outer].alive
                     {
@@ -1809,7 +1954,7 @@ fn delaunay_triangulate_2d(pts: &[(f64, f64, f64)]) -> Vec<[usize; 3]> {
                 let b = tv[(k + 2) % 3];
                 let (ax, ay) = coords[a];
                 let (bx, by) = coords[b];
-                if orient2d(ax, ay, bx, by, px, py) <= 1e-15 {
+                if orient2d(ax, ay, bx, by, px, py) <= 0.0 {
                     all_positive = false;
                 }
                 boundary.push((a, b, nb, ti));
@@ -2392,5 +2537,31 @@ mod tests {
             ..Default::default()
         };
         assert!(lidar_to_dsm(&laz_path, tmp.path().join("empty.tif"), &opts_empty).is_err());
+    }
+
+    #[test]
+    fn delaunay_regular_integer_grid_drops_zero_points() {
+        let mut pts = Vec::new();
+        for r in 0..20 {
+            for c in 0..20 {
+                pts.push((500_000.0 + c as f64, 4_000_000.0 + r as f64, 10.0));
+            }
+        }
+        let tris = delaunay_triangulate_2d(&pts);
+        assert!(
+            !tris.is_empty(),
+            "regular integer grid must produce triangles"
+        );
+        let mut seen = vec![false; pts.len()];
+        for [a, b, c] in tris {
+            seen[a] = true;
+            seen[b] = true;
+            seen[c] = true;
+        }
+        let dropped = seen.iter().filter(|&&v| !v).count();
+        assert_eq!(
+            dropped, 0,
+            "regular integer grid triangulation must drop zero points"
+        );
     }
 }

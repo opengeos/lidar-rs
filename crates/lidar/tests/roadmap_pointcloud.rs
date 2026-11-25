@@ -466,6 +466,7 @@ fn polygon_spatial_query_on_copc_respects_exterior_and_interior_hole() {
     // Expected retained points = 400 - 64 = 336.
     let geojson = r#"{
         "type": "FeatureCollection",
+        "crs": {"type": "name", "properties": {"name": "urn:ogc:def:crs:EPSG::32615"}},
         "features": [{
             "type": "Feature",
             "properties": {"name": "donut"},
@@ -767,6 +768,7 @@ fn multipolygon_query_and_pit_free_chm_with_csf_and_cog() {
     // MultiPolygon with two disjoint 4x4 squares: [1..5]x[1..5] and [18..22]x[18..22].
     let geojson = r#"{
         "type": "FeatureCollection",
+        "crs": {"type": "name", "properties": {"name": "urn:ogc:def:crs:EPSG::32615"}},
         "features": [{
             "type": "Feature",
             "properties": {},
@@ -832,5 +834,175 @@ fn multipolygon_query_and_pit_free_chm_with_csf_and_cog() {
     assert!(
         pit_h > 13.0 && pit_h < 17.0,
         "CSF pit-free CHM should bridge interior crown pit to ~15 m (got {pit_h})"
+    );
+}
+
+#[test]
+fn polygon_query_reprojects_wgs84_geojson_to_utm_and_applies_post_clip_max_points_and_grid_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let copc_path = tmp.path().join("utm_scene.copc.laz");
+    let wgs84_poly_path = tmp.path().join("aoi_wgs84.geojson");
+    let many_polys_path = tmp.path().join("many_polys.geojson");
+
+    // 40x40 UTM Zone 15N (EPSG:32615) cloud spanning [500000..500039] x [4000000..4000039].
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    let mut zs = Vec::new();
+    let mut cls = Vec::new();
+    let mut rn = Vec::new();
+    let mut nr = Vec::new();
+    for r in 0..40 {
+        for c in 0..40 {
+            xs.push(500_000.0 + c as f64 + 0.5);
+            ys.push(4_000_000.0 + r as f64 + 0.5);
+            zs.push(100.0);
+            cls.push(2);
+            rn.push(1);
+            nr.push(1);
+        }
+    }
+    let cloud = build_cloud(xs, ys, zs, cls, rn, nr);
+    write_lidar(&cloud, &copc_path, &PointWriteOptions::default()).unwrap();
+
+    // 1. Build an RFC 7946 EPSG:4326 GeoJSON polygon covering [500010, 4000010]..[500030, 4000030]
+    //    by transforming the 4 UTM corners to WGS 84 lon/lat.
+    let utm = terrio::crs::SpatialRef::parse("EPSG:32615").unwrap();
+    let wgs84 = terrio::crs::SpatialRef::parse("EPSG:4326").unwrap();
+    let to_wgs84 = terrio::crs::Transformer::new(&utm, &wgs84).unwrap();
+    let corners_utm = [
+        (500_010.0, 4_000_010.0),
+        (500_030.0, 4_000_010.0),
+        (500_030.0, 4_000_030.0),
+        (500_010.0, 4_000_030.0),
+        (500_010.0, 4_000_010.0),
+    ];
+    let ring_coords: Vec<String> = corners_utm
+        .iter()
+        .map(|&(x, y)| {
+            let (lon, lat) = to_wgs84.transform(x, y).unwrap();
+            format!("[{lon:.12}, {lat:.12}]")
+        })
+        .collect();
+    // Standard RFC 7946 GeoJSON (no "crs" member -> EPSG:4326).
+    let wgs84_geojson = format!(
+        r#"{{"type":"FeatureCollection","features":[{{"type":"Feature","properties":{{}},"geometry":{{"type":"Polygon","coordinates":[[{}]]}}}}]}}"#,
+        ring_coords.join(",")
+    );
+    std::fs::write(&wgs84_poly_path, wgs84_geojson).unwrap();
+
+    let clipped_wgs84 =
+        read_lidar_in_polygon(&copc_path, &wgs84_poly_path, &LidarReadOptions::default()).unwrap();
+    assert_eq!(
+        clipped_wgs84.len(),
+        400,
+        "EPSG:4326 GeoJSON polygon must automatically reproject to EPSG:32615 and match 20x20=400 points"
+    );
+
+    // 2. Post-clip `max_points`: even with a diagonal-thin L-shaped/small polygon or cap of 50,
+    //    returns exactly 50 interior points without starving the polygon.
+    let capped = read_lidar_in_polygon(
+        &copc_path,
+        &wgs84_poly_path,
+        &LidarReadOptions {
+            max_points: Some(50),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(capped.len(), 50);
+    let cx = capped.coords("x").unwrap();
+    let cy = capped.coords("y").unwrap();
+    for (&x, &y) in cx.iter().zip(cy.iter()) {
+        assert!(
+            (500_010.0..=500_030.0).contains(&x) && (4_000_010.0..=4_000_030.0).contains(&y),
+            "capped point ({x}, {y}) must remain inside reprojected polygon"
+        );
+    }
+
+    // 3. Spatial grid index path (> 8 polygons): 16 disjoint 2x2 squares (4x4 grid of polygons),
+    //    each capturing 2x2 = 4 points -> 64 total points.
+    let mut features = Vec::new();
+    for py in 0..4 {
+        for px in 0..4 {
+            let x0 = 500_001.0 + px as f64 * 9.0;
+            let y0 = 4_000_001.0 + py as f64 * 9.0;
+            let x1 = x0 + 2.0;
+            let y1 = y0 + 2.0;
+            features.push(format!(
+                r#"{{"type":"Feature","properties":{{}},"geometry":{{"type":"Polygon","coordinates":[[[{x0},{y0}],[{x1},{y0}],[{x1},{y1}],[{x0},{y1}],[{x0},{y0}]]]}}}}"#
+            ));
+        }
+    }
+    let many_geojson = format!(
+        r#"{{"type":"FeatureCollection","crs":{{"type":"name","properties":{{"name":"urn:ogc:def:crs:EPSG::32615"}}}},"features":[{}]}}"#,
+        features.join(",")
+    );
+    std::fs::write(&many_polys_path, many_geojson).unwrap();
+
+    let indexed_clipped =
+        read_lidar_in_polygon(&copc_path, &many_polys_path, &LidarReadOptions::default()).unwrap();
+    assert_eq!(
+        indexed_clipped.len(),
+        64,
+        "16 disjoint 2x2 polygons should retain exactly 64 points via PolygonGridIndex"
+    );
+}
+
+#[test]
+fn pit_free_chm_on_perfectly_regular_integer_grid_with_canopy_pit() {
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    let mut zs = Vec::new();
+    let mut cls = Vec::new();
+    let mut rn = Vec::new();
+    let mut nr = Vec::new();
+
+    // Perfectly regular integer lattice (exact integer x, y coordinates, no fractional offsets).
+    for r in 0..20 {
+        for c in 0..20 {
+            let x = 500_000.0 + c as f64;
+            let y = 4_000_000.0 + r as f64;
+            xs.push(x);
+            ys.push(y);
+            zs.push(100.0);
+            cls.push(2);
+            rn.push(2);
+            nr.push(2);
+
+            if (5..=14).contains(&c) && (5..=14).contains(&r) {
+                let is_pit = c == 9 && r == 9;
+                xs.push(x);
+                ys.push(y);
+                zs.push(if is_pit { 100.2 } else { 118.0 });
+                cls.push(5);
+                rn.push(1);
+                nr.push(2);
+            }
+        }
+    }
+    let cloud = build_cloud(xs, ys, zs, cls, rn, nr);
+    let chm = points_to_chm_pit_free(
+        &cloud,
+        &PitFreeChmOptions {
+            resolution: 1.0,
+            height_thresholds: vec![0.0, 2.0, 5.0, 10.0, 15.0],
+            max_triangle_edge: Some(3.5),
+            dtm: LidarToDtmOptions {
+                ground_method: GroundFilterMethod::Preclassified,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // Pit at integer coordinate (500009, 4000009) should be bridged to ~18 m without dropping vertices.
+    let gt = chm.geotransform;
+    let c = ((500_009.0 - gt[0]) / gt[1]).floor() as usize;
+    let r = ((4_000_009.0 - gt[3]) / gt[5]).floor() as usize;
+    let pit_h = chm.get(c, r);
+    assert!(
+        pit_h > 16.5 && pit_h <= 18.5,
+        "regular integer grid pit-free CHM should bridge pit to ~18 m (got {pit_h})"
     );
 }
