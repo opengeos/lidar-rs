@@ -111,7 +111,15 @@ deps.free();
 // 3. Delineate mounts from DSM
 const mounts = lidar.delineateMounts(dsmBytes, "dsm.tif", 1000, 0.3, 0.3);
 assert.ok(mounts.maxLevel >= 2);
-assert.ok(JSON.parse(mounts.depressionsJson()).length >= 2);
+const mountList = JSON.parse(mounts.mountsJson());
+assert.ok(mountList.length >= 2);
+assert.equal(mounts.mountsJson(), mounts.depressionsJson());
+const mountIds = mounts.mountIdValues();
+assert.ok(mountIds instanceof Int32Array, "mountIdValues must return Int32Array");
+assert.equal(mountIds.length, 400 * 400);
+assert.ok(mountIds.some((id) => id > 0), "expected positive mount IDs");
+assert.equal(mounts.depressionIdValues().length, 400 * 400);
+assert.equal(typeof mounts.projection, "string");
 mounts.free();
 
 // 4. Full in-memory inundation dynamics + lazy animated GIF encoding

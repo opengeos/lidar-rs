@@ -118,9 +118,10 @@ pub use mounts::{
 };
 #[cfg(feature = "pointcloud")]
 pub use pointcloud::{
-    GroundFilterMethod, LidarToDsmOptions, LidarToDtmOptions, ReturnKind, classify_ground,
-    convert_lidar, filter_by_classification, lidar_to_chm, lidar_to_dsm, lidar_to_dtm, read_lidar,
-    read_lidar_filtered, write_lidar,
+    GroundFilterMethod, LidarReadOptions, LidarToDsmOptions, LidarToDtmOptions, ReturnKind,
+    classify_ground, convert_lidar, filter_by_classification, filter_outliers_elm,
+    filter_outliers_statistical, lidar_to_chm, lidar_to_dsm, lidar_to_dtm, normalize_hag,
+    read_lidar, read_lidar_filtered, read_lidar_windowed, write_lidar,
 };
 pub use raster_ops::{
     add_crs, clip_image, csv_points_to_vector, image_to_cog, join_csv_to_vector, mosaic,

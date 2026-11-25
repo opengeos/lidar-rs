@@ -21,13 +21,22 @@ path = "src/main.rs"
 
 [features]
 default = []
-## Enable the `lidar download` subcommand (pulls `ureq` with `rustls`)
-download = ["lidar/download"]
+## Enable the `lidar download` and `lidar noaa-atlas14` subcommands plus remote COG/COPC/EPT range reads via `terrio/remote`
+download = ["lidar/download", "terrio/remote"]
+## Enable pure-Rust GeoParquet vector I/O via `terrio/parquet`
+parquet = ["lidar/parquet", "terrio/parquet"]
+## Enable pure-Rust FlatGeobuf vector I/O via `terrio/flatgeobuf`
+flatgeobuf = ["lidar/flatgeobuf", "terrio/flatgeobuf"]
+## Enable pure-Rust LERC-compressed GeoTIFF/COG reading via `terrio/lerc`
+lerc = ["lidar/lerc", "terrio/lerc"]
+## Enable pure-Rust PMTiles and MBTiles export via `terrio/tiles`
+tiles = ["lidar/tiles", "terrio/tiles"]
 
 [dependencies]
 lidar = { workspace = true, features = ["parallel", "pointcloud", "serde"] }
 richdem = { workspace = true, features = ["parallel"] }
 terrio = { workspace = true, features = ["pointcloud"] }
 clap.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

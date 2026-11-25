@@ -1,11 +1,14 @@
 //! Pure-Rust LiDAR point cloud I/O, format conversion, ground classification,
+//! outlier removal, height-above-ground normalization, COPC octree windowing,
 //! and DSM / DTM / CHM gridding via `terrio`.
 //!
 //! Replaces `laspy` and `WhiteboxTools` (`read_lidar`, `write_lidar`,
 //! `convert_lidar`, `lidar_to_dsm`) from `lidar/common.py` with zero C dependencies,
-//! and adds ASPRS classification / return filtering, Cloth Simulation Filter (CSF)
-//! and Progressive Morphological Filter (PMF) ground classification, bare-earth DTM
-//! generation, and Canopy Height Model (CHM) creation.
+//! and adds ASPRS classification / return filtering, Cloth Simulation Filter (CSF),
+//! Progressive Morphological Filter (PMF), and Simple Morphological Filter (SMRF)
+//! ground classification, Extended Local Minimum (ELM) and statistical outlier
+//! filtering, Height Above Ground (HAG) normalization, COPC octree LOD/spatial
+//! windowing, bare-earth DTM generation, and Canopy Height Model (CHM) creation.
 
 use std::path::Path;
 use std::str::FromStr;
@@ -14,7 +17,10 @@ pub use terrio::pointcloud::{
     Dimension, LasHeader, PointCloud, PointFilter, PointFormat, PointReadOptions,
     PointWriteOptions, ReturnKind, ValueType, Values,
     filters::{
-        CsfOptions, PmfOptions, csf as terrio_csf, csf_classes, pmf as terrio_pmf, pmf_classes,
+        CsfOptions, HagOptions, OutlierMethod, OutlierOptions, PmfOptions, SmrfOptions,
+        csf as terrio_csf, csf_classes, elm as terrio_elm, hag_delaunay, hag_nn,
+        outlier as terrio_outlier, outlier_mask, pmf as terrio_pmf, pmf_classes,
+        smrf as terrio_smrf, smrf_classes,
     },
     grid::{GridMethod, GridOptions, GridStat},
 };
@@ -51,6 +57,8 @@ pub enum GroundFilterMethod {
     Csf,
     /// Progressive Morphological Filter (Zhang et al., 2003) via `terrio`.
     Pmf,
+    /// Simple Morphological Filter (Pingel et al., 2013) via `terrio`.
+    Smrf,
 }
 
 impl FromStr for GroundFilterMethod {
@@ -61,8 +69,9 @@ impl FromStr for GroundFilterMethod {
             "preclassified" => Ok(Self::Preclassified),
             "csf" => Ok(Self::Csf),
             "pmf" => Ok(Self::Pmf),
+            "smrf" => Ok(Self::Smrf),
             other => Err(Error::InvalidArgument(format!(
-                "unknown ground filter method '{other}'; expected preclassified, csf, or pmf"
+                "unknown ground filter method '{other}'; expected preclassified, csf, pmf, or smrf"
             ))),
         }
     }
@@ -158,6 +167,8 @@ pub struct LidarToDtmOptions {
     pub window_size: usize,
     /// Output NoData value (`-9999.0` by default).
     pub nodata: f64,
+    /// Strip ASPRS low/high noise outliers (classes 7 and 18) via ELM before gridding (default `false`).
+    pub remove_outliers: bool,
 }
 
 impl Default for LidarToDtmOptions {
@@ -171,8 +182,31 @@ impl Default for LidarToDtmOptions {
             stat: GridStat::Idw,
             window_size: 5,
             nodata: -9999.0,
+            remove_outliers: false,
         }
     }
+}
+
+/// Windowing, COPC octree level-of-detail (LOD), and point filtering options for
+/// [`read_lidar_windowed`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LidarReadOptions {
+    /// Optional 2D spatial bounding box `[min_x, min_y, max_x, max_y]` in the file's CRS.
+    pub bounds: Option<[f64; 4]>,
+    /// Optional maximum COPC octree level (`0` = root; ignored for non-COPC formats).
+    pub max_level: Option<u32>,
+    /// Optional target point spacing in CRS units for COPC LOD selection (ignored for non-COPC formats).
+    pub resolution: Option<f64>,
+    /// Optional approximate maximum point count (COPC chooses octree level; other formats thin by stride).
+    pub max_points: Option<usize>,
+    /// Optional ASPRS classification codes to keep (empty keeps all).
+    pub classifications: Vec<u8>,
+    /// Optional pulse return kinds to keep (empty keeps all).
+    pub return_kinds: Vec<ReturnKind>,
+    /// Optional minimum Z threshold for point inclusion.
+    pub min_z: Option<f64>,
+    /// Optional maximum Z threshold for point inclusion.
+    pub max_z: Option<f64>,
 }
 
 /// Reads a LiDAR point cloud file (LAS, LAZ, COPC, PLY, E57, EPT).
@@ -193,6 +227,72 @@ pub fn read_lidar_filtered(path: impl AsRef<Path>, filter: PointFilter) -> Resul
         ..Default::default()
     };
     Ok(reader.read(&opts)?)
+}
+
+/// Reads a LiDAR point cloud with COPC octree LOD (`max_level`, `resolution`), spatial
+/// bounding-box windowing (`bounds`), approximate point cap (`max_points`), and attribute
+/// filters (`classifications`, `return_kinds`, `min_z`, `max_z`).
+pub fn read_lidar_windowed(path: impl AsRef<Path>, opts: &LidarReadOptions) -> Result<PointCloud> {
+    if let Some([x0, y0, x1, y1]) = opts.bounds {
+        if !x0.is_finite() || !y0.is_finite() || !x1.is_finite() || !y1.is_finite() {
+            return Err(Error::InvalidArgument(
+                "bounds coordinates must be finite".into(),
+            ));
+        }
+        if x0 > x1 || y0 > y1 {
+            return Err(Error::InvalidArgument(format!(
+                "invalid bounds [{x0}, {y0}, {x1}, {y1}]: expected min <= max"
+            )));
+        }
+    }
+    if let Some(res) = opts.resolution
+        && (!res.is_finite() || res <= 0.0)
+    {
+        return Err(Error::InvalidArgument(format!(
+            "resolution must be finite and > 0, got {res}"
+        )));
+    }
+    if let Some(lo) = opts.min_z
+        && !lo.is_finite()
+    {
+        return Err(Error::InvalidArgument(format!(
+            "min_z must be finite, got {lo}"
+        )));
+    }
+    if let Some(hi) = opts.max_z
+        && !hi.is_finite()
+    {
+        return Err(Error::InvalidArgument(format!(
+            "max_z must be finite, got {hi}"
+        )));
+    }
+    if let (Some(lo), Some(hi)) = (opts.min_z, opts.max_z)
+        && lo > hi
+    {
+        return Err(Error::InvalidArgument(format!(
+            "min_z ({lo}) must be <= max_z ({hi})"
+        )));
+    }
+    let filter = PointFilter {
+        bounds: opts.bounds,
+        z_range: match (opts.min_z, opts.max_z) {
+            (Some(lo), Some(hi)) => Some((lo, hi)),
+            (Some(lo), None) => Some((lo, f64::INFINITY)),
+            (None, Some(hi)) => Some((f64::NEG_INFINITY, hi)),
+            (None, None) => None,
+        },
+        classes: opts.classifications.clone(),
+        returns: opts.return_kinds.clone(),
+    };
+    let read_opts = PointReadOptions {
+        filter,
+        max_level: opts.max_level,
+        resolution: opts.resolution,
+        max_points: opts.max_points.map(|n| n as u64),
+    };
+    let p = path_to_str(path.as_ref())?;
+    let mut reader = terrio::pointcloud::open_points(p)?;
+    Ok(reader.read(&read_opts)?)
 }
 
 /// Writes a [`PointCloud`] to disk (LAS, LAZ, COPC, PLY, or E57 by file extension).
@@ -252,13 +352,106 @@ pub fn convert_lidar(
     Ok(count)
 }
 
-/// Classifies ground points in a [`PointCloud`] using either Cloth Simulation Filter (CSF)
-/// or Progressive Morphological Filter (PMF).
+/// Classifies ground points in a [`PointCloud`] using Cloth Simulation Filter (CSF),
+/// Progressive Morphological Filter (PMF), or Simple Morphological Filter (SMRF).
 pub fn classify_ground(cloud: &PointCloud, method: GroundFilterMethod) -> Result<PointCloud> {
     match method {
         GroundFilterMethod::Preclassified => Ok(cloud.clone()),
         GroundFilterMethod::Csf => Ok(terrio_csf(cloud, &CsfOptions::default())?),
         GroundFilterMethod::Pmf => Ok(terrio_pmf(cloud, &PmfOptions::default())?),
+        GroundFilterMethod::Smrf => Ok(terrio_smrf(cloud, &SmrfOptions::default())?),
+    }
+}
+
+/// Removes points classified as ASPRS low noise (`7`) or high noise (`18`).
+fn strip_noise_classes(cloud: &PointCloud) -> PointCloud {
+    let Some(dim) = cloud
+        .dim("classification")
+        .or_else(|| cloud.dim("Classification"))
+    else {
+        return cloud.clone();
+    };
+    let n = cloud.len();
+    let keep: Vec<bool> = (0..n)
+        .map(|i| {
+            let c = dim.values.get_f64(i);
+            !(c == 7.0 || c == 18.0)
+        })
+        .collect();
+    cloud.select(&keep)
+}
+
+/// Identifies low-noise outliers using the Extended Local Minimum (ELM) filter
+/// (`terrio::pointcloud::filters::elm`, matching PDAL's `filters.elm`).
+///
+/// Points flagged as low noise are assigned ASPRS class `7`. When `remove_noise` is `true`,
+/// all ASPRS low-noise (`7`) and high-noise (`18`) points are stripped from the returned cloud.
+pub fn filter_outliers_elm(
+    cloud: &PointCloud,
+    cell: f64,
+    threshold: f64,
+    remove_noise: bool,
+) -> Result<PointCloud> {
+    if !threshold.is_finite() || threshold < 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "threshold must be finite and >= 0, got {threshold}"
+        )));
+    }
+    let classified = terrio_elm(cloud, cell, threshold, 7)?;
+    if remove_noise {
+        Ok(strip_noise_classes(&classified))
+    } else {
+        Ok(classified)
+    }
+}
+
+/// Identifies statistical outliers using k-nearest-neighbor mean-distance thresholding
+/// (`terrio::pointcloud::filters::outlier`, matching PDAL's `filters.outlier` in statistical mode).
+///
+/// Outliers are assigned ASPRS class `7`. When `remove_noise` is `true`, all ASPRS low-noise
+/// (`7`) and high-noise (`18`) points are stripped from the returned cloud.
+pub fn filter_outliers_statistical(
+    cloud: &PointCloud,
+    mean_k: usize,
+    multiplier: f64,
+    remove_noise: bool,
+) -> Result<PointCloud> {
+    if mean_k == 0 {
+        return Err(Error::InvalidArgument(
+            "mean_k must be >= 1 for statistical outlier filtering".into(),
+        ));
+    }
+    if !multiplier.is_finite() || multiplier < 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "multiplier must be finite and >= 0, got {multiplier}"
+        )));
+    }
+    let opts = OutlierOptions {
+        method: OutlierMethod::Statistical,
+        mean_k,
+        multiplier,
+        class: 7,
+        ..Default::default()
+    };
+    let classified = terrio_outlier(cloud, &opts)?;
+    if remove_noise {
+        Ok(strip_noise_classes(&classified))
+    } else {
+        Ok(classified)
+    }
+}
+
+/// Computes Height Above Ground (HAG) for every point in `cloud`, storing the result in the
+/// `height_above_ground` dimension using either Delaunay triangulation (`use_delaunay = true`,
+/// PDAL `filters.hag_delaunay`) or nearest-neighbor interpolation (`use_delaunay = false`,
+/// PDAL `filters.hag_nn`).
+///
+/// Requires a `classification` dimension with ASPRS ground points (class `2`).
+pub fn normalize_hag(cloud: &PointCloud, use_delaunay: bool) -> Result<PointCloud> {
+    if use_delaunay {
+        Ok(hag_delaunay(cloud, &HagOptions::delaunay())?)
+    } else {
+        Ok(hag_nn(cloud, &HagOptions::nn())?)
     }
 }
 
@@ -448,7 +641,7 @@ fn select_ground_points(
 ) -> Result<PointCloud> {
     match method {
         GroundFilterMethod::Preclassified => filter_by_classification(raw, &[ground_class]),
-        GroundFilterMethod::Csf | GroundFilterMethod::Pmf => {
+        GroundFilterMethod::Csf | GroundFilterMethod::Pmf | GroundFilterMethod::Smrf => {
             if ground_class != 2 {
                 return Err(Error::InvalidArgument(format!(
                     "{method:?} always assigns ASPRS ground class 2; set ground_class=2 or use GroundFilterMethod::Preclassified (got ground_class={ground_class})"
@@ -457,6 +650,7 @@ fn select_ground_points(
             let classes = match method {
                 GroundFilterMethod::Csf => csf_classes(raw, &CsfOptions::default())?,
                 GroundFilterMethod::Pmf => pmf_classes(raw, &PmfOptions::default())?,
+                GroundFilterMethod::Smrf => smrf_classes(raw, &SmrfOptions::default())?,
                 GroundFilterMethod::Preclassified => unreachable!(),
             };
             let keep: Vec<bool> = classes.iter().map(|&c| c == Some(2)).collect();
@@ -468,7 +662,7 @@ fn select_ground_points(
 /// Generates a bare-earth Digital Terrain Model (DTM) GeoTIFF from a LiDAR point cloud.
 ///
 /// Uses existing ASPRS ground returns (`Preclassified`) or runs pure-Rust ground
-/// classification (`Csf` or `Pmf`), selects ground points, and interpolates a continuous
+/// classification (`Csf`, `Pmf`, or `Smrf`), selects ground points, and interpolates a continuous
 /// bare-earth surface.
 pub fn lidar_to_dtm(
     in_lidar: impl AsRef<Path>,
@@ -499,11 +693,21 @@ pub fn lidar_to_dtm(
                 classes: vec![options.ground_class],
                 ..Default::default()
             };
-            read_lidar_filtered(in_lidar, filter)?
+            let pts = read_lidar_filtered(in_lidar, filter)?;
+            if options.remove_outliers {
+                filter_outliers_elm(&pts, 10.0, 1.0, true)?
+            } else {
+                pts
+            }
         }
         method => {
             let raw = read_lidar(in_lidar)?;
-            select_ground_points(&raw, method, options.ground_class)?
+            let cleaned = if options.remove_outliers {
+                filter_outliers_elm(&raw, 10.0, 1.0, true)?
+            } else {
+                raw
+            };
+            select_ground_points(&cleaned, method, options.ground_class)?
         }
     };
 
@@ -555,6 +759,11 @@ pub fn lidar_to_chm(
     ensure_parent_dir(out_path)?;
 
     let raw = read_lidar(in_lidar)?;
+    let raw = if options.remove_outliers {
+        filter_outliers_elm(&raw, 10.0, 1.0, true)?
+    } else {
+        raw
+    };
     if raw.is_empty() {
         return Err(Error::Algorithm("input point cloud is empty".into()));
     }

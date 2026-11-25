@@ -635,9 +635,11 @@ pub fn extract_sinks(
 pub struct DepressionsOutput {
     width: usize,
     height: usize,
+    projection: String,
     max_level: u32,
     num_regions: usize,
     depressions_json: String,
+    depression_id: Vec<i32>,
     id_tif: Vec<u8>,
     level_tif: Vec<u8>,
     geojson: String,
@@ -654,6 +656,10 @@ impl DepressionsOutput {
     pub fn height(&self) -> usize {
         self.height
     }
+    #[wasm_bindgen(getter)]
+    pub fn projection(&self) -> String {
+        self.projection.clone()
+    }
     #[wasm_bindgen(getter, js_name = maxLevel)]
     pub fn max_level(&self) -> u32 {
         self.max_level
@@ -665,6 +671,21 @@ impl DepressionsOutput {
     #[wasm_bindgen(js_name = depressionsJson)]
     pub fn depressions_json(&self) -> String {
         self.depressions_json.clone()
+    }
+    /// Alias of [`Self::depressions_json`] for mount delineation outputs.
+    #[wasm_bindgen(js_name = mountsJson)]
+    pub fn mounts_json(&self) -> String {
+        self.depressions_json.clone()
+    }
+    /// Per-cell depression/mount ID grid (`Int32Array`, `0` outside features) for interactive inspection.
+    #[wasm_bindgen(js_name = depressionIdValues)]
+    pub fn depression_id_values(&self) -> Vec<i32> {
+        self.depression_id.clone()
+    }
+    /// Alias of [`Self::depression_id_values`] for mount delineation outputs.
+    #[wasm_bindgen(js_name = mountIdValues)]
+    pub fn mount_id_values(&self) -> Vec<i32> {
+        self.depression_id.clone()
     }
     #[wasm_bindgen(js_name = idTif)]
     pub fn id_tif(&self) -> Vec<u8> {
@@ -696,9 +717,11 @@ fn marshal_depressions(
     Ok(DepressionsOutput {
         width: mem.depression_id.width(),
         height: mem.depression_id.height(),
+        projection: mem.depression_id.projection.clone(),
         max_level: mem.max_level,
         num_regions: mem.num_regions as usize,
         depressions_json,
+        depression_id: mem.depression_id.data().to_vec(),
         id_tif,
         level_tif,
         geojson,

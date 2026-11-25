@@ -55,6 +55,10 @@ Run **`lidar-rs`** directly in your browser via WebAssembly: DEM smoothing, sele
       <input type="number" id="lp-rain" value="5" min="0.5" max="100" step="0.5">
     </div>
     <div class="lp-field lp-inundation-only">
+      <label for="lp-scs-mm">SCS Type II storm (mm, 0=const)</label>
+      <input type="number" id="lp-scs-mm" value="0" min="0" max="2000" step="10" placeholder="0 (constant)">
+    </div>
+    <div class="lp-field lp-inundation-only">
       <label for="lp-runoff-coeff">Runoff coeff C (0..1)</label>
       <input type="number" id="lp-runoff-coeff" value="1.0" min="0.05" max="1.0" step="0.05">
     </div>
@@ -75,12 +79,12 @@ Run **`lidar-rs`** directly in your browser via WebAssembly: DEM smoothing, sele
     <div class="lp-summary" id="lp-summary"></div>
 
     <div id="lp-player-section" hidden>
-      <h3>Interactive Inundation Simulation</h3>
+      <h3 id="lp-player-heading">Interactive Inundation Simulation</h3>
       <div class="lp-player-grid">
         <div class="lp-player-stage">
-          <canvas id="lp-player-canvas" title="Click any depression to inspect hierarchy, morphometry, and stage-volume curve"></canvas>
+          <canvas id="lp-player-canvas" title="Click any depression or mount to inspect hierarchy and morphometry"></canvas>
           <div class="lp-player-telemetry" id="lp-player-telemetry"></div>
-          <div class="lp-player-bar">
+          <div class="lp-player-bar" id="lp-player-bar">
             <button type="button" id="lp-play-btn" class="md-button md-button--primary">Pause</button>
             <button type="button" id="lp-prev-btn" class="lp-icon-btn" title="Previous time step">&#9664;</button>
             <button type="button" id="lp-next-btn" class="lp-icon-btn" title="Next time step">&#9654;</button>
@@ -97,9 +101,11 @@ Run **`lidar-rs`** directly in your browser via WebAssembly: DEM smoothing, sele
           </div>
         </div>
         <div class="lp-player-side">
-          <h4>Inundation Curve</h4>
-          <p class="lp-hint">Click the chart or drag the slider to inspect any time step. Click any depression on the map or table to inspect it.</p>
-          <canvas id="lp-chart" width="420" height="200"></canvas>
+          <div id="lp-chart-wrap">
+            <h4>Inundation Curve</h4>
+            <p class="lp-hint">Click the chart or drag the slider to inspect any time step. Click any depression on the map or table to inspect it.</p>
+            <canvas id="lp-chart" width="420" height="200"></canvas>
+          </div>
 
           <div class="lp-inspector" id="lp-inspector">
             <div class="lp-inspector-head">
@@ -118,24 +124,24 @@ Run **`lidar-rs`** directly in your browser via WebAssembly: DEM smoothing, sele
       <div class="lp-tree-panel" id="lp-tree-panel">
         <div class="lp-tree-head">
           <div>
-            <h4>Depression Tree Graph <span class="lp-hint" id="lp-tree-status"></span></h4>
-            <p class="lp-hint">Builds progressively bottom-up as rising water layers fill leaf depressions and merge them into enclosing levels. Click any node to inspect.</p>
+            <h4><span id="lp-tree-title">Depression Tree Graph</span> <span class="lp-hint" id="lp-tree-status"></span></h4>
+            <p class="lp-hint" id="lp-tree-desc">Builds progressively bottom-up as rising water layers fill leaf depressions and merge them into enclosing levels. Click any node to inspect.</p>
           </div>
           <div class="lp-tree-controls">
             <label class="lp-tree-region-wrap" id="lp-tree-region-wrap" hidden>
               Region
-              <select id="lp-tree-region" aria-label="Sink region hierarchy"></select>
+              <select id="lp-tree-region" aria-label="Region hierarchy"></select>
             </label>
             <label class="lp-tree-region-wrap" id="lp-tree-node-wrap">
               Node
-              <select id="lp-tree-node-select" aria-label="Inspect depression node"></select>
+              <select id="lp-tree-node-select" aria-label="Inspect hierarchy node"></select>
             </label>
-            <label class="lp-inline-check"><input type="checkbox" id="lp-tree-outline" checked> Show unreached outline</label>
+            <label class="lp-inline-check" id="lp-tree-outline-wrap"><input type="checkbox" id="lp-tree-outline" checked> Show unreached outline</label>
             <button type="button" id="lp-tree-gif-btn" class="lp-icon-btn" title="Export animated depression tree GIF">Download GIF</button>
           </div>
         </div>
         <div class="lp-tree-canvas-wrap" id="lp-tree-canvas-wrap">
-          <canvas id="lp-tree-canvas" width="960" height="360" tabindex="0" role="application" aria-label="Depression tree graph. Use arrow keys to step through nodes and Enter to inspect." title="Click any node or use arrow keys + Enter to inspect its depression on the map"></canvas>
+          <canvas id="lp-tree-canvas" width="960" height="360" tabindex="0" role="application" aria-label="Hierarchy tree graph. Use arrow keys to step through nodes and Enter to inspect." title="Click any node or use arrow keys + Enter to inspect it on the map"></canvas>
         </div>
         <div class="lp-tree-legend" id="lp-tree-legend"></div>
       </div>
@@ -182,7 +188,7 @@ Run **`lidar-rs`** directly in your browser via WebAssembly: DEM smoothing, sele
             <th>Cells</th>
             <th>Area</th>
             <th>Volume</th>
-            <th>Max Depth</th>
+            <th id="lp-th-depth">Max Depth</th>
             <th>Circularity</th>
             <th>HI</th>
             <th>Rim Slope</th>

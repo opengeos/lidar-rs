@@ -261,7 +261,7 @@
   function precomputeDepressionGridStats(width, height, depIds, fillTimes, depressions) {
     const fillStats = new Map();
     const badgePos = new Map();
-    if (!depIds || !fillTimes || !depressions || depressions.length === 0) {
+    if (!depIds || !depressions || depressions.length === 0) {
       return { fillStats, badgePos };
     }
 
@@ -273,7 +273,7 @@
 
     const n = width * height;
     const totalCounts = new Uint32Array(maxId + 1);
-    const wetCounts = new Uint32Array(maxId + 1);
+    const wetCounts = fillTimes ? new Uint32Array(maxId + 1) : null;
     const sumCol = new Float64Array(maxId + 1);
     const sumRow = new Float64Array(maxId + 1);
 
@@ -286,33 +286,37 @@
         totalCounts[id]++;
         sumCol[id] += c;
         sumRow[id] += r;
-        const ft = fillTimes[idx];
-        if (Number.isFinite(ft) && ft >= 0) {
-          wetCounts[id]++;
+        if (fillTimes) {
+          const ft = fillTimes[idx];
+          if (Number.isFinite(ft) && ft >= 0) {
+            wetCounts[id]++;
+          }
         }
       }
     }
 
-    // Allocate and populate per-depression fill-time arrays, then sort numerically.
-    const timesById = new Array(maxId + 1);
-    const cursors = new Uint32Array(maxId + 1);
-    for (const d of depressions) {
-      const id = d.id;
-      const arr = new Float64Array(wetCounts[id]);
-      timesById[id] = arr;
-      fillStats.set(id, { total: totalCounts[id], times: arr });
-    }
-    for (let i = 0; i < n; i++) {
-      const id = depIds[i];
-      if (id <= 0 || id > maxId) continue;
-      const arr = timesById[id];
-      if (!arr) continue;
-      const ft = fillTimes[i];
-      if (!Number.isFinite(ft) || ft < 0) continue;
-      arr[cursors[id]++] = ft;
-    }
-    for (const entry of fillStats.values()) {
-      entry.times.sort();
+    if (fillTimes) {
+      // Allocate and populate per-depression fill-time arrays, then sort numerically.
+      const timesById = new Array(maxId + 1);
+      const cursors = new Uint32Array(maxId + 1);
+      for (const d of depressions) {
+        const id = d.id;
+        const arr = new Float64Array(wetCounts[id]);
+        timesById[id] = arr;
+        fillStats.set(id, { total: totalCounts[id], times: arr });
+      }
+      for (let i = 0; i < n; i++) {
+        const id = depIds[i];
+        if (id <= 0 || id > maxId) continue;
+        const arr = timesById[id];
+        if (!arr) continue;
+        const ft = fillTimes[i];
+        if (!Number.isFinite(ft) || ft < 0) continue;
+        arr[cursors[id]++] = ft;
+      }
+      for (const entry of fillStats.values()) {
+        entry.times.sort();
+      }
     }
 
     // 2-pass L1 distance-to-boundary transform to place each ID badge in the widest interior
@@ -634,14 +638,17 @@
       if (!pos) continue;
       const depTree = treeByRegion.get(d.region_id);
       const childrenMap = depTree ? depTree.childrenMap : null;
-      const state = computeDepressionFillState(
-        d.id,
-        tHours,
-        fillStats,
-        childrenMap,
-        memo,
-        fsmBasinsById,
-      );
+      const state =
+        playerState.kind === "mounts"
+          ? { frac: 1, status: "full" }
+          : computeDepressionFillState(
+              d.id,
+              tHours,
+              fillStats,
+              childrenMap,
+              memo,
+              fsmBasinsById,
+            );
       const isSelected = d.id === selectedDepId;
       const color = levelColor(d.level);
       const alpha = isSelected || state.status !== "dry" ? 0.96 : 0.62;
@@ -685,7 +692,7 @@
     playerState.badgeHitTargets = hitBadges;
   }
 
-  function renderTreeLegend(tree) {
+  function renderTreeLegend(tree, isMounts) {
     const el = $("lp-tree-legend");
     if (!el || !tree) return;
     el.innerHTML = "";
@@ -699,18 +706,20 @@
       item.append(sw, document.createTextNode(`Level ${lvl}${suffix}`));
       el.appendChild(item);
     }
-    const states = [
-      ["lp-tree-swatch-state lp-tree-swatch-dry", "Dry"],
-      ["lp-tree-swatch-state lp-tree-swatch-filling", "Filling"],
-      ["lp-tree-swatch-state lp-tree-swatch-full", "Full / Merged"],
-    ];
-    for (const [cls, lbl] of states) {
-      const item = document.createElement("span");
-      item.className = "lp-tree-legend-item";
-      const sw = document.createElement("span");
-      sw.className = cls;
-      item.append(sw, document.createTextNode(lbl));
-      el.appendChild(item);
+    if (!isMounts) {
+      const states = [
+        ["lp-tree-swatch-state lp-tree-swatch-dry", "Dry"],
+        ["lp-tree-swatch-state lp-tree-swatch-filling", "Filling"],
+        ["lp-tree-swatch-state lp-tree-swatch-full", "Full / Merged"],
+      ];
+      for (const [cls, lbl] of states) {
+        const item = document.createElement("span");
+        item.className = "lp-tree-legend-item";
+        const sw = document.createElement("span");
+        sw.className = cls;
+        item.append(sw, document.createTextNode(lbl));
+        el.appendChild(item);
+      }
     }
   }
 
@@ -748,18 +757,23 @@
       selectedDepId = 0,
       hoveredTreeDepId = 0,
       offsetY = 0,
+      isMounts = false,
     } = opts;
 
     const states = new Map();
     for (const d of tree.nodes) {
-      computeDepressionFillState(
-        d.id,
-        tHours,
-        fillStats,
-        tree.childrenMap,
-        states,
-        fsmBasinsById,
-      );
+      if (isMounts) {
+        states.set(d.id, { frac: 1, status: "full" });
+      } else {
+        computeDepressionFillState(
+          d.id,
+          tHours,
+          fillStats,
+          tree.childrenMap,
+          states,
+          fsmBasinsById,
+        );
+      }
     }
 
     let activeCount = 0;
@@ -990,8 +1004,9 @@
       }
 
       const fillingPct = Math.min(99, Math.max(1, Math.round(st.frac * 100)));
-      const elevLine =
-        st.status === "filling"
+      const elevLine = isMounts
+        ? `H: ${d.max_depth.toFixed(1)}${elevUnit}`
+        : st.status === "filling"
           ? `${d.max_elev.toFixed(1)}${elevUnit} (${fillingPct}%)`
           : `${d.max_elev.toFixed(1)}${elevUnit}`;
       const volLine = formatCompactVolume(d.volume, areaUnit);
@@ -1560,6 +1575,7 @@
     const canvasBg =
       (wrap && getComputedStyle(wrap).backgroundColor) || (dark ? "#1e2129" : "#ffffff");
 
+    const isMounts = player.kind === "mounts";
     const { hitNodes, activeCount, fullCount, maxActiveLevel } = drawDepressionTreeScene(
       ctx,
       layout,
@@ -1577,15 +1593,18 @@
         selectedDepId: player.selectedDepId,
         hoveredTreeDepId: player.hoveredTreeDepId,
         offsetY: 0,
+        isMounts,
       },
     );
 
     const statusEl = $("lp-tree-status");
     if (statusEl) {
-      if (activeCount === 0) {
+      if (isMounts) {
+        statusEl.textContent = `(${tree.nodes.length} mounts · Levels 1-${tree.maxLevel})`;
+      } else if (activeCount === 0) {
         statusEl.textContent = `(0/${tree.nodes.length} active · Dry at T = ${tHours.toFixed(1)} h)`;
       } else if (fullCount === tree.nodes.length) {
-        statusEl.textContent = `(${tree.nodes.length}/${tree.nodes.length} full · Levels 1–${tree.maxLevel} complete)`;
+        statusEl.textContent = `(${tree.nodes.length}/${tree.nodes.length} full · Levels 1-${tree.maxLevel} complete)`;
       } else {
         statusEl.textContent = `(${activeCount}/${tree.nodes.length} active · ${fullCount} full · Active level ${maxActiveLevel}/${tree.maxLevel})`;
       }
@@ -1755,20 +1774,28 @@
 
   function selectDepression(depId) {
     if (!player) return;
+    const isMounts = player.kind === "mounts";
+    const entityLabel = isMounts ? "Mount" : "Depression";
     player.selectedDepId = depId || 0;
     const titleEl = $("lp-inspector-title");
     const emptyEl = $("lp-inspector-empty");
     const bodyEl = $("lp-inspector-body");
     const clearBtn = $("lp-inspector-clear");
     const statsEl = $("lp-inspector-stats");
+    const ratingCanvas = $("lp-rating-chart");
 
     document.querySelectorAll("#lp-tbody tr").forEach((tr) => {
       tr.classList.toggle("lp-row-selected", Number(tr.dataset.depId) === player.selectedDepId);
     });
 
     if (!player.selectedDepId || !player.depsById.has(player.selectedDepId)) {
-      if (titleEl) titleEl.textContent = "Depression Inspector";
-      if (emptyEl) emptyEl.hidden = false;
+      if (titleEl) titleEl.textContent = `${entityLabel} Inspector`;
+      if (emptyEl) {
+        emptyEl.textContent = isMounts
+          ? "Click any mount on the map, tree graph, or feature table below to view its parent/child hierarchy, height, volume, and morphometry."
+          : "Click any depression on the map or in the feature table below to view its parent/child hierarchy, morphometry, spill threshold, and stage-volume rating curve.";
+        emptyEl.hidden = false;
+      }
       if (bodyEl) bodyEl.hidden = true;
       if (clearBtn) clearBtn.hidden = true;
       const nodeSel = $("lp-tree-node-select");
@@ -1784,21 +1811,23 @@
         player.activeRegionId = d.region_id;
         const regSel = $("lp-tree-region");
         if (regSel) regSel.value = String(d.region_id);
-        renderTreeLegend(targetTree);
+        renderTreeLegend(targetTree, isMounts);
         populateTreeNodeSelect(targetTree, d.id);
       }
     } else {
       const nodeSel = $("lp-tree-node-select");
       if (nodeSel) nodeSel.value = String(d.id);
     }
-    const outSpill = (player.spillPaths || []).find((s) => s.from_dep_id === d.id);
+    const outSpill = isMounts
+      ? null
+      : (player.spillPaths || []).find((s) => s.from_dep_id === d.id);
     const effMmH = player.rainIntensity * player.runoffCoeff * 10.0;
     const spillRunoff = outSpill ? `${(outSpill.spill_time_h * effMmH).toFixed(1)} mm` : "N/A";
     const childrenStr =
       Array.isArray(d.children_ids) && d.children_ids.length > 0 ? d.children_ids.join(", ") : "None";
     const parentStr = d.parent_id > 0 ? `#${d.parent_id}` : "Root";
 
-    if (titleEl) titleEl.textContent = `Depression #${d.id} (Level ${d.level}, Region ${d.region_id})`;
+    if (titleEl) titleEl.textContent = `${entityLabel} #${d.id} (Level ${d.level}, Region ${d.region_id})`;
     if (emptyEl) emptyEl.hidden = true;
     if (bodyEl) bodyEl.hidden = false;
     if (clearBtn) clearBtn.hidden = false;
@@ -1810,10 +1839,15 @@
       const items = [
         ["Area", formatArea(d.area, player.areaUnit)],
         ["Volume", `${d.volume.toLocaleString(undefined, { maximumFractionDigits: 1 })} ${volUnit}`],
-        ["Max / Mean Depth", `${d.max_depth.toFixed(2)} / ${d.avg_depth.toFixed(2)}${depthUnit}`],
+        [
+          isMounts ? "Max / Mean Height" : "Max / Mean Depth",
+          `${d.max_depth.toFixed(2)} / ${d.avg_depth.toFixed(2)}${depthUnit}`,
+        ],
         ["Parent / Children", `${parentStr} / ${childrenStr}`],
         ["Circularity / HI", `${d.circularity.toFixed(2)} / ${d.hypsometric_integral.toFixed(2)}`],
-        ["Rim Slope / Spill", `${d.rim_slope_deg.toFixed(1)}° / ${spillRunoff}`],
+        isMounts
+          ? ["Rim Slope / Cells", `${d.rim_slope_deg.toFixed(1)}° / ${d.count.toLocaleString()}`]
+          : ["Rim Slope / Spill", `${d.rim_slope_deg.toFixed(1)}° / ${spillRunoff}`],
       ];
       for (const [k, v] of items) {
         const div = document.createElement("div");
@@ -1827,8 +1861,13 @@
       }
     }
 
-    const rcPts = (player.ratingCurvesByDep.get(d.id) || []).slice().sort((a, b) => a.depth - b.depth);
-    renderRatingChart(rcPts);
+    if (ratingCanvas) {
+      ratingCanvas.hidden = isMounts;
+    }
+    if (!isMounts) {
+      const rcPts = (player.ratingCurvesByDep.get(d.id) || []).slice().sort((a, b) => a.depth - b.depth);
+      renderRatingChart(rcPts);
+    }
     renderPlayerFrame();
   }
 
@@ -1971,9 +2010,11 @@
   function renderPlayerFrame() {
     if (!player) return;
     const {
+      kind,
       width,
       height,
       hillshade,
+      levelRgba,
       fillTimes,
       steps,
       spillPaths,
@@ -1983,33 +2024,54 @@
       stepIdx,
       direction,
     } = player;
+    const isMounts = kind === "mounts";
     const step = steps[stepIdx];
     const tHours = step ? step.time_hours : 0;
 
-    // Composite live water inundation over shaded-relief DEM using full-precision f64 fill times
-    const alpha = 0.72;
-    const inv = 1 - alpha;
-    const wr = 20;
-    const wg = 115;
-    const wb = 225;
-    const n = width * height;
-    for (let i = 0; i < n; i++) {
-      const p = i * 4;
-      const ft = fillTimes[i];
-      if (tHours > 0 && ft >= 0 && ft <= tHours) {
-        const freshness = Math.min(1, Math.max(0, (tHours - ft) / Math.max(tHours, 1)));
-        const r = Math.round(wr * (1 - 0.35 * freshness));
-        const g = Math.round(wg * (1 - 0.3 * freshness));
-        const b = Math.round(wb * (1 - 0.12 * freshness));
-        frameBuf[p] = Math.round(hillshade[p] * inv + r * alpha);
-        frameBuf[p + 1] = Math.round(hillshade[p + 1] * inv + g * alpha);
-        frameBuf[p + 2] = Math.round(hillshade[p + 2] * inv + b * alpha);
-        frameBuf[p + 3] = 255;
-      } else {
-        frameBuf[p] = hillshade[p];
-        frameBuf[p + 1] = hillshade[p + 1];
-        frameBuf[p + 2] = hillshade[p + 2];
-        frameBuf[p + 3] = 255;
+    if (isMounts) {
+      const n = width * height;
+      const alpha = 0.78;
+      const inv = 1 - alpha;
+      for (let i = 0; i < n; i++) {
+        const p = i * 4;
+        if (levelRgba && levelRgba[p + 3] > 0) {
+          frameBuf[p] = Math.round(hillshade[p] * inv + levelRgba[p] * alpha);
+          frameBuf[p + 1] = Math.round(hillshade[p + 1] * inv + levelRgba[p + 1] * alpha);
+          frameBuf[p + 2] = Math.round(hillshade[p + 2] * inv + levelRgba[p + 2] * alpha);
+          frameBuf[p + 3] = 255;
+        } else {
+          frameBuf[p] = hillshade[p];
+          frameBuf[p + 1] = hillshade[p + 1];
+          frameBuf[p + 2] = hillshade[p + 2];
+          frameBuf[p + 3] = 255;
+        }
+      }
+    } else {
+      // Composite live water inundation over shaded-relief DEM using full-precision f64 fill times
+      const alpha = 0.72;
+      const inv = 1 - alpha;
+      const wr = 20;
+      const wg = 115;
+      const wb = 225;
+      const n = width * height;
+      for (let i = 0; i < n; i++) {
+        const p = i * 4;
+        const ft = fillTimes[i];
+        if (tHours > 0 && ft >= 0 && ft <= tHours) {
+          const freshness = Math.min(1, Math.max(0, (tHours - ft) / Math.max(tHours, 1)));
+          const r = Math.round(wr * (1 - 0.35 * freshness));
+          const g = Math.round(wg * (1 - 0.3 * freshness));
+          const b = Math.round(wb * (1 - 0.12 * freshness));
+          frameBuf[p] = Math.round(hillshade[p] * inv + r * alpha);
+          frameBuf[p + 1] = Math.round(hillshade[p + 1] * inv + g * alpha);
+          frameBuf[p + 2] = Math.round(hillshade[p + 2] * inv + b * alpha);
+          frameBuf[p + 3] = 255;
+        } else {
+          frameBuf[p] = hillshade[p];
+          frameBuf[p + 1] = hillshade[p + 1];
+          frameBuf[p + 2] = hillshade[p + 2];
+          frameBuf[p + 3] = 255;
+        }
       }
     }
 
@@ -2032,16 +2094,16 @@
     const ctx = canvas.getContext("2d");
     ctx.putImageData(new ImageData(frameBuf, width, height), 0, 0);
 
-    const showSpills = $("lp-spill-paths") ? $("lp-spill-paths").checked : true;
+    const showSpills = !isMounts && ($("lp-spill-paths") ? $("lp-spill-paths").checked : true);
     const activeSpills = showSpills
       ? drawActiveSpillPaths(ctx, width, height, fillTimes, tHours, spillPaths, stepIdx)
       : 0;
 
-    if (player.selectedDepId > 0) {
+    if (!isMounts && player.selectedDepId > 0) {
       drawSelectedSpillPaths(ctx, width, height, player.selectedDepId, spillPaths);
     }
 
-    const showBadges = $("lp-id-badges") ? $("lp-id-badges").checked : true;
+    const showBadges = isMounts || ($("lp-id-badges") ? $("lp-id-badges").checked : true);
     if (showBadges) {
       drawDepressionBadges(ctx, width, height, player, tHours);
     } else {
@@ -2049,22 +2111,36 @@
     }
 
     const slider = $("lp-slider");
-    if (slider) slider.value = String(stepIdx);
+    if (!isMounts && slider) slider.value = String(stepIdx);
 
     const telemetry = $("lp-player-telemetry");
-    if (telemetry && step) {
-      const phase = direction >= 0 ? "RISING" : "FALLING";
-      const totalHours = steps[steps.length - 1].time_hours;
-      const effRunoffMm = (tHours * rainIntensity * player.runoffCoeff * 10.0).toFixed(0);
-      const pct = (step.inundated_fraction * 100).toFixed(1);
-      const areaStr = formatArea(step.inundated_area, areaUnit);
-      const spillSuffix = showSpills ? ` · Active spills: ${activeSpills}` : "";
-      const cNote = player.runoffCoeff < 0.999 ? ` (C=${player.runoffCoeff.toFixed(2)})` : "";
-      telemetry.textContent =
-        `${phase} · T = ${tHours.toFixed(1)} / ${totalHours.toFixed(1)} h · Runoff: ${effRunoffMm} mm${cNote} · Inundated: ${step.inundated_cells.toLocaleString()} cells (${areaStr}, ${pct}%)${spillSuffix}`;
+    if (telemetry) {
+      if (isMounts) {
+        const regCount = (player.treeRegions || []).length;
+        telemetry.textContent =
+          `MOUNTS · ${player.depressions.length} features across ${regCount} region(s) · Click any mount on the map, tree graph, or table to inspect`;
+      } else if (step) {
+        const phase = direction >= 0 ? "RISING" : "FALLING";
+        const totalHours = steps[steps.length - 1].time_hours;
+        const stepRunoff =
+          player.runoffByStep && player.runoffByStep.has(step.step)
+            ? player.runoffByStep.get(step.step)
+            : tHours * rainIntensity * player.runoffCoeff * 10.0;
+        const effRunoffMm = Number.isFinite(stepRunoff) ? stepRunoff.toFixed(1) : "0.0";
+        const pct = (step.inundated_fraction * 100).toFixed(1);
+        const areaStr = formatArea(step.inundated_area, areaUnit);
+        const spillSuffix = showSpills ? ` · Active spills: ${activeSpills}` : "";
+        const cNote = player.runoffCoeff < 0.999 ? ` (C=${player.runoffCoeff.toFixed(2)})` : "";
+        const forcingBadge =
+          player.scsType2Mm > 0 ? ` · SCS Type II (${player.scsType2Mm.toFixed(0)} mm)` : "";
+        telemetry.textContent =
+          `${phase} · T = ${tHours.toFixed(1)} / ${totalHours.toFixed(1)} h${forcingBadge} · Runoff: ${effRunoffMm} mm${cNote} · Inundated: ${step.inundated_cells.toLocaleString()} cells (${areaStr}, ${pct}%)${spillSuffix}`;
+      }
     }
 
-    renderInundationChart();
+    if (!isMounts) {
+      renderInundationChart();
+    }
     renderDepressionTree();
   }
 
@@ -2182,6 +2258,23 @@
     playTimer = setInterval(stepPlayer, delayMs);
   }
 
+  function parseInundationCurveRunoff(csv) {
+    const map = new Map();
+    map.set(0, 0);
+    if (!csv || typeof csv !== "string") return map;
+    const lines = csv.trim().split(/\r?\n/);
+    for (let i = 1; i < lines.length; i++) {
+      const parts = lines[i].split(",");
+      if (parts.length < 3) continue;
+      const stepNum = parseInt(parts[0], 10);
+      const runoffMm = parseFloat(parts[2]);
+      if (Number.isFinite(stepNum) && Number.isFinite(runoffMm)) {
+        map.set(stepNum, runoffMm);
+      }
+    }
+    return map;
+  }
+
   function initPlayer(
     width,
     height,
@@ -2197,8 +2290,11 @@
     areaUnit,
     elevUnit,
     fsmBasinsById,
+    extraOpts = {},
   ) {
     stopPlayer();
+    const kind = extraOpts.kind || "inundation";
+    const isMounts = kind === "mounts";
     const depsById = new Map();
     for (const d of depressions || []) {
       depsById.set(d.id, d);
@@ -2236,7 +2332,7 @@
       regWrap.hidden = treeRegions.length <= 1;
     }
     if (treeRegions.length > 0) {
-      renderTreeLegend(treeRegions[0]);
+      renderTreeLegend(treeRegions[0], isMounts);
       populateTreeNodeSelect(treeRegions[0], 0);
     } else {
       populateTreeNodeSelect(null, 0);
@@ -2244,7 +2340,7 @@
 
     // Prepend the dry initial state (T = 0 h) so playback, scrubbing, and chart clicks start at T0.
     const playerSteps =
-      steps.length > 0 && steps[0].time_hours > 0
+      !isMounts && steps.length > 0 && steps[0].time_hours > 0
         ? [
             {
               step: 0,
@@ -2257,9 +2353,11 @@
           ]
         : steps;
     player = {
+      kind,
       width,
       height,
       hillshade,
+      levelRgba: extraOpts.levelRgba || null,
       fillTimes,
       depIds,
       depressions: depressions || [],
@@ -2278,6 +2376,8 @@
       spillPaths,
       rainIntensity,
       runoffCoeff,
+      scsType2Mm: extraOpts.scsType2Mm || 0,
+      runoffByStep: extraOpts.runoffByStep || null,
       areaUnit,
       elevUnit: elevUnit || "",
       frameBuf: new Uint8ClampedArray(width * height * 4),
@@ -2292,7 +2392,7 @@
       slider.value = "0";
     }
     selectDepression(0);
-    if (playerSteps.length > 1) {
+    if (!isMounts && playerSteps.length > 1) {
       startPlayer();
     }
   }
@@ -2528,6 +2628,8 @@
     const minDepth = Math.max(0.01, parseFloat($("lp-min-depth").value) || 0.3);
     const interval = Math.max(0.01, parseFloat($("lp-interval").value) || 0.3);
     const rain = Math.max(0.1, parseFloat($("lp-rain").value) || 5.0);
+    const scsVal = Math.max(0, parseFloat($("lp-scs-mm")?.value) || 0);
+    const scsType2Mm = scsVal > 0 ? scsVal : undefined;
     const runoffCoeff = Math.min(1.0, Math.max(0.05, parseFloat($("lp-runoff-coeff")?.value) || 1.0));
     const duration = Math.max(0.5, parseFloat($("lp-duration").value) || 70.0);
     const step = Math.max(0.1, parseFloat($("lp-step").value) || 1.0);
@@ -2561,7 +2663,7 @@
                 step,
                 breachMaxDepth,
                 runoffCoeff,
-                undefined,
+                scsType2Mm,
                 routingMode,
               )
             : wasm.simulateInundation(
@@ -2603,6 +2705,10 @@
           typeof sim.ratingCurvesJson === "function" ? JSON.parse(sim.ratingCurvesJson()) : [];
         const steps = JSON.parse(sim.stepsJson());
         const spillPaths = JSON.parse(sim.spillPathsJson());
+        const runoffByStep =
+          typeof sim.inundationCurveCsv === "function"
+            ? parseInundationCurveRunoff(sim.inundationCurveCsv())
+            : null;
         const fsmBasins =
           typeof sim.fsmBasinsJson === "function" ? JSON.parse(sim.fsmBasinsJson()) : [];
         const fsmBasinsById =
@@ -2613,6 +2719,17 @@
 
         $("lp-results").hidden = false;
         $("lp-player-section").hidden = false;
+        if ($("lp-player-heading")) $("lp-player-heading").textContent = "Interactive Inundation Simulation";
+        if ($("lp-player-bar")) $("lp-player-bar").hidden = false;
+        if ($("lp-chart-wrap")) $("lp-chart-wrap").hidden = false;
+        if ($("lp-tree-title")) $("lp-tree-title").textContent = "Depression Tree Graph";
+        if ($("lp-tree-desc")) {
+          $("lp-tree-desc").textContent =
+            "Builds progressively bottom-up as rising water layers fill leaf depressions and merge them into enclosing levels. Click any node to inspect.";
+        }
+        if ($("lp-tree-outline-wrap")) $("lp-tree-outline-wrap").hidden = false;
+        if ($("lp-tree-gif-btn")) $("lp-tree-gif-btn").hidden = false;
+        if ($("lp-th-depth")) $("lp-th-depth").textContent = "Max Depth";
         $("lp-fig-depth").hidden = false;
         $("lp-fig-fill").hidden = false;
         $("lp-cap-level").textContent = "Nested Depression Levels (over hillshade)";
@@ -2643,6 +2760,11 @@
           areaUnit,
           elevUnit,
           fsmBasinsById,
+          {
+            kind: "inundation",
+            scsType2Mm: scsType2Mm || 0,
+            runoffByStep,
+          },
         );
 
         drawRgba($("lp-c-hillshade"), w, h, hill, null);
@@ -2657,6 +2779,10 @@
         const summaryCards = [
           ["Raster Size", `${w} × ${h}`],
           ["Routing", fsmMassBalance !== null ? "Fill-Spill-Merge" : "Static"],
+          [
+            "Forcing",
+            scsType2Mm ? `SCS Type II (${scsType2Mm.toFixed(0)} mm)` : `Constant (${rain} cm/h)`,
+          ],
           ["Sink Regions", String(sim.numRegions)],
           ["Nested Depressions", String(depressions.length)],
           ["Max Level", String(sim.maxLevel)],
@@ -2746,11 +2872,33 @@
           const elapsed = performance.now() - t0;
           const w = mounts.width;
           const h = mounts.height;
+          const projection = typeof mounts.projection === "string" ? mounts.projection : "";
+          const areaUnit = detectAreaUnit(projection);
+          const elevUnit = detectElevationUnit(projection);
           const level = mounts.levelRgba();
-          const features = JSON.parse(mounts.depressionsJson());
+          const mountIds =
+            typeof mounts.mountIdValues === "function"
+              ? mounts.mountIdValues()
+              : typeof mounts.depressionIdValues === "function"
+                ? mounts.depressionIdValues()
+                : null;
+          const features = JSON.parse(
+            typeof mounts.mountsJson === "function" ? mounts.mountsJson() : mounts.depressionsJson(),
+          );
 
           $("lp-results").hidden = false;
-          $("lp-player-section").hidden = true;
+          $("lp-player-section").hidden = false;
+          if ($("lp-player-heading")) $("lp-player-heading").textContent = "Interactive Mount / Canopy Hierarchy";
+          if ($("lp-player-bar")) $("lp-player-bar").hidden = true;
+          if ($("lp-chart-wrap")) $("lp-chart-wrap").hidden = true;
+          if ($("lp-tree-title")) $("lp-tree-title").textContent = "Mount Tree Graph";
+          if ($("lp-tree-desc")) {
+            $("lp-tree-desc").textContent =
+              "Nested hierarchy of elevated features (peaks, buildings, or tree canopies) from leaf peaks (Level 1) to enclosing mounts. Click any node to inspect.";
+          }
+          if ($("lp-tree-outline-wrap")) $("lp-tree-outline-wrap").hidden = true;
+          if ($("lp-tree-gif-btn")) $("lp-tree-gif-btn").hidden = true;
+          if ($("lp-th-depth")) $("lp-th-depth").textContent = "Max Height";
           $("lp-fig-depth").hidden = true;
           $("lp-fig-fill").hidden = true;
           $("lp-cap-level").textContent = "Nested Mount / Canopy Levels (over hillshade)";
@@ -2765,6 +2913,27 @@
           if (gifWrap) gifWrap.hidden = true;
           const gifImg = $("lp-gif");
           if (gifImg) gifImg.removeAttribute("src");
+
+          initPlayer(
+            w,
+            h,
+            hill,
+            null,
+            mountIds,
+            features,
+            [],
+            [],
+            [],
+            0,
+            1.0,
+            areaUnit,
+            elevUnit,
+            null,
+            {
+              kind: "mounts",
+              levelRgba: level,
+            },
+          );
 
           drawRgba($("lp-c-hillshade"), w, h, hill, null);
           drawRgba($("lp-c-level"), w, h, level, hill);
@@ -2935,7 +3104,7 @@
         player.activeRegionId = rid;
         const target = (player.treeRegions || []).find((t) => t.regionId === rid);
         if (target) {
-          renderTreeLegend(target);
+          renderTreeLegend(target, player.kind === "mounts");
           populateTreeNodeSelect(target, player.selectedDepId);
         }
         renderPlayerFrame();
@@ -3158,9 +3327,11 @@
     themeObserverAttached = true;
     new MutationObserver(() => {
       if (!player) return;
-      renderInundationChart();
+      if (player.kind !== "mounts") {
+        renderInundationChart();
+      }
       renderDepressionTree();
-      if (player.selectedDepId > 0) {
+      if (player.kind !== "mounts" && player.selectedDepId > 0) {
         const rcPts = (player.ratingCurvesByDep.get(player.selectedDepId) || [])
           .slice()
           .sort((a, b) => a.depth - b.depth);
