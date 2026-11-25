@@ -7,6 +7,115 @@ use std::f64::consts::{FRAC_PI_4, PI};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
+use terrio::crs::SpatialRef;
+
+/// CRS-aware metric cell dimensions and linear-unit scale factor for a raster grid.
+///
+/// For projected CRSs (meters, US survey feet, international feet, etc.), `to_meter` is
+/// the CRS linear unit scale factor (`1.0` for metric or unknown CRSs) and
+/// `cell_width_m`, `cell_height_m`, and `cell_area_m2` are converted directly into SI
+/// meters and square meters.
+///
+/// For geographic CRSs (e.g., `EPSG:4326`, `EPSG:4269`), cell dimensions are computed
+/// using WGS 84 ellipsoidal prime-vertical and meridional radii of curvature evaluated at
+/// the raster's center latitude, and `to_meter` stores the geometric-mean meters-per-degree
+/// scale factor at that latitude.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct CrsMetricScale {
+    /// `true` when the CRS is geographic (angular degrees), `false` for projected or unknown CRSs.
+    pub is_geographic: bool,
+    /// Linear-unit conversion factor to meters (`m / map_unit` for projected CRSs; geometric-mean
+    /// meters per degree at center latitude for geographic CRSs).
+    pub to_meter: f64,
+    /// Cell column spacing in meters.
+    pub cell_width_m: f64,
+    /// Cell row spacing in meters.
+    pub cell_height_m: f64,
+    /// Cell surface area in square meters.
+    pub cell_area_m2: f64,
+}
+
+/// Computes CRS-aware metric cell spacing and cell area in SI meters (`m`, `m^2`) from
+/// a raster's projection string, GDAL-style 6-element affine geotransform, and row count.
+///
+/// - Projected CRSs (meters, US survey feet, international feet): reads `to_meter` from
+///   `terrio::crs::SpatialRef::parse(projection)` (defaulting to `1.0` when unknown).
+/// - Geographic CRSs (`EPSG:4326`, `EPSG:4269`, etc.): evaluates the WGS 84 ellipsoidal
+///   radii of curvature at the raster's center latitude to convert degree spacings into
+///   accurate local geodesic meters.
+pub fn crs_metric_scale(
+    projection: &str,
+    geotransform: &[f64; 6],
+    height: usize,
+) -> CrsMetricScale {
+    let (vx, vy, raw_area) = affine_basis(geotransform);
+    let trimmed = projection.trim();
+    if !trimmed.is_empty()
+        && let Ok(srs) = SpatialRef::parse(trimmed)
+        && !srs.is_unknown()
+    {
+        if srs.is_geographic() {
+            // WGS 84 ellipsoid parameters.
+            const WGS84_A: f64 = 6_378_137.0;
+            const WGS84_F: f64 = 1.0 / 298.257_223_563;
+            const WGS84_E2: f64 = WGS84_F * (2.0 - WGS84_F);
+
+            let mid_lat_deg = (geotransform[3] + 0.5 * (height as f64) * geotransform[5])
+                .clamp(-89.999_999, 89.999_999);
+            let phi = mid_lat_deg.to_radians();
+            let sin_phi = phi.sin();
+            let cos_phi = phi.cos().abs();
+            let w_sq = (1.0 - WGS84_E2 * sin_phi * sin_phi).max(1e-12);
+            let w_sqrt = w_sq.sqrt();
+            // Prime vertical (east-west) and meridional (north-south) radii of curvature.
+            let n_rad = WGS84_A / w_sqrt;
+            let m_rad = WGS84_A * (1.0 - WGS84_E2) / (w_sq * w_sqrt);
+            let m_per_deg_lon = (PI / 180.0) * n_rad * cos_phi;
+            let m_per_deg_lat = (PI / 180.0) * m_rad;
+
+            let vx_m = (vx.0 * m_per_deg_lon, vx.1 * m_per_deg_lat);
+            let vy_m = (vy.0 * m_per_deg_lon, vy.1 * m_per_deg_lat);
+            let cell_width_m = vx_m.0.hypot(vx_m.1);
+            let cell_height_m = vy_m.0.hypot(vy_m.1);
+            let cell_area_m2 = (vx_m.0 * vy_m.1 - vy_m.0 * vx_m.1).abs();
+            let to_meter = (m_per_deg_lon * m_per_deg_lat).sqrt();
+            return CrsMetricScale {
+                is_geographic: true,
+                to_meter,
+                cell_width_m,
+                cell_height_m,
+                cell_area_m2,
+            };
+        }
+
+        let to_meter = srs
+            .projection_params()
+            .map(|p| p.to_meter)
+            .filter(|&v| v.is_finite() && v > 0.0)
+            .unwrap_or(1.0);
+        let cell_width_m = vx.0.hypot(vx.1) * to_meter;
+        let cell_height_m = vy.0.hypot(vy.1) * to_meter;
+        let cell_area_m2 = raw_area * to_meter * to_meter;
+        return CrsMetricScale {
+            is_geographic: false,
+            to_meter,
+            cell_width_m,
+            cell_height_m,
+            cell_area_m2,
+        };
+    }
+
+    let cell_width_m = vx.0.hypot(vx.1);
+    let cell_height_m = vy.0.hypot(vy.1);
+    CrsMetricScale {
+        is_geographic: false,
+        to_meter: 1.0,
+        cell_width_m,
+        cell_height_m,
+        cell_area_m2: raw_area,
+    }
+}
 
 /// Geometric and elevation statistics of a single labeled connected component.
 #[derive(Debug, Clone, PartialEq)]

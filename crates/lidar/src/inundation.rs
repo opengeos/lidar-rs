@@ -35,8 +35,10 @@ use crate::error::{Error, Result};
 use crate::filling::{InMemorySinks, extract_sinks_in_memory};
 use crate::filtering::median_filter;
 use crate::fsm::{
-    FsmBasinSummary, FsmMassBalance, OutletSearchScratch, RoutingMode,
-    simulate_fill_spill_merge_with_flowdirs, write_fsm_basins_csv,
+    FsmBasinSummary, FsmForcing, FsmHydrographPoint, FsmMassBalance, OutletSearchScratch,
+    RoutingMode, simulate_fill_spill_merge_with_flowdirs,
+    simulate_fill_spill_merge_with_forcing_and_flowdirs, write_fsm_basins_csv,
+    write_fsm_hydrograph_csv,
 };
 #[cfg(feature = "serde")]
 use crate::graph::write_connectivity_graph_json;
@@ -1467,6 +1469,244 @@ pub fn scs_type2_hyetograph(
     Ok(out)
 }
 
+/// Converts a raw rainfall hyetograph `[(dt_h, intensity_cm_h)]` into a time-varying
+/// incremental SCS-CN excess-rainfall hyetograph `[(dt_h, excess_cm_h)]`, accounting
+/// for initial abstraction `Ia = initial_abstraction_ratio * S` (standard NRCS TR-55
+/// uses `0.2`; Hawkins et al. 2002 / NRCS NEH-630 updates recommend `0.05`).
+///
+/// Exact conservation properties:
+/// - Initial steps while cumulative rainfall `P(t) <= Ia` emit exactly `0.0` cm/h.
+/// - The cumulative excess depth across all returned steps equals the storm-total
+///   SCS-CN runoff `Q(P_total)`.
+pub fn scs_cn_incremental_hyetograph(
+    raw_hyetograph: &[(f64, f64)],
+    curve_number: f64,
+    initial_abstraction_ratio: f64,
+) -> Result<Vec<(f64, f64)>> {
+    if raw_hyetograph.is_empty() {
+        return Err(Error::InvalidArgument(
+            "raw_hyetograph must not be empty".into(),
+        ));
+    }
+    if !curve_number.is_finite() || curve_number <= 0.0 || curve_number > 100.0 {
+        return Err(Error::InvalidArgument(format!(
+            "curve_number must be finite and in (0, 100], got {curve_number}"
+        )));
+    }
+    if !initial_abstraction_ratio.is_finite() || initial_abstraction_ratio < 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "initial_abstraction_ratio must be finite and >= 0, got {initial_abstraction_ratio}"
+        )));
+    }
+    for (idx, &(dt, intensity)) in raw_hyetograph.iter().enumerate() {
+        if !dt.is_finite() || dt <= 0.0 || !intensity.is_finite() || intensity < 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "invalid hyetograph step {idx}: dt={dt}, intensity_cm_h={intensity}"
+            )));
+        }
+    }
+
+    let s_mm = if (curve_number - 100.0).abs() <= 1e-12 {
+        0.0
+    } else {
+        (25_400.0 / curve_number - 254.0).max(0.0)
+    };
+    let ia_mm = initial_abstraction_ratio * s_mm;
+
+    let mut out = Vec::with_capacity(raw_hyetograph.len());
+    let mut cum_p_mm = 0.0f64;
+    let mut prev_q_mm = 0.0f64;
+
+    for &(dt_h, intensity_cm_h) in raw_hyetograph {
+        let dp_mm = dt_h * intensity_cm_h * 10.0;
+        cum_p_mm += dp_mm;
+        let cum_q_mm = if cum_p_mm <= ia_mm {
+            0.0
+        } else if s_mm <= 0.0 {
+            cum_p_mm
+        } else {
+            let pe = cum_p_mm - ia_mm;
+            (pe * pe) / (pe + s_mm)
+        };
+        let dq_mm = (cum_q_mm - prev_q_mm).max(0.0);
+        prev_q_mm = cum_q_mm;
+        let excess_cm_h = dq_mm / (dt_h * 10.0);
+        out.push((dt_h, excess_cm_h));
+    }
+
+    Ok(out)
+}
+
+/// Green-Ampt physically based soil infiltration parameters (Green & Ampt, 1911;
+/// Mein & Larson, 1973).
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct GreenAmptParams {
+    /// Saturated hydraulic conductivity `K_s` in `cm/h` (must be finite and `> 0.0`).
+    pub ks_cm_h: f64,
+    /// Wetting-front capillary suction head `psi` in `cm` (must be finite and `>= 0.0`).
+    pub psi_cm: f64,
+    /// Initial soil moisture deficit `delta_theta = theta_s - theta_i` in `(0.0, 1.0]`.
+    pub delta_theta: f64,
+}
+
+impl GreenAmptParams {
+    /// Validates Green-Ampt soil parameters.
+    pub fn validate(&self) -> Result<()> {
+        if !self.ks_cm_h.is_finite() || self.ks_cm_h <= 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "ks_cm_h must be finite and > 0, got {}",
+                self.ks_cm_h
+            )));
+        }
+        if !self.psi_cm.is_finite() || self.psi_cm < 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "psi_cm must be finite and >= 0, got {}",
+                self.psi_cm
+            )));
+        }
+        if !self.delta_theta.is_finite() || self.delta_theta <= 0.0 || self.delta_theta > 1.0 {
+            return Err(Error::InvalidArgument(format!(
+                "delta_theta must be finite and in (0, 1], got {}",
+                self.delta_theta
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Evaluates the instantaneous Green-Ampt infiltration capacity `f(F)` in `cm/h`:
+/// `f = K_s * (1 + psi * delta_theta / F)` for `F > 0`.
+///
+/// Returns `f64::INFINITY` when `F <= 0` and `psi * delta_theta > 0`, or `K_s` when
+/// `psi == 0`.
+pub fn green_ampt_infiltration_rate_cm_h(params: GreenAmptParams, cumulative_f_cm: f64) -> f64 {
+    let m = params.psi_cm * params.delta_theta;
+    if m <= 0.0 {
+        return params.ks_cm_h;
+    }
+    if cumulative_f_cm <= 0.0 {
+        return f64::INFINITY;
+    }
+    params.ks_cm_h * (1.0 + m / cumulative_f_cm)
+}
+
+/// Solves the implicit ponded Green-Ampt equation for cumulative infiltration `F_new` (cm)
+/// over ponded duration `dt_h` (hours) starting from `f_old_cm` (cm):
+///
+/// `F_new - F_old - psi * delta_theta * ln((F_new + psi * delta_theta) / (F_old + psi * delta_theta)) = K_s * dt_h`
+///
+/// Uses safeguarded Newton-Raphson on the strictly convex, strictly increasing residual
+/// to achieve `< 1e-13` relative precision across all valid parameter regimes, including
+/// `f_old_cm == 0.0`.
+pub(crate) fn solve_green_ampt_ponded(params: GreenAmptParams, f_old_cm: f64, dt_h: f64) -> f64 {
+    if dt_h <= 0.0 {
+        return f_old_cm.max(0.0);
+    }
+    let f_old = f_old_cm.max(0.0);
+    let ks_dt = params.ks_cm_h * dt_h;
+    let m = params.psi_cm * params.delta_theta;
+    if m <= 0.0 {
+        return f_old + ks_dt;
+    }
+
+    let g = |f: f64| -> f64 { (f - f_old) - m * ((f + m) / (f_old + m)).ln() - ks_dt };
+
+    let mut lo = f_old + ks_dt;
+    let mut hi = lo + (2.0 * m * ks_dt).sqrt().max(ks_dt);
+    while g(hi) < 0.0 {
+        hi = lo + 2.0 * (hi - lo);
+    }
+
+    let mut x = 0.5 * (lo + hi);
+    for _ in 0..64 {
+        let fx = g(x);
+        if fx < 0.0 {
+            lo = x;
+        } else {
+            hi = x;
+        }
+        let tol = 1e-13 * (1.0 + x);
+        if fx.abs() <= tol || (hi - lo) <= tol {
+            break;
+        }
+        let dfx = x / (x + m);
+        let cand = if dfx > 1e-15 { x - fx / dfx } else { f64::NAN };
+        if cand.is_finite() && cand > lo && cand < hi {
+            x = cand;
+        } else {
+            x = 0.5 * (lo + hi);
+        }
+    }
+    x
+}
+
+/// Computes step-integrated Green-Ampt infiltration and returns the resulting ponded
+/// excess-rainfall hyetograph `[(dt_h, excess_cm_h)]` for a raw rainfall hyetograph
+/// `[(dt_h, intensity_cm_h)]`.
+///
+/// Handles all three Mein-Larson regimes cleanly at every step:
+/// 1. `i <= K_s`: no ponding possible; all rainfall infiltrates (`excess = 0`).
+/// 2. `i > K_s` with `F_old < F_p`: computes exact mid-step ponding time
+///    `dt_p = (F_p - F_old) / i` where `F_p = K_s * psi * delta_theta / (i - K_s)`
+///    and integrates the implicit Green-Ampt equation over `dt - dt_p`.
+/// 3. `i > K_s` with `F_old >= F_p`: integrates the implicit Green-Ampt equation
+///    over the entire step `dt`.
+pub fn green_ampt_hyetograph_losses(
+    raw_hyetograph: &[(f64, f64)],
+    params: GreenAmptParams,
+) -> Result<Vec<(f64, f64)>> {
+    params.validate()?;
+    if raw_hyetograph.is_empty() {
+        return Err(Error::InvalidArgument(
+            "raw_hyetograph must not be empty".into(),
+        ));
+    }
+    for (idx, &(dt, intensity)) in raw_hyetograph.iter().enumerate() {
+        if !dt.is_finite() || dt <= 0.0 || !intensity.is_finite() || intensity < 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "invalid hyetograph step {idx}: dt={dt}, intensity_cm_h={intensity}"
+            )));
+        }
+    }
+
+    let m = params.psi_cm * params.delta_theta;
+    let ks = params.ks_cm_h;
+    let mut cum_f_cm = 0.0f64;
+    let mut out = Vec::with_capacity(raw_hyetograph.len());
+
+    for &(dt_h, i_cm_h) in raw_hyetograph {
+        let rain_cm = i_cm_h * dt_h;
+        if i_cm_h <= ks {
+            cum_f_cm += rain_cm;
+            out.push((dt_h, 0.0));
+            continue;
+        }
+        let fp = if m > 0.0 { ks * m / (i_cm_h - ks) } else { 0.0 };
+        if cum_f_cm >= fp {
+            let f_new = solve_green_ampt_ponded(params, cum_f_cm, dt_h);
+            let df = (f_new - cum_f_cm).clamp(0.0, rain_cm);
+            cum_f_cm += df;
+            let excess_cm_h = ((rain_cm - df) / dt_h).max(0.0);
+            out.push((dt_h, excess_cm_h));
+        } else if cum_f_cm + rain_cm <= fp {
+            cum_f_cm += rain_cm;
+            out.push((dt_h, 0.0));
+        } else {
+            // Ponding begins mid-step at dt_p.
+            let dt_p = (fp - cum_f_cm) / i_cm_h;
+            let dt_rem = (dt_h - dt_p).max(0.0);
+            let f_new = solve_green_ampt_ponded(params, fp, dt_rem);
+            let df = (f_new - cum_f_cm).clamp(0.0, rain_cm);
+            cum_f_cm += df;
+            let excess_cm_h = ((rain_cm - df) / dt_h).max(0.0);
+            out.push((dt_h, excess_cm_h));
+        }
+    }
+
+    Ok(out)
+}
+
 /// Integrates cumulative storm rainfall / effective runoff depth (mm) up to `t_hours`.
 ///
 /// When `hyetograph` is `Some`, integrates piecewise-constant `(dt_h, intensity_cm_h)` steps
@@ -1991,6 +2231,9 @@ pub struct InMemoryFullPipeline {
     pub fsm_basins: Option<Vec<FsmBasinSummary>>,
     /// Dynamic Fill-Spill-Merge watershed mass balance (populated when `routing == RoutingMode::FillSpillMerge`).
     pub fsm_mass_balance: Option<FsmMassBalance>,
+    /// Dynamic Fill-Spill-Merge watershed outlet hydrograph and dynamic connectivity curve
+    /// (populated when `routing == RoutingMode::FillSpillMerge`).
+    pub fsm_hydrograph: Option<Vec<FsmHydrographPoint>>,
 }
 
 fn effective_runoff_scale(
@@ -2060,41 +2303,42 @@ pub fn run_full_pipeline_in_memory(
         &flowdirs,
     )?;
 
-    let (fill_time, num_regions, spill_paths, fsm_basins, fsm_mass_balance) = match options.routing
-    {
-        RoutingMode::Static => {
-            let (ft, nr) = simulate_inundation_with_forcing_in_memory(
-                &sinks.sink,
-                &catchment_hierarchy,
-                sim_opts,
-                &options.forcing,
-            )?;
-            let sp = delineate_spill_flow_paths_with_flowdirs(
-                &sinks.dem_refined,
-                &depressions,
-                &ft,
-                &flowdirs,
-            )?;
-            (ft, nr, sp, None, None)
-        }
-        RoutingMode::FillSpillMerge => {
-            let fsm = simulate_fill_spill_merge_with_flowdirs(
-                &sinks.dem_refined,
-                &sinks.sink,
-                &depressions,
-                sim_opts,
-                &options.forcing,
-                &flowdirs,
-            )?;
-            (
-                fsm.fill_time,
-                fsm.num_regions,
-                fsm.spill_paths,
-                Some(fsm.basins),
-                Some(fsm.mass_balance),
-            )
-        }
-    };
+    let (fill_time, num_regions, spill_paths, fsm_basins, fsm_mass_balance, fsm_hydrograph) =
+        match options.routing {
+            RoutingMode::Static => {
+                let (ft, nr) = simulate_inundation_with_forcing_in_memory(
+                    &sinks.sink,
+                    &catchment_hierarchy,
+                    sim_opts,
+                    &options.forcing,
+                )?;
+                let sp = delineate_spill_flow_paths_with_flowdirs(
+                    &sinks.dem_refined,
+                    &depressions,
+                    &ft,
+                    &flowdirs,
+                )?;
+                (ft, nr, sp, None, None, None)
+            }
+            RoutingMode::FillSpillMerge => {
+                let fsm = simulate_fill_spill_merge_with_flowdirs(
+                    &sinks.dem_refined,
+                    &sinks.sink,
+                    &depressions,
+                    sim_opts,
+                    &options.forcing,
+                    &flowdirs,
+                )?;
+                (
+                    fsm.fill_time,
+                    fsm.num_regions,
+                    fsm.spill_paths,
+                    Some(fsm.basins),
+                    Some(fsm.mass_balance),
+                    Some(fsm.hydrograph),
+                )
+            }
+        };
     let steps =
         compute_inundation_step_summaries(&sinks.sink, &fill_time, num_steps, sim_opts.time_step_h);
     let rating_curves = compute_rating_curves(&sinks.sink, &depressions, sim_opts.interval.abs())?;
@@ -2141,6 +2385,7 @@ pub fn run_full_pipeline_in_memory(
         inundation_curve_csv,
         fsm_basins,
         fsm_mass_balance,
+        fsm_hydrograph,
     })
 }
 
@@ -2189,6 +2434,10 @@ pub struct RunPipelineOptions {
     pub antecedent_depth_path: Option<PathBuf>,
     /// Optional piecewise-constant storm hyetograph `[(dt_h, intensity_cm_h)]`.
     pub hyetograph: Option<Vec<(f64, f64)>>,
+    /// Optional Green-Ampt soil infiltration parameters applied dynamically during
+    /// Fill-Spill-Merge routing (`None` by default).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub green_ampt: Option<GreenAmptParams>,
     /// Optional stream/ditch polyline vector path for computing spill-to-stream distances.
     pub stream_vector: Option<PathBuf>,
     /// Load source DEM as `f32` before widening to reduce peak I/O memory (default `false`).
@@ -2217,6 +2466,7 @@ impl Default for RunPipelineOptions {
             infiltration_path: None,
             antecedent_depth_path: None,
             hyetograph: None,
+            green_ampt: None,
             stream_vector: None,
             use_f32: false,
             save_rasters: true,
@@ -2253,6 +2503,9 @@ pub struct RunPipelineResult {
     /// Path to `fsm_basins.csv` when `routing == RoutingMode::FillSpillMerge`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub fsm_basins_csv: Option<PathBuf>,
+    /// Path to `fsm_hydrograph.csv` when `routing == RoutingMode::FillSpillMerge`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub fsm_hydrograph_csv: Option<PathBuf>,
     /// Watershed-scale mass balance summary when `routing == RoutingMode::FillSpillMerge`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub fsm_mass_balance: Option<FsmMassBalance>,
@@ -2308,6 +2561,7 @@ pub fn run_pipeline(
     }
     if options.routing == RoutingMode::FillSpillMerge {
         candidate_outputs.push(out_dir.join("fsm_basins.csv"));
+        candidate_outputs.push(out_dir.join("fsm_hydrograph.csv"));
     }
     let candidate_refs: Vec<&Path> = candidate_outputs.iter().map(PathBuf::as_path).collect();
     crate::raster_ops::ensure_no_path_collision(in_dem, &candidate_refs)?;
@@ -2397,7 +2651,7 @@ pub fn run_pipeline(
         antecedent_depth: ant_arr.as_ref(),
         hyetograph: options.hyetograph.as_deref(),
     };
-    let (fill_time, spill_paths, fsm_basins, fsm_basins_csv, fsm_mass_balance) =
+    let (fill_time, spill_paths, fsm_basins, fsm_basins_csv, fsm_hydrograph_csv, fsm_mass_balance) =
         match options.routing {
             RoutingMode::Static => {
                 let (ft, _num_sim_regions) = simulate_inundation_with_forcing_in_memory(
@@ -2412,24 +2666,32 @@ pub fn run_pipeline(
                     &ft,
                     &flowdirs,
                 )?;
-                (ft, sp, None, None, None)
+                (ft, sp, None, None, None, None)
             }
             RoutingMode::FillSpillMerge => {
-                let fsm = simulate_fill_spill_merge_with_flowdirs(
+                let fsm_forcing = FsmForcing {
+                    base: forcing,
+                    green_ampt: options.green_ampt,
+                    green_ampt_substep_h: None,
+                };
+                let fsm = simulate_fill_spill_merge_with_forcing_and_flowdirs(
                     &sinks.dem_refined,
                     &sinks.sink,
                     &depressions,
                     sim_opts,
-                    &forcing,
+                    &fsm_forcing,
                     &flowdirs,
                 )?;
                 let basins_csv = out_dir.join("fsm_basins.csv");
                 write_fsm_basins_csv(&fsm.basins, &basins_csv)?;
+                let hydrograph_csv = out_dir.join("fsm_hydrograph.csv");
+                write_fsm_hydrograph_csv(&fsm.hydrograph, &hydrograph_csv)?;
                 (
                     fsm.fill_time,
                     fsm.spill_paths,
                     Some(fsm.basins),
                     Some(basins_csv),
+                    Some(hydrograph_csv),
                     Some(fsm.mass_balance),
                 )
             }
@@ -2558,6 +2820,7 @@ pub fn run_pipeline(
         connectivity_graphml,
         routing: options.routing,
         fsm_basins_csv,
+        fsm_hydrograph_csv,
         fsm_mass_balance,
     };
 

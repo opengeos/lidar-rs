@@ -4,11 +4,13 @@
 //! Powered by [`richdem::lindsay2016`] and [`terrio`] with zero C/C++ or GDAL
 //! dependencies.
 
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 
 use richdem::{
-    Array2D, DemNum, LindsayMode, Topology, complete_breaching_lindsay2016, lindsay2016,
+    Array2D, D8X, D8Y, DemNum, LindsayMode, Topology, complete_breaching_lindsay2016, lindsay2016,
     load_raster, save_raster,
 };
 #[cfg(feature = "serde")]
@@ -22,6 +24,8 @@ use terrio::{
 
 use crate::error::{Error, Result};
 use crate::raster_ops::ensure_no_path_collision;
+use crate::region::crs_metric_scale;
+use crate::slicing::InMemoryDepressions;
 
 /// Breaching mode for [`breach_depressions`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -148,11 +152,16 @@ pub fn breach_depressions(dem: &Array2D<f64>, options: &BreachOptions) -> Result
     Ok(out)
 }
 
-/// File-based wrapper around [`breach_depressions`].
-pub fn breach_depressions_file(
+/// File-based wrapper around [`breach_depressions`] with an optional NoData override.
+///
+/// Validates against input/output path collisions before creating parent directories,
+/// loads the DEM, applies `no_data` when `Some`, runs [`breach_depressions`], and writes
+/// the conditioned DEM to `out_dem`.
+pub fn breach_depressions_file_with_no_data(
     in_dem: impl AsRef<Path>,
     out_dem: impl AsRef<Path>,
     options: &BreachOptions,
+    no_data: Option<f64>,
 ) -> Result<Array2D<f64>> {
     let in_dem = in_dem.as_ref();
     let out_dem = out_dem.as_ref();
@@ -162,10 +171,22 @@ pub fn breach_depressions_file(
     {
         std::fs::create_dir_all(parent)?;
     }
-    let dem = load_raster::<f64>(in_dem, None)?;
+    let mut dem = load_raster::<f64>(in_dem, None)?;
+    if let Some(nd) = no_data {
+        dem.set_no_data(nd);
+    }
     let out = breach_depressions(&dem, options)?;
     save_raster(&out, out_dem, Some("breach_depressions"), options.compress)?;
     Ok(out)
+}
+
+/// File-based wrapper around [`breach_depressions`].
+pub fn breach_depressions_file(
+    in_dem: impl AsRef<Path>,
+    out_dem: impl AsRef<Path>,
+    options: &BreachOptions,
+) -> Result<Array2D<f64>> {
+    breach_depressions_file_with_no_data(in_dem, out_dem, options, None)
 }
 
 /// Options controlling [`burn_culverts`] and [`burn_culverts_file`].
@@ -1350,6 +1371,547 @@ pub fn synthesize_culverts(
     let count = out_layer.features.len();
     terrio::write_vector(&[out_layer], out_str, &VectorWriteOptions::default())?;
     Ok(count)
+}
+
+/// Configuration options for [`classify_embankment_artifacts`].
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct ArtifactClassifierOptions {
+    /// Maximum search distance across a suspected embankment barrier in meters
+    /// (default `60.0` m).
+    pub max_barrier_width_m: f64,
+    /// Minimum elevation drop below the depression spill rim on the far side of
+    /// the barrier required to confirm a lower downstream outlet (vertical DEM units,
+    /// default `0.05`).
+    pub min_exit_drop: f64,
+    /// Composite score threshold in `[0.0, 1.0]` at or above which `is_likely_artifact`
+    /// is flagged `true` (default `0.55`).
+    pub score_threshold: f64,
+    /// When `true` (default), evaluates only leaf depressions (`level == 1`); when
+    /// `false`, evaluates all hierarchy levels.
+    pub leaves_only: bool,
+}
+
+impl Default for ArtifactClassifierOptions {
+    fn default() -> Self {
+        Self {
+            max_barrier_width_m: 60.0,
+            min_exit_drop: 0.05,
+            score_threshold: 0.55,
+            leaves_only: true,
+        }
+    }
+}
+
+impl ArtifactClassifierOptions {
+    /// Validates classifier threshold parameters.
+    pub fn validate(&self) -> Result<()> {
+        if !self.max_barrier_width_m.is_finite() || self.max_barrier_width_m <= 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "max_barrier_width_m must be finite and > 0, got {}",
+                self.max_barrier_width_m
+            )));
+        }
+        if !self.min_exit_drop.is_finite() || self.min_exit_drop < 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "min_exit_drop must be finite and >= 0, got {}",
+                self.min_exit_drop
+            )));
+        }
+        if !self.score_threshold.is_finite() || !(0.0..=1.0).contains(&self.score_threshold) {
+            return Err(Error::InvalidArgument(format!(
+                "score_threshold must be finite and in [0, 1], got {}",
+                self.score_threshold
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Topographic and morphometric assessment of whether a delineated depression is
+/// likely an artificial road/rail embankment impoundment rather than a natural basin.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct EmbankmentArtifactCandidate {
+    /// 1-based depression ID.
+    pub dep_id: u32,
+    /// Hierarchy level (`1` = leaf).
+    pub level: u32,
+    /// Depression surface area in square meters (CRS-aware).
+    pub area_m2: f64,
+    /// Depression maximum depth in vertical DEM units.
+    pub max_depth: f64,
+    /// Depression elongatedness (`major_axis / minor_axis`).
+    pub elongatedness: f64,
+    /// Isoperimetric circularity (`4 * pi * area / perimeter^2` in `[0, 1]`).
+    pub circularity: f64,
+    /// Compactness / bounding-box extent ratio (`area_bbox_ratio` in `[0, 1]`).
+    pub compactness: f64,
+    /// Metric length (meters) of the lowest-cost breach path across the embankment
+    /// barrier to lower downstream ground (`None` if no exit lies within
+    /// `max_barrier_width_m`).
+    pub barrier_width_m: Option<f64>,
+    /// Ratio of barrier crest relief above the depression floor to `max_depth`
+    /// (`>= 1.0` when a raised road/rail berm crowns above the rim; `0.0` if no
+    /// barrier breach was found).
+    pub barrier_height_ratio: f64,
+    /// Linearity score in `[0.0, 1.0]` of the breachable barrier rim bordering the
+    /// depression (`~1.0` for straight engineered embankments, `~0.0` for circular
+    /// or closed natural rims).
+    pub rim_linearity: f64,
+    /// Composite artifact likelihood score in `[0.0, 1.0]`.
+    pub artifact_score: f64,
+    /// `true` when a breachable narrow barrier was found and
+    /// `artifact_score >= options.score_threshold`.
+    pub is_likely_artifact: bool,
+    /// Suggested culvert / breach segment endpoints `((x1, y1), (x2, y2))` in the
+    /// DEM's coordinate system, running from inside the depression across the
+    /// embankment to the lower downstream side.
+    pub suggested_breach: Option<((f64, f64), (f64, f64))>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BreachHeapState {
+    cost: f64,
+    dist_m: f64,
+    idx: usize,
+    crossed_barrier: bool,
+}
+
+impl PartialEq for BreachHeapState {
+    fn eq(&self, other: &Self) -> bool {
+        self.cost.to_bits() == other.cost.to_bits() && self.idx == other.idx
+    }
+}
+
+impl Eq for BreachHeapState {}
+
+impl PartialOrd for BreachHeapState {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for BreachHeapState {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .cost
+            .total_cmp(&self.cost)
+            .then_with(|| other.dist_m.total_cmp(&self.dist_m))
+            .then_with(|| other.idx.cmp(&self.idx))
+    }
+}
+
+#[inline]
+fn cell_center_world(gt: &[f64; 6], col: usize, row: usize) -> (f64, f64) {
+    let cf = col as f64 + 0.5;
+    let rf = row as f64 + 0.5;
+    (
+        gt[0] + cf * gt[1] + rf * gt[2],
+        gt[3] + cf * gt[4] + rf * gt[5],
+    )
+}
+
+/// Automatically scores delineated depressions to flag likely road/rail embankment
+/// impoundment artifacts and suggest culvert breach lines, requiring no external
+/// road or stream vector layers.
+///
+/// Combines depression morphometry (`elongatedness`, `circularity`, `compactness`,
+/// `max_depth`, `area`) with constrained least-cost topographic barrier profiling
+/// across the surrounding rim (measuring barrier width in meters via CRS-aware
+/// [`crs_metric_scale`], barrier crest relief ratio, downstream drop, and
+/// breachable-rim linearity).
+pub fn classify_embankment_artifacts(
+    dem: &Array2D<f64>,
+    depressions: &InMemoryDepressions,
+    options: &ArtifactClassifierOptions,
+) -> Result<Vec<EmbankmentArtifactCandidate>> {
+    options.validate()?;
+    let w = dem.width();
+    let h = dem.height();
+    let n = w * h;
+    if depressions.depression_id.width() != w || depressions.depression_id.height() != h {
+        return Err(Error::DimensionMismatch(format!(
+            "depression_id ({}x{}) does not match DEM ({w}x{h})",
+            depressions.depression_id.width(),
+            depressions.depression_id.height()
+        )));
+    }
+    if n == 0 || depressions.depressions.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let scale = crs_metric_scale(&dem.projection, &dem.geotransform, h);
+    let dx_m = scale.cell_width_m.max(1e-6);
+    let dy_m = scale.cell_height_m.max(1e-6);
+    let diag_m = dx_m.hypot(dy_m);
+    let min_cell_m = dx_m.min(dy_m);
+
+    // Precompute step lengths for D8 directions 1..=8.
+    let mut step_len_m = [0.0f64; 9];
+    for d in 1..=8 {
+        step_len_m[d] = if D8X[d] != 0 && D8Y[d] != 0 {
+            diag_m
+        } else if D8X[d] != 0 {
+            dx_m
+        } else {
+            dy_m
+        };
+    }
+
+    // Build hierarchy children lookup and group pixels by depression ID.
+    let mut children_map: HashMap<u32, Vec<u32>> =
+        HashMap::with_capacity(depressions.depressions.len());
+    for d in &depressions.depressions {
+        children_map.insert(d.id, d.children_ids.clone());
+    }
+    let dep_ids = depressions.depression_id.data();
+    let mut pixels_by_id: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (idx, &did) in dep_ids.iter().enumerate() {
+        if did > 0 {
+            pixels_by_id.entry(did as u32).or_default().push(idx);
+        }
+    }
+
+    let zdata = dem.data();
+    let z_nd = dem.no_data();
+
+    // Reusable per-cell generation stamps for O(local window) Dijkstra searches.
+    let mut in_dep_stamp = vec![0u32; n];
+    let mut outer_stamp = vec![0u32; n];
+    let mut best_cost_stamp = vec![0u32; n];
+    let mut best_cost = vec![f64::INFINITY; n];
+    let mut parent_cell = vec![usize::MAX; n];
+    let mut stamp_gen = 0u32;
+    let mut heap: BinaryHeap<BreachHeapState> = BinaryHeap::new();
+    let mut results = Vec::with_capacity(depressions.depressions.len());
+
+    for dep in &depressions.depressions {
+        if options.leaves_only && dep.level != 1 {
+            continue;
+        }
+        // Gather all pixels belonging to `dep` (including descendants if non-leaf).
+        let mut desc_ids: HashSet<u32> = HashSet::new();
+        let mut stack = vec![dep.id];
+        while let Some(cid) = stack.pop() {
+            if desc_ids.insert(cid)
+                && let Some(kids) = children_map.get(&cid)
+            {
+                stack.extend(kids.iter().copied());
+            }
+        }
+        let mut dep_cells: Vec<usize> = Vec::new();
+        for &cid in &desc_ids {
+            if let Some(pts) = pixels_by_id.get(&cid) {
+                dep_cells.extend(pts.iter().copied());
+            }
+        }
+        if dep_cells.is_empty() {
+            continue;
+        }
+
+        stamp_gen = stamp_gen.wrapping_add(1);
+        if stamp_gen == 0 {
+            in_dep_stamp.fill(0);
+            outer_stamp.fill(0);
+            best_cost_stamp.fill(0);
+            stamp_gen = 1;
+        }
+
+        for &idx in &dep_cells {
+            in_dep_stamp[idx] = stamp_gen;
+        }
+
+        let area_m2 = dep_cells.len() as f64 * scale.cell_area_m2;
+        let depth_scale = dep.max_depth.max(0.1);
+        let exit_thresh = dep.max_elev - options.min_exit_drop;
+        let rim_floor_thresh = dep.max_elev - 0.1 * dep.max_depth;
+
+        // Seed Dijkstra from perimeter cells of `dep_cells`, and record immediate exterior
+        // neighbor cells for rim linearity profiling.
+        heap.clear();
+        let mut outer_ring: Vec<usize> = Vec::new();
+        for &idx in &dep_cells {
+            let r = idx / w;
+            let c = idx % w;
+            let mut on_perimeter = false;
+            for d in 1..=8 {
+                let nr = r as isize + D8Y[d] as isize;
+                let nc = c as isize + D8X[d] as isize;
+                if nr < 0 || nc < 0 || nr >= h as isize || nc >= w as isize {
+                    continue;
+                }
+                let nidx = (nr as usize) * w + (nc as usize);
+                if in_dep_stamp[nidx] != stamp_gen {
+                    on_perimeter = true;
+                    if outer_stamp[nidx] != stamp_gen {
+                        outer_stamp[nidx] = stamp_gen;
+                        outer_ring.push(nidx);
+                    }
+                }
+            }
+            if on_perimeter {
+                best_cost_stamp[idx] = stamp_gen;
+                best_cost[idx] = 0.0;
+                parent_cell[idx] = usize::MAX;
+                heap.push(BreachHeapState {
+                    cost: 0.0,
+                    dist_m: 0.0,
+                    idx,
+                    crossed_barrier: false,
+                });
+            }
+        }
+
+        // Constrained least-cost search across surrounding rim up to `max_barrier_width_m`.
+        let mut found_exit: Option<(usize, f64)> = None;
+        while let Some(state) = heap.pop() {
+            if best_cost_stamp[state.idx] == stamp_gen && state.cost > best_cost[state.idx] + 1e-12
+            {
+                continue;
+            }
+            if in_dep_stamp[state.idx] != stamp_gen
+                && state.crossed_barrier
+                && dep_ids[state.idx] <= 0
+            {
+                let z = zdata[state.idx];
+                if z.is_finite() && !z.rd_eq(z_nd) && z <= exit_thresh {
+                    found_exit = Some((state.idx, state.dist_m));
+                    break;
+                }
+            }
+            let r = state.idx / w;
+            let c = state.idx % w;
+            for d in 1..=8 {
+                let nr = r as isize + D8Y[d] as isize;
+                let nc = c as isize + D8X[d] as isize;
+                if nr < 0 || nc < 0 || nr >= h as isize || nc >= w as isize {
+                    continue;
+                }
+                let nidx = (nr as usize) * w + (nc as usize);
+                if in_dep_stamp[nidx] == stamp_gen || dep_ids[nidx] > 0 {
+                    continue;
+                }
+                let nz = zdata[nidx];
+                if !nz.is_finite() || nz.rd_eq(z_nd) {
+                    continue;
+                }
+                let next_dist = state.dist_m + step_len_m[d];
+                if next_dist > options.max_barrier_width_m + 1e-9 {
+                    continue;
+                }
+                let next_crossed = state.crossed_barrier || nz > exit_thresh;
+                let step_cost = step_len_m[d] * (1.0 + (nz - dep.min_elev).max(0.0) / depth_scale);
+                let next_cost = state.cost + step_cost;
+                let prev_best = if best_cost_stamp[nidx] == stamp_gen {
+                    best_cost[nidx]
+                } else {
+                    f64::INFINITY
+                };
+                if next_cost + 1e-12 < prev_best {
+                    best_cost_stamp[nidx] = stamp_gen;
+                    best_cost[nidx] = next_cost;
+                    parent_cell[nidx] = state.idx;
+                    heap.push(BreachHeapState {
+                        cost: next_cost,
+                        dist_m: next_dist,
+                        idx: nidx,
+                        crossed_barrier: next_crossed,
+                    });
+                }
+            }
+        }
+
+        let geom_elong_score = ((dep.elongatedness - 1.5) / 4.5).clamp(0.0, 1.0);
+        let geom_circ_score = ((0.75 - dep.circularity) / 0.55).clamp(0.0, 1.0);
+        let geom_score = 0.55 * geom_elong_score + 0.45 * geom_circ_score;
+
+        let (
+            barrier_width_m,
+            barrier_height_ratio,
+            rim_linearity,
+            artifact_score,
+            is_likely_artifact,
+            suggested_breach,
+        ) = if let Some((exit_idx, dist_m)) = found_exit {
+            let mut path = Vec::new();
+            let mut cur = exit_idx;
+            while cur != usize::MAX {
+                path.push(cur);
+                if in_dep_stamp[cur] == stamp_gen {
+                    break;
+                }
+                cur = parent_cell[cur];
+            }
+            path.reverse();
+            let entry_idx = path[0];
+            let entry_c = entry_idx % w;
+            let entry_r = entry_idx / w;
+            let exit_c = exit_idx % w;
+            let exit_r = exit_idx / w;
+
+            let mut crest_z = dep.max_elev;
+            for &pidx in path.iter().skip(1).take(path.len().saturating_sub(2)) {
+                let pz = zdata[pidx];
+                if pz.is_finite() && !pz.rd_eq(z_nd) && pz > crest_z {
+                    crest_z = pz;
+                }
+            }
+            let exit_z = zdata[exit_idx];
+            let exit_drop = (dep.max_elev - exit_z).max(0.0);
+            let barrier_relief = (crest_z - dep.min_elev).max(0.0);
+            let height_ratio = if dep.max_depth > 1e-9 {
+                barrier_relief / dep.max_depth
+            } else {
+                0.0
+            };
+
+            // Measure linearity of exterior rim cells facing the breachable embankment.
+            let dir_x_m = (exit_c as f64 - entry_c as f64) * dx_m;
+            let dir_y_m = (exit_r as f64 - entry_r as f64) * dy_m;
+            let dir_len = dir_x_m.hypot(dir_y_m);
+            let rim_lin = if dir_len > 1e-9 {
+                let ux = dir_x_m / dir_len;
+                let uy = dir_y_m / dir_len;
+                let probe_max_m = (dist_m + 2.0 * diag_m).min(options.max_barrier_width_m);
+                let step_m = (0.5 * min_cell_m).max(1e-6);
+                let max_steps = ((probe_max_m / step_m).ceil() as usize).max(1);
+                let mut barrier_rim_pts: Vec<(f64, f64)> = Vec::new();
+                for &oidx in &outer_ring {
+                    let oz = zdata[oidx];
+                    if !oz.is_finite() || oz.rd_eq(z_nd) || oz < rim_floor_thresh {
+                        continue;
+                    }
+                    let oc = oidx % w;
+                    let or = oidx / w;
+                    let mut hits_lower = false;
+                    for s in 1..=max_steps {
+                        let d_m = s as f64 * step_m;
+                        let pc = (oc as f64 + (ux * d_m) / dx_m).round() as isize;
+                        let pr = (or as f64 + (uy * d_m) / dy_m).round() as isize;
+                        if pc < 0 || pr < 0 || pc >= w as isize || pr >= h as isize {
+                            break;
+                        }
+                        let pidx = (pr as usize) * w + (pc as usize);
+                        if in_dep_stamp[pidx] == stamp_gen {
+                            continue;
+                        }
+                        if dep_ids[pidx] > 0 {
+                            break;
+                        }
+                        let pz = zdata[pidx];
+                        let z_ok = pz.is_finite() && !pz.rd_eq(z_nd);
+                        if !z_ok {
+                            break;
+                        }
+                        if z_ok && pz <= exit_thresh && dep_ids[pidx] <= 0 {
+                            hits_lower = true;
+                            break;
+                        }
+                    }
+                    if hits_lower {
+                        barrier_rim_pts.push((oc as f64 * dx_m, or as f64 * dy_m));
+                    }
+                }
+                let raw_lin = compute_point_set_linearity(&barrier_rim_pts);
+                let coverage = (barrier_rim_pts.len() as f64
+                    / (0.25 * outer_ring.len() as f64).max(3.0))
+                .clamp(0.0, 1.0);
+                raw_lin * coverage
+            } else {
+                0.0
+            };
+
+            let width_score = (-(dist_m - 5.0).max(0.0) / 15.0).exp().clamp(0.0, 1.0);
+            let drop_score = (exit_drop / depth_scale).clamp(0.0, 1.0);
+            let raised_berm_score = ((height_ratio - 1.0) / 0.5).clamp(0.0, 1.0);
+            let cross_slope = (crest_z - exit_z).max(0.0) / dist_m.max(1e-6);
+            let slope_score = (cross_slope / 0.5).clamp(0.0, 1.0);
+            let prominence_score = 0.5 * raised_berm_score + 0.5 * slope_score;
+            let barrier_score = width_score * (0.45 + 0.30 * drop_score + 0.25 * prominence_score);
+            let score = (0.35 * geom_score + 0.40 * barrier_score + 0.25 * rim_lin).clamp(0.0, 1.0);
+            let likely = score >= options.score_threshold;
+
+            let p1 = cell_center_world(&dem.geotransform, entry_c, entry_r);
+            let p2 = cell_center_world(&dem.geotransform, exit_c, exit_r);
+            (
+                Some(dist_m),
+                height_ratio,
+                rim_lin,
+                score,
+                likely,
+                Some((p1, p2)),
+            )
+        } else {
+            // No lower exit within max_barrier_width_m: natural closed depression.
+            let score = (0.35 * geom_score).clamp(0.0, 0.35);
+            (None, 0.0, 0.0, score, false, None)
+        };
+
+        results.push(EmbankmentArtifactCandidate {
+            dep_id: dep.id,
+            level: dep.level,
+            area_m2,
+            max_depth: dep.max_depth,
+            elongatedness: dep.elongatedness,
+            circularity: dep.circularity,
+            compactness: dep.area_bbox_ratio,
+            barrier_width_m,
+            barrier_height_ratio,
+            rim_linearity,
+            artifact_score,
+            is_likely_artifact,
+            suggested_breach,
+        });
+    }
+
+    // Sort highest artifact likelihood first, tie-breaking deterministically by dep_id.
+    results.sort_by(|a, b| {
+        b.artifact_score
+            .total_cmp(&a.artifact_score)
+            .then_with(|| a.dep_id.cmp(&b.dep_id))
+    });
+    Ok(results)
+}
+
+/// Computes 2D straightness / linearity in `[0, 1]` for a set of metric `(x, y)`
+/// barrier-rim coordinates (`0.0` when fewer than 3 points are present).
+///
+/// Rescales `1 - sqrt(lambda_min / lambda_max)` above the semicircular arc baseline
+/// (`~0.565`) so curved rims of circular natural depressions score near `0.0` while
+/// straight engineered road/rail embankments score near `1.0`.
+fn compute_point_set_linearity(pts: &[(f64, f64)]) -> f64 {
+    if pts.len() < 3 {
+        return 0.0;
+    }
+    let nf = pts.len() as f64;
+    let (mut mx, mut my) = (0.0, 0.0);
+    for &(x, y) in pts {
+        mx += x;
+        my += y;
+    }
+    mx /= nf;
+    my /= nf;
+    let (mut sxx, mut syy, mut sxy) = (0.0, 0.0, 0.0);
+    for &(x, y) in pts {
+        let dx = x - mx;
+        let dy = y - my;
+        sxx += dx * dx;
+        syy += dy * dy;
+        sxy += dx * dy;
+    }
+    sxx /= nf;
+    syy /= nf;
+    sxy /= nf;
+    let disc = ((sxx - syy).powi(2) + 4.0 * sxy * sxy).sqrt();
+    let l1 = (0.5 * (sxx + syy + disc)).max(0.0);
+    let l2 = (0.5 * (sxx + syy - disc)).max(0.0);
+    if l1 <= 1e-12 {
+        0.0
+    } else {
+        let raw = (1.0 - (l2 / l1).sqrt()).clamp(0.0, 1.0);
+        ((raw - 0.55) / 0.45).clamp(0.0, 1.0)
+    }
 }
 
 #[cfg(test)]
