@@ -52,10 +52,17 @@ use crate::inundation::{
     trace_downstream_away_from_source, validate_forcing_grids, validate_grid_alignment,
     validate_options_with_hyetograph,
 };
+use crate::region::crs_metric_basis;
 use crate::slicing::{InMemoryDepressions, NestedDepression};
 
 /// Time tolerance in hours for deciding whether an event falls within the storm duration.
 const STORM_TIME_EPS_H: f64 = 1e-9;
+
+/// Upper bound on total Green-Ampt subdivided storm segments to prevent runaway allocations.
+const MAX_GREEN_AMPT_SUBSTEPS: usize = 100_000;
+
+/// Upper bound on output bins produced by [`attenuate_fsm_hydrograph_with_options`].
+const MAX_ATTENUATION_STEPS: usize = 200_000;
 
 /// Piecewise-linear basin volume segment `(t_start_h, t_end_h, vol_start_m3, vol_end_m3)`
 /// used to compute drain-aware inundation durations.
@@ -277,10 +284,15 @@ pub struct FsmSimulationResult {
     /// Peak stored volume reached by each basin during `[0, duration_h]` (aligned with `basins`),
     /// used by [`compute_fsm_hazard_rasters`] for exact peak stage inversion even if basins drain.
     pub(crate) basin_peak_vol_storm_m3: Vec<f64>,
-    /// Optional per-basin piecewise-linear volume history `(t0, t1, v0, v1)` within `[0, duration_h]`,
-    /// populated whenever any basin drains during the storm so [`compute_fsm_hazard_rasters`]
-    /// computes exact drain-aware inundation durations.
-    pub(crate) basin_drain_history: Option<Vec<Vec<BasinVolumeSegment>>>,
+    /// Per-basin piecewise-linear volume history `(t0, t1, v0, v1)` within `[0, duration_h]`,
+    /// used by [`compute_fsm_hazard_rasters`] for sub-window clipping and drain-aware durations.
+    pub(crate) basin_vol_history: Vec<Vec<BasinVolumeSegment>>,
+    /// Whether any basin experienced a draining interval (`q_net < 0` with stored water) during
+    /// the storm window.
+    pub(crate) basin_had_draining: bool,
+    /// Time in hours when each basin first became active (`Some(0.0)` for leaves; `Some(t_merge)`
+    /// for compound parents that merged during the storm; `None` for parents still `Waiting`).
+    pub(crate) basin_activation_time_h: Vec<Option<f64>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,9 +359,11 @@ struct BasinNode {
     initial_vol_m3: f64,
     /// Peak stored volume reached during `[0, storm_duration_h]` (`m^3`).
     storm_peak_vol_m3: f64,
-    /// Piecewise-linear `(t0, t1, v0, v1)` volume trajectory within `[0, storm_duration_h]`
-    /// (populated only when vertical losses are active).
+    /// Piecewise-linear `(t0, t1, v0, v1)` volume trajectory within `[0, storm_duration_h]`.
     storm_vol_history: Vec<BasinVolumeSegment>,
+    /// Time when this basin first entered an active state (`Some(0.0)` for leaves,
+    /// `Some(t_merge)` when a `Waiting` parent merges, `None` while still `Waiting`).
+    activation_time_h: Option<f64>,
     /// Time when basin first reached full capacity.
     first_fill_time_h: Option<f64>,
     /// Time when basin merged into its parent.
@@ -1117,7 +1131,9 @@ fn simulate_fill_spill_merge_impl(
             num_spill_events: 0,
             num_merge_events: 0,
             basin_peak_vol_storm_m3: Vec::new(),
-            basin_drain_history: None,
+            basin_vol_history: Vec::new(),
+            basin_had_draining: false,
+            basin_activation_time_h: Vec::new(),
         });
     }
 
@@ -1673,6 +1689,7 @@ fn simulate_fill_spill_merge_impl(
             initial_vol_m3: owned_ant_vol,
             storm_peak_vol_m3: owned_ant_vol,
             storm_vol_history: Vec::new(),
+            activation_time_h: is_leaf.then_some(0.0),
             first_fill_time_h: None,
             merge_time_h: None,
             outlet: outlets[dep_idx].clone(),
@@ -1734,7 +1751,26 @@ fn simulate_fill_spill_merge_impl(
         raw_segments.push((storm_duration_h, rain_m_h, true));
         raw_segments.push((f64::INFINITY, rain_m_h, false));
     }
-    let mut segments: Vec<(f64, f64, bool, bool)> = Vec::with_capacity(raw_segments.len());
+    let mut total_segments = 0usize;
+    for &(dt, _, in_storm) in &raw_segments {
+        if in_storm && green_ampt.is_some() && dt.is_finite() && dt > ga_substep_h + 1e-12 {
+            let n_sub_f = (dt / ga_substep_h).ceil();
+            if !n_sub_f.is_finite() || n_sub_f > MAX_GREEN_AMPT_SUBSTEPS as f64 {
+                return Err(Error::InvalidArgument(format!(
+                    "green_ampt_substep_h={ga_substep_h} requires {n_sub_f} substeps (exceeds limit {MAX_GREEN_AMPT_SUBSTEPS})"
+                )));
+            }
+            total_segments = total_segments.saturating_add(n_sub_f as usize);
+        } else {
+            total_segments = total_segments.saturating_add(1);
+        }
+        if total_segments > MAX_GREEN_AMPT_SUBSTEPS {
+            return Err(Error::InvalidArgument(format!(
+                "Green-Ampt storm subdivision requires > {MAX_GREEN_AMPT_SUBSTEPS} segments; increase green_ampt_substep_h"
+            )));
+        }
+    }
+    let mut segments: Vec<(f64, f64, bool, bool)> = Vec::with_capacity(total_segments);
     for (dt, rain_m_h, in_storm) in raw_segments {
         if in_storm && green_ampt.is_some() && dt.is_finite() && dt > ga_substep_h + 1e-12 {
             let n_sub = (dt / ga_substep_h).ceil() as usize;
@@ -1908,6 +1944,9 @@ fn simulate_fill_spill_merge_impl(
                     p.loss_rate_m3_h = p.static_loss_rate_m3_h + p.ga_loss_rate_m3_h;
                 }
                 p.state = BasinState::Active;
+                if p.activation_time_h.is_none() {
+                    p.activation_time_h = Some(t_now);
+                }
                 *num_merge_events += 1;
 
                 mark_cells_at_instant(p, t_now, fill_time_data);
@@ -2141,7 +2180,6 @@ fn simulate_fill_spill_merge_impl(
     let mut last_rain_m_h = 0.0f64;
     let mut topology_dirty = true;
     let mut hydrograph: Vec<FsmHydrographPoint> = Vec::with_capacity(segments.len() + 8);
-    let record_vol_history = forcing.infiltration_cm_h.is_some() || green_ampt.is_some();
     let mut any_basin_drained_in_storm = false;
 
     for (seg_idx, (seg_dt, rain_m_h, in_storm_window, snapshot_after_segment)) in
@@ -2154,8 +2192,10 @@ fn simulate_fill_spill_merge_impl(
             topology_dirty = true;
         }
         if let Some(ga) = green_ampt {
+            let mut any_loss_increased = false;
             for &i in &live_indices {
                 let b = &mut basins[i];
+                let prev_loss = b.loss_rate_m3_h;
                 let ga_rate_m_h = if in_storm_window && seg_dt.is_finite() {
                     let f_new = solve_green_ampt_ponded(ga, b.ga_cum_infil_cm, seg_dt);
                     ((f_new - b.ga_cum_infil_cm) / seg_dt) / 100.0
@@ -2164,9 +2204,16 @@ fn simulate_fill_spill_merge_impl(
                 };
                 b.ga_loss_rate_m3_h = ga_rate_m_h * b.footprint_area_m2;
                 b.loss_rate_m3_h = b.static_loss_rate_m3_h + b.ga_loss_rate_m3_h;
-                b.spill_override = None;
+                if b.loss_rate_m3_h > prev_loss + 1e-15 {
+                    any_loss_increased = true;
+                }
             }
-            topology_dirty = true;
+            if any_loss_increased {
+                for &i in &live_indices {
+                    basins[i].spill_override = None;
+                }
+                topology_dirty = true;
+            }
         }
         last_rain_m_h = rain_m_h;
         let t_seg_end = if seg_dt.is_finite() {
@@ -2311,10 +2358,24 @@ fn simulate_fill_spill_merge_impl(
                             if q_net < -1e-15 && vol_old > 1e-12 {
                                 any_basin_drained_in_storm = true;
                             }
-                            if record_vol_history && dt_next > 0.0 {
-                                basins[i]
-                                    .storm_vol_history
-                                    .push((t_start, t_end, vol_old, vol_new));
+                            if dt_next > 0.0 {
+                                if q_net < -1e-15 && vol_old > 0.0 && vol_new <= 0.0 {
+                                    let t_empty = (t_start + vol_old / (-q_net)).min(t_end);
+                                    if t_empty > t_start {
+                                        basins[i]
+                                            .storm_vol_history
+                                            .push((t_start, t_empty, vol_old, 0.0));
+                                    }
+                                    if t_end > t_empty {
+                                        basins[i]
+                                            .storm_vol_history
+                                            .push((t_empty, t_end, 0.0, 0.0));
+                                    }
+                                } else {
+                                    basins[i]
+                                        .storm_vol_history
+                                        .push((t_start, t_end, vol_old, vol_new));
+                                }
                             }
                         }
 
@@ -2373,7 +2434,7 @@ fn simulate_fill_spill_merge_impl(
                             if basins[i].capacity_m3 > basins[i].storm_peak_vol_m3 {
                                 basins[i].storm_peak_vol_m3 = basins[i].capacity_m3;
                             }
-                            if record_vol_history && dt_next > 0.0 {
+                            if dt_next > 0.0 {
                                 let cap = basins[i].capacity_m3;
                                 basins[i].storm_vol_history.push((t_start, t_end, cap, cap));
                             }
@@ -2636,8 +2697,12 @@ fn simulate_fill_spill_merge_impl(
     fill_time.set_no_data(-1.0);
 
     let basin_peak_vol_storm_m3: Vec<f64> = basins.iter().map(|b| b.storm_peak_vol_m3).collect();
-    let basin_drain_history = any_basin_drained_in_storm
-        .then(|| basins.into_iter().map(|b| b.storm_vol_history).collect());
+    let basin_activation_time_h: Vec<Option<f64>> = basins
+        .iter()
+        .map(|b| b.activation_time_h.filter(|&t| t <= storm_end))
+        .collect();
+    let basin_vol_history: Vec<Vec<BasinVolumeSegment>> =
+        basins.into_iter().map(|b| b.storm_vol_history).collect();
 
     Ok(FsmSimulationResult {
         fill_time,
@@ -2649,7 +2714,9 @@ fn simulate_fill_spill_merge_impl(
         num_spill_events,
         num_merge_events,
         basin_peak_vol_storm_m3,
-        basin_drain_history,
+        basin_vol_history,
+        basin_had_draining: any_basin_drained_in_storm,
+        basin_activation_time_h,
     })
 }
 
@@ -2716,6 +2783,10 @@ pub fn integrate_fsm_hydrograph_m3(hydrograph: &[FsmHydrographPoint]) -> f64 {
 }
 
 /// Formats an FSM watershed outlet hydrograph and dynamic connectivity curve as a CSV string.
+///
+/// Uses full floating-point round-trip formatting for `time_h`, `q_boundary_m3_s`, and
+/// `total_stored_m3` so small positive discharges (e.g., `2.78e-7 m^3/s`) are never
+/// truncated to zero.
 pub fn fsm_hydrograph_to_csv_string(hydrograph: &[FsmHydrographPoint]) -> String {
     use std::fmt::Write as _;
     let mut out = String::from(
@@ -2724,7 +2795,7 @@ pub fn fsm_hydrograph_to_csv_string(hydrograph: &[FsmHydrographPoint]) -> String
     for pt in hydrograph {
         let _ = writeln!(
             out,
-            "{:.6},{:.6},{:.4},{:.6},{}",
+            "{},{},{},{:.6},{}",
             pt.time_h,
             pt.q_boundary_m3_s,
             pt.total_stored_m3,
@@ -2753,13 +2824,20 @@ pub fn write_fsm_hydrograph_csv(
 }
 
 /// Estimates mean overland spill-path travel time in hours from a set of delineated
-/// [`SpillFlowPath`] polylines, the raster's affine geotransform, and a characteristic
-/// overland/channel flow velocity (`velocity_m_s > 0.0`).
+/// [`SpillFlowPath`] polylines, the DEM's CRS (`projection`), affine `geotransform`,
+/// raster dimensions (`width`, `height`), and a characteristic overland/channel flow
+/// velocity (`velocity_m_s > 0.0`).
 ///
-/// Returns `0.0` when `spill_paths` is empty.
+/// Uses CRS-aware metric basis vectors ([`crate::region::crs_metric_scale`]) so metric
+/// projected CRSs, foot-based projected CRSs (e.g. State Plane US survey feet), rotated
+/// affine grids, and geographic CRSs (`EPSG:4326`, `EPSG:4269`) all measure path lengths
+/// in SI meters. Returns `0.0` when `spill_paths` is empty.
 pub fn estimate_mean_travel_time_h(
     spill_paths: &[SpillFlowPath],
+    projection: &str,
     geotransform: &[f64; 6],
+    width: usize,
+    height: usize,
     velocity_m_s: f64,
 ) -> Result<f64> {
     if !velocity_m_s.is_finite() || velocity_m_s <= 0.0 {
@@ -2770,27 +2848,28 @@ pub fn estimate_mean_travel_time_h(
     if spill_paths.is_empty() {
         return Ok(0.0);
     }
-    let mut total_len = 0.0f64;
+    let (vx_m, vy_m, _) = crs_metric_basis(projection, geotransform, width, height);
+    let mut total_len_m = 0.0f64;
     let mut count = 0usize;
     for sp in spill_paths {
         if sp.cells.len() < 2 {
             continue;
         }
-        let mut len = 0.0f64;
+        let mut len_m = 0.0f64;
         for w in sp.cells.windows(2) {
             let dc = w[1].0 as f64 - w[0].0 as f64;
             let dr = w[1].1 as f64 - w[0].1 as f64;
-            let dx = dc * geotransform[1] + dr * geotransform[2];
-            let dy = dc * geotransform[4] + dr * geotransform[5];
-            len += dx.hypot(dy);
+            let dx_m = dc * vx_m.0 + dr * vy_m.0;
+            let dy_m = dc * vx_m.1 + dr * vy_m.1;
+            len_m += dx_m.hypot(dy_m);
         }
-        total_len += len;
+        total_len_m += len_m;
         count += 1;
     }
     if count == 0 {
         return Ok(0.0);
     }
-    let mean_len_m = total_len / count as f64;
+    let mean_len_m = total_len_m / count as f64;
     Ok(mean_len_m / (velocity_m_s * 3600.0))
 }
 
@@ -2815,9 +2894,15 @@ pub fn attenuate_fsm_hydrograph(
 /// Applies volume-conserving Nash linear-reservoir travel-time attenuation to an FSM
 /// watershed outlet hydrograph with configurable reservoir count and recession tail.
 ///
-/// Exact analytical integration over each uniform bin `[t_k, t_k + dt_h]` guarantees
-/// strict non-negativity, unconditional stability, and conservation of total outflow
-/// volume (`integrate_fsm_hydrograph_m3`) once the recession tail completes.
+/// For `num_reservoirs == 1`, each uniform bin `[t_k, t_k + dt_h]` integrates the linear
+/// reservoir ODE analytically against exact bin inflow volume. For `num_reservoirs > 1`,
+/// reservoirs are routed sequentially with piecewise-constant bin-averaged coupling
+/// between stages, guaranteeing strict non-negativity, unconditional stability, and exact
+/// conservation of total outflow volume (`integrate_fsm_hydrograph_m3`) across all `dt_h > 0`
+/// while converging to the continuous Nash cascade as `dt_h -> 0`.
+///
+/// Returns [`Error::InvalidArgument`] if the required number of bins exceeds
+/// `200_000` (e.g., for very small `dt_h` relative to storm duration and recession tail).
 pub fn attenuate_fsm_hydrograph_with_options(
     hydrograph: &[FsmHydrographPoint],
     options: &SpillAttenuationOptions,
@@ -2858,47 +2943,21 @@ pub fn attenuate_fsm_hydrograph_with_options(
     let k_res = options.mean_travel_time_h / n_res as f64;
     let total_in_vol = integrate_fsm_hydrograph_m3(hydrograph);
 
-    // Helper: exact integral of input hydrograph (m^3) over [a, b].
-    let bin_inflow_vol = |a: f64, b: f64| -> f64 {
-        if b <= t0 || a >= t_storm_end || b <= a {
-            return 0.0;
-        }
-        let mut vol = 0.0f64;
-        for w in hydrograph.windows(2) {
-            let s0 = w[0].time_h;
-            let s1 = w[1].time_h;
-            if s1 <= a {
-                continue;
-            }
-            if s0 >= b {
-                break;
-            }
-            let ov = s1.min(b) - s0.max(a);
-            if ov > 0.0 {
-                vol += w[0].q_boundary_m3_s * 3600.0 * ov;
-            }
-        }
-        vol
-    };
-
-    // Helper: sample piecewise-constant watershed state from input hydrograph at time `t`.
-    let sample_state = |t: f64| -> (f64, f64, usize) {
-        let idx = hydrograph
-            .partition_point(|p| p.time_h <= t + 1e-12)
-            .saturating_sub(1)
-            .min(hydrograph.len() - 1);
-        let p = &hydrograph[idx];
-        (
-            p.total_stored_m3,
-            p.connected_area_fraction,
-            p.spilling_basin_count,
-        )
-    };
-
     let auto_tail_h = (30.0 * options.mean_travel_time_h).max(dt);
     let max_t_end = t_storm_end + options.tail_duration_h.unwrap_or(auto_tail_h);
-    let max_steps = (((max_t_end - t0) / dt).ceil() as usize).clamp(1, 200_000);
+    let raw_steps = ((max_t_end - t0) / dt).ceil();
+    if !raw_steps.is_finite() || raw_steps > MAX_ATTENUATION_STEPS as f64 {
+        return Err(Error::InvalidArgument(format!(
+            "attenuation requires {raw_steps} steps (exceeds limit {MAX_ATTENUATION_STEPS}); increase dt_h or reduce tail_duration_h"
+        )));
+    }
+    let max_steps = (raw_steps as usize).max(1);
     let vol_tol = 1e-12 * total_in_vol.max(1.0);
+
+    // Advancing cursors keep bin integration and state sampling O(N + M) overall.
+    let mut in_cursor = 0usize;
+    let mut state_cursor = 0usize;
+    let last_in_idx = hydrograph.len() - 1;
 
     let mut storage = vec![0.0f64; n_res];
     let mut out: Vec<FsmHydrographPoint> = Vec::with_capacity(max_steps.min(4096) + 2);
@@ -2914,8 +2973,36 @@ pub fn attenuate_fsm_hydrograph_with_options(
         if step_dt <= 1e-15 {
             break;
         }
+
+        // Sample start-of-bin watershed state and channel storage at `t_cur`.
+        while state_cursor < last_in_idx && hydrograph[state_cursor + 1].time_h <= t_cur + 1e-12 {
+            state_cursor += 1;
+        }
+        let p_state = &hydrograph[state_cursor];
+        let channel_storage_start: f64 = storage.iter().sum();
+
+        // Integrate input hydrograph over [t_cur, t_next] using advancing cursor.
+        while in_cursor < last_in_idx && hydrograph[in_cursor + 1].time_h <= t_cur {
+            in_cursor += 1;
+        }
+        let mut vol_through = 0.0f64;
+        if t_cur < t_storm_end && t_next > t0 {
+            let mut k = in_cursor;
+            while k < last_in_idx {
+                let s0 = hydrograph[k].time_h;
+                if s0 >= t_next {
+                    break;
+                }
+                let s1 = hydrograph[k + 1].time_h;
+                let ov = s1.min(t_next) - s0.max(t_cur);
+                if ov > 0.0 {
+                    vol_through += hydrograph[k].q_boundary_m3_s * 3600.0 * ov;
+                }
+                k += 1;
+            }
+        }
+
         let alpha = (-step_dt / k_res).exp();
-        let mut vol_through = bin_inflow_vol(t_cur, t_next);
         for s in &mut storage {
             let inflow_rate = vol_through / step_dt; // m^3/h
             let s_old = *s;
@@ -2925,28 +3012,35 @@ pub fn attenuate_fsm_hydrograph_with_options(
             vol_through = v_out;
         }
         let q_step_m3_s = vol_through / (3600.0 * step_dt);
-        let channel_storage: f64 = storage.iter().sum();
-        let (dep_stored, conn_frac, spill_cnt) = sample_state(t_cur);
 
         out.push(FsmHydrographPoint {
             time_h: t_cur,
             q_boundary_m3_s: q_step_m3_s,
-            total_stored_m3: dep_stored + channel_storage,
-            connected_area_fraction: conn_frac,
-            spilling_basin_count: spill_cnt,
+            total_stored_m3: p_state.total_stored_m3 + channel_storage_start,
+            connected_area_fraction: p_state.connected_area_fraction,
+            spilling_basin_count: p_state.spilling_basin_count,
         });
         t_cur = t_next;
 
+        let channel_storage_end: f64 = storage.iter().sum();
         if options.tail_duration_h.is_none()
             && t_cur >= t_storm_end - 1e-12
-            && channel_storage <= vol_tol
+            && channel_storage_end <= vol_tol
         {
             break;
         }
     }
 
-    let channel_storage: f64 = storage.iter().sum();
-    let (dep_stored, conn_frac, spill_cnt) = sample_state(t_cur);
+    let channel_storage_final: f64 = storage.iter().sum();
+    if options.tail_duration_h.is_none() && channel_storage_final > vol_tol {
+        return Err(Error::InvalidArgument(format!(
+            "attenuation recession did not converge within {MAX_ATTENUATION_STEPS} steps (residual channel storage {channel_storage_final:.4} m^3); increase dt_h"
+        )));
+    }
+    while state_cursor < last_in_idx && hydrograph[state_cursor + 1].time_h <= t_cur + 1e-12 {
+        state_cursor += 1;
+    }
+    let p_end = &hydrograph[state_cursor];
     let last_q = out.last().map_or(0.0, |p| p.q_boundary_m3_s);
     out.push(FsmHydrographPoint {
         time_h: t_cur,
@@ -2955,19 +3049,68 @@ pub fn attenuate_fsm_hydrograph_with_options(
         } else {
             last_q
         },
-        total_stored_m3: dep_stored + channel_storage,
-        connected_area_fraction: conn_frac,
-        spilling_basin_count: spill_cnt,
+        total_stored_m3: p_end.total_stored_m3 + channel_storage_final,
+        connected_area_fraction: p_end.connected_area_fraction,
+        spilling_basin_count: p_end.spilling_basin_count,
     });
     Ok(out)
 }
 
+/// Evaluates peak stored volume along a piecewise-linear volume history clipped strictly
+/// to `[0.0, window_end_h]`.
+fn peak_vol_from_history(
+    history: &[BasinVolumeSegment],
+    window_end_h: f64,
+    initial_vol: f64,
+) -> f64 {
+    let mut peak = initial_vol.max(0.0);
+    for &(t0, t1, v0, v1) in history {
+        if t0 >= window_end_h {
+            break;
+        }
+        let dt = t1 - t0;
+        if dt <= 0.0 {
+            continue;
+        }
+        if v0 > peak {
+            peak = v0;
+        }
+        let v_at_end = if t1 <= window_end_h {
+            v1
+        } else {
+            let frac = ((window_end_h - t0) / dt).clamp(0.0, 1.0);
+            v0 + frac * (v1 - v0)
+        };
+        if v_at_end > peak {
+            peak = v_at_end;
+        }
+    }
+    peak
+}
+
 /// Computes exact wet duration (in hours) spent at or above storage threshold `thresh_vol`
-/// along a piecewise-linear volume history `[(t0, t1, v0, v1)]`.
-fn wet_duration_from_history(history: &[BasinVolumeSegment], thresh_vol: f64) -> f64 {
+/// along a piecewise-linear volume history `[(t0, t1, v0, v1)]`, clipped to `[0.0, window_end_h]`.
+fn wet_duration_from_history(
+    history: &[BasinVolumeSegment],
+    thresh_vol: f64,
+    window_end_h: f64,
+) -> f64 {
     let mut dur = 0.0f64;
     for &(t0, t1, v0, v1) in history {
-        let dt = (t1 - t0).max(0.0);
+        if t0 >= window_end_h {
+            break;
+        }
+        let full_dt = t1 - t0;
+        if full_dt <= 0.0 {
+            continue;
+        }
+        let (eff_t1, eff_v1) = if t1 <= window_end_h {
+            (t1, v1)
+        } else {
+            let frac = ((window_end_h - t0) / full_dt).clamp(0.0, 1.0);
+            (window_end_h, v0 + frac * (v1 - v0))
+        };
+        let dt = (eff_t1 - t0).max(0.0);
         if dt <= 0.0 {
             continue;
         }
@@ -2977,20 +3120,20 @@ fn wet_duration_from_history(history: &[BasinVolumeSegment], thresh_vol: f64) ->
             v0 >= thresh_vol - 1e-12
         };
         let wet1 = if thresh_vol <= 0.0 {
-            v1 > 1e-12
+            eff_v1 > 1e-12
         } else {
-            v1 >= thresh_vol - 1e-12
+            eff_v1 >= thresh_vol - 1e-12
         };
         if wet0 && wet1 {
             dur += dt;
         } else if !wet0 && wet1 {
-            let dv = v1 - v0;
+            let dv = eff_v1 - v0;
             if dv > 1e-15 {
-                let frac = ((v1 - thresh_vol) / dv).clamp(0.0, 1.0);
+                let frac = ((eff_v1 - thresh_vol) / dv).clamp(0.0, 1.0);
                 dur += dt * frac;
             }
         } else if wet0 && !wet1 {
-            let dv = v0 - v1;
+            let dv = v0 - eff_v1;
             if dv > 1e-15 {
                 let frac = ((v0 - thresh_vol) / dv).clamp(0.0, 1.0);
                 dur += dt * frac;
@@ -3003,13 +3146,18 @@ fn wet_duration_from_history(history: &[BasinVolumeSegment], thresh_vol: f64) ->
 /// Computes flood-hazard raster products (`max_depth`, `wse`, and `duration_h`) from a
 /// Fill-Spill-Merge simulation over `[0, storm_duration_h]`.
 ///
-/// For every cell inundated within the storm window (`0 <= fill_time <= storm_duration_h`):
+/// `storm_duration_h` must satisfy `0.0 <= storm_duration_h <= fsm.mass_balance.duration_h`.
+/// For sub-windows (`storm_duration_h < fsm.mass_balance.duration_h`), both peak stage and
+/// wet duration are clipped strictly to `[0.0, storm_duration_h]`.
+///
+/// For every cell inundated within the window (`0 <= fill_time <= storm_duration_h`):
 /// - `wse` is inverted from the peak stored volume reached by the cell's enclosing
-///   basin (and any compound parent it merged into during the storm), capped at the
-///   basin's spill rim elevation and guaranteed `>= dem_z`.
+///   basin (and any compound parent it merged into within `[0, storm_duration_h]`), capped
+///   at the basin's spill rim elevation and guaranteed `>= dem_z`.
 /// - `max_depth = (wse - dem_z).max(0.0)`.
 /// - `duration_h` is the inundated duration in `[0.0, storm_duration_h]` (accounting for
-///   draining intervals when vertical infiltration exceeds inflow).
+///   draining intervals and preserving antecedent ponding while a compound parent waits
+///   for its children to merge).
 ///
 /// Non-inundated valid DEM cells receive `0.0` in `max_depth` and `duration_h`, and NoData
 /// in `wse`. NoData DEM cells remain NoData in all three rasters.
@@ -3023,6 +3171,12 @@ pub fn compute_fsm_hazard_rasters(
     if !storm_duration_h.is_finite() || storm_duration_h < 0.0 {
         return Err(Error::InvalidArgument(format!(
             "storm_duration_h must be finite and >= 0, got {storm_duration_h}"
+        )));
+    }
+    if storm_duration_h > fsm.mass_balance.duration_h + STORM_TIME_EPS_H {
+        return Err(Error::InvalidArgument(format!(
+            "storm_duration_h ({storm_duration_h}) exceeds simulated FSM storm duration ({})",
+            fsm.mass_balance.duration_h
         )));
     }
     validate_grid_alignment(dem, fill_time, "fill_time")?;
@@ -3073,6 +3227,9 @@ pub fn compute_fsm_hazard_rasters(
         });
     }
 
+    let is_subwindow = storm_duration_h < fsm.mass_balance.duration_h - STORM_TIME_EPS_H;
+    let has_history = fsm.basin_vol_history.len() == fsm.basins.len();
+
     // Build hierarchy maps and per-depression sorted subtree elevations.
     let mut id_to_idx: HashMap<u32, usize> = HashMap::with_capacity(m);
     let mut parent_map: HashMap<u32, u32> = HashMap::with_capacity(m);
@@ -3100,7 +3257,7 @@ pub fn compute_fsm_hazard_rasters(
     }
 
     // For each basin, compute exact sorted subtree elevations, cumulative storage table,
-    // and storm peak WSE.
+    // and storm peak WSE clipped to `[0, storm_duration_h]`.
     let mut subtree_elevs: Vec<Vec<f64>> = vec![Vec::new(); m];
     let mut subtree_prefix_v: Vec<Vec<f64>> = vec![Vec::new(); m];
     let mut basin_peak_wse: Vec<Option<f64>> = vec![None; m];
@@ -3143,7 +3300,13 @@ pub fn compute_fsm_hazard_rasters(
             let fidx_opt = fsm_idx_by_id.get(&d.id).copied();
             let (peak_vol, cap_m3) = if let Some(fidx) = fidx_opt {
                 let summary = &fsm.basins[fidx];
-                let pv = if fsm.basin_peak_vol_storm_m3.len() == fsm.basins.len() {
+                let pv = if is_subwindow && has_history {
+                    peak_vol_from_history(
+                        &fsm.basin_vol_history[fidx],
+                        storm_duration_h,
+                        summary.initial_volume_m3,
+                    )
+                } else if fsm.basin_peak_vol_storm_m3.len() == fsm.basins.len() {
                     fsm.basin_peak_vol_storm_m3[fidx]
                 } else {
                     summary
@@ -3164,10 +3327,12 @@ pub fn compute_fsm_hazard_rasters(
             let z_rim = z_rim_from_cap.max(elevs[k - 1]).max(d.max_elev);
             let eff_vol = peak_vol.min(cap_m3);
 
-            if eff_vol > 1e-12
-                || (cap_m3 <= 1e-12
-                    && fidx_opt.is_some_and(|fi| fsm.basins[fi].fill_time_h.is_some()))
-            {
+            let filled_in_window = fidx_opt.is_some_and(|fi| {
+                fsm.basins[fi]
+                    .fill_time_h
+                    .is_some_and(|ft| ft <= storm_duration_h + STORM_TIME_EPS_H)
+            });
+            if eff_vol > 1e-12 || (cap_m3 <= 1e-12 && filled_in_window) {
                 let wse = if eff_vol >= cap_m3 - 1e-9 {
                     z_rim
                 } else {
@@ -3199,6 +3364,7 @@ pub fn compute_fsm_hazard_rasters(
     };
 
     let storm_end = storm_duration_h + STORM_TIME_EPS_H;
+    let use_history_duration = fsm.basin_had_draining && has_history;
 
     for idx in 0..n {
         let z = zdata[idx];
@@ -3219,7 +3385,7 @@ pub fn compute_fsm_hazard_rasters(
         };
 
         // Determine highest WSE across `start_id` and any enclosing parent that it merged into
-        // within the storm window.
+        // within `[0, storm_duration_h]`.
         let mut best_wse = basin_peak_wse[start_bidx].unwrap_or(z);
         let mut cur_id = start_id;
         let mut merged_chain: Vec<(u32, usize)> = vec![(start_id, start_bidx)];
@@ -3248,14 +3414,28 @@ pub fn compute_fsm_hazard_rasters(
         wse_data[idx] = final_wse;
         max_depth_data[idx] = (final_wse - z).max(0.0);
 
-        let dur = if let Some(ref histories) = fsm.basin_drain_history {
+        let dur = if use_history_duration {
             let mut total_dur = 0.0f64;
+            // Preserve antecedent ponding duration [0, t_activate] on parent-owned cells
+            // while their compound parent waits for its children to fill and merge.
+            if ft <= 1e-12
+                && !depressions.depressions[start_bidx].children_ids.is_empty()
+                && let Some(&start_fidx) = fsm_idx_by_id.get(&start_id)
+            {
+                let act_t = fsm
+                    .basin_activation_time_h
+                    .get(start_fidx)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(storm_duration_h);
+                total_dur += act_t.clamp(0.0, storm_duration_h);
+            }
             for &(bid, bidx) in &merged_chain {
                 if let Some(&fidx) = fsm_idx_by_id.get(&bid)
-                    && let Some(hist) = histories.get(fidx)
+                    && let Some(hist) = fsm.basin_vol_history.get(fidx)
                 {
                     let thresh = cell_threshold_vol(bidx, z);
-                    total_dur += wet_duration_from_history(hist, thresh);
+                    total_dur += wet_duration_from_history(hist, thresh, storm_duration_h);
                 }
             }
             total_dur.clamp(0.0, storm_duration_h)

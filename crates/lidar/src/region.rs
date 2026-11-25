@@ -37,18 +37,31 @@ pub struct CrsMetricScale {
 }
 
 /// Computes CRS-aware metric cell spacing and cell area in SI meters (`m`, `m^2`) from
-/// a raster's projection string, GDAL-style 6-element affine geotransform, and row count.
+/// a raster's projection string, GDAL-style 6-element affine geotransform, width, and height.
 ///
 /// - Projected CRSs (meters, US survey feet, international feet): reads `to_meter` from
 ///   `terrio::crs::SpatialRef::parse(projection)` (defaulting to `1.0` when unknown).
 /// - Geographic CRSs (`EPSG:4326`, `EPSG:4269`, etc.): evaluates the WGS 84 ellipsoidal
-///   radii of curvature at the raster's center latitude to convert degree spacings into
-///   accurate local geodesic meters.
+///   radii of curvature at the raster's center `(width / 2, height / 2)` latitude to convert
+///   degree spacings into accurate local geodesic meters.
 pub fn crs_metric_scale(
     projection: &str,
     geotransform: &[f64; 6],
+    width: usize,
     height: usize,
 ) -> CrsMetricScale {
+    let (_, _, scale) = crs_metric_basis(projection, geotransform, width, height);
+    scale
+}
+
+/// Computes the metric column basis vector `vx_m` (meters per `+1 col`), metric row basis
+/// vector `vy_m` (meters per `+1 row`), and [`CrsMetricScale`] for a raster grid.
+pub(crate) fn crs_metric_basis(
+    projection: &str,
+    geotransform: &[f64; 6],
+    width: usize,
+    height: usize,
+) -> ((f64, f64), (f64, f64), CrsMetricScale) {
     let (vx, vy, raw_area) = affine_basis(geotransform);
     let trimmed = projection.trim();
     if !trimmed.is_empty()
@@ -61,7 +74,9 @@ pub fn crs_metric_scale(
             const WGS84_F: f64 = 1.0 / 298.257_223_563;
             const WGS84_E2: f64 = WGS84_F * (2.0 - WGS84_F);
 
-            let mid_lat_deg = (geotransform[3] + 0.5 * (height as f64) * geotransform[5])
+            let mid_lat_deg = (geotransform[3]
+                + 0.5 * (width as f64) * geotransform[4]
+                + 0.5 * (height as f64) * geotransform[5])
                 .clamp(-89.999_999, 89.999_999);
             let phi = mid_lat_deg.to_radians();
             let sin_phi = phi.sin();
@@ -80,13 +95,17 @@ pub fn crs_metric_scale(
             let cell_height_m = vy_m.0.hypot(vy_m.1);
             let cell_area_m2 = (vx_m.0 * vy_m.1 - vy_m.0 * vx_m.1).abs();
             let to_meter = (m_per_deg_lon * m_per_deg_lat).sqrt();
-            return CrsMetricScale {
-                is_geographic: true,
-                to_meter,
-                cell_width_m,
-                cell_height_m,
-                cell_area_m2,
-            };
+            return (
+                vx_m,
+                vy_m,
+                CrsMetricScale {
+                    is_geographic: true,
+                    to_meter,
+                    cell_width_m,
+                    cell_height_m,
+                    cell_area_m2,
+                },
+            );
         }
 
         let to_meter = srs
@@ -94,27 +113,37 @@ pub fn crs_metric_scale(
             .map(|p| p.to_meter)
             .filter(|&v| v.is_finite() && v > 0.0)
             .unwrap_or(1.0);
-        let cell_width_m = vx.0.hypot(vx.1) * to_meter;
-        let cell_height_m = vy.0.hypot(vy.1) * to_meter;
+        let vx_m = (vx.0 * to_meter, vx.1 * to_meter);
+        let vy_m = (vy.0 * to_meter, vy.1 * to_meter);
+        let cell_width_m = vx_m.0.hypot(vx_m.1);
+        let cell_height_m = vy_m.0.hypot(vy_m.1);
         let cell_area_m2 = raw_area * to_meter * to_meter;
-        return CrsMetricScale {
-            is_geographic: false,
-            to_meter,
-            cell_width_m,
-            cell_height_m,
-            cell_area_m2,
-        };
+        return (
+            vx_m,
+            vy_m,
+            CrsMetricScale {
+                is_geographic: false,
+                to_meter,
+                cell_width_m,
+                cell_height_m,
+                cell_area_m2,
+            },
+        );
     }
 
     let cell_width_m = vx.0.hypot(vx.1);
     let cell_height_m = vy.0.hypot(vy.1);
-    CrsMetricScale {
-        is_geographic: false,
-        to_meter: 1.0,
-        cell_width_m,
-        cell_height_m,
-        cell_area_m2: raw_area,
-    }
+    (
+        vx,
+        vy,
+        CrsMetricScale {
+            is_geographic: false,
+            to_meter: 1.0,
+            cell_width_m,
+            cell_height_m,
+            cell_area_m2: raw_area,
+        },
+    )
 }
 
 /// Geometric and elevation statistics of a single labeled connected component.

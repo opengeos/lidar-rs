@@ -1614,8 +1614,17 @@ pub(crate) fn solve_green_ampt_ponded(params: GreenAmptParams, f_old_cm: f64, dt
 
     let mut lo = f_old + ks_dt;
     let mut hi = lo + (2.0 * m * ks_dt).sqrt().max(ks_dt);
+    let mut expand_iters = 0usize;
     while g(hi) < 0.0 {
-        hi = lo + 2.0 * (hi - lo);
+        if expand_iters >= 128 {
+            return hi;
+        }
+        expand_iters += 1;
+        let next_hi = lo + 2.0 * (hi - lo);
+        if !next_hi.is_finite() || next_hi <= hi {
+            return lo;
+        }
+        hi = next_hi;
     }
 
     let mut x = 0.5 * (lo + hi);
@@ -2525,6 +2534,14 @@ pub fn run_pipeline(
 
     let num_steps =
         validate_options_with_hyetograph(&options.simulation, options.hyetograph.is_some())?;
+    if let Some(ga) = options.green_ampt {
+        ga.validate()?;
+        if options.routing == RoutingMode::Static {
+            return Err(Error::InvalidArgument(
+                "green_ampt infiltration is only supported with RoutingMode::FillSpillMerge (for Static routing, pre-adjust the hyetograph with green_ampt_hyetograph_losses)".into(),
+            ));
+        }
+    }
     let sim_opts = &options.simulation;
 
     // Guard against output paths resolving to the input DEM before writing anything.

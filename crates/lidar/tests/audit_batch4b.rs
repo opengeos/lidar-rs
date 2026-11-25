@@ -182,6 +182,11 @@ fn fsm_hydrograph_empty_depressions_fast_path_conserves_volume() {
     )
     .unwrap();
     let vol = integrate_fsm_hydrograph_m3(&res.hydrograph);
+    // 64 cells * 4 m^2 = 256 m^2; rain = (1*2 + 2*6 + 1*0) cm = 14 cm = 0.14 m -> 35.84 m^3.
+    assert!(
+        (vol - 35.84).abs() < 1e-9,
+        "expected exact analytic volume 35.84 m^3, got {vol}"
+    );
     assert!((vol - res.mass_balance.total_boundary_outflow_m3).abs() < 1e-10);
     assert!((res.hydrograph[0].connected_area_fraction - 1.0).abs() < 1e-12);
 }
@@ -213,7 +218,15 @@ fn fsm_spill_attenuation_conserves_volume_and_attenuates_lags_peak() {
     )
     .unwrap();
 
-    let tt = estimate_mean_travel_time_h(&res.spill_paths, &dem_refined.geotransform, 0.2).unwrap();
+    let tt = estimate_mean_travel_time_h(
+        &res.spill_paths,
+        &dem_refined.projection,
+        &dem_refined.geotransform,
+        dem_refined.width(),
+        dem_refined.height(),
+        0.2,
+    )
+    .unwrap();
     assert!(tt >= 0.0 && tt.is_finite());
 
     let raw_vol = integrate_fsm_hydrograph_m3(&res.hydrograph);
@@ -576,7 +589,7 @@ fn green_ampt_infiltration_physics_hyetograph_and_fsm_mass_conservation() {
 fn crs_metric_scale_handles_utm_state_plane_feet_and_geographic_at_45n() {
     // 1. Projected UTM (meters): EPSG:26914, 2.5 m x 2.5 m cells.
     let gt_utm = [500_000.0, 2.5, 0.0, 5_000_000.0, 0.0, -2.5];
-    let s_utm = crs_metric_scale("EPSG:26914", &gt_utm, 100);
+    let s_utm = crs_metric_scale("EPSG:26914", &gt_utm, 100, 100);
     assert!(!s_utm.is_geographic);
     assert!((s_utm.to_meter - 1.0).abs() < 1e-12);
     assert!((s_utm.cell_width_m - 2.5).abs() < 1e-12);
@@ -585,7 +598,7 @@ fn crs_metric_scale_handles_utm_state_plane_feet_and_geographic_at_45n() {
 
     // 2. Projected State Plane (US survey feet): EPSG:2263 (NAD83 / NY Long Island ftUS), 10 ft cells.
     let gt_ft = [1_000_000.0, 10.0, 0.0, 200_000.0, 0.0, -10.0];
-    let s_ft = crs_metric_scale("EPSG:2263", &gt_ft, 100);
+    let s_ft = crs_metric_scale("EPSG:2263", &gt_ft, 100, 100);
     assert!(!s_ft.is_geographic);
     let us_ft = 1200.0 / 3937.0;
     assert!(
@@ -601,7 +614,7 @@ fn crs_metric_scale_handles_utm_state_plane_feet_and_geographic_at_45n() {
     // 100 rows at 0.001 deg/cell with top = 45.05 -> center latitude = 45.00°N.
     let gt_geo = [-95.0, 0.001, 0.0, 45.05, 0.0, -0.001];
     for epsg in ["EPSG:4326", "EPSG:4269"] {
-        let s_geo = crs_metric_scale(epsg, &gt_geo, 100);
+        let s_geo = crs_metric_scale(epsg, &gt_geo, 100, 100);
         assert!(s_geo.is_geographic, "{epsg} must be detected as geographic");
         // At 45°N on WGS 84: ~78.847 m per 0.001° lon, ~111.132 m per 0.001° lat.
         assert!(
@@ -616,6 +629,17 @@ fn crs_metric_scale_handles_utm_state_plane_feet_and_geographic_at_45n() {
         );
         assert!((s_geo.cell_area_m2 - s_geo.cell_width_m * s_geo.cell_height_m).abs() < 1e-6);
     }
+
+    // 4. Rotated geographic raster (nonzero geotransform[4]): center column shifts center latitude.
+    // Origin lat = 0.0, width = 1000, gt[4] = +0.09 -> center lat = 45.0°N (not 0.0°)!
+    let gt_rot = [-95.0, 0.001, 0.0, 0.0, 0.09, -0.001];
+    let s_rot = crs_metric_scale("EPSG:4326", &gt_rot, 1000, 2);
+    let s_zero_w = crs_metric_scale("EPSG:4326", &gt_rot, 0, 2);
+    assert!(s_rot.is_geographic);
+    assert!(
+        (s_rot.cell_width_m - s_zero_w.cell_width_m).abs() > 1.0,
+        "nonzero geotransform[4] must shift center latitude via width/2"
+    );
 }
 
 #[test]
@@ -834,4 +858,300 @@ fn run_pipeline_fsm_exports_hydrograph_csv_and_in_memory_pipeline_populates_hydr
         "time_h,q_boundary_m3_s,total_stored_m3,connected_area_fraction,spilling_basin_count"
     );
     assert!(lines.len() >= 3);
+}
+
+#[test]
+fn review_regressions_green_ampt_bounds_static_rejection_and_tiny_dt() {
+    let ga = GreenAmptParams {
+        ks_cm_h: 1.0,
+        psi_cm: 10.0,
+        delta_theta: 0.3,
+    };
+
+    // Regression #1: tiny dt (1e-40) where lo == hi in f64 must terminate cleanly without hanging.
+    let res = green_ampt_hyetograph_losses(&[(1.0, 1.0), (1e-40, 4.0)], ga).unwrap();
+    assert_eq!(res.len(), 2);
+    assert!(res[1].1.is_finite() && res[1].1 >= 0.0);
+
+    // Regression #2: run_pipeline rejects green_ampt under RoutingMode::Static.
+    let dem_path = test_data_dir().join("dem.tif");
+    let tmp = tempfile::tempdir().unwrap();
+    let static_err = run_pipeline(
+        &dem_path,
+        tmp.path(),
+        &RunPipelineOptions {
+            routing: RoutingMode::Static,
+            green_ampt: Some(ga),
+            ..Default::default()
+        },
+    );
+    assert!(
+        static_err.is_err(),
+        "run_pipeline must reject green_ampt with RoutingMode::Static"
+    );
+
+    // Regression #3: Green-Ampt subdivision cap rejects runaway substep counts up front.
+    let (dem_refined, sink, deps) = build_compound_watershed_dem();
+    let opts = SimulateInundationOptions {
+        min_size: 10,
+        min_depth: 0.3,
+        interval: 0.3,
+        rain_intensity_cm_h: 5.0,
+        rain_duration_h: 50.0,
+        time_step_h: 1.0,
+        compress: false,
+    };
+    let oom_err = simulate_fill_spill_merge_with_green_ampt_in_memory(
+        &dem_refined,
+        &sink,
+        &deps,
+        &opts,
+        &FsmForcing {
+            base: InundationForcing::default(),
+            green_ampt: Some(ga),
+            green_ampt_substep_h: Some(1e-9),
+        },
+    );
+    assert!(
+        oom_err.is_err(),
+        "tiny green_ampt_substep_h producing >100k substeps must fail upfront"
+    );
+}
+
+#[test]
+fn review_regressions_csv_precision_crs_travel_time_and_attenuation_guards() {
+    use lidar::{FsmHydrographPoint, SpillFlowPath};
+
+    // Regression #6: tiny discharge 2.78e-7 m^3/s is preserved in CSV round-trip.
+    let pts = vec![
+        FsmHydrographPoint {
+            time_h: 0.0,
+            q_boundary_m3_s: 2.78e-7,
+            total_stored_m3: 1.5e-5,
+            connected_area_fraction: 0.25,
+            spilling_basin_count: 1,
+        },
+        FsmHydrographPoint {
+            time_h: 1.0,
+            q_boundary_m3_s: 2.78e-7,
+            total_stored_m3: 1.5e-5,
+            connected_area_fraction: 0.25,
+            spilling_basin_count: 1,
+        },
+    ];
+    let csv = fsm_hydrograph_to_csv_string(&pts);
+    let data_line = csv.lines().nth(1).unwrap();
+    let parsed_q: f64 = data_line.split(',').nth(1).unwrap().parse().unwrap();
+    assert!((parsed_q - 2.78e-7).abs() < 1e-12);
+
+    // Regression #7: CRS-aware estimate_mean_travel_time_h for foot CRS and geographic CRS.
+    let sp = vec![SpillFlowPath {
+        from_dep_id: 1,
+        from_level: 1,
+        to_dep_id: 0,
+        spill_time_h: 1.0,
+        merge_time_h: None,
+        spill_elev: 10.0,
+        cells: vec![(0, 0), (10, 0)], // 10 columns east
+    }];
+    // EPSG:2263 (US survey feet), 10 ft/cell -> 100 ftUS ~= 30.48006 m; at 1 m/s -> 30.48006 / 3600 h.
+    let gt_ft = [1_000_000.0, 10.0, 0.0, 200_000.0, 0.0, -10.0];
+    let tt_ft = estimate_mean_travel_time_h(&sp, "EPSG:2263", &gt_ft, 20, 20, 1.0).unwrap();
+    let expected_ft_h = (100.0 * (1200.0 / 3937.0)) / 3600.0;
+    assert!((tt_ft - expected_ft_h).abs() < 1e-6);
+
+    // EPSG:4326 at 45°N, 0.001 deg/cell -> 10 cols = 0.01 deg lon ~= 788.47 m; at 1 m/s -> ~0.2190 h.
+    let gt_geo = [-95.0, 0.001, 0.0, 45.05, 0.0, -0.001];
+    let tt_geo = estimate_mean_travel_time_h(&sp, "EPSG:4326", &gt_geo, 100, 100, 1.0).unwrap();
+    assert!(
+        (tt_geo - 788.47 / 3600.0).abs() < 1e-3,
+        "expected geographic travel time ~0.219 h, got {tt_geo}"
+    );
+
+    // Regression #8: attenuation rejects step counts exceeding 200,000 instead of silently truncating,
+    // and records start-of-bin channel storage (0 at t=0).
+    let cap_err = attenuate_fsm_hydrograph_with_options(
+        &pts,
+        &SpillAttenuationOptions {
+            mean_travel_time_h: 100.0,
+            dt_h: 1e-4,
+            num_reservoirs: 2,
+            tail_duration_h: None,
+        },
+    );
+    assert!(cap_err.is_err(), "step count > 200,000 must return Err");
+
+    let att = attenuate_fsm_hydrograph(&pts, 1.0, 0.5).unwrap();
+    // At t = 0.0, channel storage is 0.0, so total_stored_m3 equals input dep storage (1.5e-5).
+    assert!(
+        (att[0].total_stored_m3 - pts[0].total_stored_m3).abs() < 1e-12,
+        "t=0 bin must record start-of-bin channel storage (0.0), got {}",
+        att[0].total_stored_m3
+    );
+}
+
+#[test]
+fn review_regressions_exact_t_empty_hazard_window_and_waiting_antecedent() {
+    // Regression #5 & #9:
+    // 1. Single flat-bottomed basin draining completely before segment end: duration_h must stop
+    //    at exact `t_empty`, NOT at `t_end`!
+    // 2. Compound parent holding antecedent water while `Waiting` must preserve `[0, t_activate]`
+    //    even when a child basin drains!
+    // 3. `compute_fsm_hazard_rasters` must reject `storm_duration_h > fsm.mass_balance.duration_h`.
+    let (w, h) = (10usize, 6usize);
+    let mut z = vec![20.0f64; w * h];
+    let mut dep_id = vec![0i32; w * h];
+    let mut dep_lvl = vec![0i32; w * h];
+
+    // Compound parent (id=1, level=2) enclosing two flat-bottomed sibling bowls A (id=2) and B (id=3).
+    for r in 1..h - 1 {
+        for c in 1..w - 1 {
+            dep_id[r * w + c] = 1;
+            dep_lvl[r * w + c] = 2;
+            if (2..=3).contains(&r) && (2..=3).contains(&c) {
+                z[r * w + c] = 10.0;
+                dep_id[r * w + c] = 2;
+                dep_lvl[r * w + c] = 1;
+            } else if (2..=3).contains(&r) && (6..=7).contains(&c) {
+                z[r * w + c] = 10.0;
+                dep_id[r * w + c] = 3;
+                dep_lvl[r * w + c] = 1;
+            } else {
+                z[r * w + c] = 15.0;
+            }
+        }
+    }
+    let mut dem = Array2D::from_vec(w, h, z.clone()).unwrap();
+    dem.set_no_data(-9999.0);
+    dem.geotransform = [0.0, 1.0, 0.0, h as f64, 0.0, -1.0];
+
+    let mut sink_data = vec![0.0f64; w * h];
+    for i in 0..w * h {
+        if dep_id[i] > 0 {
+            sink_data[i] = z[i];
+        }
+    }
+    let mut sink = Array2D::from_vec(w, h, sink_data).unwrap();
+    sink.copy_metadata_from(&dem);
+    sink.set_no_data(0.0);
+
+    let mut id_arr = Array2D::from_vec(w, h, dep_id).unwrap();
+    id_arr.copy_metadata_from(&dem);
+    id_arr.set_no_data(0);
+    let mut lvl_arr = Array2D::from_vec(w, h, dep_lvl).unwrap();
+    lvl_arr.copy_metadata_from(&dem);
+    lvl_arr.set_no_data(0);
+
+    let make_dep = |id: u32,
+                    level: u32,
+                    parent_id: u32,
+                    children_ids: Vec<u32>,
+                    count: usize,
+                    min_elev: f64,
+                    max_elev: f64| {
+        lidar::NestedDepression {
+            id,
+            level,
+            count,
+            area: count as f64,
+            volume: count as f64 * (max_elev - min_elev),
+            avg_depth: max_elev - min_elev,
+            max_depth: max_elev - min_elev,
+            min_elev,
+            max_elev,
+            children_ids,
+            region_id: 1,
+            perimeter: 8.0,
+            major_axis: 2.0,
+            minor_axis: 2.0,
+            elongatedness: 1.0,
+            eccentricity: 0.0,
+            orientation: 0.0,
+            area_bbox_ratio: 1.0,
+            parent_id,
+            circularity: 1.0,
+            depth_diam_ratio: 0.5,
+            hypsometric_integral: 1.0,
+            rim_slope_deg: 45.0,
+            artifact_flag: false,
+        }
+    };
+    let deps = InMemoryDepressions {
+        depression_id: id_arr,
+        depression_level: lvl_arr,
+        depressions: vec![
+            make_dep(1, 2, 0, vec![2, 3], 32, 10.0, 20.0),
+            make_dep(2, 1, 1, vec![], 4, 10.0, 15.0),
+            make_dep(3, 1, 1, vec![], 4, 10.0, 15.0),
+        ],
+        max_level: 2,
+        num_regions: 1,
+    };
+
+    // Antecedent water:
+    // - Basin A (id=2, 4 cells) starts with 1.0 m depth -> 4.0 m^3 stored.
+    // - Parent-owned rim cell (col=1, row=1, id=1) starts with 0.5 m antecedent depth -> fill_time = 0.0.
+    let mut ant_data = vec![0.0f64; w * h];
+    for r in 2..=3 {
+        for c in 2..=3 {
+            ant_data[r * w + c] = 1.0;
+        }
+    }
+    ant_data[w + 1] = 0.5;
+    let mut ant = Array2D::from_vec(w, h, ant_data).unwrap();
+    ant.copy_metadata_from(&dem);
+    ant.set_no_data(-9999.0);
+
+    // Uniform infiltration = 50 cm/h = 0.5 m/h on 4 cells of A -> 2.0 m^3/h loss rate!
+    // With 0 rainfall for 10.0 h: A drains from 4.0 m^3 to 0.0 m^3 in EXACTLY 2.0 h (`t_empty = 2.0 h`),
+    // then stays dry for the remaining 8.0 h!
+    // Meanwhile parent 1 stays `Waiting` for the entire 10.0 h, so its antecedent cell (1, 1)
+    // must keep `duration_h == 10.0 h`!
+    let mut inf = Array2D::from_vec(w, h, vec![50.0f64; w * h]).unwrap();
+    inf.copy_metadata_from(&dem);
+    inf.set_no_data(-9999.0);
+
+    let hyeto = [(10.0, 0.0)];
+    let opts = SimulateInundationOptions {
+        min_size: 2,
+        min_depth: 0.2,
+        interval: 0.5,
+        rain_intensity_cm_h: 0.0,
+        rain_duration_h: 10.0,
+        time_step_h: 1.0,
+        compress: false,
+    };
+    let fsm = simulate_fill_spill_merge_in_memory(
+        &dem,
+        &sink,
+        &deps,
+        &opts,
+        &InundationForcing {
+            infiltration_cm_h: Some(&inf),
+            antecedent_depth: Some(&ant),
+            hyetograph: Some(&hyeto),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // Reject storm_duration_h exceeding simulated storm duration.
+    assert!(compute_fsm_hazard_rasters(&dem, &fsm.fill_time, &deps, &fsm, 12.0).is_err());
+
+    let haz = compute_fsm_hazard_rasters(&dem, &fsm.fill_time, &deps, &fsm, 10.0).unwrap();
+    let dur_a = haz.duration_h.get(2, 2);
+    assert!(
+        (dur_a - 2.0).abs() < 1e-6,
+        "basin A drained to 0 at t_empty=2.0 h, expected duration_h=2.0 h, got {dur_a}"
+    );
+    let dur_parent_ant = haz.duration_h.get(1, 1);
+    assert!(
+        (dur_parent_ant - 10.0).abs() < 1e-6,
+        "waiting parent antecedent cell (1,1) must retain 10.0 h duration, got {dur_parent_ant}"
+    );
+
+    // Sub-window clipping: at t=1.0 h, basin A has only been wet for 1.0 h.
+    let haz_sub = compute_fsm_hazard_rasters(&dem, &fsm.fill_time, &deps, &fsm, 1.0).unwrap();
+    assert!((haz_sub.duration_h.get(2, 2) - 1.0).abs() < 1e-6);
+    assert!((haz_sub.duration_h.get(1, 1) - 1.0).abs() < 1e-6);
 }
