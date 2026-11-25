@@ -120,12 +120,8 @@ impl Default for BreachOptions {
     }
 }
 
-/// Performs pure-Rust least-cost depression breaching (Lindsay, 2016) on an in-memory DEM.
-///
-/// Using [`BreachMode::Selective`] with small `max_depth` / `max_length` removes
-/// narrow road-embankment impoundments and micro-pits while preserving true large
-/// wetlands and karst dolines.
-pub fn breach_depressions(dem: &Array2D<f64>, options: &BreachOptions) -> Result<Array2D<f64>> {
+/// Validates [`BreachOptions`] fields before processing any DEM or tile.
+pub(crate) fn validate_breach_options(options: &BreachOptions) -> Result<()> {
     if let Some(md) = options.max_depth
         && (!md.is_finite() || md < 0.0)
     {
@@ -133,6 +129,16 @@ pub fn breach_depressions(dem: &Array2D<f64>, options: &BreachOptions) -> Result
             "max_depth must be finite and >= 0, got {md}"
         )));
     }
+    Ok(())
+}
+
+/// Performs pure-Rust least-cost depression breaching (Lindsay, 2016) on an in-memory DEM.
+///
+/// Using [`BreachMode::Selective`] with small `max_depth` / `max_length` removes
+/// narrow road-embankment impoundments and micro-pits while preserving true large
+/// wetlands and karst dolines.
+pub fn breach_depressions(dem: &Array2D<f64>, options: &BreachOptions) -> Result<Array2D<f64>> {
+    validate_breach_options(options)?;
     let mut out = dem.clone();
     if options.mode == BreachMode::Complete && !options.eps_gradients && !options.fill_remaining {
         complete_breaching_lindsay2016(&mut out, options.topology);

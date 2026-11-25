@@ -1,25 +1,51 @@
-//! Tiled regional depression delineation with overlapping halos and optional `f32` loading.
+//! Tiled regional depression delineation with windowed out-of-core raster I/O,
+//! overlapping halos, optional per-tile breaching, and optional full-DEM stitched spatial outputs.
 //!
-//! Splits large DEM rasters into overlapping square tiles, delineates nested
-//! depressions independently per tile (in parallel when the `parallel` feature is
-//! enabled), deduplicates features along tile overlap seams using non-overlapping
-//! tile cores and minimum-elevation keys, and merges globally numbered depression
-//! attributes. Peak per-tile working memory is bounded by the tile size, while the
-//! source raster is loaded into memory (optionally as `f32` to halve RAM usage).
+//! Splits large DEM rasters into overlapping square tiles, reads each tile's padded window
+//! on demand via `terrio::open_raster_lazy` + `read_window` (falling back to `load_raster`
+//! only for legacy non-lazy formats such as ESRI ASCII `.asc` grids), delineates nested
+//! depressions independently per tile (in parallel when the `parallel` feature is enabled),
+//! deduplicates features across tile seams via Union-Find clustering, and optionally
+//! stitches full-DEM `depression_id.tif`, `depression_level.tif`, `depth.tif`, and
+//! `depressions.gpkg` outputs.
+//!
+//! ## Memory Bounds
+//!
+//! - **Metadata-only mode** (`write_rasters = false`, `write_gpkg = false`, default in
+//!   [`delineate_depressions_tiled`]): peak DEM memory is `O(tile_size^2)` per worker tile
+//!   plus merged depression attributes and seam-band cell indices.
+//! - **Stitched spatial output mode** ([`delineate_depressions_tiled_with_outputs`] with
+//!   `write_rasters = true` or `write_gpkg = true`): assembling a single full-extent mosaic
+//!   GeoTIFF / GeoPackage allocates full-extent stitched output buffers (`16` bytes/pixel
+//!   when `write_rasters = true`, or `4` bytes/pixel for `write_gpkg = true` alone).
+//!   Strictly interior sink regions are written directly into the stitched buffers as each
+//!   tile completes so only seam-crossing regions retain temporary pixel payloads.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
-use richdem::{Array2D, DemNum, Topology, load_raster};
+use richdem::{Array2D, DemNum, Topology, dataset_to_dynamic, load_raster, save_raster};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+use crate::conditioning::{BreachOptions, breach_depressions, validate_breach_options};
 use crate::error::{Error, Result};
 use crate::filling::extract_sinks_in_memory;
 use crate::filtering::median_filter;
-use crate::slicing::{NestedDepression, delineate_depressions_in_memory, write_depressions_csv};
+use crate::slicing::{
+    NestedDepression, delineate_depressions_in_memory, write_depressions_csv,
+    write_depressions_vector_with_enclosing,
+};
+
+#[cfg(test)]
+static LAZY_WINDOW_READS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static EAGER_FALLBACK_READS: AtomicUsize = AtomicUsize::new(0);
 
 /// Options controlling [`delineate_depressions_tiled`].
 #[derive(Debug, Clone)]
@@ -41,7 +67,9 @@ pub struct TiledDelineationOptions {
     pub interval: f64,
     /// Connectivity topology for depression filling (`Topology::D8` by default).
     pub topology: Topology,
-    /// Load source DEM as `f32` to halve peak memory usage on large rasters (default `true`).
+    /// Load source DEM as `f32` when running on the eager/in-memory tiled path (used for
+    /// formats that do not support windowed lazy reads; default `true`). Windowed GeoTIFF/COG
+    /// inputs read one padded tile at a time directly into `f64`.
     pub use_f32: bool,
 }
 
@@ -60,7 +88,47 @@ impl Default for TiledDelineationOptions {
     }
 }
 
-/// Summary and merged outputs produced by [`delineate_depressions_tiled`].
+/// Spatial output and per-tile conditioning options for
+/// [`delineate_depressions_tiled_with_outputs`].
+///
+/// Note on memory: enabling `write_rasters` allocates full-extent stitched buffers
+/// (`16` bytes/pixel: `i32` ID, `i32` level, `f64` depth) and enabling `write_gpkg` alone
+/// allocates a full-extent `i32` ID buffer (`4` bytes/pixel) to polygonize the mosaic.
+/// When both are `false`, peak DEM memory remains `O(tile_size^2)` per worker tile.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct TiledOutputOptions {
+    /// Stitch and write full-DEM `depression_id.tif`, `depression_level.tif`, and `depth.tif`
+    /// into `out_dir` (default `false`).
+    pub write_rasters: bool,
+    /// Stitch and write full-DEM `depressions.gpkg` (including `"depressions"` and
+    /// `"depressions_full"` layers) into `out_dir` (default `false`).
+    pub write_gpkg: bool,
+    /// Optional per-tile least-cost depression breaching applied before sink extraction
+    /// (default `None`).
+    ///
+    /// Note: breaching runs independently on each padded tile window, so least-cost breach
+    /// paths extending beyond `overlap` cells can vary with tile layout. Increase `overlap`
+    /// or run global [`crate::breach_depressions`] beforehand when tile-invariant breaching
+    /// is required.
+    pub breach: Option<BreachOptions>,
+    /// Apply DEFLATE compression to stitched GeoTIFF outputs (default `true`).
+    pub compress: bool,
+}
+
+impl Default for TiledOutputOptions {
+    fn default() -> Self {
+        Self {
+            write_rasters: false,
+            write_gpkg: false,
+            breach: None,
+            compress: true,
+        }
+    }
+}
+
+/// Summary and merged outputs produced by [`delineate_depressions_tiled`] and
+/// [`delineate_depressions_tiled_with_outputs`].
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct TiledDelineationResult {
@@ -72,6 +140,18 @@ pub struct TiledDelineationResult {
     pub depressions: Vec<NestedDepression>,
     /// Path to merged `depressions_info.csv`.
     pub csv_path: PathBuf,
+    /// Optional path to stitched `depression_id.tif` when `write_rasters = true`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub depression_id_tif: Option<PathBuf>,
+    /// Optional path to stitched `depression_level.tif` when `write_rasters = true`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub depression_level_tif: Option<PathBuf>,
+    /// Optional path to stitched `depth.tif` when `write_rasters = true`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub depth_tif: Option<PathBuf>,
+    /// Optional path to stitched `depressions.gpkg` when `write_gpkg = true`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub gpkg_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -86,7 +166,66 @@ struct TileWindow {
     pad_c1: usize,
 }
 
-/// Extracts a tile sub-grid as `Array2D<f64>` from either an `f32` or `f64` source raster,
+#[derive(Clone)]
+struct RasterMeta {
+    width: usize,
+    height: usize,
+    geotransform: [f64; 6],
+    projection: String,
+}
+
+/// Compact per-pixel payload retained ONLY for seam-crossing regions when spatial
+/// outputs are enabled (interior regions are written directly into [`StitchedBuffers`]).
+#[derive(Clone, Copy)]
+struct SeamPixel {
+    gidx: usize,
+    local_did: u32,
+    level: u32,
+    depth: f64,
+}
+
+struct StitchedBuffers {
+    id: Vec<i32>,
+    lvl: Vec<i32>,
+    depth: Vec<f64>,
+    next_temp_id: u32,
+    write_rasters: bool,
+}
+
+impl StitchedBuffers {
+    fn new(n_pix: usize, write_rasters: bool) -> Self {
+        Self {
+            id: vec![0i32; n_pix],
+            lvl: if write_rasters {
+                vec![0i32; n_pix]
+            } else {
+                Vec::new()
+            },
+            depth: if write_rasters {
+                vec![0.0f64; n_pix]
+            } else {
+                Vec::new()
+            },
+            next_temp_id: 1,
+            write_rasters,
+        }
+    }
+}
+
+fn shifted_geotransform(gt: &[f64; 6], col_off: usize, row_off: usize) -> [f64; 6] {
+    let c0f = col_off as f64;
+    let r0f = row_off as f64;
+    [
+        gt[0] + c0f * gt[1] + r0f * gt[2],
+        gt[1],
+        gt[2],
+        gt[3] + c0f * gt[4] + r0f * gt[5],
+        gt[4],
+        gt[5],
+    ]
+}
+
+/// Extracts a tile sub-grid as `Array2D<f64>` from either an `f32` or `f64` in-memory raster,
 /// preserving the source NoData sentinel so valid elevations are never misclassified as NoData.
 fn extract_tile_f64<T: DemNum>(src: &Array2D<T>, win: TileWindow) -> Result<Array2D<f64>> {
     let w = src.width();
@@ -111,18 +250,39 @@ fn extract_tile_f64<T: DemNum>(src: &Array2D<T>, win: TileWindow) -> Result<Arra
     }
     let mut tile = Array2D::from_vec(tw, th, data)?;
     tile.set_no_data(out_nd);
-    let gt = src.geotransform;
-    let c0f = win.pad_c0 as f64;
-    let r0f = win.pad_r0 as f64;
-    tile.geotransform = [
-        gt[0] + c0f * gt[1] + r0f * gt[2],
-        gt[1],
-        gt[2],
-        gt[3] + c0f * gt[4] + r0f * gt[5],
-        gt[4],
-        gt[5],
-    ];
+    tile.geotransform = shifted_geotransform(&src.geotransform, win.pad_c0, win.pad_r0);
     tile.projection = src.projection.clone();
+    Ok(tile)
+}
+
+/// Reads a single padded tile window directly from disk via `terrio::open_raster_lazy`
+/// without loading the full raster into memory.
+fn read_tile_window_lazy(
+    path_str: &str,
+    meta: &RasterMeta,
+    win: TileWindow,
+) -> Result<Array2D<f64>> {
+    #[cfg(test)]
+    LAZY_WINDOW_READS.fetch_add(1, Ordering::Relaxed);
+
+    let mut lazy = terrio::open_raster_lazy(path_str)?;
+    let ds = lazy.read_window(
+        terrio::Window {
+            x: win.pad_c0,
+            y: win.pad_r0,
+            width: win.pad_c1 - win.pad_c0,
+            height: win.pad_r1 - win.pad_r0,
+        },
+        &terrio::WindowOptions {
+            bands: vec![1],
+            overview: None,
+        },
+    )?;
+    let mut tile = dataset_to_dynamic(ds, path_str)?.to_f64();
+    tile.geotransform = shifted_geotransform(&meta.geotransform, win.pad_c0, win.pad_r0);
+    if tile.projection.is_empty() && !meta.projection.is_empty() {
+        tile.projection = meta.projection.clone();
+    }
     Ok(tile)
 }
 
@@ -141,6 +301,13 @@ struct TileRegionOutput {
     seam_cells: Vec<usize>,
     /// Complete nested depression hierarchy for this sink region.
     depressions: Vec<NestedDepression>,
+    /// Sparse per-pixel spatial payload retained ONLY for seam-crossing regions when
+    /// `write_rasters || write_gpkg`. Interior regions are written directly into
+    /// [`StitchedBuffers`] with negative temporary IDs recorded in `direct_temp_ids`.
+    seam_pixels: Vec<SeamPixel>,
+    /// Mapping from `local_did -> temp_id` (positive magnitude of negative tag written into
+    /// `StitchedBuffers::id`) for strictly interior regions streamed directly during the tile pass.
+    direct_temp_ids: Vec<(u32, u32)>,
 }
 
 fn process_one_tile(
@@ -149,13 +316,20 @@ fn process_one_tile(
     full_w: usize,
     full_h: usize,
     options: &TiledDelineationOptions,
+    outputs: &TiledOutputOptions,
+    stitched: Option<&Mutex<StitchedBuffers>>,
 ) -> Result<Vec<TileRegionOutput>> {
     let smoothed = if options.kernel_size > 1 {
         median_filter(&tile, options.kernel_size)?
     } else {
         tile
     };
-    let sinks = extract_sinks_in_memory(&smoothed, options.min_size, options.topology)?;
+    let conditioned = if let Some(ref breach_opts) = outputs.breach {
+        breach_depressions(&smoothed, breach_opts)?
+    } else {
+        smoothed
+    };
+    let sinks = extract_sinks_in_memory(&conditioned, options.min_size, options.topology)?;
     let deps = delineate_depressions_in_memory(
         &sinks.sink,
         options.min_size,
@@ -166,10 +340,13 @@ fn process_one_tile(
         return Ok(Vec::new());
     }
 
+    let need_spatial = stitched.is_some();
     let tw = deps.depression_id.width();
     let th = deps.depression_id.height();
     let id_data = deps.depression_id.data();
+    let lvl_data = deps.depression_level.data();
     let sink_data = sinks.sink.data();
+    let depth_data = sinks.depth.data();
     let sink_nd = sinks.sink.no_data();
     let dep_region: HashMap<u32, u32> = deps
         .depressions
@@ -259,6 +436,97 @@ fn process_one_tile(
         }
     }
 
+    // Prepare interior write-back entries and seam-region pixels completely OUTSIDE the
+    // stitched-buffer mutex so parallel tile workers never serialize during pixel scanning.
+    let mut interior_temp_map: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
+    let mut seam_pixel_map: HashMap<u32, Vec<SeamPixel>> = HashMap::new();
+
+    if need_spatial {
+        let mut interior_did_set: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut interior_rids: Vec<u32> = Vec::new();
+        for (&rid, acc) in &reg_acc {
+            if acc.seam_cells.is_empty()
+                && acc.intersects_core
+                && let Some(rdeps) = by_reg.get(&rid)
+            {
+                interior_rids.push(rid);
+                for d in rdeps {
+                    interior_did_set.insert(d.id);
+                }
+            }
+        }
+
+        // Scan tile pixels without holding any lock.
+        let mut interior_writes: Vec<(usize, u32, i32, f64)> = Vec::new();
+        for r in 0..th {
+            let off = r * tw;
+            let gr = win.pad_r0 + r;
+            for c in 0..tw {
+                let did = id_data[off + c];
+                if did <= 0 {
+                    continue;
+                }
+                let did_u = did as u32;
+                let Some(&rid) = dep_region.get(&did_u) else {
+                    continue;
+                };
+                let gc = win.pad_c0 + c;
+                let gidx = gr * full_w + gc;
+                let dval = depth_data[off + c];
+                let depth = if dval.is_finite() && dval > 0.0 {
+                    dval
+                } else {
+                    0.0
+                };
+                let lvl = lvl_data[off + c].max(0);
+                if interior_did_set.contains(&did_u) {
+                    interior_writes.push((gidx, did_u, lvl, depth));
+                } else if reg_acc.get(&rid).is_some_and(|a| !a.seam_cells.is_empty()) {
+                    seam_pixel_map.entry(rid).or_default().push(SeamPixel {
+                        gidx,
+                        local_did: did_u,
+                        level: lvl as u32,
+                        depth,
+                    });
+                }
+            }
+        }
+
+        // Acquire lock ONLY for the brief write-back of this tile's interior pixels.
+        if !interior_rids.is_empty()
+            && let Some(mtx) = stitched
+        {
+            let mut local_did_to_temp: HashMap<u32, u32> =
+                HashMap::with_capacity(interior_did_set.len());
+            let mut sb = mtx
+                .lock()
+                .map_err(|_| Error::Algorithm("stitched buffer mutex poisoned".into()))?;
+            for rid in interior_rids {
+                if let Some(rdeps) = by_reg.get(&rid) {
+                    let mut pairs = Vec::with_capacity(rdeps.len());
+                    for d in rdeps {
+                        let tid = sb.next_temp_id;
+                        sb.next_temp_id = sb.next_temp_id.checked_add(1).ok_or_else(|| {
+                            Error::Algorithm("exceeded maximum temporary depression IDs".into())
+                        })?;
+                        local_did_to_temp.insert(d.id, tid);
+                        pairs.push((d.id, tid));
+                    }
+                    interior_temp_map.insert(rid, pairs);
+                }
+            }
+            for (gidx, did_u, lvl, depth) in interior_writes {
+                if let Some(&tid) = local_did_to_temp.get(&did_u) {
+                    sb.id[gidx] = -(tid as i32);
+                    if sb.write_rasters {
+                        sb.lvl[gidx] = lvl;
+                        sb.depth[gidx] = depth;
+                    }
+                }
+            }
+        }
+    }
+
     let mut out = Vec::with_capacity(by_reg.len());
     for (rid, reg_deps) in by_reg {
         let Some(acc) = reg_acc.remove(&rid) else {
@@ -274,21 +542,14 @@ fn process_one_tile(
             touches_internal_pad_edge: acc.touches_internal_pad_edge,
             seam_cells: acc.seam_cells,
             depressions: reg_deps,
+            seam_pixels: seam_pixel_map.remove(&rid).unwrap_or_default(),
+            direct_temp_ids: interior_temp_map.remove(&rid).unwrap_or_default(),
         });
     }
     Ok(out)
 }
 
-fn run_tiled_generic<T: DemNum>(
-    dem: &Array2D<T>,
-    out_dir: &Path,
-    options: &TiledDelineationOptions,
-) -> Result<TiledDelineationResult> {
-    let w = dem.width();
-    let h = dem.height();
-    let ts = options.tile_size;
-    let ov = options.overlap;
-
+fn build_tile_windows(w: usize, h: usize, ts: usize, ov: usize) -> Vec<TileWindow> {
     let mut windows = Vec::new();
     let mut r0 = 0usize;
     while r0 < h {
@@ -310,39 +571,25 @@ fn run_tiled_generic<T: DemNum>(
         }
         r0 = r1;
     }
+    windows
+}
 
-    let num_tiles = windows.len();
-    let run_one = |win: TileWindow| -> Result<Vec<TileRegionOutput>> {
-        let tile = extract_tile_f64(dem, win)?;
-        process_one_tile(tile, win, w, h, options)
-    };
-
-    #[cfg(feature = "parallel")]
-    let per_tile: Vec<Vec<TileRegionOutput>> = windows
-        .into_par_iter()
-        .map(run_one)
-        .collect::<Result<Vec<_>>>()?;
-
-    #[cfg(not(feature = "parallel"))]
-    let per_tile: Vec<Vec<TileRegionOutput>> = windows
-        .into_iter()
-        .map(run_one)
-        .collect::<Result<Vec<_>>>()?;
-
-    // Global deduplication across tile seams:
-    // - Regions strictly inside a tile interior (`seam_cells.is_empty()`) cannot overlap any
-    //   neighbor tile and are kept directly.
-    // - Regions overlapping a tile seam halo band are clustered via Union-Find whenever two tile
-    //   copies share any global pixel or share the same `min_cell`. Within each cluster we require
-    //   at least one copy to intersect its tile core (rejecting spurious halo-only edge artifacts)
-    //   and retain the best copy (preferring unclipped copies, then largest pixel count).
-    let mut dedup_regions: Vec<TileRegionOutput> = Vec::new();
+fn merge_and_export_tiled(
+    per_tile: Vec<Vec<TileRegionOutput>>,
+    num_tiles: usize,
+    meta: &RasterMeta,
+    out_dir: &Path,
+    outputs: &TiledOutputOptions,
+    stitched: Option<StitchedBuffers>,
+) -> Result<TiledDelineationResult> {
+    let mut kept_regions: Vec<TileRegionOutput> = Vec::new();
     let mut seam_regions: Vec<TileRegionOutput> = Vec::new();
+
     for tile_regions in per_tile {
         for reg in tile_regions {
             if reg.seam_cells.is_empty() {
                 if reg.intersects_core {
-                    dedup_regions.push(reg);
+                    kept_regions.push(reg);
                 }
             } else {
                 seam_regions.push(reg);
@@ -386,7 +633,9 @@ fn run_tiled_generic<T: DemNum>(
             }
         }
 
-        // For each cluster root, track `(any_intersects_core, best_member_idx)`.
+        // For each cluster root, retain ONLY the single best tile copy (preferring unclipped
+        // copies, then largest pixel count) so exported polygon footprints strictly agree with
+        // the winner's `count` and `area` attributes.
         let mut clusters: HashMap<usize, (bool, usize)> = HashMap::new();
         for (i, reg) in seam_regions.iter().enumerate() {
             let root = find(&mut parent, i);
@@ -417,20 +666,25 @@ fn run_tiled_generic<T: DemNum>(
         }
         for (reg, is_kept) in seam_regions.into_iter().zip(keep) {
             if is_kept {
-                dedup_regions.push(reg);
+                kept_regions.push(reg);
             }
         }
     }
 
-    dedup_regions.sort_by_key(|r| (r.min_cell, r.total_cells));
+    kept_regions.sort_by_key(|r| (r.min_cell, r.total_cells));
 
     // Reassign globally unique sequential IDs, parent_ids, children_ids, and region_ids.
+    let mut sb_opt = stitched;
+    let mut temp_to_global: Vec<i32> = sb_opt
+        .as_ref()
+        .map_or_else(Vec::new, |sb| vec![0i32; sb.next_temp_id as usize]);
+
     let mut merged = Vec::new();
     let mut next_dep_id = 1u32;
     let mut next_reg_id = 1u32;
     let mut max_level = 0u32;
 
-    for reg in dedup_regions {
+    for reg in kept_regions {
         let tile_deps = reg.depressions;
         if tile_deps.is_empty() {
             continue;
@@ -446,6 +700,26 @@ fn run_tiled_generic<T: DemNum>(
                 r
             });
         }
+
+        if let Some(ref mut sb) = sb_opt {
+            // Record remap entries for interior regions already streamed directly to `sb`.
+            for &(local_did, temp_id) in &reg.direct_temp_ids {
+                if let Some(&gid) = id_map.get(&local_did) {
+                    temp_to_global[temp_id as usize] = gid as i32;
+                }
+            }
+            // Paint winning seam-crossing region pixels directly with final global IDs.
+            for p in &reg.seam_pixels {
+                if let Some(&gid) = id_map.get(&p.local_did) {
+                    sb.id[p.gidx] = gid as i32;
+                    if sb.write_rasters {
+                        sb.lvl[p.gidx] = p.level as i32;
+                        sb.depth[p.gidx] = p.depth;
+                    }
+                }
+            }
+        }
+
         for mut d in tile_deps {
             d.id = id_map[&d.id];
             d.parent_id = if d.parent_id > 0 {
@@ -470,21 +744,147 @@ fn run_tiled_generic<T: DemNum>(
     let csv_path = out_dir.join("depressions_info.csv");
     write_depressions_csv(&merged, &csv_path)?;
 
+    let mut depression_id_tif = None;
+    let mut depression_level_tif = None;
+    let mut depth_tif = None;
+    let mut gpkg_path = None;
+
+    if let Some(mut sb) = sb_opt {
+        // Resolve negative temporary tags from streamed interior regions to final global IDs.
+        for slot in &mut sb.id {
+            if *slot < 0 {
+                let tid = (-*slot) as usize;
+                *slot = temp_to_global.get(tid).copied().unwrap_or(0);
+            }
+        }
+
+        let mut id_arr = Array2D::from_vec(meta.width, meta.height, sb.id)?;
+        id_arr.geotransform = meta.geotransform;
+        id_arr.projection = meta.projection.clone();
+        id_arr.set_no_data(0);
+
+        if outputs.write_rasters {
+            let id_path = out_dir.join("depression_id.tif");
+            save_raster(
+                &id_arr,
+                &id_path,
+                Some("delineate_depressions_tiled: id"),
+                outputs.compress,
+            )?;
+            depression_id_tif = Some(id_path);
+
+            let mut lvl_arr = Array2D::from_vec(meta.width, meta.height, sb.lvl)?;
+            lvl_arr.geotransform = meta.geotransform;
+            lvl_arr.projection = meta.projection.clone();
+            lvl_arr.set_no_data(0);
+            let lvl_path = out_dir.join("depression_level.tif");
+            save_raster(
+                &lvl_arr,
+                &lvl_path,
+                Some("delineate_depressions_tiled: level"),
+                outputs.compress,
+            )?;
+            depression_level_tif = Some(lvl_path);
+
+            let mut depth_arr = Array2D::from_vec(meta.width, meta.height, sb.depth)?;
+            depth_arr.geotransform = meta.geotransform;
+            depth_arr.projection = meta.projection.clone();
+            depth_arr.set_no_data(0.0);
+            let d_path = out_dir.join("depth.tif");
+            save_raster(
+                &depth_arr,
+                &d_path,
+                Some("delineate_depressions_tiled: depth"),
+                outputs.compress,
+            )?;
+            depth_tif = Some(d_path);
+        }
+
+        if outputs.write_gpkg {
+            let gp = out_dir.join("depressions.gpkg");
+            write_depressions_vector_with_enclosing(&id_arr, &merged, &gp, true)?;
+            gpkg_path = Some(gp);
+        }
+    }
+
     Ok(TiledDelineationResult {
         num_tiles,
         max_level,
         depressions: merged,
         csv_path,
+        depression_id_tif,
+        depression_level_tif,
+        depth_tif,
+        gpkg_path,
     })
 }
 
-/// Runs tiled nested depression delineation on a DEM file with overlapping halos and
-/// optional `f32` loading for reduced peak memory consumption.
-pub fn delineate_depressions_tiled(
-    in_dem: impl AsRef<Path>,
-    out_dir: impl AsRef<Path>,
+fn run_tiled_in_memory<T: DemNum>(
+    dem: &Array2D<T>,
+    out_dir: &Path,
     options: &TiledDelineationOptions,
+    outputs: &TiledOutputOptions,
 ) -> Result<TiledDelineationResult> {
+    #[cfg(test)]
+    EAGER_FALLBACK_READS.fetch_add(1, Ordering::Relaxed);
+
+    let meta = RasterMeta {
+        width: dem.width(),
+        height: dem.height(),
+        geotransform: dem.geotransform,
+        projection: dem.projection.clone(),
+    };
+    let n_pix = meta.width.checked_mul(meta.height).ok_or_else(|| {
+        Error::DimensionMismatch(format!(
+            "raster dimensions overflow ({}x{})",
+            meta.width, meta.height
+        ))
+    })?;
+    let need_spatial = outputs.write_rasters || outputs.write_gpkg;
+    let stitched_mtx =
+        need_spatial.then(|| Mutex::new(StitchedBuffers::new(n_pix, outputs.write_rasters)));
+
+    let windows = build_tile_windows(meta.width, meta.height, options.tile_size, options.overlap);
+    let num_tiles = windows.len();
+    let run_one = |win: TileWindow| -> Result<Vec<TileRegionOutput>> {
+        let tile = extract_tile_f64(dem, win)?;
+        process_one_tile(
+            tile,
+            win,
+            meta.width,
+            meta.height,
+            options,
+            outputs,
+            stitched_mtx.as_ref(),
+        )
+    };
+
+    #[cfg(feature = "parallel")]
+    let per_tile: Vec<Vec<TileRegionOutput>> = windows
+        .into_par_iter()
+        .map(run_one)
+        .collect::<Result<Vec<_>>>()?;
+
+    #[cfg(not(feature = "parallel"))]
+    let per_tile: Vec<Vec<TileRegionOutput>> = windows
+        .into_iter()
+        .map(run_one)
+        .collect::<Result<Vec<_>>>()?;
+
+    let stitched = match stitched_mtx {
+        Some(m) => Some(
+            m.into_inner()
+                .map_err(|_| Error::Algorithm("stitched buffer mutex poisoned".into()))?,
+        ),
+        None => None,
+    };
+    merge_and_export_tiled(per_tile, num_tiles, &meta, out_dir, outputs, stitched)
+}
+
+fn validate_tiled_options(
+    options: &TiledDelineationOptions,
+    outputs: &TiledOutputOptions,
+) -> Result<()> {
     if options.tile_size < 16 {
         return Err(Error::InvalidArgument(format!(
             "tile_size must be >= 16, got {}",
@@ -516,17 +916,162 @@ pub fn delineate_depressions_tiled(
             options.interval
         )));
     }
+    if let Some(ref breach_opts) = outputs.breach {
+        validate_breach_options(breach_opts)?;
+    }
+    Ok(())
+}
+
+/// Returns `true` for GeoTIFF / COG extensions where `terrio::open_raster_lazy` failures
+/// should be propagated explicitly instead of silently falling back to full-raster eager loading.
+fn is_geotiff_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .is_some_and(|ext| matches!(ext.as_str(), "tif" | "tiff" | "gtiff" | "cog"))
+}
+
+/// Runs tiled nested depression delineation on a DEM file with windowed out-of-core
+/// reading (`O(tile_size^2)` peak DEM memory per worker tile) and overlapping halos.
+pub fn delineate_depressions_tiled(
+    in_dem: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+    options: &TiledDelineationOptions,
+) -> Result<TiledDelineationResult> {
+    delineate_depressions_tiled_with_outputs(
+        in_dem,
+        out_dir,
+        options,
+        &TiledOutputOptions::default(),
+    )
+}
+
+/// Runs windowed tiled nested depression delineation with optional per-tile breaching
+/// and optional full-DEM stitched spatial outputs (`depression_id.tif`,
+/// `depression_level.tif`, `depth.tif`, and `depressions.gpkg`).
+///
+/// Peak DEM memory is `O(tile_size^2)` per worker tile when `write_rasters` and
+/// `write_gpkg` are both `false`. Enabling full-extent stitched outputs allocates
+/// full-raster stitched buffers (`16` bytes/pixel for rasters, `4` bytes/pixel for
+/// GPKG-only) to write the single mosaic file.
+pub fn delineate_depressions_tiled_with_outputs(
+    in_dem: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+    options: &TiledDelineationOptions,
+    outputs: &TiledOutputOptions,
+) -> Result<TiledDelineationResult> {
+    validate_tiled_options(options, outputs)?;
     let in_dem = in_dem.as_ref();
     let out_dir = out_dir.as_ref();
     std::fs::create_dir_all(out_dir)?;
+
     let csv_path = out_dir.join("depressions_info.csv");
-    crate::raster_ops::ensure_no_path_collision(in_dem, &[&csv_path])?;
+    let id_path = out_dir.join("depression_id.tif");
+    let lvl_path = out_dir.join("depression_level.tif");
+    let depth_path = out_dir.join("depth.tif");
+    let gpkg_path = out_dir.join("depressions.gpkg");
+    let mut out_paths: Vec<&Path> = vec![csv_path.as_path()];
+    if outputs.write_rasters {
+        out_paths.push(id_path.as_path());
+        out_paths.push(lvl_path.as_path());
+        out_paths.push(depth_path.as_path());
+    }
+    if outputs.write_gpkg {
+        out_paths.push(gpkg_path.as_path());
+    }
+    crate::raster_ops::ensure_no_path_collision(in_dem, &out_paths)?;
+
+    // Out-of-core windowed path via `terrio::open_raster_lazy`:
+    // - If `open_raster_lazy` succeeds AND `lazy.reads_by_window()` is true, read each padded
+    //   tile on demand via `read_window` (`O(tile_size^2)` DEM memory per worker).
+    // - If `open_raster_lazy` succeeds AND `!lazy.reads_by_window()` (e.g., whole-file drivers
+    //   such as `.xyz` or in-memory formats), fall through to one shared in-memory load rather
+    //   than re-decoding the entire file once per tile.
+    // - If `open_raster_lazy` fails on a GeoTIFF/COG extension, propagate the error explicitly
+    //   instead of silently loading a large GeoTIFF into RAM; fall back cleanly for other formats.
+    if let Some(p_str) = in_dem.to_str() {
+        match terrio::open_raster_lazy(p_str) {
+            Ok(lazy) if lazy.reads_by_window() => {
+                let width = lazy.width();
+                let height = lazy.height();
+                let crs = lazy.crs();
+                let projection = crs.to_wkt().or_else(|| crs.to_proj4()).unwrap_or_default();
+                let meta = RasterMeta {
+                    width,
+                    height,
+                    geotransform: lazy.geo_transform(),
+                    projection,
+                };
+                drop(lazy);
+
+                let n_pix = meta.width.checked_mul(meta.height).ok_or_else(|| {
+                    Error::DimensionMismatch(format!(
+                        "raster dimensions overflow ({}x{})",
+                        meta.width, meta.height
+                    ))
+                })?;
+                let need_spatial = outputs.write_rasters || outputs.write_gpkg;
+                let stitched_mtx = need_spatial
+                    .then(|| Mutex::new(StitchedBuffers::new(n_pix, outputs.write_rasters)));
+
+                let windows =
+                    build_tile_windows(meta.width, meta.height, options.tile_size, options.overlap);
+                let num_tiles = windows.len();
+                let run_one = |win: TileWindow| -> Result<Vec<TileRegionOutput>> {
+                    let tile = read_tile_window_lazy(p_str, &meta, win)?;
+                    process_one_tile(
+                        tile,
+                        win,
+                        meta.width,
+                        meta.height,
+                        options,
+                        outputs,
+                        stitched_mtx.as_ref(),
+                    )
+                };
+
+                #[cfg(feature = "parallel")]
+                let per_tile: Vec<Vec<TileRegionOutput>> = windows
+                    .into_par_iter()
+                    .map(run_one)
+                    .collect::<Result<Vec<_>>>()?;
+
+                #[cfg(not(feature = "parallel"))]
+                let per_tile: Vec<Vec<TileRegionOutput>> = windows
+                    .into_iter()
+                    .map(run_one)
+                    .collect::<Result<Vec<_>>>()?;
+
+                let stitched =
+                    match stitched_mtx {
+                        Some(m) => Some(m.into_inner().map_err(|_| {
+                            Error::Algorithm("stitched buffer mutex poisoned".into())
+                        })?),
+                        None => None,
+                    };
+                return merge_and_export_tiled(
+                    per_tile, num_tiles, &meta, out_dir, outputs, stitched,
+                );
+            }
+            Ok(_) => {
+                // Driver does not read by window; fall through to one shared in-memory load.
+            }
+            Err(err) if is_geotiff_extension(in_dem) => {
+                return Err(err.into());
+            }
+            Err(_) => {
+                // Non-GeoTIFF format not supported by lazy open; fall back to `load_raster`.
+            }
+        }
+    }
+
+    // Fallback for legacy non-lazy formats (e.g., ESRI ASCII grids or non-UTF-8 paths).
     if options.use_f32 {
         let dem = load_raster::<f32>(in_dem, None)?;
-        run_tiled_generic(&dem, out_dir, options)
+        run_tiled_in_memory(&dem, out_dir, options, outputs)
     } else {
         let dem = load_raster::<f64>(in_dem, None)?;
-        run_tiled_generic(&dem, out_dir, options)
+        run_tiled_in_memory(&dem, out_dir, options, outputs)
     }
 }
 
@@ -534,4 +1079,201 @@ pub fn delineate_depressions_tiled(
 /// float32 3DEP rasters) and converts on demand.
 pub fn load_dem_f32(path: impl AsRef<Path>) -> Result<Array2D<f32>> {
     Ok(load_raster::<f32>(path, None)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    // Serialize tests that inspect the global lazy/eager read counters.
+    static COUNTER_LOCK: StdMutex<()> = StdMutex::new(());
+
+    #[test]
+    fn tiled_geotiff_uses_lazy_window_reads_without_eager_fallback() {
+        let _guard = COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (w, h) = (36usize, 36usize);
+        let mut z = vec![20.0f64; w * h];
+        for r in 14..22 {
+            for c in 14..22 {
+                z[r * w + c] = 15.0 + ((r as i32 - 18).abs() + (c as i32 - 18).abs()) as f64 * 0.3;
+            }
+        }
+        let mut dem = Array2D::from_vec(w, h, z).unwrap();
+        dem.set_no_data(-9999.0);
+        dem.geotransform = [100.0, 2.0, 0.0, 500.0, 0.0, -2.0];
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tif = tmp.path().join("lazy_test.tif");
+        save_raster(&dem, &tif, None, false).unwrap();
+
+        LAZY_WINDOW_READS.store(0, Ordering::SeqCst);
+        EAGER_FALLBACK_READS.store(0, Ordering::SeqCst);
+
+        let opts = TiledDelineationOptions {
+            tile_size: 18,
+            overlap: 6,
+            kernel_size: 1,
+            min_size: 5,
+            min_depth: 0.2,
+            interval: 0.5,
+            topology: Topology::D8,
+            use_f32: false,
+        };
+        let res = delineate_depressions_tiled_with_outputs(
+            &tif,
+            tmp.path().join("out"),
+            &opts,
+            &TiledOutputOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(res.num_tiles, 4);
+        assert_eq!(
+            LAZY_WINDOW_READS.load(Ordering::SeqCst),
+            4,
+            "expected exactly 4 lazy window reads for 2x2 tiles"
+        );
+        assert_eq!(
+            EAGER_FALLBACK_READS.load(Ordering::SeqCst),
+            0,
+            "eager fallback must NOT run for GeoTIFF inputs"
+        );
+    }
+
+    #[test]
+    fn read_tile_window_lazy_matches_full_raster_slice_with_nodata() {
+        let _guard = COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (w, h) = (36usize, 36usize);
+        let mut z = vec![30.0f64; w * h];
+        // Place a real -9999 NoData hole straddling the tile seam (rows 16..20, cols 16..20)
+        // plus a depression at rows 4..10, cols 4..10 and a seam-crossing basin at rows 22..28, cols 14..22.
+        for r in 16..20 {
+            for c in 16..20 {
+                z[r * w + c] = -9999.0;
+            }
+        }
+        for r in 4..10 {
+            for c in 4..10 {
+                z[r * w + c] = 22.0 + ((r as i32 - 7).abs() + (c as i32 - 7).abs()) as f64 * 0.5;
+            }
+        }
+        for r in 22..28 {
+            for c in 14..22 {
+                z[r * w + c] = 20.0 + ((r as i32 - 25).abs() + (c as i32 - 18).abs()) as f64 * 0.4;
+            }
+        }
+        let mut dem = Array2D::from_vec(w, h, z).unwrap();
+        dem.set_no_data(-9999.0);
+        dem.geotransform = [200.0, 2.5, 0.0, 600.0, 0.0, -2.5];
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tif = tmp.path().join("nodata_seam.tif");
+        save_raster(&dem, &tif, None, false).unwrap();
+
+        let meta = RasterMeta {
+            width: w,
+            height: h,
+            geotransform: dem.geotransform,
+            projection: dem.projection.clone(),
+        };
+        let win = TileWindow {
+            core_r0: 18,
+            core_c0: 18,
+            core_r1: 36,
+            core_c1: 36,
+            pad_r0: 12,
+            pad_c0: 12,
+            pad_r1: 36,
+            pad_c1: 36,
+        };
+        let lazy_tile = read_tile_window_lazy(tif.to_str().unwrap(), &meta, win).unwrap();
+        let mem_tile = extract_tile_f64(&dem, win).unwrap();
+        assert_eq!(
+            (lazy_tile.width(), lazy_tile.height()),
+            (mem_tile.width(), mem_tile.height())
+        );
+        assert_eq!(lazy_tile.geotransform, mem_tile.geotransform);
+        assert_eq!(lazy_tile.no_data(), -9999.0);
+        assert_eq!(lazy_tile.data(), mem_tile.data());
+
+        // Compare full tiled lazy run vs in-memory tiled run on the NoData-seam DEM!
+        let opts = TiledDelineationOptions {
+            tile_size: 18,
+            overlap: 8,
+            kernel_size: 1,
+            min_size: 8,
+            min_depth: 0.3,
+            interval: 0.5,
+            topology: Topology::D8,
+            use_f32: false,
+        };
+        let out_opts = TiledOutputOptions {
+            write_rasters: true,
+            write_gpkg: false,
+            breach: None,
+            compress: false,
+        };
+        let lazy_res = delineate_depressions_tiled_with_outputs(
+            &tif,
+            tmp.path().join("lazy_out"),
+            &opts,
+            &out_opts,
+        )
+        .unwrap();
+        let mem_res =
+            run_tiled_in_memory(&dem, &tmp.path().join("mem_out"), &opts, &out_opts).unwrap();
+
+        assert_eq!(lazy_res.depressions.len(), mem_res.depressions.len());
+        assert_eq!(lazy_res.depressions.len(), 2);
+        let lazy_id =
+            load_raster::<i32>(lazy_res.depression_id_tif.as_ref().unwrap(), None).unwrap();
+        let mem_id = load_raster::<i32>(mem_res.depression_id_tif.as_ref().unwrap(), None).unwrap();
+        assert_eq!(lazy_id.data(), mem_id.data());
+        // NoData hole pixels must never be classified as depressions.
+        for r in 16..20 {
+            for c in 16..20 {
+                assert_eq!(lazy_id.get(c, r), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn tiled_rejects_invalid_breach_options_before_reading_tiles() {
+        let _guard = COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let nonexistent = tmp.path().join("never_opened.tif");
+
+        LAZY_WINDOW_READS.store(0, Ordering::SeqCst);
+        let bad_neg = TiledOutputOptions {
+            breach: Some(BreachOptions {
+                max_depth: Some(-1.0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = delineate_depressions_tiled_with_outputs(
+            &nonexistent,
+            tmp.path().join("out1"),
+            &TiledDelineationOptions::default(),
+            &bad_neg,
+        );
+        assert!(matches!(err, Err(Error::InvalidArgument(_))));
+        assert_eq!(LAZY_WINDOW_READS.load(Ordering::SeqCst), 0);
+
+        let bad_nan = TiledOutputOptions {
+            breach: Some(BreachOptions {
+                max_depth: Some(f64::NAN),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err_nan = delineate_depressions_tiled_with_outputs(
+            &nonexistent,
+            tmp.path().join("out2"),
+            &TiledDelineationOptions::default(),
+            &bad_nan,
+        );
+        assert!(matches!(err_nan, Err(Error::InvalidArgument(_))));
+    }
 }

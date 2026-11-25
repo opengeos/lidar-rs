@@ -49,6 +49,7 @@ pub mod filtering;
 pub mod fsm;
 pub mod graph;
 pub mod inundation;
+pub mod merge_tree;
 pub mod mounts;
 #[cfg(feature = "pointcloud")]
 pub mod pointcloud;
@@ -97,8 +98,9 @@ pub use filling::{
     extract_sinks_in_memory, extract_sinks_with_filled_in_memory, write_sink_csv,
 };
 pub use filtering::{
-    gaussian_filter, gaussian_filter_file, mean_filter, mean_filter_file, median_filter,
-    median_filter_file,
+    FeaturePreservingOptions, bilateral_filter, bilateral_filter_file,
+    feature_preserving_smoothing, feature_preserving_smoothing_file, gaussian_filter,
+    gaussian_filter_file, mean_filter, mean_filter_file, median_filter, median_filter_file,
 };
 pub use fsm::{
     FsmBasinSummary, FsmForcing, FsmHazardRasters, FsmHydrographPoint, FsmMassBalance,
@@ -131,6 +133,10 @@ pub use inundation::{
     simulate_inundation_with_forcing_in_memory,
     simulate_inundation_with_weighted_catchment_in_memory, write_inundation_summary_csv,
 };
+pub use merge_tree::{
+    MergeTreeNode, MergeTreeOptions, MergeTreeResult, delineate_depressions_merge_tree_in_memory,
+    delineate_depressions_merge_tree_with_dem_in_memory,
+};
 pub use mounts::{
     DelineateMountsResult, delineate_mounts, delineate_mounts_in_memory, flip_dem, flip_dem_file,
 };
@@ -154,11 +160,12 @@ pub use region::{
 };
 pub use slicing::{
     DelineateOptions, DelineateResult, InMemoryDepressions, NestedDepression,
-    delineate_depressions, delineate_depressions_in_memory, write_depressions_csv,
-    write_depressions_vector,
+    build_enclosing_depressions_layer, delineate_depressions, delineate_depressions_in_memory,
+    write_depressions_csv, write_depressions_vector, write_depressions_vector_with_enclosing,
 };
 pub use tiling::{
-    TiledDelineationOptions, TiledDelineationResult, delineate_depressions_tiled, load_dem_f32,
+    TiledDelineationOptions, TiledDelineationResult, TiledOutputOptions,
+    delineate_depressions_tiled, delineate_depressions_tiled_with_outputs, load_dem_f32,
 };
 
 /// Re-exports from `richdem` (`Array2D`, `Topology`, `load_raster`, `save_raster`).

@@ -5,7 +5,6 @@
 //! slicing, and `terrio` for GeoTIFF and Shapefile output.
 
 use std::collections::{BTreeMap, HashMap};
-use std::f64::consts::PI;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -25,7 +24,7 @@ use terrio::{
 use crate::error::{Error, Result};
 use crate::raster_ops::{ensure_no_path_collision, polygonize};
 use crate::region::{
-    RegionProps, region_basic_stats, region_group, region_group_slice,
+    RegionProps, extended_morphometrics, region_basic_stats, region_group, region_group_slice,
     region_props_for_single_label,
 };
 
@@ -167,45 +166,6 @@ pub struct InMemoryDepressions {
     pub max_level: u32,
     /// Number of top-level sink regions processed.
     pub num_regions: u32,
-}
-
-fn extended_morphometrics(
-    area: f64,
-    perimeter: f64,
-    avg_depth: f64,
-    max_depth: f64,
-    elongatedness: f64,
-    area_bbox_ratio: f64,
-) -> (f64, f64, f64, f64, bool) {
-    let circularity = if perimeter > 0.0 && area > 0.0 {
-        (4.0 * PI * area / (perimeter * perimeter)).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let eq_radius = if area > 0.0 { (area / PI).sqrt() } else { 0.0 };
-    let depth_diam_ratio = if eq_radius > 0.0 {
-        max_depth / (2.0 * eq_radius)
-    } else {
-        0.0
-    };
-    let hypsometric_integral = if max_depth > 0.0 {
-        (avg_depth / max_depth).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let rim_slope_deg = if eq_radius > 0.0 && max_depth > 0.0 {
-        (max_depth / eq_radius).atan().to_degrees()
-    } else {
-        0.0
-    };
-    let artifact_flag = elongatedness > 6.0 && area_bbox_ratio < 0.25;
-    (
-        circularity,
-        depth_diam_ratio,
-        hypsometric_integral,
-        rim_slope_deg,
-        artifact_flag,
-    )
 }
 
 fn depression_from_props(id: u32, region_id: u32, p: &RegionProps) -> NestedDepression {
@@ -564,7 +524,429 @@ pub fn write_depressions_vector(
     depressions: &[NestedDepression],
     out_path: impl AsRef<Path>,
 ) -> Result<()> {
+    write_depressions_vector_with_enclosing(depression_id, depressions, out_path, false)
+}
+
+fn add_depression_schema_fields(layer: &mut Layer) {
+    for (name, ftype) in [
+        ("id", FieldType::Integer),
+        ("parent_id", FieldType::Integer),
+        ("level", FieldType::Integer),
+        ("region_id", FieldType::Integer),
+        ("count", FieldType::Integer),
+        ("area", FieldType::Float),
+        ("volume", FieldType::Float),
+        ("avg_depth", FieldType::Float),
+        ("max_depth", FieldType::Float),
+        ("min_elev", FieldType::Float),
+        ("max_elev", FieldType::Float),
+        ("perimeter", FieldType::Float),
+        ("major_axis", FieldType::Float),
+        ("minor_axis", FieldType::Float),
+        ("elongatedness", FieldType::Float),
+        ("eccentricity", FieldType::Float),
+        ("orientation", FieldType::Float),
+        ("area_bbox_ratio", FieldType::Float),
+        ("circularity", FieldType::Float),
+        ("depth_diam_ratio", FieldType::Float),
+        ("hypsometric_integral", FieldType::Float),
+        ("rim_slope_deg", FieldType::Float),
+        ("artifact_flag", FieldType::Integer),
+    ] {
+        layer.schema.add_field(FieldDef::new(name, ftype));
+    }
+}
+
+fn depression_attributes(d: &NestedDepression) -> Vec<FieldValue> {
+    vec![
+        FieldValue::Integer(d.id as i64),
+        FieldValue::Integer(d.parent_id as i64),
+        FieldValue::Integer(d.level as i64),
+        FieldValue::Integer(d.region_id as i64),
+        FieldValue::Integer(d.count as i64),
+        FieldValue::Float(d.area),
+        FieldValue::Float(d.volume),
+        FieldValue::Float(d.avg_depth),
+        FieldValue::Float(d.max_depth),
+        FieldValue::Float(d.min_elev),
+        FieldValue::Float(d.max_elev),
+        FieldValue::Float(d.perimeter),
+        FieldValue::Float(d.major_axis),
+        FieldValue::Float(d.minor_axis),
+        FieldValue::Float(d.elongatedness),
+        FieldValue::Float(d.eccentricity),
+        FieldValue::Float(d.orientation),
+        FieldValue::Float(d.area_bbox_ratio),
+        FieldValue::Float(d.circularity),
+        FieldValue::Float(d.depth_diam_ratio),
+        FieldValue::Float(d.hypsometric_integral),
+        FieldValue::Float(d.rim_slope_deg),
+        FieldValue::Integer(i64::from(d.artifact_flag)),
+    ]
+}
+
+fn build_layer_from_parts(
+    layer_name: &str,
+    polys_by_id: BTreeMap<u32, Vec<(Ring, Vec<Ring>)>>,
+    dep_map: &HashMap<u32, &NestedDepression>,
+    crs: Option<terrio::vector::Crs>,
+    projection: &str,
+) -> Layer {
+    let has_multipart = polys_by_id.values().any(|parts| parts.len() > 1);
+    let mut layer = Layer::new(layer_name.to_string()).with_geom_type(if has_multipart {
+        GeometryType::MultiPolygon
+    } else {
+        GeometryType::Polygon
+    });
+    layer.crs = crs;
+    if layer.crs.is_none()
+        && !projection.is_empty()
+        && let Ok(srs) = SpatialRef::parse(projection)
+    {
+        srs.apply_to_layer(&mut layer);
+    }
+    add_depression_schema_fields(&mut layer);
+
+    for (did, mut parts) in polys_by_id {
+        let Some(d) = dep_map.get(&did) else {
+            continue;
+        };
+        if parts.is_empty() {
+            continue;
+        }
+        let geometry = if has_multipart {
+            Some(Geometry::MultiPolygon(parts))
+        } else {
+            let (exterior, interiors) = parts.remove(0);
+            Some(Geometry::Polygon {
+                exterior,
+                interiors,
+            })
+        };
+        layer.features.push(Feature {
+            fid: (layer.features.len() + 1) as u64,
+            geometry,
+            attributes: depression_attributes(d),
+        });
+    }
+    layer
+}
+
+/// Builds the `"depressions_full"` vector layer containing complete, child-hole-free
+/// enclosing polygons for every compound depression (`level >= 2`) as well as all leaf
+/// depressions (`level == 1`).
+///
+/// Complexity note: leaf polygons are reused from a single full-raster polygonization pass,
+/// while each compound depression (`level >= 2`) rasterizes and polygonizes its subtree
+/// bounding box, so total work scales with the sum of compound subtree bounding-box areas
+/// across hierarchy levels.
+pub fn build_enclosing_depressions_layer(
+    depression_id: &Array2D<i32>,
+    depressions: &[NestedDepression],
+) -> Result<Layer> {
+    let ds = array2d_to_dataset(depression_id)?;
+    let poly_layer = terrio_polygonize(
+        &ds,
+        &PolygonizeOptions {
+            band: 0,
+            field_name: "id".to_string(),
+            layer_name: "depressions".to_string(),
+            connectedness8: false,
+            ignore_nodata: false,
+            mask: None,
+        },
+    )?;
+
+    let dep_map: HashMap<u32, &NestedDepression> = depressions.iter().map(|d| (d.id, d)).collect();
+    let mut leaf_polys: BTreeMap<u32, Vec<(Ring, Vec<Ring>)>> = BTreeMap::new();
+    for feat in poly_layer.features {
+        let did = match feat.attributes.first() {
+            Some(FieldValue::Integer(i)) if *i > 0 => *i as u32,
+            Some(FieldValue::Float(f)) if *f > 0.0 && f.is_finite() => *f as u32,
+            _ => continue,
+        };
+        if let Some(d) = dep_map.get(&did)
+            && d.children_ids.is_empty()
+        {
+            match feat.geometry {
+                Some(Geometry::Polygon {
+                    exterior,
+                    interiors,
+                }) => {
+                    leaf_polys
+                        .entry(did)
+                        .or_default()
+                        .push((exterior, interiors));
+                }
+                Some(Geometry::MultiPolygon(polys)) => {
+                    leaf_polys.entry(did).or_default().extend(polys);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    build_enclosing_layer_inner(
+        depression_id,
+        depressions,
+        &dep_map,
+        leaf_polys,
+        poly_layer.crs,
+    )
+}
+
+fn build_enclosing_layer_inner(
+    depression_id: &Array2D<i32>,
+    depressions: &[NestedDepression],
+    dep_map: &HashMap<u32, &NestedDepression>,
+    mut full_polys_by_id: BTreeMap<u32, Vec<(Ring, Vec<Ring>)>>,
+    crs: Option<terrio::vector::Crs>,
+) -> Result<Layer> {
+    let w = depression_id.width();
+    let h = depression_id.height();
+    let id_data = depression_id.data();
+    let gt = depression_id.geotransform;
+
+    // Single pass to gather per-ID bounding boxes over `depression_id` and max ID for O(1) lookup.
+    let mut id_bboxes: HashMap<u32, (usize, usize, usize, usize)> = HashMap::new();
+    let mut max_id = depressions.iter().map(|d| d.id).max().unwrap_or(0) as usize;
+    for r in 0..h {
+        let off = r * w;
+        for c in 0..w {
+            let v = id_data[off + c];
+            if v > 0 {
+                let did = v as u32;
+                if did as usize > max_id {
+                    max_id = did as usize;
+                }
+                id_bboxes
+                    .entry(did)
+                    .and_modify(|b| {
+                        if r < b.0 {
+                            b.0 = r;
+                        }
+                        if c < b.1 {
+                            b.1 = c;
+                        }
+                        if r + 1 > b.2 {
+                            b.2 = r + 1;
+                        }
+                        if c + 1 > b.3 {
+                            b.3 = c + 1;
+                        }
+                    })
+                    .or_insert((r, c, r + 1, c + 1));
+            }
+        }
+    }
+
+    // Adaptive subtree membership lookup: use a flat generation-stamped vec when IDs are
+    // compact relative to depression count, and fall back to a HashSet for sparse/large IDs
+    // so arbitrary external IDs (e.g. 1 and 1_000_000_000) never cause huge allocations.
+    enum SubtreeLookup {
+        Dense { stamp: Vec<u32>, cur: u32 },
+        Sparse(std::collections::HashSet<u32>),
+    }
+
+    impl SubtreeLookup {
+        fn new(max_id: usize, num_deps: usize) -> Self {
+            let dense_cap = (num_deps.max(1).saturating_mul(4)).max(65_536);
+            if max_id <= dense_cap {
+                Self::Dense {
+                    stamp: vec![0u32; max_id + 1],
+                    cur: 0,
+                }
+            } else {
+                Self::Sparse(std::collections::HashSet::new())
+            }
+        }
+
+        fn begin_subtree(&mut self) {
+            match self {
+                Self::Dense { cur, .. } => *cur += 1,
+                Self::Sparse(set) => set.clear(),
+            }
+        }
+
+        #[inline]
+        fn insert(&mut self, id: u32) -> bool {
+            match self {
+                Self::Dense { stamp, cur } => {
+                    let idx = id as usize;
+                    if idx >= stamp.len() || stamp[idx] == *cur {
+                        false
+                    } else {
+                        stamp[idx] = *cur;
+                        true
+                    }
+                }
+                Self::Sparse(set) => set.insert(id),
+            }
+        }
+
+        #[inline]
+        fn contains(&self, id: u32) -> bool {
+            match self {
+                Self::Dense { stamp, cur } => stamp.get(id as usize).is_some_and(|&s| s == *cur),
+                Self::Sparse(set) => set.contains(&id),
+            }
+        }
+    }
+
+    let mut lookup = SubtreeLookup::new(max_id, depressions.len());
+    let mut stack: Vec<u32> = Vec::new();
+    let mut subtree_ids: Vec<u32> = Vec::new();
+
+    for d in depressions {
+        if d.children_ids.is_empty() {
+            continue;
+        }
+        lookup.begin_subtree();
+        stack.clear();
+        subtree_ids.clear();
+        stack.push(d.id);
+        while let Some(cur) = stack.pop() {
+            if !lookup.insert(cur) {
+                continue;
+            }
+            subtree_ids.push(cur);
+            if let Some(node) = dep_map.get(&cur) {
+                for &cid in &node.children_ids {
+                    stack.push(cid);
+                }
+            }
+        }
+
+        let mut r0 = usize::MAX;
+        let mut c0 = usize::MAX;
+        let mut r1 = 0usize;
+        let mut c1 = 0usize;
+        for &sid in &subtree_ids {
+            if let Some(&(sr0, sc0, sr1, sc1)) = id_bboxes.get(&sid) {
+                if sr0 < r0 {
+                    r0 = sr0;
+                }
+                if sc0 < c0 {
+                    c0 = sc0;
+                }
+                if sr1 > r1 {
+                    r1 = sr1;
+                }
+                if sc1 > c1 {
+                    c1 = sc1;
+                }
+            }
+        }
+        if r0 >= r1 || c0 >= c1 {
+            continue;
+        }
+
+        let bw = c1 - c0;
+        let bh = r1 - r0;
+        let mut mask_vec = vec![0i32; bw * bh];
+        for r in r0..r1 {
+            let src_off = r * w;
+            let dst_off = (r - r0) * bw;
+            for c in c0..c1 {
+                let v = id_data[src_off + c];
+                if v > 0 && lookup.contains(v as u32) {
+                    mask_vec[dst_off + (c - c0)] = 1;
+                }
+            }
+        }
+
+        let mut sub_arr = Array2D::from_vec(bw, bh, mask_vec)?;
+        let c0f = c0 as f64;
+        let r0f = r0 as f64;
+        sub_arr.geotransform = [
+            gt[0] + c0f * gt[1] + r0f * gt[2],
+            gt[1],
+            gt[2],
+            gt[3] + c0f * gt[4] + r0f * gt[5],
+            gt[4],
+            gt[5],
+        ];
+        sub_arr.projection = depression_id.projection.clone();
+        sub_arr.set_no_data(0);
+
+        let sub_ds = array2d_to_dataset(&sub_arr)?;
+        let sub_poly = terrio_polygonize(
+            &sub_ds,
+            &PolygonizeOptions {
+                band: 0,
+                field_name: "id".to_string(),
+                layer_name: "depressions_full".to_string(),
+                connectedness8: false,
+                ignore_nodata: true,
+                mask: None,
+            },
+        )?;
+
+        let mut parts: Vec<(Ring, Vec<Ring>)> = Vec::new();
+        for feat in sub_poly.features {
+            let val = match feat.attributes.first() {
+                Some(FieldValue::Integer(i)) => *i,
+                Some(FieldValue::Float(f)) if f.is_finite() => *f as i64,
+                _ => 0,
+            };
+            if val != 1 {
+                continue;
+            }
+            match feat.geometry {
+                Some(Geometry::Polygon {
+                    exterior,
+                    interiors,
+                }) => parts.push((exterior, interiors)),
+                Some(Geometry::MultiPolygon(polys)) => parts.extend(polys),
+                _ => {}
+            }
+        }
+        if !parts.is_empty() {
+            full_polys_by_id.insert(d.id, parts);
+        }
+    }
+
+    Ok(build_layer_from_parts(
+        "depressions_full",
+        full_polys_by_id,
+        dep_map,
+        crs,
+        &depression_id.projection,
+    ))
+}
+
+/// Exports all nested depressions into a unified multi-level vector file with full
+/// untrimmed attribute names.
+///
+/// Single-layer export (`include_enclosing = false`) supports GeoPackage (`.gpkg`),
+/// GeoJSON (`.geojson`), and Shapefile (`.shp`). Two-layer export (`include_enclosing = true`)
+/// writes both `"depressions"` and `"depressions_full"` (containing complete, child-hole-free
+/// enclosing footprint polygons for compound `level >= 2` and leaf `level == 1` depressions)
+/// and requires GeoPackage (`.gpkg`); passing `.geojson`/`.json`/`.shp` with
+/// `include_enclosing = true` returns [`Error::InvalidArgument`] before building any layers.
+///
+/// Complexity note: when `include_enclosing = true`, each compound depression (`level >= 2`)
+/// rasterizes and polygonizes its subtree bounding box, so work scales with the sum of
+/// compound subtree bounding-box areas across hierarchy levels.
+pub fn write_depressions_vector_with_enclosing(
+    depression_id: &Array2D<i32>,
+    depressions: &[NestedDepression],
+    out_path: impl AsRef<Path>,
+    include_enclosing: bool,
+) -> Result<()> {
     let out_path = out_path.as_ref();
+    if include_enclosing {
+        let ext = out_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase());
+        if matches!(ext.as_deref(), Some("geojson" | "json" | "shp")) {
+            return Err(Error::InvalidArgument(format!(
+                "two-layer export (include_enclosing = true) requires GeoPackage (.gpkg), got '{}'",
+                out_path.display()
+            )));
+        }
+    }
     if let Some(parent) = out_path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -617,96 +999,45 @@ pub fn write_depressions_vector(
         }
     }
 
-    let has_multipart = polys_by_id.values().any(|parts| parts.len() > 1);
-    let mut layer = Layer::new("depressions".to_string()).with_geom_type(if has_multipart {
-        GeometryType::MultiPolygon
-    } else {
-        GeometryType::Polygon
-    });
-    layer.crs = poly_layer.crs.clone();
-    if layer.crs.is_none()
-        && !depression_id.projection.is_empty()
-        && let Ok(srs) = SpatialRef::parse(&depression_id.projection)
-    {
-        srs.apply_to_layer(&mut layer);
-    }
-
-    for (name, ftype) in [
-        ("id", FieldType::Integer),
-        ("parent_id", FieldType::Integer),
-        ("level", FieldType::Integer),
-        ("region_id", FieldType::Integer),
-        ("count", FieldType::Integer),
-        ("area", FieldType::Float),
-        ("volume", FieldType::Float),
-        ("avg_depth", FieldType::Float),
-        ("max_depth", FieldType::Float),
-        ("min_elev", FieldType::Float),
-        ("max_elev", FieldType::Float),
-        ("perimeter", FieldType::Float),
-        ("major_axis", FieldType::Float),
-        ("minor_axis", FieldType::Float),
-        ("elongatedness", FieldType::Float),
-        ("eccentricity", FieldType::Float),
-        ("orientation", FieldType::Float),
-        ("area_bbox_ratio", FieldType::Float),
-        ("circularity", FieldType::Float),
-        ("depth_diam_ratio", FieldType::Float),
-        ("hypsometric_integral", FieldType::Float),
-        ("rim_slope_deg", FieldType::Float),
-        ("artifact_flag", FieldType::Integer),
-    ] {
-        layer.schema.add_field(FieldDef::new(name, ftype));
-    }
-
-    for (did, mut parts) in polys_by_id {
-        let Some(d) = dep_map.get(&did) else {
-            continue;
-        };
-        if parts.is_empty() {
-            continue;
+    let leaf_polys_for_enclosing = if include_enclosing {
+        let mut lp: BTreeMap<u32, Vec<(Ring, Vec<Ring>)>> = BTreeMap::new();
+        for (&did, parts) in &polys_by_id {
+            if let Some(d) = dep_map.get(&did)
+                && d.children_ids.is_empty()
+            {
+                lp.insert(did, parts.clone());
+            }
         }
-        let geometry = if has_multipart {
-            Some(Geometry::MultiPolygon(parts))
-        } else {
-            let (exterior, interiors) = parts.remove(0);
-            Some(Geometry::Polygon {
-                exterior,
-                interiors,
-            })
-        };
-        layer.features.push(Feature {
-            fid: (layer.features.len() + 1) as u64,
-            geometry,
-            attributes: vec![
-                FieldValue::Integer(d.id as i64),
-                FieldValue::Integer(d.parent_id as i64),
-                FieldValue::Integer(d.level as i64),
-                FieldValue::Integer(d.region_id as i64),
-                FieldValue::Integer(d.count as i64),
-                FieldValue::Float(d.area),
-                FieldValue::Float(d.volume),
-                FieldValue::Float(d.avg_depth),
-                FieldValue::Float(d.max_depth),
-                FieldValue::Float(d.min_elev),
-                FieldValue::Float(d.max_elev),
-                FieldValue::Float(d.perimeter),
-                FieldValue::Float(d.major_axis),
-                FieldValue::Float(d.minor_axis),
-                FieldValue::Float(d.elongatedness),
-                FieldValue::Float(d.eccentricity),
-                FieldValue::Float(d.orientation),
-                FieldValue::Float(d.area_bbox_ratio),
-                FieldValue::Float(d.circularity),
-                FieldValue::Float(d.depth_diam_ratio),
-                FieldValue::Float(d.hypsometric_integral),
-                FieldValue::Float(d.rim_slope_deg),
-                FieldValue::Integer(i64::from(d.artifact_flag)),
-            ],
-        });
-    }
+        Some(lp)
+    } else {
+        None
+    };
 
-    terrio::write_vector(&[layer], out_str, &VectorWriteOptions::default())?;
+    let base_crs = poly_layer.crs.clone();
+    let layer = build_layer_from_parts(
+        "depressions",
+        polys_by_id,
+        &dep_map,
+        base_crs.clone(),
+        &depression_id.projection,
+    );
+
+    if let Some(leaf_polys) = leaf_polys_for_enclosing {
+        let full_layer = build_enclosing_layer_inner(
+            depression_id,
+            depressions,
+            &dep_map,
+            leaf_polys,
+            base_crs,
+        )?;
+        terrio::write_vector(
+            &[layer, full_layer],
+            out_str,
+            &VectorWriteOptions::default(),
+        )?;
+    } else {
+        terrio::write_vector(&[layer], out_str, &VectorWriteOptions::default())?;
+    }
     Ok(())
 }
 
@@ -1148,5 +1479,51 @@ mod tests {
         let mut tiny = Array2D::from_vec(2, 2, vec![10.0, 10.0, 11.0, 11.0]).unwrap();
         tiny.set_no_data(0.0);
         assert!(delineate_depressions_in_memory(&tiny, 0, 0.0, 1e-30).is_err());
+    }
+
+    #[test]
+    fn enclosing_layer_handles_sparse_large_depression_ids_without_huge_allocation() {
+        // Two-cell raster with IDs 1 (parent) and 1_000_000_000 (child): must use sparse
+        // lookup instead of allocating a 4 GB stamp vector.
+        let mut id_arr = Array2D::from_vec(2, 1, vec![1i32, 1_000_000_000i32]).unwrap();
+        id_arr.geotransform = [0.0, 1.0, 0.0, 1.0, 0.0, -1.0];
+        id_arr.set_no_data(0);
+
+        let make_dep =
+            |id: u32, level: u32, parent_id: u32, children_ids: Vec<u32>, count: usize| {
+                NestedDepression {
+                    id,
+                    level,
+                    count,
+                    area: count as f64,
+                    volume: count as f64,
+                    avg_depth: 1.0,
+                    max_depth: 1.0,
+                    min_elev: 10.0,
+                    max_elev: 11.0,
+                    children_ids,
+                    region_id: 1,
+                    perimeter: 4.0,
+                    major_axis: 1.0,
+                    minor_axis: 1.0,
+                    elongatedness: 1.0,
+                    eccentricity: 0.0,
+                    orientation: 0.0,
+                    area_bbox_ratio: 1.0,
+                    parent_id,
+                    circularity: 0.78,
+                    depth_diam_ratio: 0.5,
+                    hypsometric_integral: 0.5,
+                    rim_slope_deg: 45.0,
+                    artifact_flag: false,
+                }
+            };
+        let deps = vec![
+            make_dep(1, 2, 0, vec![1_000_000_000], 2),
+            make_dep(1_000_000_000, 1, 1, vec![], 1),
+        ];
+        let layer = build_enclosing_depressions_layer(&id_arr, &deps).unwrap();
+        assert_eq!(layer.name, "depressions_full");
+        assert_eq!(layer.features.len(), 2);
     }
 }
