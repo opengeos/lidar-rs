@@ -150,6 +150,9 @@ def _coerce_2d_float64(raw: Any) -> NDArray[np.float64]:
     return np.ascontiguousarray(arr, dtype=np.float64)
 
 
+_IDENTITY_GEOTRANSFORM: Geotransform = (0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+
+
 def extract_spatial_array(
     obj: Any,
     *,
@@ -160,18 +163,26 @@ def extract_spatial_array(
     """Extract `(array, geotransform, crs, no_data)` from a NumPy array, xarray.DataArray, or rasterio.DatasetReader.
 
     Explicit `geotransform`, `crs`, and `no_data` arguments take precedence over metadata
-    discovered on the input object.
+    discovered on the input object. Any explicit `geotransform` or georeferenced input
+    metadata takes precedence over `cell_size` in downstream `*_array` functions; an
+    un-georeferenced identity transform `(0.0, 1.0, 0.0, 0.0, 0.0, 1.0)` with no CRS is
+    ignored so caller-supplied `cell_size` applies.
     """
-    gt_out = _normalize_transform(geotransform) if geotransform is not None else None
+    explicit_gt = geotransform is not None
+    gt_out = _normalize_transform(geotransform) if explicit_gt else None
     crs_out = _normalize_crs(crs) if crs is not None else None
     nd_out = float(no_data) if no_data is not None else None
 
     if _is_rasterio_dataset(obj):
         arr = _coerce_2d_float64(obj.read(1))
-        if gt_out is None:
-            gt_out = _normalize_transform(getattr(obj, "transform", None))
         if crs_out is None:
             crs_out = _normalize_crs(getattr(obj, "crs", None))
+        if gt_out is None:
+            discovered = _normalize_transform(getattr(obj, "transform", None))
+            if discovered is not None and (
+                crs_out is not None or discovered != _IDENTITY_GEOTRANSFORM
+            ):
+                gt_out = discovered
         if nd_out is None:
             raw_nd = getattr(obj, "nodata", None)
             if raw_nd is not None:
@@ -182,13 +193,17 @@ def extract_spatial_array(
         arr = _coerce_2d_float64(obj.values)
         rio = getattr(obj, "rio", None)
         if rio is not None:
+            if crs_out is None:
+                crs_out = _normalize_crs(getattr(rio, "crs", None))
             if gt_out is None:
                 rio_tf = getattr(rio, "transform", None)
                 tf_val = rio_tf() if callable(rio_tf) else rio_tf
                 if tf_val is not None:
-                    gt_out = _normalize_transform(tf_val)
-            if crs_out is None:
-                crs_out = _normalize_crs(getattr(rio, "crs", None))
+                    discovered = _normalize_transform(tf_val)
+                    if discovered is not None and (
+                        crs_out is not None or discovered != _IDENTITY_GEOTRANSFORM
+                    ):
+                        gt_out = discovered
             if nd_out is None:
                 raw_nd = getattr(rio, "nodata", None)
                 if raw_nd is None:
@@ -198,13 +213,17 @@ def extract_spatial_array(
 
         attrs = getattr(obj, "attrs", None)
         if isinstance(attrs, Mapping):
+            if crs_out is None and "crs" in attrs:
+                crs_out = _normalize_crs(attrs["crs"])
             if gt_out is None:
                 for key in ("geotransform", "transform"):
                     if key in attrs and attrs[key] is not None:
-                        gt_out = _normalize_transform(attrs[key])
+                        discovered = _normalize_transform(attrs[key])
+                        if discovered is not None and (
+                            crs_out is not None or discovered != _IDENTITY_GEOTRANSFORM
+                        ):
+                            gt_out = discovered
                         break
-            if crs_out is None and "crs" in attrs:
-                crs_out = _normalize_crs(attrs["crs"])
             if nd_out is None:
                 for key in ("nodata", "_FillValue"):
                     if key in attrs and attrs[key] is not None:
@@ -212,7 +231,11 @@ def extract_spatial_array(
                         break
 
         if gt_out is None:
-            gt_out = _geotransform_from_xarray_coords(obj)
+            discovered = _geotransform_from_xarray_coords(obj)
+            if discovered is not None and (
+                crs_out is not None or discovered != _IDENTITY_GEOTRANSFORM
+            ):
+                gt_out = discovered
 
         return arr, gt_out, crs_out, nd_out
 

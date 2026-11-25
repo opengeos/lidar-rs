@@ -309,6 +309,14 @@ def test_duck_typed_xarray_and_rasterio_input_adapters():
     hs = lidar_rs.compute_hillshade(rio_ds)
     assert hs.shape == (30, 30, 3) and hs.dtype == np.uint8
 
+    # Un-georeferenced identity transform without CRS falls back to caller cell_size
+    ident_aff = _FakeAffine(1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+    ungeoref_ds = _FakeRasterioDataset(dem, ident_aff, crs=None, nodata=None)  # type: ignore[arg-type]
+    sinks_ungeoref = lidar_rs.extract_sinks_array(ungeoref_ds, min_size=5, cell_size=3.0)
+    assert sinks_ungeoref["geotransform"][1] == pytest.approx(3.0)
+    assert sinks_ungeoref["geotransform"][5] == pytest.approx(-3.0)
+    assert sinks_ungeoref["crs"] is None
+
 
 def test_output_adapters_import_errors_and_conversion(monkeypatch: pytest.MonkeyPatch):
     dem = _make_two_basin_dem()
@@ -541,6 +549,10 @@ def test_delineate_mounts_array_and_compute_hillshade():
         lidar_rs.compute_hillshade(TEST_DATA / "dem.tif", geotransform=gt)
     with pytest.raises(ValueError, match="file path"):
         lidar_rs.compute_hillshade(TEST_DATA / "dem.tif", crs="EPSG:32615")
+    with pytest.raises(ValueError, match="file path"):
+        lidar_rs.breach_depressions(TEST_DATA / "dem.tif", "unused.tif", geotransform=gt)
+    with pytest.raises(ValueError, match="file path"):
+        lidar_rs.breach_depressions(TEST_DATA / "dem.tif", "unused.tif", crs="EPSG:32615")
 
 
 def test_read_write_lidar_numpy_roundtrip_and_filtering(tmp_path: Path):
@@ -588,6 +600,10 @@ def test_read_write_lidar_numpy_roundtrip_and_filtering(tmp_path: Path):
 
     sub_capped = lidar_rs.read_lidar(laz_path, max_points=25)
     assert sub_capped["count"] <= 25
+
+    # Bare string return_kinds should be treated as a single return kind, not split into chars
+    sub_return = lidar_rs.read_lidar(las_path, return_kinds="only")
+    assert sub_return["count"] == written
 
     poly_gj = tmp_path / "clip.geojson"
     poly_gj.write_text(

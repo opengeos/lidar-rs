@@ -574,7 +574,7 @@ def read_lidar(
     min_z: float | None = None,
     max_z: float | None = None,
     classifications: Sequence[int] | None = None,
-    return_kinds: Sequence[str] | None = None,
+    return_kinds: str | Sequence[str] | None = None,
     max_level: int | None = None,
     resolution: float | None = None,
 ) -> PointCloudDict:
@@ -588,7 +588,9 @@ def read_lidar(
         float(min_z) if min_z is not None else None,
         float(max_z) if max_z is not None else None,
         [int(c) for c in classifications] if classifications is not None else None,
-        list(return_kinds) if return_kinds is not None else None,
+        list((return_kinds,) if isinstance(return_kinds, str) else return_kinds)
+        if return_kinds is not None
+        else None,
         int(max_level) if max_level is not None else None,
         float(resolution) if resolution is not None else None,
     )
@@ -1141,7 +1143,11 @@ def breach_depressions(
     geotransform: Geotransform | None = None,
     crs: str | None = None,
 ) -> str | NDArray[np.float64]:
-    """Breach depressions using Lindsay (2016) on a GeoTIFF path, 2D NumPy array, xarray DataArray, or rasterio dataset."""
+    """Breach depressions using Lindsay (2016) on a GeoTIFF path, 2D NumPy array, xarray DataArray, or rasterio dataset.
+
+    Note: `geotransform` and `crs` apply only to in-memory spatial array inputs; passing them
+    with a raster file path raises `ValueError` because spatial metadata is read from the file.
+    """
     if is_spatial_array(in_dem) or not isinstance(in_dem, (str, os.PathLike)):
         if out_dem is not None:
             raise ValueError(
@@ -1162,6 +1168,11 @@ def breach_depressions(
         )
     if out_dem is None:
         raise ValueError("out_dem is required when in_dem is a file path")
+    if geotransform is not None or crs is not None:
+        raise ValueError(
+            "geotransform and crs overrides are not supported when in_dem is a file path; "
+            "geotransform and CRS are read from the input raster file"
+        )
     return str(
         _lidar_rs.breach_depressions(
             _as_path_str(in_dem),

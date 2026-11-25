@@ -3,14 +3,30 @@
 from __future__ import annotations
 
 import os
-from typing import Any, TypedDict
+from typing import Any, Protocol, TypedDict
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
+
+class _XarrayLike(Protocol):
+    @property
+    def values(self) -> Any: ...
+
+    @property
+    def dims(self) -> Any: ...
+
+
+class _RasterioLike(Protocol):
+    @property
+    def transform(self) -> Any: ...
+
+    def read(self, band: int = 1) -> Any: ...
+
+
 PathLikeStr = str | os.PathLike[str]
 Geotransform = tuple[float, float, float, float, float, float]
-SpatialArrayLike = ArrayLike | Any
+SpatialArrayLike = ArrayLike | _XarrayLike | _RasterioLike
 
 
 class SinkDepressionRecord(TypedDict):
