@@ -1,11 +1,27 @@
 // Interactive browser playground for lidar-rs compiled to WebAssembly (lidar-js).
-// Runs entirely client-side on Uint8Array GeoTIFF buffers — zero server uploads.
+// Runs entirely client-side on Uint8Array GeoTIFF buffers: zero server uploads.
 (function () {
   "use strict";
 
   const SCRIPT_SRC = document.currentScript ? document.currentScript.src : window.location.href;
   const SITE_ROOT = new URL("../", SCRIPT_SRC);
   const WASM_URL = new URL("wasm/lidar_js.js", SITE_ROOT).href;
+  const WORKER_URL = new URL("javascripts/playground-worker.js", SITE_ROOT).href;
+  const LEAFLET_VERSION = "1.9.4";
+  const LEAFLET_SOURCES = [
+    {
+      css: `https://unpkg.com/leaflet@${LEAFLET_VERSION}/dist/leaflet.css`,
+      js: `https://unpkg.com/leaflet@${LEAFLET_VERSION}/dist/leaflet.js`,
+      cssIntegrity: "sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=",
+      jsIntegrity: "sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=",
+    },
+    {
+      css: `https://cdn.jsdelivr.net/npm/leaflet@${LEAFLET_VERSION}/dist/leaflet.css`,
+      js: `https://cdn.jsdelivr.net/npm/leaflet@${LEAFLET_VERSION}/dist/leaflet.js`,
+      cssIntegrity: "sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=",
+      jsIntegrity: "sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=",
+    },
+  ];
   const SAMPLES = {
     dem: {
       url: new URL("samples/dem.tif", SITE_ROOT).href,
@@ -25,10 +41,22 @@
   };
 
   let modulePromise = null;
+  let useWorker = typeof Worker !== "undefined";
+  let worker = null;
+  let workerReqSeq = 0;
+  let workerPending = new Map(); // reqId -> { resolve, reject, onProgress }
+  let workerInitialized = false;
+  let workerSimRunId = 0;
+  let workerMountsRunId = 0;
+  let activeJobKind = null; // "run" | "gif" | "export" | "treeGif" | null
+  let treeGifCancelled = false;
+
   let loadedFile = null; // { bytes: Uint8Array, name: string }
   let activeObjectUrls = [];
-  let currentSim = null; // retained for lazy on-demand GIF encoding; freed on replace/unload
+  let currentSim = null; // main-thread fallback handle; freed on replace/unload
+  let currentMounts = null; // main-thread fallback handle; freed on replace/unload
   let currentSimId = 0;
+  let nextRunId = 0;
   let currentSimStem = "";
   let cachedGifUrl = null;
   let cachedGifKey = null;
@@ -41,7 +69,69 @@
   let player = null;
   let playTimer = null;
 
+  // Lazy-loaded Leaflet map overlay state
+  let leafletLoadPromise = null;
+  const leafletState = {
+    map: null,
+    containerEl: null,
+    layerControl: null,
+    depLayer: null,
+    spillLayer: null,
+    featureLayersById: new Map(),
+    activeView: "canvas",
+    dataRunId: 0,
+    loading: false,
+    unavailableReason: null,
+  };
+
   const $ = (id) => document.getElementById(id);
+
+  function createCancelledError() {
+    const err = new Error("Cancelled");
+    err.name = "AbortError";
+    err.cancelled = true;
+    return err;
+  }
+
+  function isCancelledError(e) {
+    return Boolean(e && (e.cancelled || e.name === "AbortError"));
+  }
+
+  function setProgress(fraction, label, showCancel) {
+    const wrap = $("lp-progress-wrap");
+    const bar = $("lp-progress-bar");
+    const lbl = $("lp-progress-label");
+    const cancelBtn = $("lp-cancel");
+    const pct = Math.max(0, Math.min(100, Math.round((fraction || 0) * 100)));
+    if (wrap) {
+      wrap.hidden = false;
+      wrap.setAttribute("aria-valuenow", String(pct));
+    }
+    if (bar) {
+      bar.style.width = `${Math.max(4, pct)}%`;
+    }
+    if (lbl) {
+      lbl.textContent = label ? `${pct}% · ${label}` : `${pct}%`;
+    }
+    if (cancelBtn) {
+      cancelBtn.hidden = !showCancel;
+      cancelBtn.disabled = false;
+    }
+  }
+
+  function clearProgress() {
+    const wrap = $("lp-progress-wrap");
+    const bar = $("lp-progress-bar");
+    const lbl = $("lp-progress-label");
+    const cancelBtn = $("lp-cancel");
+    if (wrap) {
+      wrap.hidden = true;
+      wrap.setAttribute("aria-valuenow", "0");
+    }
+    if (bar) bar.style.width = "0%";
+    if (lbl) lbl.textContent = "";
+    if (cancelBtn) cancelBtn.hidden = true;
+  }
 
   function loadWasm() {
     if (!modulePromise) {
@@ -51,6 +141,130 @@
       });
     }
     return modulePromise;
+  }
+
+  function terminateWorker(reason) {
+    if (worker) {
+      try {
+        worker.terminate();
+      } catch (_) {
+        // Ignore termination errors
+      }
+      worker = null;
+    }
+    workerSimRunId = 0;
+    workerMountsRunId = 0;
+    const err = reason || createCancelledError();
+    const pending = Array.from(workerPending.values());
+    workerPending.clear();
+    for (const entry of pending) {
+      entry.reject(err);
+    }
+  }
+
+  function ensureWorker() {
+    if (!useWorker) return null;
+    if (worker) return worker;
+    try {
+      const w = new Worker(WORKER_URL, { type: "module" });
+      w.addEventListener("message", (event) => {
+        const msg = event.data;
+        if (!msg || typeof msg !== "object") return;
+        const entry = workerPending.get(msg.id);
+        if (msg.type === "progress") {
+          if (entry && typeof entry.onProgress === "function") {
+            entry.onProgress(msg);
+          }
+          return;
+        }
+        if (!entry) return;
+        workerPending.delete(msg.id);
+        if (msg.type === "cancelled") {
+          entry.reject(createCancelledError());
+        } else if (msg.type === "error") {
+          entry.reject(new Error(msg.message || "WebAssembly worker error"));
+        } else {
+          entry.resolve(msg);
+        }
+      });
+      w.addEventListener("error", (event) => {
+        const message = (event && event.message) || "Web Worker failed to load";
+        if (!workerInitialized) {
+          useWorker = false;
+        }
+        if (worker === w) {
+          terminateWorker(new Error(message));
+        }
+      });
+      worker = w;
+      return worker;
+    } catch (_) {
+      useWorker = false;
+      return null;
+    }
+  }
+
+  function workerRequest(payload, opts = {}) {
+    const w = ensureWorker();
+    if (!w) {
+      return Promise.reject(new Error("Web Worker unavailable"));
+    }
+    const id = ++workerReqSeq;
+    return new Promise((resolve, reject) => {
+      workerPending.set(id, { resolve, reject, onProgress: opts.onProgress });
+      try {
+        w.postMessage({ ...payload, id }, opts.transfer || []);
+      } catch (err) {
+        workerPending.delete(id);
+        reject(err);
+      }
+    });
+  }
+
+  async function initEngine() {
+    if (useWorker) {
+      try {
+        const res = await workerRequest({ type: "init", wasmUrl: WASM_URL });
+        workerInitialized = true;
+        return { version: res.version, mode: "worker" };
+      } catch (_) {
+        useWorker = false;
+        terminateWorker(new Error("Falling back to main thread"));
+      }
+    }
+    const mod = await loadWasm();
+    return { version: mod.version(), mode: "main" };
+  }
+
+  function cancelActiveWork() {
+    const kind = activeJobKind;
+    if (!kind && workerPending.size === 0) return;
+
+    if (kind === "run") {
+      runToken++;
+    }
+    if (kind === "treeGif") {
+      treeGifCancelled = true;
+    }
+    activeJobKind = null;
+    pendingGif = null;
+
+    if (worker && workerPending.size > 0) {
+      terminateWorker(createCancelledError());
+      if (useWorker) {
+        // Warm up a clean standby worker in the background for the next run.
+        workerRequest({ type: "init", wasmUrl: WASM_URL }).catch(() => {});
+      }
+    }
+
+    clearProgress();
+    const runBtn = $("lp-run");
+    if (runBtn) runBtn.disabled = !loadedFile;
+    setStatus("Operation cancelled.");
+  }
+
+  function hasActiveSimulation() {
+    return (useWorker && workerSimRunId === currentSimId && currentSimId > 0) || currentSim !== null;
   }
 
   function setStatus(text, isError) {
@@ -108,12 +322,23 @@
     pendingGif = null;
   }
 
-  function releaseSim() {
+  function releaseSim(keepWorkerRun) {
     if (currentSim) {
       currentSim.free();
       currentSim = null;
     }
-    currentSimId++;
+    if (currentMounts) {
+      currentMounts.free();
+      currentMounts = null;
+    }
+    if (!keepWorkerRun) {
+      workerSimRunId = 0;
+      workerMountsRunId = 0;
+      if (worker && workerPending.size === 0) {
+        workerRequest({ type: "release" }).catch(() => {});
+      }
+      currentSimId++;
+    }
     currentSimStem = "";
     invalidateCachedGif();
     pendingGif = null;
@@ -1512,12 +1737,15 @@
 
     const gifBytes = encodeStreamedFramesToGif(
       schedule.length,
-      renderFrameRgba,
+      (fi) => {
+        if (treeGifCancelled) throw createCancelledError();
+        return renderFrameRgba(fi);
+      },
       gifW,
       gifH,
       delayMs,
     );
-    if (player !== playerRef || currentSimId !== simIdRef) return;
+    if (treeGifCancelled || player !== playerRef || currentSimId !== simIdRef) return;
 
     const elapsed = performance.now() - t0;
     const blobUrl = URL.createObjectURL(new Blob([gifBytes], { type: "image/gif" }));
@@ -1801,6 +2029,7 @@
       const nodeSel = $("lp-tree-node-select");
       if (nodeSel) nodeSel.value = "0";
       renderPlayerFrame();
+      refreshLeafletSelection();
       return;
     }
 
@@ -1872,6 +2101,7 @@
       renderRatingChart(rcPts);
     }
     renderPlayerFrame();
+    refreshLeafletSelection();
   }
 
   function drawRgba(canvas, width, height, rgba, baseRgba) {
@@ -2414,6 +2644,8 @@
       runoffCurve: extraOpts.runoffCurve || null,
       areaUnit,
       elevUnit: elevUnit || "",
+      boundsWgs84: extraOpts.boundsWgs84 || null,
+      geoCache: Object.create(null),
       frameBuf: new Uint8ClampedArray(width * height * 4),
       stepIdx: 0,
       direction: 1,
@@ -2426,37 +2658,669 @@
       slider.value = "0";
     }
     selectDepression(0);
+    updateMapToggleAvailability();
+    if (leafletState.activeView === "map") {
+      populateLeafletMap().catch((err) => {
+        if (!isCancelledError(err)) {
+          setStatus(`Map overlay update failed: ${errMsg(err)}`, true);
+        }
+      });
+    }
     if (!isMounts && playerSteps.length > 1) {
       startPlayer();
     }
   }
 
+  function loadStylesheetWithSri(href, integrity) {
+    return new Promise((resolve, reject) => {
+      const existing = document.querySelector(`link[data-lp-leaflet-css="${href}"]`);
+      if (existing) {
+        resolve();
+        return;
+      }
+      const link = document.createElement("link");
+      link.rel = "stylesheet";
+      link.href = href;
+      if (integrity) {
+        link.integrity = integrity;
+        link.crossOrigin = "anonymous";
+      }
+      link.dataset.lpLeafletCss = href;
+      link.onload = () => resolve();
+      link.onerror = () => {
+        link.remove();
+        reject(new Error(`Failed to load stylesheet ${href}`));
+      };
+      document.head.appendChild(link);
+    });
+  }
+
+  function loadScriptWithSri(src, integrity) {
+    return new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = src;
+      if (integrity) {
+        script.integrity = integrity;
+        script.crossOrigin = "anonymous";
+      }
+      script.async = true;
+      script.onload = () => resolve();
+      script.onerror = () => {
+        script.remove();
+        reject(new Error(`Failed to load script ${src}`));
+      };
+      document.head.appendChild(script);
+    });
+  }
+
+  function loadLeaflet() {
+    if (typeof window.L !== "undefined" && window.L && typeof window.L.map === "function") {
+      return Promise.resolve(window.L);
+    }
+    if (leafletLoadPromise) return leafletLoadPromise;
+
+    leafletLoadPromise = (async () => {
+      let lastErr = null;
+      for (const src of LEAFLET_SOURCES) {
+        try {
+          await loadStylesheetWithSri(src.css, src.cssIntegrity);
+          await loadScriptWithSri(src.js, src.jsIntegrity);
+          if (typeof window.L !== "undefined" && window.L && typeof window.L.map === "function") {
+            return window.L;
+          }
+          throw new Error("Leaflet global L was not defined after script load");
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+      leafletLoadPromise = null;
+      throw lastErr || new Error("Could not load Leaflet library");
+    })();
+    return leafletLoadPromise;
+  }
+
+  function destroyLeafletMap() {
+    if (leafletState.map) {
+      try {
+        leafletState.map.remove();
+      } catch (_) {
+        // Ignore teardown errors
+      }
+    }
+    leafletState.map = null;
+    leafletState.containerEl = null;
+    leafletState.layerControl = null;
+    leafletState.depLayer = null;
+    leafletState.spillLayer = null;
+    leafletState.featureLayersById.clear();
+    leafletState.dataRunId = 0;
+    leafletState.activeView = "canvas";
+  }
+
+  function depressionFillTimeHours(playerState, depId) {
+    if (!playerState || playerState.kind === "mounts") return null;
+    const fsmBasin = playerState.fsmBasinsById ? playerState.fsmBasinsById.get(depId) : null;
+    if (fsmBasin && typeof fsmBasin.fill_time_h === "number" && Number.isFinite(fsmBasin.fill_time_h)) {
+      return fsmBasin.fill_time_h;
+    }
+    const stat = playerState.fillStats ? playerState.fillStats.get(depId) : null;
+    if (stat && stat.times && stat.times.length > 0) {
+      return stat.times[stat.times.length - 1];
+    }
+    return null;
+  }
+
+  function fillTimeRampColor(fillTimeH, maxTimeH) {
+    if (fillTimeH === null || !Number.isFinite(fillTimeH)) return "#94a3b8";
+    const t = maxTimeH > 0 ? Math.max(0, Math.min(1, fillTimeH / maxTimeH)) : 0;
+    const stops = [
+      [0.0, [2, 132, 199]],   // Earliest: Sky/Royal Blue
+      [0.45, [13, 148, 136]], // Mid: Teal
+      [0.8, [234, 179, 8]],   // Late: Yellow/Amber
+      [1.0, [234, 88, 12]],   // Latest: Deep Orange
+    ];
+    for (let i = 0; i < stops.length - 1; i++) {
+      const [t0, c0] = stops[i];
+      const [t1, c1] = stops[i + 1];
+      if (t <= t1) {
+        const f = t1 > t0 ? (t - t0) / (t1 - t0) : 0;
+        const r = Math.round(c0[0] + f * (c1[0] - c0[0]));
+        const g = Math.round(c0[1] + f * (c1[1] - c0[1]));
+        const b = Math.round(c0[2] + f * (c1[2] - c0[2]));
+        return `rgb(${r}, ${g}, ${b})`;
+      }
+    }
+    return "#ea580c";
+  }
+
+  function buildPopupTableNode(title, rows) {
+    const wrap = document.createElement("div");
+    wrap.className = "lp-map-popup";
+    const head = document.createElement("strong");
+    head.textContent = title;
+    wrap.appendChild(head);
+    const table = document.createElement("table");
+    const tbody = document.createElement("tbody");
+    for (const [k, v] of rows) {
+      const tr = document.createElement("tr");
+      const th = document.createElement("th");
+      th.textContent = k;
+      const td = document.createElement("td");
+      td.textContent = v;
+      tr.append(th, td);
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    return wrap;
+  }
+
+  function buildDepressionPopupNode(props, playerState) {
+    const isMounts = playerState && playerState.kind === "mounts";
+    const entity = isMounts ? "Mount" : "Depression";
+    const areaUnit = (playerState && playerState.areaUnit) || "m²";
+    const elevUnit = (playerState && playerState.elevUnit) || "";
+    const depthSuffix = elevUnit ? ` ${elevUnit}` : "";
+    const volUnit = volumeUnitFor(areaUnit);
+    const fillH = depressionFillTimeHours(playerState, props.id);
+    const rows = [
+      ["ID", `#${props.id}`],
+      ["Level", String(props.level)],
+      ["Area", formatArea(props.area, areaUnit)],
+      [
+        "Volume",
+        Number.isFinite(props.volume)
+          ? `${props.volume.toLocaleString(undefined, { maximumFractionDigits: 1 })} ${volUnit}`
+          : `N/A ${volUnit}`,
+      ],
+      [
+        isMounts ? "Max Height" : "Max Depth",
+        Number.isFinite(props.max_depth) ? `${props.max_depth.toFixed(2)}${depthSuffix}` : "N/A",
+      ],
+    ];
+    if (!isMounts) {
+      rows.push(["Fill Time", fillH !== null ? `${fillH.toFixed(2)} h` : "Dry / unreached"]);
+    }
+    return buildPopupTableNode(`${entity} #${props.id}`, rows);
+  }
+
+  function buildSpillPopupNode(props, playerState) {
+    const elevUnit = (playerState && playerState.elevUnit) || "";
+    const elevSuffix = elevUnit ? ` ${elevUnit}` : "";
+    const target = props.to_dep_id > 0 ? `Depression #${props.to_dep_id}` : "Watershed boundary";
+    const rows = [
+      ["From", `Depression #${props.from_dep_id} (Lvl ${props.from_level})`],
+      ["To", target],
+      [
+        "Spill Time",
+        Number.isFinite(props.spill_time_h) ? `${props.spill_time_h.toFixed(2)} h` : "N/A",
+      ],
+      [
+        "Merge Time",
+        props.merge_time_h != null && Number.isFinite(props.merge_time_h)
+          ? `${props.merge_time_h.toFixed(2)} h`
+          : "Unmerged",
+      ],
+      [
+        "Spill Elev",
+        Number.isFinite(props.spill_elev) ? `${props.spill_elev.toFixed(2)}${elevSuffix}` : "N/A",
+      ],
+    ];
+    return buildPopupTableNode("Spill Flow Path", rows);
+  }
+
+  function styleDepressionFeature(feature) {
+    const props = (feature && feature.properties) || {};
+    const styleMode = $("lp-map-style") ? $("lp-map-style").value : "level";
+    const isSelected = player && player.selectedDepId > 0 && props.id === player.selectedDepId;
+    let fillColor;
+    if (styleMode === "fill_time" && player && player.kind !== "mounts") {
+      const maxT =
+        player.steps && player.steps.length > 0
+          ? player.steps[player.steps.length - 1].time_hours
+          : 1;
+      fillColor = fillTimeRampColor(depressionFillTimeHours(player, props.id), maxT);
+    } else {
+      fillColor = levelColor(props.level);
+    }
+    return {
+      color: isSelected ? "#fbbf24" : "#0f172a",
+      weight: isSelected ? 3.2 : 1.2,
+      opacity: isSelected ? 1.0 : 0.78,
+      fillColor,
+      fillOpacity: isSelected ? 0.65 : 0.42,
+    };
+  }
+
+  function refreshLeafletSelection() {
+    if (!leafletState.depLayer) return;
+    leafletState.depLayer.setStyle(styleDepressionFeature);
+    if (player && player.selectedDepId > 0) {
+      const layers = leafletState.featureLayersById.get(player.selectedDepId);
+      if (layers) {
+        for (const lyr of layers) {
+          if (typeof lyr.bringToFront === "function") lyr.bringToFront();
+        }
+      }
+    }
+    if (leafletState.spillLayer && typeof leafletState.spillLayer.bringToFront === "function") {
+      leafletState.spillLayer.bringToFront();
+    }
+  }
+
+  function fitLeafletBounds() {
+    if (!leafletState.map) return;
+    if (leafletState.depLayer) {
+      const b = leafletState.depLayer.getBounds();
+      if (b && typeof b.isValid === "function" && b.isValid()) {
+        leafletState.map.fitBounds(b, { padding: [22, 22], maxZoom: 17 });
+        return;
+      }
+    }
+    if (player && Array.isArray(player.boundsWgs84) && player.boundsWgs84.length === 4) {
+      const [minLon, minLat, maxLon, maxLat] = player.boundsWgs84;
+      leafletState.map.fitBounds(
+        [
+          [minLat, minLon],
+          [maxLat, maxLon],
+        ],
+        { padding: [22, 22], maxZoom: 17 },
+      );
+    }
+  }
+
+  function updateMapToggleAvailability() {
+    const mapBtn = $("lp-view-map");
+    const noteEl = $("lp-map-note");
+    const styleWrap = $("lp-map-style-wrap");
+    const styleSel = $("lp-map-style");
+    if (!mapBtn) return;
+
+    const isMounts = Boolean(player && player.kind === "mounts");
+    if (styleWrap) styleWrap.hidden = isMounts;
+    if (isMounts && styleSel) styleSel.value = "level";
+
+    const hasCrs = Boolean(player && Array.isArray(player.boundsWgs84) && player.boundsWgs84.length === 4);
+    if (leafletState.unavailableReason) {
+      mapBtn.disabled = true;
+      if (noteEl) {
+        noteEl.textContent = leafletState.unavailableReason;
+        noteEl.hidden = false;
+      }
+      if (leafletState.activeView === "map") {
+        setActiveView("canvas");
+      }
+    } else if (!hasCrs) {
+      mapBtn.disabled = true;
+      if (noteEl) {
+        noteEl.textContent =
+          "Map View unavailable: loaded raster has no recognized CRS for WGS 84 reprojection.";
+        noteEl.hidden = false;
+      }
+      if (leafletState.activeView === "map") {
+        setActiveView("canvas");
+      }
+    } else {
+      mapBtn.disabled = false;
+      if (noteEl) {
+        noteEl.textContent = "";
+        noteEl.hidden = true;
+      }
+    }
+  }
+
+  async function ensureLeafletMap() {
+    const container = $("lp-map-container");
+    if (!container) throw new Error("Map container element not found");
+    const L = await loadLeaflet();
+    if (leafletState.map && leafletState.containerEl === container) {
+      return { L, map: leafletState.map };
+    }
+    if (leafletState.map) {
+      destroyLeafletMap();
+    }
+    const osm = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap contributors",
+    });
+    const esriImagery = L.tileLayer(
+      "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+      {
+        maxZoom: 19,
+        attribution: "Tiles &copy; Esri",
+      },
+    );
+    const map = L.map(container, {
+      center: [0, 0],
+      zoom: 2,
+      layers: [osm],
+      preferCanvas: true,
+    });
+    const baseMaps = {
+      OpenStreetMap: osm,
+      "Esri World Imagery": esriImagery,
+    };
+    leafletState.map = map;
+    leafletState.containerEl = container;
+    leafletState.layerControl = L.control.layers(baseMaps, {}, { collapsed: true }).addTo(map);
+    return { L, map };
+  }
+
+  async function populateLeafletMap() {
+    if (!player) return;
+    if (!Array.isArray(player.boundsWgs84) || player.boundsWgs84.length !== 4) {
+      updateMapToggleAvailability();
+      return;
+    }
+    const simIdRef = currentSimId;
+    const playerRef = player;
+    const isMounts = playerRef.kind === "mounts";
+
+    leafletState.loading = true;
+    try {
+      const { L, map } = await ensureLeafletMap();
+      if (player !== playerRef || currentSimId !== simIdRef) return;
+
+      const depAsset = isMounts ? "mountsGeojson" : "depressionsGeojson";
+      const depGeoStr = await fetchExportAsset(depAsset);
+      if (player !== playerRef || currentSimId !== simIdRef) return;
+      const depGeo = JSON.parse(depGeoStr);
+
+      let spillGeo = null;
+      if (!isMounts) {
+        try {
+          const spillGeoStr = await fetchExportAsset("spillPathsGeojson");
+          if (player !== playerRef || currentSimId !== simIdRef) return;
+          spillGeo = JSON.parse(spillGeoStr);
+        } catch (_) {
+          spillGeo = null;
+        }
+      }
+
+      if (leafletState.depLayer) {
+        map.removeLayer(leafletState.depLayer);
+        if (leafletState.layerControl) leafletState.layerControl.removeLayer(leafletState.depLayer);
+        leafletState.depLayer = null;
+      }
+      if (leafletState.spillLayer) {
+        map.removeLayer(leafletState.spillLayer);
+        if (leafletState.layerControl) leafletState.layerControl.removeLayer(leafletState.spillLayer);
+        leafletState.spillLayer = null;
+      }
+      leafletState.featureLayersById.clear();
+
+      const depLayer = L.geoJSON(depGeo, {
+        style: styleDepressionFeature,
+        onEachFeature: (feature, layer) => {
+          const props = (feature && feature.properties) || {};
+          if (typeof props.id === "number") {
+            let list = leafletState.featureLayersById.get(props.id);
+            if (!list) {
+              list = [];
+              leafletState.featureLayersById.set(props.id, list);
+            }
+            list.push(layer);
+          }
+          layer.bindPopup(() => buildDepressionPopupNode(props, player));
+          layer.on("click", () => {
+            if (player && typeof props.id === "number" && props.id > 0) {
+              stopPlayer();
+              selectDepression(props.id);
+            }
+          });
+        },
+      }).addTo(map);
+      leafletState.depLayer = depLayer;
+      if (leafletState.layerControl) {
+        leafletState.layerControl.addOverlay(depLayer, isMounts ? "Mounts" : "Depressions");
+      }
+
+      if (spillGeo && Array.isArray(spillGeo.features) && spillGeo.features.length > 0) {
+        const spillLayer = L.geoJSON(spillGeo, {
+          style: {
+            color: "#0284c7",
+            weight: 3,
+            opacity: 0.92,
+          },
+          onEachFeature: (feature, layer) => {
+            const props = (feature && feature.properties) || {};
+            layer.bindPopup(() => buildSpillPopupNode(props, player));
+          },
+        }).addTo(map);
+        leafletState.spillLayer = spillLayer;
+        if (leafletState.layerControl) {
+          leafletState.layerControl.addOverlay(spillLayer, "Spill Flow Paths");
+        }
+      }
+
+      leafletState.dataRunId = simIdRef;
+      refreshLeafletSelection();
+      map.invalidateSize();
+      fitLeafletBounds();
+    } finally {
+      leafletState.loading = false;
+    }
+  }
+
+  async function setActiveView(view) {
+    const target = view === "map" ? "map" : "canvas";
+    const canvasEl = $("lp-player-canvas");
+    const mapEl = $("lp-map-container");
+    const mapControls = $("lp-map-controls");
+    const canvasBtn = $("lp-view-canvas");
+    const mapBtn = $("lp-view-map");
+
+    if (target === "map") {
+      if (!player || !Array.isArray(player.boundsWgs84) || player.boundsWgs84.length !== 4) {
+        updateMapToggleAvailability();
+        return;
+      }
+      stopPlayer();
+    }
+
+    leafletState.activeView = target;
+    if (canvasEl) canvasEl.hidden = target === "map";
+    if (mapEl) mapEl.hidden = target !== "map";
+    if (mapControls) mapControls.hidden = target !== "map";
+    if (canvasBtn) {
+      canvasBtn.classList.toggle("lp-view-active", target === "canvas");
+      canvasBtn.setAttribute("aria-selected", target === "canvas" ? "true" : "false");
+    }
+    if (mapBtn) {
+      mapBtn.classList.toggle("lp-view-active", target === "map");
+      mapBtn.setAttribute("aria-selected", target === "map" ? "true" : "false");
+    }
+
+    if (target === "map") {
+      try {
+        if (!leafletState.map || leafletState.dataRunId !== currentSimId) {
+          await populateLeafletMap();
+        } else {
+          window.requestAnimationFrame(() => {
+            if (leafletState.map) {
+              leafletState.map.invalidateSize();
+            }
+          });
+        }
+      } catch (err) {
+        if (isCancelledError(err)) {
+          setActiveView("canvas");
+          return;
+        }
+        const msg = errMsg(err);
+        if (typeof window.L === "undefined") {
+          leafletState.unavailableReason =
+            "Map View unavailable: could not load Leaflet library (offline or blocked CDN).";
+          updateMapToggleAvailability();
+        } else {
+          setActiveView("canvas");
+        }
+        setStatus(`Map View error: ${msg}`, true);
+      }
+    }
+  }
+
+  async function fetchExportAsset(asset, options = {}) {
+    const cacheable =
+      asset === "depressionsGeojson" ||
+      asset === "spillPathsGeojson" ||
+      asset === "mountsGeojson";
+    if (cacheable && player && player.geoCache && player.geoCache[asset] !== undefined) {
+      return player.geoCache[asset];
+    }
+
+    const simIdRef = currentSimId;
+    const isMountAsset =
+      asset === "mountsGeojson" || asset === "mountLevelTif" || asset === "mountIdTif";
+
+    let data;
+    if (useWorker) {
+      const hasHandle = isMountAsset
+        ? workerMountsRunId === simIdRef && simIdRef > 0
+        : workerSimRunId === simIdRef && simIdRef > 0;
+      if (!hasHandle) {
+        throw new Error(
+          "Simulation worker was reset; click Run simulation to regenerate exports.",
+        );
+      }
+      activeJobKind = "export";
+      setProgress(0.3, `Exporting ${asset}...`, true);
+      try {
+        const res = await workerRequest(
+          { type: "exportAsset", runId: simIdRef, asset, options },
+          {
+            onProgress: (p) => {
+              setProgress(p.fraction, p.stage, true);
+              if (p.message) setStatus(p.message);
+            },
+          },
+        );
+        data = res.data;
+      } finally {
+        if (activeJobKind === "export") {
+          activeJobKind = null;
+          clearProgress();
+        }
+      }
+    } else if (isMountAsset) {
+      if (!currentMounts) throw new Error("No active mount delineation");
+      if (asset === "mountsGeojson") data = currentMounts.geojson();
+      else if (asset === "mountLevelTif") data = currentMounts.levelTif();
+      else data = currentMounts.idTif();
+    } else {
+      if (!currentSim) throw new Error("No active inundation simulation");
+      switch (asset) {
+        case "pngSnapshot":
+          data = currentSim.renderFramePng(
+            options.stepIdx || 0,
+            options.showScaleBar !== false,
+            options.showLegend !== false,
+            options.showSpills !== false,
+          );
+          break;
+        case "depressionsGeojson":
+          data = currentSim.depressionsGeojson();
+          break;
+        case "spillPathsGeojson":
+          data = currentSim.spillPathsGeojson();
+          break;
+        case "connectivityGraphJson":
+          data = currentSim.connectivityGraphJson();
+          break;
+        case "connectivityGraphml":
+          data = currentSim.connectivityGraphml();
+          break;
+        case "ratingCurvesCsv":
+          data = currentSim.ratingCurvesCsv();
+          break;
+        case "inundationCurveCsv":
+          data = currentSim.inundationCurveCsv();
+          break;
+        case "fsmBasinsCsv":
+          data = currentSim.fsmBasinsCsv();
+          break;
+        case "levelTif":
+          data = currentSim.levelTif();
+          break;
+        case "fillTimeTif":
+          data = currentSim.fillTimeTif();
+          break;
+        case "catchmentHirTif":
+          data = currentSim.catchmentHirTif();
+          break;
+        case "sinkTif":
+          data = currentSim.sinkTif();
+          break;
+        default:
+          throw new Error(`Unknown export asset: ${asset}`);
+      }
+    }
+
+    if (cacheable && player && currentSimId === simIdRef && player.geoCache) {
+      player.geoCache[asset] = data;
+    }
+    return data;
+  }
+
   async function ensureGifUrl() {
-    const simRef = currentSim;
-    if (!simRef) throw new Error("No active inundation simulation");
+    if (!hasActiveSimulation()) {
+      throw new Error(
+        "No active inundation simulation available for GIF export; click Run simulation first.",
+      );
+    }
+    const simIdRef = currentSimId;
     const opts = currentGifOptions();
     if (cachedGifUrl && cachedGifKey === opts.key) return cachedGifUrl;
     if (pendingGif && pendingGif.key === opts.key) return pendingGif.promise;
 
     const taskKey = opts.key;
     const promise = (async () => {
-      setStatus("Encoding animated inundation GIF in WebAssembly…");
-      await nextTick();
-      if (currentSim !== simRef) {
+      setStatus("Encoding animated inundation GIF in Web Worker...");
+      setProgress(0.2, "Encoding GIF", true);
+      activeJobKind = "gif";
+
+      let gifBytes;
+      let elapsed;
+      try {
+        if (useWorker && workerSimRunId === simIdRef) {
+          const res = await workerRequest(
+            {
+              type: "exportGif",
+              runId: simIdRef,
+              delayMs: opts.delayMs,
+              pingPong: opts.pingPong,
+              maxDim: 400,
+              showSpills: opts.showSpills,
+            },
+            {
+              onProgress: (p) => {
+                setProgress(p.fraction, "Encoding GIF", true);
+                if (p.message) setStatus(p.message);
+              },
+            },
+          );
+          gifBytes = res.bytes;
+          elapsed = res.elapsedMs;
+        } else {
+          await nextTick();
+          if (currentSimId !== simIdRef || !currentSim) return null;
+          const t0 = performance.now();
+          gifBytes = currentSim.encodeGif(opts.delayMs, opts.pingPong, 400, opts.showSpills);
+          elapsed = performance.now() - t0;
+        }
+      } finally {
+        if (activeJobKind === "gif") {
+          activeJobKind = null;
+          clearProgress();
+        }
+      }
+
+      if (currentSimId !== simIdRef) {
         return null;
       }
       if (currentGifOptions().key !== taskKey) {
         return ensureGifUrl();
       }
-      const t0 = performance.now();
-      const gifBytes = simRef.encodeGif(opts.delayMs, opts.pingPong, 400, opts.showSpills);
-      if (currentSim !== simRef) {
-        return null;
-      }
-      if (currentGifOptions().key !== taskKey) {
-        return ensureGifUrl();
-      }
-      const elapsed = performance.now() - t0;
       const url = URL.createObjectURL(new Blob([gifBytes], { type: "image/gif" }));
       invalidateCachedGif();
       activeObjectUrls.push(url);
@@ -2507,13 +3371,23 @@
   async function runTreeGifExport() {
     if (treeGifExporting) return;
     treeGifExporting = true;
+    treeGifCancelled = false;
+    activeJobKind = "treeGif";
     setTreeGifButtonsDisabled(true);
+    setProgress(0.1, "Encoding tree GIF", true);
     try {
       await exportDepressionTreeGif();
     } catch (e) {
-      setStatus(`Depression tree GIF export failed: ${errMsg(e)}`, true);
+      if (!isCancelledError(e)) {
+        setStatus(`Depression tree GIF export failed: ${errMsg(e)}`, true);
+      }
     } finally {
       treeGifExporting = false;
+      treeGifCancelled = false;
+      if (activeJobKind === "treeGif") {
+        activeJobKind = null;
+        clearProgress();
+      }
       setTreeGifButtonsDisabled(false);
     }
   }
@@ -2536,7 +3410,9 @@
           a.download = `${currentSimStem}_inundation.gif`;
           a.click();
         } catch (e) {
-          setStatus(`GIF export failed: ${errMsg(e)}`, true);
+          if (!isCancelledError(e)) {
+            setStatus(`GIF export failed: ${errMsg(e)}`, true);
+          }
         } finally {
           btn.disabled = false;
         }
@@ -2559,9 +3435,11 @@
         btn.type = "button";
         btn.className = "md-button";
         btn.textContent = label;
-        btn.addEventListener("click", () => {
+        btn.addEventListener("click", async () => {
+          btn.disabled = true;
           try {
-            const payload = getData();
+            const payload = await getData();
+            if (payload == null) return;
             const url = URL.createObjectURL(new Blob([payload], { type: mime }));
             const a = document.createElement("a");
             a.href = url;
@@ -2569,7 +3447,11 @@
             a.click();
             setTimeout(() => URL.revokeObjectURL(url), 30000);
           } catch (e) {
-            setStatus(`${label} export failed: ${errMsg(e)}`, true);
+            if (!isCancelledError(e)) {
+              setStatus(`${label} export failed: ${errMsg(e)}`, true);
+            }
+          } finally {
+            btn.disabled = false;
           }
         });
         el.appendChild(btn);
@@ -2653,6 +3535,7 @@
   async function runAnalysis() {
     if (!loadedFile) return;
     const token = ++runToken;
+    const runId = ++nextRunId;
     const mode = $("lp-mode").value;
     const routingMode = $("lp-routing") ? $("lp-routing").value : "static";
     const kernelSize = Math.max(1, parseInt($("lp-kernel").value, 10) || 1);
@@ -2668,83 +3551,235 @@
     const duration = Math.max(0.5, parseFloat($("lp-duration").value) || 70.0);
     const step = Math.max(0.1, parseFloat($("lp-step").value) || 1.0);
 
+    // Supersede any stale in-flight worker computation immediately so large DEM runs never queue.
+    if (worker && workerPending.size > 0) {
+      terminateWorker(createCancelledError());
+    }
+
     const runBtn = $("lp-run");
     runBtn.disabled = true;
+    activeJobKind = "run";
+    const execLabel = useWorker ? "Web Worker" : "WebAssembly";
     setStatus(
-      `Running ${mode === "inundation" ? "inundation simulation" : "mount delineation"} on ${loadedFile.name} in WebAssembly…`,
+      `Running ${mode === "inundation" ? "inundation simulation" : "mount delineation"} on ${loadedFile.name} in ${execLabel}...`,
     );
-    await nextTick();
+    setProgress(0.08, "Preparing", true);
+
+    const stem = loadedFile.name.replace(/\.[^.]+$/, "");
+    const params = {
+      kernelSize,
+      minSize,
+      minDepth,
+      interval,
+      rain,
+      duration,
+      step,
+      breachMaxDepth,
+      runoffCoeff,
+      scsType2Mm,
+      routingMode,
+    };
 
     try {
-      const wasm = await loadWasm();
-      if (token !== runToken) return;
+      let versionStr = "";
+      let elapsed = 0;
+      let resData = null;
 
-      const t0 = performance.now();
-      const stem = loadedFile.name.replace(/\.[^.]+$/, "");
+      if (useWorker) {
+        try {
+          // Copy the buffer so loadedFile.bytes remains intact on the main thread for re-runs,
+          // while the copy is transferred zero-copy into the Web Worker.
+          const transferBytes = loadedFile.bytes.slice();
+          const workerRes = await workerRequest(
+            {
+              type: "run",
+              runId,
+              wasmUrl: WASM_URL,
+              mode,
+              bytes: transferBytes,
+              filename: loadedFile.name,
+              params,
+            },
+            {
+              transfer: [transferBytes.buffer],
+              onProgress: (p) => {
+                if (token !== runToken) return;
+                setProgress(p.fraction, p.stage, true);
+                if (p.message) setStatus(p.message);
+              },
+            },
+          );
+          if (token !== runToken) return;
+          workerInitialized = true;
+          versionStr = workerRes.version;
+          elapsed = workerRes.elapsedMs;
+          resData = workerRes.result;
+          if (mode === "inundation") {
+            workerSimRunId = runId;
+            workerMountsRunId = 0;
+          } else {
+            workerMountsRunId = runId;
+            workerSimRunId = 0;
+          }
+        } catch (workerErr) {
+          if (isCancelledError(workerErr) || token !== runToken) {
+            return;
+          }
+          if (!workerInitialized) {
+            // Worker startup failed (e.g. restricted environment); fall back seamlessly to main thread.
+            useWorker = false;
+            terminateWorker(workerErr);
+          } else {
+            throw workerErr;
+          }
+        }
+      }
+
+      if (!resData) {
+        // Main-thread fallback when Web Workers are unavailable
+        await nextTick();
+        const wasm = await loadWasm();
+        if (token !== runToken) return;
+        versionStr = wasm.version();
+        const t0 = performance.now();
+        setProgress(0.35, "Computing", false);
+
+        if (mode === "inundation") {
+          const sim =
+            typeof wasm.simulateInundationAdvanced === "function"
+              ? wasm.simulateInundationAdvanced(
+                  loadedFile.bytes,
+                  loadedFile.name,
+                  kernelSize,
+                  minSize,
+                  minDepth,
+                  interval,
+                  rain,
+                  duration,
+                  step,
+                  breachMaxDepth,
+                  runoffCoeff,
+                  scsType2Mm,
+                  routingMode,
+                )
+              : wasm.simulateInundation(
+                  loadedFile.bytes,
+                  loadedFile.name,
+                  kernelSize,
+                  minSize,
+                  minDepth,
+                  interval,
+                  rain,
+                  duration,
+                  step,
+                );
+          if (token !== runToken) {
+            sim.free();
+            return;
+          }
+          stopPlayer();
+          releaseSim(true);
+          clearObjectUrls();
+          currentSim = sim;
+          const rawBounds = typeof sim.boundsWgs84 === "function" ? sim.boundsWgs84() : undefined;
+          elapsed = performance.now() - t0;
+          resData = {
+            width: sim.width,
+            height: sim.height,
+            projection: sim.projection,
+            boundsWgs84: rawBounds && rawBounds.length === 4 ? Array.from(rawBounds) : null,
+            maxLevel: sim.maxLevel,
+            numRegions: sim.numRegions,
+            numSteps: sim.numSteps,
+            runoffCoeff: typeof sim.runoffCoeff === "number" ? sim.runoffCoeff : runoffCoeff,
+            hill: sim.hillshadeRgba(),
+            depth: sim.depthRgba(),
+            level: sim.levelRgba(),
+            fill: sim.fillTimeRgba(),
+            fillTimes: sim.fillTimeValues(),
+            depIds: typeof sim.depressionIdValues === "function" ? sim.depressionIdValues() : null,
+            depressionsJson: sim.depressionsJson(),
+            ratingCurvesJson:
+              typeof sim.ratingCurvesJson === "function" ? sim.ratingCurvesJson() : "[]",
+            stepsJson: sim.stepsJson(),
+            spillPathsJson: sim.spillPathsJson(),
+            inundationCurveCsv:
+              typeof sim.inundationCurveCsv === "function" ? sim.inundationCurveCsv() : "",
+            fsmMassBalanceJson:
+              typeof sim.fsmMassBalanceJson === "function" ? sim.fsmMassBalanceJson() : "null",
+            fsmBasinsJson: typeof sim.fsmBasinsJson === "function" ? sim.fsmBasinsJson() : "[]",
+            hasFsmBasinsCsv: typeof sim.fsmBasinsCsv === "function",
+          };
+        } else {
+          const hill = wasm.hillshadeRgba(loadedFile.bytes, loadedFile.name, 315.0, 45.0, 1.5);
+          const mounts = wasm.delineateMounts(
+            loadedFile.bytes,
+            loadedFile.name,
+            minSize,
+            minDepth,
+            interval,
+          );
+          if (token !== runToken) {
+            mounts.free();
+            return;
+          }
+          stopPlayer();
+          releaseSim(true);
+          clearObjectUrls();
+          currentMounts = mounts;
+          const rawBounds =
+            typeof mounts.boundsWgs84 === "function" ? mounts.boundsWgs84() : undefined;
+          elapsed = performance.now() - t0;
+          resData = {
+            width: mounts.width,
+            height: mounts.height,
+            projection: typeof mounts.projection === "string" ? mounts.projection : "",
+            boundsWgs84: rawBounds && rawBounds.length === 4 ? Array.from(rawBounds) : null,
+            maxLevel: mounts.maxLevel,
+            numRegions: mounts.numRegions,
+            hill,
+            level: mounts.levelRgba(),
+            mountIds:
+              typeof mounts.mountIdValues === "function"
+                ? mounts.mountIdValues()
+                : typeof mounts.depressionIdValues === "function"
+                  ? mounts.depressionIdValues()
+                  : null,
+            featuresJson:
+              typeof mounts.mountsJson === "function"
+                ? mounts.mountsJson()
+                : mounts.depressionsJson(),
+          };
+        }
+      } else {
+        stopPlayer();
+        releaseSim(true);
+        clearObjectUrls();
+      }
+
+      if (token !== runToken) return;
+      currentSimId = runId;
+      currentSimStem = stem;
 
       if (mode === "inundation") {
-        const sim =
-          typeof wasm.simulateInundationAdvanced === "function"
-            ? wasm.simulateInundationAdvanced(
-                loadedFile.bytes,
-                loadedFile.name,
-                kernelSize,
-                minSize,
-                minDepth,
-                interval,
-                rain,
-                duration,
-                step,
-                breachMaxDepth,
-                runoffCoeff,
-                scsType2Mm,
-                routingMode,
-              )
-            : wasm.simulateInundation(
-                loadedFile.bytes,
-                loadedFile.name,
-                kernelSize,
-                minSize,
-                minDepth,
-                interval,
-                rain,
-                duration,
-                step,
-              );
-        if (token !== runToken) {
-          sim.free();
-          return;
-        }
-        // Only discard previous results and object URLs once the new run succeeds.
-        stopPlayer();
-        releaseSim();
-        clearObjectUrls();
-        currentSim = sim;
-        currentSimStem = stem;
-
-        const elapsed = performance.now() - t0;
-        const w = sim.width;
-        const h = sim.height;
-        const areaUnit = detectAreaUnit(sim.projection);
-        const elevUnit = detectElevationUnit(sim.projection);
-        const hill = sim.hillshadeRgba();
-        const depth = sim.depthRgba();
-        const level = sim.levelRgba();
-        const fill = sim.fillTimeRgba();
-        const fillTimes = sim.fillTimeValues();
-        const depIds =
-          typeof sim.depressionIdValues === "function" ? sim.depressionIdValues() : null;
-        const depressions = JSON.parse(sim.depressionsJson());
-        const ratingCurves =
-          typeof sim.ratingCurvesJson === "function" ? JSON.parse(sim.ratingCurvesJson()) : [];
-        const steps = JSON.parse(sim.stepsJson());
-        const spillPaths = JSON.parse(sim.spillPathsJson());
-        const parsedRunoff =
-          typeof sim.inundationCurveCsv === "function"
-            ? parseInundationCurveRunoff(sim.inundationCurveCsv())
-            : null;
-        const fsmBasins =
-          typeof sim.fsmBasinsJson === "function" ? JSON.parse(sim.fsmBasinsJson()) : [];
+        const w = resData.width;
+        const h = resData.height;
+        const areaUnit = detectAreaUnit(resData.projection);
+        const elevUnit = detectElevationUnit(resData.projection);
+        const hill = resData.hill;
+        const depth = resData.depth;
+        const level = resData.level;
+        const fill = resData.fill;
+        const fillTimes = resData.fillTimes;
+        const depIds = resData.depIds;
+        const depressions = JSON.parse(resData.depressionsJson);
+        const ratingCurves = JSON.parse(resData.ratingCurvesJson || "[]");
+        const steps = JSON.parse(resData.stepsJson);
+        const spillPaths = JSON.parse(resData.spillPathsJson);
+        const parsedRunoff = resData.inundationCurveCsv
+          ? parseInundationCurveRunoff(resData.inundationCurveCsv)
+          : null;
+        const fsmBasins = JSON.parse(resData.fsmBasinsJson || "[]");
         const fsmBasinsById =
           Array.isArray(fsmBasins) && fsmBasins.length > 0
             ? new Map(fsmBasins.map((b) => [b.dep_id, b]))
@@ -2799,6 +3834,7 @@
             scsType2Mm: scsType2Mm || 0,
             runoffByStep: parsedRunoff ? parsedRunoff.byStep : null,
             runoffCurve: parsedRunoff ? parsedRunoff.curve : null,
+            boundsWgs84: resData.boundsWgs84,
           },
         );
 
@@ -2807,10 +3843,7 @@
         drawRgba($("lp-c-level"), w, h, level, hill);
         drawRgba($("lp-c-fill"), w, h, fill, hill);
 
-        const fsmMassBalance =
-          typeof sim.fsmMassBalanceJson === "function"
-            ? JSON.parse(sim.fsmMassBalanceJson())
-            : null;
+        const fsmMassBalance = JSON.parse(resData.fsmMassBalanceJson || "null");
         const summaryCards = [
           ["Raster Size", `${w} × ${h}`],
           ["Routing", fsmMassBalance !== null ? "Fill-Spill-Merge" : "Static"],
@@ -2818,9 +3851,9 @@
             "Forcing",
             scsType2Mm ? `SCS Type II (${scsType2Mm.toFixed(0)} mm)` : `Constant (${rain} cm/h)`,
           ],
-          ["Sink Regions", String(sim.numRegions)],
+          ["Sink Regions", String(resData.numRegions)],
           ["Nested Depressions", String(depressions.length)],
-          ["Max Level", String(sim.maxLevel)],
+          ["Max Level", String(resData.maxLevel)],
           ["Time Steps", String(steps.length)],
           ["Spill Paths", String(spillPaths.length)],
           ["Final Inundated", lastStep ? `${(lastStep.inundated_fraction * 100).toFixed(1)}%` : "0%"],
@@ -2842,10 +3875,6 @@
         }
         renderSummary(summaryCards);
 
-        const requireSim = () => {
-          if (!currentSim) throw new Error("No active inundation simulation");
-          return currentSim;
-        };
         const downloadItems = [
           {
             label: "Export PNG Snapshot (Scale + Legend)",
@@ -2853,26 +3882,81 @@
             getData: () => {
               const showSpills = $("lp-spill-paths") ? $("lp-spill-paths").checked : true;
               const idx = player ? player.stepIdx : 0;
-              return requireSim().renderFramePng(idx, true, true, showSpills);
+              return fetchExportAsset("pngSnapshot", {
+                stepIdx: idx,
+                showScaleBar: true,
+                showLegend: true,
+                showSpills,
+              });
             },
             mime: "image/png",
           },
-          { label: "Depressions GeoJSON", filename: `${stem}_depressions.geojson`, getData: () => requireSim().depressionsGeojson(), mime: "application/geo+json" },
-          { label: "Spill Flow Paths GeoJSON", filename: `${stem}_spill_paths.geojson`, getData: () => requireSim().spillPathsGeojson(), mime: "application/geo+json" },
-          { label: "Connectivity Graph JSON", filename: `${stem}_connectivity_graph.json`, getData: () => requireSim().connectivityGraphJson(), mime: "application/json" },
-          { label: "Connectivity GraphML", filename: `${stem}_connectivity_graph.graphml`, getData: () => requireSim().connectivityGraphml(), mime: "application/xml" },
-          { label: "Rating Curves CSV", filename: `${stem}_rating_curves.csv`, getData: () => requireSim().ratingCurvesCsv(), mime: "text/csv" },
-          { label: "Inundation Curve CSV", filename: `${stem}_inundation_curve.csv`, getData: () => requireSim().inundationCurveCsv(), mime: "text/csv" },
-          { label: "Depression Level GeoTIFF", filename: `${stem}_level.tif`, getData: () => requireSim().levelTif(), mime: "image/tiff" },
-          { label: "Fill Time GeoTIFF", filename: `${stem}_fill_time.tif`, getData: () => requireSim().fillTimeTif(), mime: "image/tiff" },
-          { label: "Catchment Hierarchy GeoTIFF", filename: `${stem}_catchment_hir.tif`, getData: () => requireSim().catchmentHirTif(), mime: "image/tiff" },
-          { label: "Sink GeoTIFF", filename: `${stem}_sink.tif`, getData: () => requireSim().sinkTif(), mime: "image/tiff" },
+          {
+            label: "Depressions GeoJSON",
+            filename: `${stem}_depressions.geojson`,
+            getData: () => fetchExportAsset("depressionsGeojson"),
+            mime: "application/geo+json",
+          },
+          {
+            label: "Spill Flow Paths GeoJSON",
+            filename: `${stem}_spill_paths.geojson`,
+            getData: () => fetchExportAsset("spillPathsGeojson"),
+            mime: "application/geo+json",
+          },
+          {
+            label: "Connectivity Graph JSON",
+            filename: `${stem}_connectivity_graph.json`,
+            getData: () => fetchExportAsset("connectivityGraphJson"),
+            mime: "application/json",
+          },
+          {
+            label: "Connectivity GraphML",
+            filename: `${stem}_connectivity_graph.graphml`,
+            getData: () => fetchExportAsset("connectivityGraphml"),
+            mime: "application/xml",
+          },
+          {
+            label: "Rating Curves CSV",
+            filename: `${stem}_rating_curves.csv`,
+            getData: () => fetchExportAsset("ratingCurvesCsv"),
+            mime: "text/csv",
+          },
+          {
+            label: "Inundation Curve CSV",
+            filename: `${stem}_inundation_curve.csv`,
+            getData: () => fetchExportAsset("inundationCurveCsv"),
+            mime: "text/csv",
+          },
+          {
+            label: "Depression Level GeoTIFF",
+            filename: `${stem}_level.tif`,
+            getData: () => fetchExportAsset("levelTif"),
+            mime: "image/tiff",
+          },
+          {
+            label: "Fill Time GeoTIFF",
+            filename: `${stem}_fill_time.tif`,
+            getData: () => fetchExportAsset("fillTimeTif"),
+            mime: "image/tiff",
+          },
+          {
+            label: "Catchment Hierarchy GeoTIFF",
+            filename: `${stem}_catchment_hir.tif`,
+            getData: () => fetchExportAsset("catchmentHirTif"),
+            mime: "image/tiff",
+          },
+          {
+            label: "Sink GeoTIFF",
+            filename: `${stem}_sink.tif`,
+            getData: () => fetchExportAsset("sinkTif"),
+            mime: "image/tiff",
+          },
         ];
-        if (fsmMassBalance && typeof sim.fsmBasinsCsv === "function") {
+        if (fsmMassBalance && resData.hasFsmBasinsCsv) {
           const fsmItem = {
             label: "FSM Basins CSV",
             filename: `${stem}_fsm_basins.csv`,
-            getData: () => requireSim().fsmBasinsCsv(),
+            getData: () => fetchExportAsset("fsmBasinsCsv"),
             mime: "text/csv",
           };
           const curveIdx = downloadItems.findIndex((item) => item.label === "Inundation Curve CSV");
@@ -2886,125 +3970,121 @@
 
         renderTable(depressions);
         setStatus(
-          `lidar-rs ${wasm.version()}: simulated ${steps.length} inundation steps across ${depressions.length} nested depressions (${sim.maxLevel} levels) in ${elapsed.toFixed(0)} ms.`,
+          `lidar-rs ${versionStr}: simulated ${steps.length} inundation steps across ${depressions.length} nested depressions (${resData.maxLevel} levels) in ${elapsed.toFixed(0)} ms.`,
         );
       } else {
-        const hill = wasm.hillshadeRgba(loadedFile.bytes, loadedFile.name, 315.0, 45.0, 1.5);
-        const mounts = wasm.delineateMounts(
-          loadedFile.bytes,
-          loadedFile.name,
-          minSize,
-          minDepth,
-          interval,
-        );
-        try {
-          if (token !== runToken) return;
-          stopPlayer();
-          releaseSim();
-          clearObjectUrls();
-          player = null;
+        const w = resData.width;
+        const h = resData.height;
+        const areaUnit = detectAreaUnit(resData.projection);
+        const elevUnit = detectElevationUnit(resData.projection);
+        const hill = resData.hill;
+        const level = resData.level;
+        const mountIds = resData.mountIds;
+        const features = JSON.parse(resData.featuresJson || "[]");
 
-          const elapsed = performance.now() - t0;
-          const w = mounts.width;
-          const h = mounts.height;
-          const projection = typeof mounts.projection === "string" ? mounts.projection : "";
-          const areaUnit = detectAreaUnit(projection);
-          const elevUnit = detectElevationUnit(projection);
-          const level = mounts.levelRgba();
-          const mountIds =
-            typeof mounts.mountIdValues === "function"
-              ? mounts.mountIdValues()
-              : typeof mounts.depressionIdValues === "function"
-                ? mounts.depressionIdValues()
-                : null;
-          const features = JSON.parse(
-            typeof mounts.mountsJson === "function" ? mounts.mountsJson() : mounts.depressionsJson(),
-          );
-
-          $("lp-results").hidden = false;
-          $("lp-player-section").hidden = false;
-          if ($("lp-player-heading")) $("lp-player-heading").textContent = "Interactive Mount / Canopy Hierarchy";
-          if ($("lp-player-bar")) $("lp-player-bar").hidden = true;
-          if ($("lp-chart-wrap")) $("lp-chart-wrap").hidden = true;
-          if ($("lp-tree-title")) $("lp-tree-title").textContent = "Mount Tree Graph";
-          if ($("lp-tree-desc")) {
-            $("lp-tree-desc").textContent =
-              "Nested hierarchy of elevated features (peaks, buildings, or tree canopies) from leaf peaks (Level 1) to enclosing mounts. Click any node to inspect.";
-          }
-          if ($("lp-tree-outline-wrap")) $("lp-tree-outline-wrap").hidden = true;
-          if ($("lp-tree-gif-btn")) $("lp-tree-gif-btn").hidden = true;
-          if ($("lp-th-depth")) $("lp-th-depth").textContent = "Max Height";
-          $("lp-fig-depth").hidden = true;
-          $("lp-fig-fill").hidden = true;
-          $("lp-cap-level").textContent = "Nested Mount / Canopy Levels (over hillshade)";
-          const gifLinkRow = $("lp-gif-link-row");
-          if (gifLinkRow) gifLinkRow.hidden = true;
-          const gifPreviewLink = $("lp-gif-preview-link");
-          if (gifPreviewLink) {
-            gifPreviewLink.textContent = "Preview exported animated GIF";
-            gifPreviewLink.setAttribute("aria-expanded", "false");
-          }
-          const gifWrap = $("lp-gif-wrap");
-          if (gifWrap) gifWrap.hidden = true;
-          const gifImg = $("lp-gif");
-          if (gifImg) gifImg.removeAttribute("src");
-
-          initPlayer(
-            w,
-            h,
-            hill,
-            null,
-            mountIds,
-            features,
-            [],
-            [],
-            [],
-            0,
-            1.0,
-            areaUnit,
-            elevUnit,
-            null,
-            {
-              kind: "mounts",
-              levelRgba: level,
-            },
-          );
-
-          drawRgba($("lp-c-hillshade"), w, h, hill, null);
-          drawRgba($("lp-c-level"), w, h, level, hill);
-
-          renderSummary([
-            ["Raster Size", `${w} × ${h}`],
-            ["Mount Regions", String(mounts.numRegions)],
-            ["Nested Mounts", String(features.length)],
-            ["Max Level", String(mounts.maxLevel)],
-            ["WASM Runtime", `${elapsed.toFixed(0)} ms`],
-          ]);
-
-          renderDownloads(
-            [
-              { label: "Mounts GeoJSON", filename: `${stem}_mounts.geojson`, data: mounts.geojson(), mime: "application/geo+json" },
-              { label: "Mount Level GeoTIFF", filename: `${stem}_mount_level.tif`, data: mounts.levelTif(), mime: "image/tiff" },
-              { label: "Mount ID GeoTIFF", filename: `${stem}_mount_id.tif`, data: mounts.idTif(), mime: "image/tiff" },
-            ],
-            false,
-          );
-
-          renderTable(features);
-          setStatus(
-            `lidar-rs ${wasm.version()}: delineated ${features.length} nested mounts across ${mounts.maxLevel} levels in ${elapsed.toFixed(0)} ms.`,
-          );
-        } finally {
-          mounts.free();
+        $("lp-results").hidden = false;
+        $("lp-player-section").hidden = false;
+        if ($("lp-player-heading")) $("lp-player-heading").textContent = "Interactive Mount / Canopy Hierarchy";
+        if ($("lp-player-bar")) $("lp-player-bar").hidden = true;
+        if ($("lp-chart-wrap")) $("lp-chart-wrap").hidden = true;
+        if ($("lp-tree-title")) $("lp-tree-title").textContent = "Mount Tree Graph";
+        if ($("lp-tree-desc")) {
+          $("lp-tree-desc").textContent =
+            "Nested hierarchy of elevated features (peaks, buildings, or tree canopies) from leaf peaks (Level 1) to enclosing mounts. Click any node to inspect.";
         }
+        if ($("lp-tree-outline-wrap")) $("lp-tree-outline-wrap").hidden = true;
+        if ($("lp-tree-gif-btn")) $("lp-tree-gif-btn").hidden = true;
+        if ($("lp-th-depth")) $("lp-th-depth").textContent = "Max Height";
+        $("lp-fig-depth").hidden = true;
+        $("lp-fig-fill").hidden = true;
+        $("lp-cap-level").textContent = "Nested Mount / Canopy Levels (over hillshade)";
+        const gifLinkRow = $("lp-gif-link-row");
+        if (gifLinkRow) gifLinkRow.hidden = true;
+        const gifPreviewLink = $("lp-gif-preview-link");
+        if (gifPreviewLink) {
+          gifPreviewLink.textContent = "Preview exported animated GIF";
+          gifPreviewLink.setAttribute("aria-expanded", "false");
+        }
+        const gifWrap = $("lp-gif-wrap");
+        if (gifWrap) gifWrap.hidden = true;
+        const gifImg = $("lp-gif");
+        if (gifImg) gifImg.removeAttribute("src");
+
+        initPlayer(
+          w,
+          h,
+          hill,
+          null,
+          mountIds,
+          features,
+          [],
+          [],
+          [],
+          0,
+          1.0,
+          areaUnit,
+          elevUnit,
+          null,
+          {
+            kind: "mounts",
+            levelRgba: level,
+            boundsWgs84: resData.boundsWgs84,
+          },
+        );
+
+        drawRgba($("lp-c-hillshade"), w, h, hill, null);
+        drawRgba($("lp-c-level"), w, h, level, hill);
+
+        renderSummary([
+          ["Raster Size", `${w} × ${h}`],
+          ["Mount Regions", String(resData.numRegions)],
+          ["Nested Mounts", String(features.length)],
+          ["Max Level", String(resData.maxLevel)],
+          ["WASM Runtime", `${elapsed.toFixed(0)} ms`],
+        ]);
+
+        renderDownloads(
+          [
+            {
+              label: "Mounts GeoJSON",
+              filename: `${stem}_mounts.geojson`,
+              getData: () => fetchExportAsset("mountsGeojson"),
+              mime: "application/geo+json",
+            },
+            {
+              label: "Mount Level GeoTIFF",
+              filename: `${stem}_mount_level.tif`,
+              getData: () => fetchExportAsset("mountLevelTif"),
+              mime: "image/tiff",
+            },
+            {
+              label: "Mount ID GeoTIFF",
+              filename: `${stem}_mount_id.tif`,
+              getData: () => fetchExportAsset("mountIdTif"),
+              mime: "image/tiff",
+            },
+          ],
+          false,
+        );
+
+        renderTable(features);
+        setStatus(
+          `lidar-rs ${versionStr}: delineated ${features.length} nested mounts across ${resData.maxLevel} levels in ${elapsed.toFixed(0)} ms.`,
+        );
       }
     } catch (e) {
-      if (token === runToken) {
+      if (token === runToken && !isCancelledError(e)) {
         setStatus(`Analysis failed: ${errMsg(e)}`, true);
       }
     } finally {
-      if (token === runToken && $("lp-run")) {
-        $("lp-run").disabled = !loadedFile;
+      if (token === runToken) {
+        if (activeJobKind === "run") {
+          activeJobKind = null;
+          clearProgress();
+        }
+        if ($("lp-run")) {
+          $("lp-run").disabled = !loadedFile;
+        }
       }
     }
   }
@@ -3053,7 +4133,10 @@
       loadGeneration++;
       runToken++;
       stopPlayer();
+      destroyLeafletMap();
+      terminateWorker(createCancelledError());
       releaseSim();
+      clearProgress();
       player = null;
       clearObjectUrls();
       loadedFile = null;
@@ -3063,13 +4146,35 @@
     root.dataset.ready = "1";
 
     syncModeFields();
-    loadWasm().then(
-      (m) =>
+    initEngine().then(
+      ({ version, mode }) =>
         setStatus(
-          `lidar-rs ${m.version()} WebAssembly is ready. Drop a GeoTIFF or click a sample below.`,
+          `lidar-rs ${version} WebAssembly is ready (${mode === "worker" ? "Web Worker" : "main thread"}). Drop a GeoTIFF or click a sample below.`,
         ),
       (e) => setStatus(`Could not load lidar-rs WebAssembly module: ${errMsg(e)}`, true),
     );
+
+    const cancelBtn = $("lp-cancel");
+    if (cancelBtn) cancelBtn.addEventListener("click", cancelActiveWork);
+    const viewCanvasBtn = $("lp-view-canvas");
+    if (viewCanvasBtn) viewCanvasBtn.addEventListener("click", () => setActiveView("canvas"));
+    const viewMapBtn = $("lp-view-map");
+    if (viewMapBtn) viewMapBtn.addEventListener("click", () => setActiveView("map"));
+    const mapStyleSel = $("lp-map-style");
+    if (mapStyleSel) {
+      mapStyleSel.addEventListener("change", () => {
+        refreshLeafletSelection();
+      });
+    }
+    const mapFitBtn = $("lp-map-fit");
+    if (mapFitBtn) {
+      mapFitBtn.addEventListener("click", () => {
+        if (leafletState.map) {
+          leafletState.map.invalidateSize();
+          fitLeafletBounds();
+        }
+      });
+    }
 
     $("lp-mode").addEventListener("change", syncModeFields);
     $("lp-run").addEventListener("click", runAnalysis);
@@ -3088,7 +4193,7 @@
     const gifWrap = $("lp-gif-wrap");
     if (gifPreviewLink && gifWrap) {
       gifPreviewLink.addEventListener("click", () => {
-        if (!currentSim) return;
+        if (!hasActiveSimulation()) return;
         const opening = gifWrap.hidden;
         gifWrap.hidden = !opening;
         gifPreviewLink.setAttribute("aria-expanded", opening ? "true" : "false");
@@ -3096,7 +4201,11 @@
           ? "Hide animated GIF preview"
           : "Preview exported animated GIF";
         if (opening && (!cachedGifUrl || cachedGifKey !== currentGifOptions().key)) {
-          ensureGifUrl().catch((err) => setStatus(`GIF preview failed: ${errMsg(err)}`, true));
+          ensureGifUrl().catch((err) => {
+            if (!isCancelledError(err)) {
+              setStatus(`GIF preview failed: ${errMsg(err)}`, true);
+            }
+          });
         }
       });
     }
@@ -3106,8 +4215,12 @@
       const gifImg = $("lp-gif");
       if (gifImg) gifImg.removeAttribute("src");
       invalidateCachedGif();
-      if (gifWrap && !gifWrap.hidden && currentSim) {
-        ensureGifUrl().catch((e) => setStatus(`GIF preview failed: ${errMsg(e)}`, true));
+      if (gifWrap && !gifWrap.hidden && hasActiveSimulation()) {
+        ensureGifUrl().catch((e) => {
+          if (!isCancelledError(e)) {
+            setStatus(`GIF preview failed: ${errMsg(e)}`, true);
+          }
+        });
       }
     };
     $("lp-pingpong").addEventListener("change", refreshGifOptions);
@@ -3384,6 +4497,9 @@
     resizeRaf = window.requestAnimationFrame(() => {
       resizeRaf = 0;
       if (player) renderDepressionTree();
+      if (leafletState.map && leafletState.activeView === "map") {
+        leafletState.map.invalidateSize();
+      }
     });
   });
 

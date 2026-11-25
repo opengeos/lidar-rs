@@ -1,0 +1,82 @@
+{
+  "name": "@opengeos/lidar-js",
+  "version": "0.5.0",
+  "description": "WebAssembly bindings for lidar-rs: nested surface depression and mount delineation, hydro-conditioning, and inundation simulation in browsers and Node.js (zero GDAL)",
+  "type": "module",
+  "main": "./pkg-node/lidar_js.js",
+  "module": "./pkg/lidar_js.js",
+  "types": "./lidar_js.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lidar_js.d.ts",
+      "node": "./pkg-node/lidar_js.js",
+      "browser": "./pkg/lidar_js.js",
+      "import": "./pkg/lidar_js.js",
+      "require": "./pkg-node/lidar_js.js",
+      "default": "./pkg/lidar_js.js"
+    },
+    "./web": {
+      "types": "./lidar_js.d.ts",
+      "import": "./pkg/lidar_js.js",
+      "default": "./pkg/lidar_js.js"
+    },
+    "./node": {
+      "types": "./lidar_js.d.ts",
+      "require": "./pkg-node/lidar_js.js",
+      "default": "./pkg-node/lidar_js.js"
+    },
+    "./bundler": {
+      "types": "./lidar_js.d.ts",
+      "import": "./pkg-bundler/lidar_js.js",
+      "default": "./pkg-bundler/lidar_js.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "pkg/",
+    "pkg-node/",
+    "pkg-bundler/",
+    "lidar_js.d.ts",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "scripts": {
+    "build:web": "wasm-pack build --target web --release --out-dir pkg -- --locked",
+    "build:node": "wasm-pack build --target nodejs --release --out-dir pkg-node -- --locked",
+    "build:bundler": "wasm-pack build --target bundler --release --out-dir pkg-bundler -- --locked",
+    "build": "npm run build:web && npm run build:node && npm run build:bundler",
+    "test": "node test.mjs",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "license": "GPL-3.0-only",
+  "author": "Qiusheng Wu <giswqs@gmail.com>",
+  "homepage": "https://lidar-rs.opengeos.org/javascript/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/opengeos/lidar-rs.git",
+    "directory": "js"
+  },
+  "bugs": {
+    "url": "https://github.com/opengeos/lidar-rs/issues"
+  },
+  "keywords": [
+    "lidar",
+    "dem",
+    "dsm",
+    "hydrology",
+    "depressions",
+    "inundation",
+    "fill-spill-merge",
+    "geospatial",
+    "gis",
+    "geotiff",
+    "wasm",
+    "webassembly",
+    "rust"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "sideEffects": false
+}
