@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use richdem::{Array2D, DemNum};
+use richdem::{Array2D, DemNum, Topology, load_raster};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use terrio::crs::SpatialRef;
@@ -19,8 +19,10 @@ use terrio::{
 
 use crate::catchment::CatchmentHierarchyRecord;
 use crate::error::{Error, Result};
+use crate::filling::extract_sinks_in_memory;
+use crate::filtering::median_filter;
 use crate::inundation::{SpillFlowPath, validate_grid_alignment};
-use crate::slicing::{InMemoryDepressions, NestedDepression};
+use crate::slicing::{InMemoryDepressions, NestedDepression, delineate_depressions_in_memory};
 
 /// One elevation sample on a depression's stage-storage-area rating curve.
 #[derive(Debug, Clone, PartialEq)]
@@ -168,6 +170,69 @@ pub fn compute_rating_curves(
     Ok(curves)
 }
 
+/// Options controlling [`compute_rating_curves_from_dem`].
+#[derive(Debug, Clone)]
+pub struct RatingCurvesFromDemOptions {
+    /// Treat input raster as a pre-extracted sink elevation raster (default `false`).
+    pub is_sink: bool,
+    /// Median filter kernel size when `is_sink == false` (`<= 1` skips smoothing; default `3`).
+    pub kernel_size: usize,
+    /// Minimum depression area in pixels (default `1000`).
+    pub min_size: usize,
+    /// Minimum depression depth (default `0.3`).
+    pub min_depth: f64,
+    /// Vertical level-set slicing interval (default `0.3`).
+    pub interval: f64,
+    /// Optional stage sampling interval for rating curves (defaults to `interval.abs()`).
+    pub curve_interval: Option<f64>,
+    /// Connectivity topology for sink extraction (default `Topology::D8`).
+    pub topology: Topology,
+}
+
+impl Default for RatingCurvesFromDemOptions {
+    fn default() -> Self {
+        Self {
+            is_sink: false,
+            kernel_size: 3,
+            min_size: 1000,
+            min_depth: 0.3,
+            interval: 0.3,
+            curve_interval: None,
+            topology: Topology::D8,
+        }
+    }
+}
+
+/// Computes stage-storage-area rating curves directly from a DEM (or pre-extracted sink)
+/// raster file, returning `(num_depressions, rating_curve_points)`.
+pub fn compute_rating_curves_from_dem(
+    in_dem: impl AsRef<Path>,
+    options: &RatingCurvesFromDemOptions,
+) -> Result<(usize, Vec<RatingCurvePoint>)> {
+    let sink = if options.is_sink {
+        load_raster::<f64>(in_dem, None)?
+    } else {
+        let raw = load_raster::<f64>(in_dem, None)?;
+        let dem = if options.kernel_size > 1 {
+            median_filter(&raw, options.kernel_size)?
+        } else {
+            raw
+        };
+        extract_sinks_in_memory(&dem, options.min_size, options.topology)?.sink
+    };
+    let deps = delineate_depressions_in_memory(
+        &sink,
+        options.min_size,
+        options.min_depth,
+        options.interval,
+    )?;
+    let step = options
+        .curve_interval
+        .unwrap_or_else(|| options.interval.abs());
+    let points = compute_rating_curves(&sink, &deps, step)?;
+    Ok((deps.depressions.len(), points))
+}
+
 /// Writes stage-storage-area rating curves to CSV.
 pub fn write_rating_curves_csv(points: &[RatingCurvePoint], path: impl AsRef<Path>) -> Result<()> {
     let path = path.as_ref();
@@ -231,6 +296,13 @@ pub struct ConnectivityGraph {
     pub rain_intensity_cm_h: f64,
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
+}
+
+impl ConnectivityGraph {
+    /// Formats all graph edges as a CSV string (`from_id,to_id,edge_type,...`).
+    pub fn to_edge_csv(&self) -> String {
+        connectivity_graph_edges_to_csv_string(self)
+    }
 }
 
 #[inline]
@@ -905,6 +977,50 @@ pub fn write_connectivity_graphml(graph: &ConnectivityGraph, path: impl AsRef<Pa
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, connectivity_graph_to_graphml_string(graph))?;
+    Ok(())
+}
+
+/// Formats all edges of a [`ConnectivityGraph`] as a CSV string.
+pub fn connectivity_graph_edges_to_csv_string(graph: &ConnectivityGraph) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from(
+        "from_id,to_id,edge_type,spill_time_h,spill_runoff_mm,merge_time_h,spill_elev,length_m,dist_to_stream\n",
+    );
+    let fmt_opt = |v: Option<f64>| -> String {
+        v.filter(|x| x.is_finite())
+            .map(|x| format!("{x:.6}"))
+            .unwrap_or_default()
+    };
+    for e in &graph.edges {
+        let _ = writeln!(
+            out,
+            "{},{},{},{},{},{},{},{:.4},{}",
+            e.from_id,
+            e.to_id,
+            e.edge_type,
+            fmt_opt(e.spill_time_h),
+            fmt_opt(e.spill_runoff_mm),
+            fmt_opt(e.merge_time_h),
+            fmt_opt(e.spill_elev),
+            e.length_m,
+            fmt_opt(e.dist_to_stream),
+        );
+    }
+    out
+}
+
+/// Writes the edge table of a [`ConnectivityGraph`] to CSV.
+pub fn write_connectivity_graph_edges_csv(
+    graph: &ConnectivityGraph,
+    path: impl AsRef<Path>,
+) -> Result<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, connectivity_graph_edges_to_csv_string(graph))?;
     Ok(())
 }
 

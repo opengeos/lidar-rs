@@ -47,6 +47,7 @@ use crate::graph::{
     build_connectivity_graph, compute_rating_curves, write_connectivity_graphml,
     write_rating_curves_csv, write_spill_paths_vector,
 };
+use crate::progress::ExecutionControl;
 use crate::raster_ops::ensure_no_path_collision;
 use crate::region::{region_basic_stats, region_group};
 use crate::slicing::{
@@ -1334,16 +1335,64 @@ pub struct InundationForcing<'a> {
     pub hyetograph: Option<&'a [(f64, f64)]>,
 }
 
-/// Converts an NRCS Curve Number (`CN` in `(0, 100]`) raster and storm precipitation
-/// depth (`precip_mm > 0`) into a spatially variable effective runoff-coefficient raster
-/// (`Q / P` in `[0, 1]`) using the standard NRCS TR-55 rainfall-runoff equation
-/// (`S = 25400 / CN - 254`, `Ia = 0.2 * S`).
+/// Computes scalar NRCS TR-55 storm runoff depth (mm) and effective runoff coefficient (`Q / P`)
+/// from a uniform Curve Number `cn` in `(0, 100]`, precipitation depth `precip_mm > 0`, and
+/// initial abstraction ratio `ia_ratio >= 0` (`Ia = ia_ratio * S`, standard TR-55 default `0.2`).
 ///
-/// Non-finite and NoData CN cells propagate as NoData (`-9999.0`) in the output raster.
-pub fn scs_curve_number_runoff(cn: &Array2D<f64>, precip_mm: f64) -> Result<Array2D<f64>> {
+/// Returns `(runoff_mm, runoff_coeff)`.
+pub fn scs_curve_number_runoff_scalar(
+    cn: f64,
+    precip_mm: f64,
+    ia_ratio: f64,
+) -> Result<(f64, f64)> {
+    if !cn.is_finite() || cn <= 0.0 || cn > 100.0 {
+        return Err(Error::InvalidArgument(format!(
+            "cn must be finite and in (0, 100], got {cn}"
+        )));
+    }
     if !precip_mm.is_finite() || precip_mm <= 0.0 {
         return Err(Error::InvalidArgument(format!(
             "precip_mm must be finite and > 0, got {precip_mm}"
+        )));
+    }
+    if !ia_ratio.is_finite() || ia_ratio < 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "ia_ratio must be finite and >= 0, got {ia_ratio}"
+        )));
+    }
+    let s = 25_400.0 / cn - 254.0;
+    if s <= 0.0 {
+        return Ok((precip_mm, 1.0));
+    }
+    let ia = ia_ratio * s;
+    if !s.is_finite() || !ia.is_finite() || precip_mm <= ia {
+        Ok((0.0, 0.0))
+    } else {
+        let q = (precip_mm - ia).powi(2) / (precip_mm - ia + s);
+        let rc = (q / precip_mm).clamp(0.0, 1.0);
+        Ok((rc * precip_mm, rc))
+    }
+}
+
+/// Converts an NRCS Curve Number (`CN` in `(0, 100]`) raster and storm precipitation
+/// depth (`precip_mm > 0`) into a spatially variable effective runoff-coefficient raster
+/// (`Q / P` in `[0, 1]`) using the NRCS TR-55 rainfall-runoff equation with configurable
+/// initial abstraction ratio `ia_ratio >= 0` (`S = 25400 / CN - 254`, `Ia = ia_ratio * S`).
+///
+/// Non-finite and NoData CN cells propagate as NoData (`-9999.0`) in the output raster.
+pub fn scs_curve_number_runoff_with_ia(
+    cn: &Array2D<f64>,
+    precip_mm: f64,
+    ia_ratio: f64,
+) -> Result<Array2D<f64>> {
+    if !precip_mm.is_finite() || precip_mm <= 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "precip_mm must be finite and > 0, got {precip_mm}"
+        )));
+    }
+    if !ia_ratio.is_finite() || ia_ratio < 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "ia_ratio must be finite and >= 0, got {ia_ratio}"
         )));
     }
     const OUT_NODATA: f64 = -9999.0;
@@ -1360,7 +1409,10 @@ pub fn scs_curve_number_runoff(cn: &Array2D<f64>, precip_mm: f64) -> Result<Arra
             }
             let c = v.min(100.0);
             let s = 25_400.0 / c - 254.0;
-            let ia = 0.2 * s;
+            if s <= 0.0 {
+                return 1.0;
+            }
+            let ia = ia_ratio * s;
             if !s.is_finite() || !ia.is_finite() || precip_mm <= ia {
                 0.0
             } else {
@@ -1373,6 +1425,51 @@ pub fn scs_curve_number_runoff(cn: &Array2D<f64>, precip_mm: f64) -> Result<Arra
     out.copy_metadata_from(cn);
     out.set_no_data(OUT_NODATA);
     Ok(out)
+}
+
+/// Builds a spatially uniform effective runoff-coefficient raster aligned to `dem_path`
+/// from a scalar NRCS Curve Number `cn_value` in `(0, 100]` and storm depth `precip_mm > 0`.
+pub fn uniform_runoff_coeff_raster_for_cn(
+    dem_path: impl AsRef<Path>,
+    cn_value: f64,
+    precip_mm: f64,
+) -> Result<Array2D<f64>> {
+    let dem_path = dem_path.as_ref();
+    let (_, rc_scalar) = scs_curve_number_runoff_scalar(cn_value, precip_mm, 0.2)?;
+
+    let (width, height, geotransform, projection) = if let Some(p_str) = dem_path.to_str()
+        && let Ok(lazy) = terrio::open_raster_lazy(p_str)
+    {
+        let crs = lazy.crs();
+        let proj = crs.to_wkt().or_else(|| crs.to_proj4()).unwrap_or_default();
+        (lazy.width(), lazy.height(), lazy.geo_transform(), proj)
+    } else {
+        let dem = load_raster::<f64>(dem_path, None)?;
+        (
+            dem.width(),
+            dem.height(),
+            dem.geotransform,
+            dem.projection.clone(),
+        )
+    };
+    let n = width.checked_mul(height).ok_or_else(|| {
+        Error::DimensionMismatch(format!("raster dimensions overflow ({width}x{height})"))
+    })?;
+    let mut rc_arr = Array2D::from_vec(width, height, vec![rc_scalar; n])?;
+    rc_arr.geotransform = geotransform;
+    rc_arr.projection = projection;
+    rc_arr.set_no_data(-9999.0);
+    Ok(rc_arr)
+}
+
+/// Converts an NRCS Curve Number (`CN` in `(0, 100]`) raster and storm precipitation
+/// depth (`precip_mm > 0`) into a spatially variable effective runoff-coefficient raster
+/// (`Q / P` in `[0, 1]`) using the standard NRCS TR-55 rainfall-runoff equation
+/// (`S = 25400 / CN - 254`, `Ia = 0.2 * S`).
+///
+/// Non-finite and NoData CN cells propagate as NoData (`-9999.0`) in the output raster.
+pub fn scs_curve_number_runoff(cn: &Array2D<f64>, precip_mm: f64) -> Result<Array2D<f64>> {
+    scs_curve_number_runoff_with_ia(cn, precip_mm, 0.2)
 }
 
 /// Official NRCS TR-55 (1986) 24-hour synthetic rainfall distribution types.
@@ -2823,6 +2920,20 @@ pub struct InMemoryFullPipelineOptions<'a> {
     pub stream_vector: Option<&'a Path>,
 }
 
+impl Default for InMemoryFullPipelineOptions<'_> {
+    fn default() -> Self {
+        Self {
+            kernel_size: 3,
+            breach: None,
+            simulation: SimulateInundationOptions::default(),
+            routing: RoutingMode::Static,
+            forcing: InundationForcing::default(),
+            scalar_runoff_coeff: 1.0,
+            stream_vector: None,
+        }
+    }
+}
+
 /// Complete in-memory outputs from [`run_full_pipeline_in_memory`].
 pub struct InMemoryFullPipeline {
     pub sinks: InMemorySinks,
@@ -3146,9 +3257,25 @@ pub fn run_pipeline(
     out_dir: impl AsRef<Path>,
     options: &RunPipelineOptions,
 ) -> Result<RunPipelineResult> {
+    run_pipeline_with_control(in_dem, out_dir, options, &ExecutionControl::default())
+}
+
+/// Runs [`run_pipeline`] with progress reporting and cooperative cancellation via
+/// [`ExecutionControl`].
+///
+/// Reports progress across each pipeline stage (`load`, `filter`, `condition`,
+/// `extract_sinks`, `delineate`, `catchments`, `inundation`, `save_outputs`, `complete`)
+/// and checks `control.check_cancelled()` between stages so cancellation aborts cleanly
+/// with [`Error::Cancelled`].
+pub fn run_pipeline_with_control(
+    in_dem: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+    options: &RunPipelineOptions,
+    control: &ExecutionControl,
+) -> Result<RunPipelineResult> {
+    control.check_cancelled()?;
     let in_dem = in_dem.as_ref();
     let out_dir = out_dir.as_ref();
-    std::fs::create_dir_all(out_dir)?;
 
     let num_steps =
         validate_options_with_hyetograph(&options.simulation, options.hyetograph.is_some())?;
@@ -3213,6 +3340,30 @@ pub fn run_pipeline(
         crate::raster_ops::ensure_no_path_collision(opt_in, &candidate_refs)?;
     }
 
+    control.check_cancelled()?;
+    control.report(
+        "load",
+        0.05,
+        Some(format!("Loading DEM {}", in_dem.display())),
+    );
+    control.check_cancelled()?;
+    std::fs::create_dir_all(out_dir)?;
+    // Recheck collisions after `out_dir` exists so non-canonical paths like
+    // `<new_dir>/../dem.tif` resolve via canonicalization before any writes.
+    crate::raster_ops::ensure_no_path_collision(in_dem, &candidate_refs)?;
+    for opt_in in [
+        options.culverts_vector.as_deref(),
+        options.runoff_coeff_path.as_deref(),
+        options.infiltration_path.as_deref(),
+        options.antecedent_depth_path.as_deref(),
+        options.stream_vector.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        crate::raster_ops::ensure_no_path_collision(opt_in, &candidate_refs)?;
+    }
+
     let mut dem = if options.use_f32 {
         let d32 = load_raster::<f32>(in_dem, None)?;
         let nd32 = d32.no_data();
@@ -3242,24 +3393,62 @@ pub fn run_pipeline(
 
     // Smooth raw DEM noise FIRST, then apply culvert burning and selective breaching so a
     // median filter never smooths away a 1-cell culvert cut or breach channel.
+    control.check_cancelled()?;
     if options.kernel_size > 1 {
+        control.report(
+            "filter",
+            0.15,
+            Some(format!(
+                "Applying {}x{} median filter",
+                options.kernel_size, options.kernel_size
+            )),
+        );
         dem = median_filter(&dem, options.kernel_size)?;
     }
-    if let Some(ref culv) = options.culverts_vector {
-        let (burned, _) = burn_culverts(&dem, culv, &options.burn_culverts)?;
-        dem = burned;
-    }
-    if let Some(ref breach_opts) = options.breach {
-        dem = breach_depressions(&dem, breach_opts)?;
+    control.check_cancelled()?;
+    if options.culverts_vector.is_some() || options.breach.is_some() {
+        control.report(
+            "condition",
+            0.25,
+            Some("Applying hydro-conditioning (culverts / breaching)".into()),
+        );
+        if let Some(ref culv) = options.culverts_vector {
+            let (burned, _) = burn_culverts(&dem, culv, &options.burn_culverts)?;
+            dem = burned;
+        }
+        control.check_cancelled()?;
+        if let Some(ref breach_opts) = options.breach {
+            dem = breach_depressions(&dem, breach_opts)?;
+        }
     }
 
+    control.check_cancelled()?;
+    control.report(
+        "extract_sinks",
+        0.35,
+        Some("Extracting surface sinks".into()),
+    );
     let sinks = extract_sinks_in_memory(&dem, sim_opts.min_size, Topology::D8)?;
+
+    control.check_cancelled()?;
+    control.report(
+        "delineate",
+        0.50,
+        Some("Delineating nested depression hierarchy".into()),
+    );
     let depressions = delineate_depressions_in_memory(
         &sinks.sink,
         sim_opts.min_size,
         sim_opts.min_depth,
         sim_opts.interval,
     )?;
+
+    control.check_cancelled()?;
+    control.report(
+        "catchments",
+        0.65,
+        Some("Computing D8 flow directions and catchment hierarchy".into()),
+    );
     let rc_arr = match &options.runoff_coeff_path {
         Some(p) => Some(load_raster::<f64>(p, None)?),
         None => None,
@@ -3296,6 +3485,13 @@ pub fn run_pipeline(
             )?;
             (ch, None, recs)
         };
+
+    control.check_cancelled()?;
+    control.report(
+        "inundation",
+        0.80,
+        Some("Simulating surface inundation dynamics".into()),
+    );
     let forcing = InundationForcing {
         runoff_coeff: rc_arr.as_ref(),
         infiltration_cm_h: inf_arr.as_ref(),
@@ -3334,6 +3530,7 @@ pub fn run_pipeline(
                     &fsm_forcing,
                     &flowdirs,
                 )?;
+                control.check_cancelled()?;
                 let basins_csv = out_dir.join("fsm_basins.csv");
                 write_fsm_basins_csv(&fsm.basins, &basins_csv)?;
                 let hydrograph_csv = out_dir.join("fsm_hydrograph.csv");
@@ -3350,6 +3547,14 @@ pub fn run_pipeline(
         };
     let steps =
         compute_inundation_step_summaries(&sinks.sink, &fill_time, num_steps, sim_opts.time_step_h);
+
+    control.check_cancelled()?;
+    control.report(
+        "save_outputs",
+        0.92,
+        Some(format!("Saving outputs to {}", out_dir.display())),
+    );
+    control.check_cancelled()?;
 
     let (_, _, cell_area) = affine_metrics(&dem.geotransform);
     let d_nd = sinks.depth.no_data();
@@ -3498,6 +3703,7 @@ pub fn run_pipeline(
         )?;
     }
 
+    control.report("complete", 1.0, Some("Pipeline complete".into()));
     Ok(result)
 }
 
@@ -4403,5 +4609,146 @@ mod tests {
             },
         );
         assert!(err_crs.is_err(), "CRS mismatch must be rejected");
+    }
+
+    #[test]
+    fn run_pipeline_with_control_reports_monotonic_stages_and_honors_cancellation() {
+        use std::sync::{Arc, Mutex};
+
+        use crate::progress::{CancellationToken, ProgressEvent};
+
+        let dem_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_data/dem.tif");
+        let tmp = tempfile::tempdir().unwrap();
+
+        let opts = RunPipelineOptions {
+            kernel_size: 3,
+            simulation: SimulateInundationOptions {
+                min_size: 1000,
+                min_depth: 0.3,
+                interval: 0.5,
+                rain_intensity_cm_h: 5.0,
+                rain_duration_h: 10.0,
+                time_step_h: 5.0,
+                compress: false,
+            },
+            save_rasters: false,
+            export_vectors: false,
+            export_graph: false,
+            ..Default::default()
+        };
+
+        // 1. Progress events must arrive in monotonic stage order with fractions in [0.0, 1.0].
+        let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let ctrl = ExecutionControl::new().with_progress_fn(move |ev| {
+            captured.lock().unwrap().push(ev.clone());
+        });
+        let res = run_pipeline_with_control(&dem_path, tmp.path().join("ok"), &opts, &ctrl)
+            .expect("pipeline should complete");
+        assert!(res.num_depressions > 0);
+
+        let recorded = events.lock().unwrap();
+        let stages: Vec<&str> = recorded.iter().map(|e| e.stage.as_str()).collect();
+        assert_eq!(
+            stages,
+            vec![
+                "load",
+                "filter",
+                "extract_sinks",
+                "delineate",
+                "catchments",
+                "inundation",
+                "save_outputs",
+                "complete"
+            ]
+        );
+        let mut prev = -1.0f64;
+        for ev in recorded.iter() {
+            assert!(
+                (0.0..=1.0).contains(&ev.fraction),
+                "fraction out of range: {}",
+                ev.fraction
+            );
+            assert!(
+                ev.fraction >= prev,
+                "fractions must be monotonic: {} < {prev}",
+                ev.fraction
+            );
+            prev = ev.fraction;
+        }
+        assert_eq!(recorded.last().unwrap().fraction, 1.0);
+
+        // 2. Pre-cancelled token aborts cleanly before creating outputs.
+        let pre_tok = CancellationToken::new();
+        pre_tok.cancel();
+        let pre_dir = tmp.path().join("pre_cancelled");
+        let pre_err = run_pipeline_with_control(
+            &dem_path,
+            &pre_dir,
+            &opts,
+            &ExecutionControl::new().with_cancel(pre_tok),
+        );
+        assert!(matches!(pre_err, Err(Error::Cancelled)));
+        assert!(
+            !pre_dir.exists(),
+            "pre-cancelled pipeline must not create output directory"
+        );
+
+        // 3. Mid-run cancellation triggered from callback aborts cleanly.
+        let mid_tok = CancellationToken::new();
+        let trigger = mid_tok.clone();
+        let mid_stages: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let mid_seen = Arc::clone(&mid_stages);
+        let mid_ctrl = ExecutionControl::new()
+            .with_cancel(mid_tok)
+            .with_progress_fn(move |ev| {
+                mid_seen.lock().unwrap().push(ev.stage.clone());
+                if ev.stage == "extract_sinks" {
+                    trigger.cancel();
+                }
+            });
+        let mid_dir = tmp.path().join("mid_cancelled");
+        let mid_err = run_pipeline_with_control(&dem_path, &mid_dir, &opts, &mid_ctrl);
+        assert!(matches!(mid_err, Err(Error::Cancelled)));
+        assert!(
+            !mid_dir.join("summary.json").exists(),
+            "mid-run cancelled pipeline must not write summary.json"
+        );
+        let seen = mid_stages.lock().unwrap();
+        assert!(seen.iter().any(|s| s == "extract_sinks"));
+        assert!(!seen.iter().any(|s| s == "complete"));
+    }
+
+    #[test]
+    fn scs_curve_number_runoff_with_custom_ia_ratio_matches_tr55_exact() {
+        // CN = 80 => S = 25400/80 - 254 = 63.5 mm.
+        // P = 100 mm, ia_ratio = 0.05 => Ia = 3.175 mm.
+        // Q = (100 - 3.175)^2 / (100 - 3.175 + 63.5) = 96.825^2 / 160.325 = 58.4754755964...
+        let expected_q = (100.0 - 3.175_f64).powi(2) / (100.0 - 3.175 + 63.5);
+        let expected_rc = expected_q / 100.0;
+
+        let (q, rc) = scs_curve_number_runoff_scalar(80.0, 100.0, 0.05).unwrap();
+        assert!((q - expected_q).abs() < 1e-10);
+        assert!((rc - expected_rc).abs() < 1e-12);
+
+        let mut cn = Array2D::from_vec(2, 1, vec![80.0, -9999.0]).unwrap();
+        cn.set_no_data(-9999.0);
+        let rc_arr = scs_curve_number_runoff_with_ia(&cn, 100.0, 0.05).unwrap();
+        assert!((rc_arr.data()[0] - expected_rc).abs() < 1e-12);
+        assert_eq!(rc_arr.data()[1], rc_arr.no_data());
+
+        // CN = 100 (impervious, S = 0) with tiny precip_mm must not underflow (precip_mm - ia)^2
+        let (q_tiny, rc_tiny) = scs_curve_number_runoff_scalar(100.0, 1e-200, 0.2).unwrap();
+        assert_eq!(q_tiny, 1e-200);
+        assert_eq!(rc_tiny, 1.0);
+        let cn100 = Array2D::from_vec(1, 1, vec![100.0]).unwrap();
+        let rc100 = scs_curve_number_runoff_with_ia(&cn100, 1e-200, 0.2).unwrap();
+        assert_eq!(rc100.data()[0], 1.0);
+
+        // Reject negative ia_ratio and out-of-range CN
+        assert!(scs_curve_number_runoff_scalar(80.0, 100.0, -0.1).is_err());
+        assert!(scs_curve_number_runoff_scalar(0.0, 100.0, 0.2).is_err());
+        assert!(scs_curve_number_runoff_scalar(101.0, 100.0, 0.2).is_err());
+        assert!(scs_curve_number_runoff_with_ia(&cn, 100.0, -0.1).is_err());
     }
 }

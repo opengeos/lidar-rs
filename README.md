@@ -106,6 +106,18 @@ Example commands:
 lidar pipeline dem.tif out_pipe --min-size 1000 --min-depth 0.3 --interval 0.3 \
   --rain-intensity 5 --duration 50 --time-step 1 --compress
 
+# Or drive the pipeline from a TOML/JSON config file with verbose per-stage timing
+# (relative paths inside --config files resolve against the current working directory)
+lidar -v pipeline --config run.toml --cn 80
+
+# Standalone SCS Curve Number, stage-volume rating curves, and connectivity graph tools
+lidar cn-to-runoff --cn 80 --precip-mm 100 --json
+lidar rating-curves dem.tif -o out/rating_curves.csv
+lidar connectivity-graph dem.tif -o out/connectivity_graph.graphml
+
+# Shell completions (bash, zsh, fish, powershell, elvish)
+lidar completions bash > /usr/local/etc/bash_completion.d/lidar
+
 # Hydro-conditioning (Lindsay 2016 breaching + culvert burning)
 lidar breach-depressions dem.tif out/breached.tif --mode selective --max-depth 0.5
 lidar burn-culverts dem.tif culverts.gpkg out/burned.tif --half-width 1 --depth-offset 0.1
@@ -114,7 +126,8 @@ lidar burn-culverts dem.tif culverts.gpkg out/burned.tif --half-width 1 --depth-
 lidar export-frames dem.tif out_pipe/fill_time.tif out_pipe/frames --num-steps 10 --time-step 5 --rain-intensity 5 --scale-bar --legend
 lidar animate-inundation dem.tif out/simulation out/inundation.gif --rain-intensity 5 --scale-bar --legend
 
-# LiDAR point clouds (CSF/PMF ground classification, DSM, bare-earth DTM, CHM)
+# LiDAR point clouds (tunable CSF/PMF/SMRF ground classification, ROR outlier removal, DSM, DTM, CHM)
+lidar classify-ground cloud.laz ground.laz --method csf --cloth-resolution 1.0 --rigidness 2
 lidar lidar-to-dsm cloud.laz dsm.tif --resolution 1.0
 lidar lidar-to-dtm cloud.laz dtm.tif --resolution 1.0 --ground-method csf
 lidar lidar-to-chm cloud.laz chm.tif --resolution 1.0 --ground-method csf

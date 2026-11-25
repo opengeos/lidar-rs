@@ -539,6 +539,12 @@ pub(crate) fn validate_allowed_dirs(
             .collect();
         match cmd.try_get_matches_from(argv) {
             Ok(m) => {
+                if name == "pipeline" && m.get_one::<PathBuf>("config").is_some() {
+                    return Err((
+                        INVALID_PARAMS,
+                        "--config is disabled under MCP --allow-dir guardrails; pass explicit validated CLI arguments instead".into(),
+                    ));
+                }
                 let mut paths = Vec::new();
                 for id in path_ids {
                     if let Some(vals) = m.get_many::<PathBuf>(&id) {
@@ -1814,6 +1820,23 @@ mod tests {
                 &[
                     OsString::from("--bogus-flag"),
                     outside_file.as_os_str().to_os_string(),
+                ],
+                &allow_canon
+            )
+            .unwrap_err()
+            .0,
+            INVALID_PARAMS
+        );
+
+        // `pipeline --config` is rejected under `--allow-dir` so config-embedded paths cannot bypass the allowlist.
+        let cfg_inside = allowed.path().join("run.toml");
+        std::fs::write(&cfg_inside, "input = \"/etc/passwd\"\n").unwrap();
+        assert_eq!(
+            validate_allowed_dirs(
+                "pipeline",
+                &[
+                    OsString::from("--config"),
+                    cfg_inside.as_os_str().to_os_string(),
                 ],
                 &allow_canon
             )
