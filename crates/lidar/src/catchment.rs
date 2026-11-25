@@ -148,6 +148,19 @@ pub struct CatchmentHierarchyResult {
     pub records: Vec<CatchmentHierarchyRecord>,
 }
 
+/// In-memory output of [`delineate_catchment_hierarchy_weighted_in_memory`].
+#[derive(Debug, Clone)]
+pub struct InMemoryCatchmentHierarchy {
+    /// Nested catchment hierarchy raster: stores upland catchment-weighted effective
+    /// contributing area `sum(cell_area * C_i)` when `runoff_coeff` is `Some`, or
+    /// geometric contributing area `sum(cell_area)` when `None` (`f64`, NoData = `0.0`).
+    pub catchment_hierarchy: Array2D<f64>,
+    /// Unweighted geometric contributing area raster (`sum(cell_area)`, NoData = `0.0`).
+    pub unweighted_catchment_hierarchy: Array2D<f64>,
+    /// Per-level catchment hierarchy statistics records.
+    pub records: Vec<CatchmentHierarchyRecord>,
+}
+
 /// Attributes of an overland flow path connecting an upstream sink to its downstream sink
 /// or the DEM outlet boundary (from `3_Flow_Path.py`).
 #[derive(Debug, Clone, PartialEq)]
@@ -654,138 +667,142 @@ pub fn write_catchments_csv(records: &[CatchmentRecord], path: impl AsRef<Path>)
     Ok(())
 }
 
-struct LevelCatchmentStats {
-    watershed: Array2D<u32>,
-    records: Vec<CatchmentHierarchyRecord>,
-    cat_area_by_id: HashMap<u32, f64>,
+const DEP_NONE: u32 = u32::MAX;
+const DEP_EXITS: u32 = u32::MAX - 1;
+const DEP_VISITING: u32 = u32::MAX - 2;
+
+/// Compressed upland-to-depression D8 flow graph built in a single `O(N)` pass over the DEM.
+///
+/// Every non-depression upland cell is compressed onto its first receiving depression cell
+/// (`upland_entry`), accumulating both geometric cell counts (`upland_weight`) and optional
+/// runoff-coefficient-weighted counts (`upland_eff_weight`). Subsequent per-level watershed
+/// queries run in `O(D)` over only the `D << N` depression cells using `next_dep`.
+struct CompressedUplandGraph {
+    grid_to_dep: Vec<u32>,
+    dep_to_grid: Vec<usize>,
+    upland_entry: Vec<u32>,
+    upland_weight: Vec<u32>,
+    upland_eff_weight: Vec<f64>,
+    dep_self_eff: Vec<f64>,
+    next_dep: Vec<u32>,
 }
 
-/// Shared per-level catchment watershed & zonal DEM statistics helper used by both
-/// [`delineate_catchment_hierarchy`] and [`delineate_catchment_hierarchy_in_memory`].
-fn compute_level_catchment_stats(
-    dem: &Array2D<f64>,
-    flowdirs: &Array2D<u8>,
-    cell_area: f64,
-    level: u32,
-    labels: &[u32],
-) -> Result<LevelCatchmentStats> {
-    let watershed = d8_watersheds(flowdirs, labels)?;
+impl CompressedUplandGraph {
+    fn build(
+        w: usize,
+        h: usize,
+        fdata: &[u8],
+        grid_to_dep: Vec<u32>,
+        dep_to_grid: Vec<usize>,
+        runoff_coeff: Option<&Array2D<f64>>,
+        keep_upland_entry: bool,
+    ) -> Self {
+        let n = w * h;
+        let d_count = dep_to_grid.len();
+        let rc_data = runoff_coeff.map(|rc| (rc.data(), rc.no_data()));
+        let cell_c = |idx: usize| -> f64 {
+            match rc_data {
+                Some((data, nd)) => {
+                    let v = data[idx];
+                    if v.is_finite() && !v.rd_eq(nd) {
+                        v.clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    }
+                }
+                None => 1.0,
+            }
+        };
 
-    let mut cat_counts: HashMap<u32, usize> = HashMap::new();
-    for &cid in watershed.data() {
-        if cid > 0 {
-            *cat_counts.entry(cid).or_insert(0) += 1;
-        }
-    }
+        let mut upland_entry = vec![DEP_NONE; n];
+        let mut upland_weight = vec![0u32; d_count];
+        let mut upland_eff_weight = if runoff_coeff.is_some() {
+            vec![0.0f64; d_count]
+        } else {
+            Vec::new()
+        };
+        let dep_self_eff = if runoff_coeff.is_some() {
+            dep_to_grid.iter().map(|&gi| cell_c(gi)).collect()
+        } else {
+            Vec::new()
+        };
+        let mut path_buf: Vec<usize> = Vec::new();
 
-    // Accumulators per depression label using Welford's online variance and `z_min`-shifted
-    // elevation sums for numerical stability on high-elevation DEMs.
-    struct ZonalAcc {
-        count: usize,
-        zmin: f64,
-        zmax: f64,
-        mean: f64,
-        m2: f64,
-        z_ref: f64,
-        sum_shifted: f64,
-    }
-    let mut zonal: BTreeMap<u32, ZonalAcc> = BTreeMap::new();
-    let dem_data = dem.data();
-    for (idx, &lbl) in labels.iter().enumerate() {
-        if lbl == 0 {
-            continue;
-        }
-        let z = dem_data[idx];
-        if is_missing(dem, z) {
-            continue;
-        }
-        let e = zonal.entry(lbl).or_insert(ZonalAcc {
-            count: 0,
-            zmin: f64::INFINITY,
-            zmax: f64::NEG_INFINITY,
-            mean: 0.0,
-            m2: 0.0,
-            z_ref: z,
-            sum_shifted: 0.0,
-        });
-        e.count += 1;
-        if z < e.zmin {
-            e.zmin = z;
-        }
-        if z > e.zmax {
-            e.zmax = z;
-        }
-        let delta = z - e.mean;
-        e.mean += delta / e.count as f64;
-        let delta2 = z - e.mean;
-        e.m2 += delta * delta2;
-        e.sum_shifted += z - e.z_ref;
-    }
+        let step_d8 = |idx: usize| -> Option<usize> {
+            let dir = fdata[idx] as usize;
+            if dir == 0 || dir > 8 {
+                return None;
+            }
+            let r = (idx / w) as isize + D8Y[dir] as isize;
+            let c = (idx % w) as isize + D8X[dir] as isize;
+            if r < 0 || c < 0 || r >= h as isize || c >= w as isize {
+                None
+            } else {
+                Some((r as usize) * w + (c as usize))
+            }
+        };
 
-    let mut cat_area_by_id: HashMap<u32, f64> = HashMap::new();
-    let mut records = Vec::with_capacity(zonal.len());
-    for (fid, acc) in zonal {
-        let count = acc.count;
-        if count == 0 {
-            continue;
+        for start in 0..n {
+            if grid_to_dep[start] != DEP_NONE || upland_entry[start] != DEP_NONE {
+                continue;
+            }
+            path_buf.clear();
+            let mut cur = start;
+            let resolved = loop {
+                if grid_to_dep[cur] != DEP_NONE {
+                    break grid_to_dep[cur];
+                }
+                let st = upland_entry[cur];
+                if st != DEP_NONE {
+                    break if st == DEP_VISITING { DEP_EXITS } else { st };
+                }
+                upland_entry[cur] = DEP_VISITING;
+                path_buf.push(cur);
+                match step_d8(cur) {
+                    Some(nxt) => cur = nxt,
+                    None => break DEP_EXITS,
+                }
+            };
+            for &p in &path_buf {
+                upland_entry[p] = resolved;
+            }
+            if resolved < DEP_EXITS {
+                let ru = resolved as usize;
+                upland_weight[ru] += path_buf.len() as u32;
+                if !upland_eff_weight.is_empty() {
+                    let mut sum_c = 0.0f64;
+                    for &p in &path_buf {
+                        sum_c += cell_c(p);
+                    }
+                    upland_eff_weight[ru] += sum_c;
+                }
+            }
         }
-        let c_cells = cat_counts.get(&fid).copied().unwrap_or(count);
-        let area = count as f64 * cell_area;
-        let cat_area = c_cells as f64 * cell_area;
-        let dep_to_cat_ratio = if cat_area > 0.0 { area / cat_area } else { 0.0 };
-        let mean_elev = acc.mean;
-        let variance = (acc.m2 / count as f64).max(0.0);
-        let std_elev = variance.sqrt();
-        let range = acc.zmax - acc.zmin;
-        let zsum = (count as f64) * acc.z_ref + acc.sum_shifted;
-        let volume =
-            ((count as f64) * (acc.zmax - acc.z_ref) - acc.sum_shifted).max(0.0) * cell_area;
-        let mean_depth = if area > 0.0 { volume / area } else { 0.0 };
 
-        cat_area_by_id.insert(fid, cat_area);
-        records.push(CatchmentHierarchyRecord {
-            level,
-            level_fid: fid,
-            count,
-            area,
-            cat_area,
-            dep_to_cat_ratio,
-            min_elev: acc.zmin,
-            max_elev: acc.zmax,
-            range,
-            mean_elev,
-            std_elev,
-            sum_elev: zsum,
-            volume,
-            mean_depth,
-        });
-    }
+        let mut next_dep = vec![DEP_EXITS; d_count];
+        for (d, &idx) in dep_to_grid.iter().enumerate() {
+            if let Some(nxt) = step_d8(idx) {
+                let nd_dep = grid_to_dep[nxt];
+                next_dep[d] = if nd_dep != DEP_NONE {
+                    nd_dep
+                } else {
+                    upland_entry[nxt]
+                };
+            }
+        }
 
-    Ok(LevelCatchmentStats {
-        watershed,
-        records,
-        cat_area_by_id,
-    })
-}
+        if !keep_upland_entry {
+            upland_entry = Vec::new();
+        }
 
-/// Paints a level's catchment areas into `hir_data` for cells that have not yet been
-/// claimed by a lower level (`hir_data[idx] == 0.0`). Processing levels in ascending order
-/// (`1..=max_level`) gives the same precedence as painting in descending order with overwrite,
-/// while releasing each level's label grid immediately (O(1) peak label memory).
-fn paint_unclaimed_catchment_area(
-    hir_data: &mut [f64],
-    labels: &[u32],
-    cat_area_by_id: &HashMap<u32, f64>,
-    min_value: f64,
-) {
-    for (dst, &lbl) in hir_data.iter_mut().zip(labels.iter()) {
-        if *dst == 0.0
-            && lbl > 0
-            && let Some(&area) = cat_area_by_id.get(&lbl)
-            && area >= min_value
-            && area > 0.0
-        {
-            *dst = area;
+        Self {
+            grid_to_dep,
+            dep_to_grid,
+            upland_entry,
+            upland_weight,
+            upland_eff_weight,
+            dep_self_eff,
+            next_dep,
         }
     }
 }
@@ -800,18 +817,21 @@ fn parse_single_level_number(path: &Path) -> Option<u32> {
 /// Delineates the nested catchment hierarchy across all depression levels produced by
 /// [`crate::delineate_depressions`].
 ///
-/// Pure-Rust port of `5_Catchment_Hierarchy.py`:
+/// Pure-Rust port of `5_Catchment_Hierarchy.py` powered by the compressed upland D8 engine
+/// (`O(N * L + D * L)` overall because each level still scans/paints the raster for shapefile
+/// export, while D8 flow routing runs once and peak per-level memory stays `O(1)`; contrast
+/// with [`delineate_catchment_hierarchy_in_memory`], which avoids per-level full-grid output
+/// and runs in `O(N + L * D)`):
 /// 1. Computes D8 flow directions (with Barnes flat resolution) once from `in_dem`.
-/// 2. For each `Single_level_*.shp` (or `Single_level_*.tif`) in `in_level_dir`:
-///    - Delineates each depression's contributing watershed (`shapefiles/Catchment_level_*.shp`),
-///    - Computes `cat_area`, `dep2catR`, zonal DEM stats (`count`, `area`, `min`, `max`,
-///      `range`, `mean`, `std`, `sum`), `volume`, and `mean_depth`,
-///    - Writes the enriched depression shapefile (`shapefiles/level/Single_level_*.shp`).
-/// 3. Merges all enriched level shapefiles into `shapefiles/Merge_levels.shp` and writes
-///    `catchment_hierarchy.csv`.
-/// 4. Writes `out_catchment_img` (e.g. `catchment_hir.tif`, `f64` `cat_area`,
-///    NoData `0.0`), burning from highest level down to level 1 so every depression level's
-///    rim carries its own contributing catchment area for [`crate::simulate_inundation`].
+/// 2. Compresses all non-depression upland cells in a single `O(N)` pass onto their
+///    receiving depression cells so each `Single_level_*.shp` (or `Single_level_*.tif`)
+///    in `in_level_dir` routes in `O(D)` over only depression cells instead of running
+///    separate full-DEM D8 watershed traversals per level.
+/// 3. Computes `cat_area`, `dep2catR`, zonal DEM stats (`count`, `area`, `min`, `max`,
+///    `range`, `mean`, `std`, `sum`), `volume`, and `mean_depth`, and writes
+///    `shapefiles/Catchment_level_*.shp`, `shapefiles/level/Single_level_*.shp`,
+///    `shapefiles/Merge_levels.shp`, `catchment_hierarchy.csv`, and `out_catchment_img`
+///    (`f64` `cat_area`, NoData `0.0`).
 pub fn delineate_catchment_hierarchy(
     in_dem: impl AsRef<Path>,
     in_level_dir: impl AsRef<Path>,
@@ -873,16 +893,48 @@ pub fn delineate_catchment_hierarchy(
     let dem = load_raster::<f64>(in_dem, None)?;
     let w = dem.width();
     let h = dem.height();
+    let n = w * h;
     let cell_area = affine_cell_area(&dem.geotransform);
     let flowdirs = d8_flow_directions_resolved(&dem)?;
+
+    // Pass 1: scan each level file one at a time (O(1) peak level memory) to build the
+    // compact union index `grid_to_dep` over all depression pixels across all levels.
+    let mut grid_to_dep = vec![DEP_NONE; n];
+    let mut dep_to_grid: Vec<usize> = Vec::new();
+
+    for (_level, path) in &level_files {
+        if is_raster_extension(path) {
+            let r = load_raster::<f64>(path, None)?;
+            validate_same_grid(&dem, &r, "level raster")?;
+            let nd = r.no_data();
+            for (idx, &v) in r.data().iter().enumerate() {
+                if v.is_finite() && !v.rd_eq(nd) && v > 0.0 && grid_to_dep[idx] == DEP_NONE {
+                    let d = dep_to_grid.len() as u32;
+                    grid_to_dep[idx] = d;
+                    dep_to_grid.push(idx);
+                }
+            }
+        } else {
+            let (labels, _layer) = rasterize_vector_to_labels(path, &dem)?;
+            for (idx, &fid) in labels.iter().enumerate() {
+                if fid > 0 && grid_to_dep[idx] == DEP_NONE {
+                    let d = dep_to_grid.len() as u32;
+                    grid_to_dep[idx] = d;
+                    dep_to_grid.push(idx);
+                }
+            }
+        }
+    }
+
+    // Single O(N) upland compression pass shared across all hierarchy levels.
+    let graph =
+        CompressedUplandGraph::build(w, h, flowdirs.data(), grid_to_dep, dep_to_grid, None, true);
+    let d_count = graph.dep_to_grid.len();
 
     let mut catchment_shapefiles = Vec::with_capacity(level_files.len());
     let mut level_shapefiles = Vec::with_capacity(level_files.len());
     let mut all_records: Vec<CatchmentHierarchyRecord> = Vec::new();
-    // Paint ascending levels (1..=max_level) only into unclaimed cells (`0.0`), releasing
-    // each level's label grid immediately (O(1) peak label memory) while preserving lowest-level
-    // precedence for inner footprints and outer-rim catchment areas.
-    let mut hir_data_f64 = vec![0.0f64; w * h];
+    let mut hir_data_f64 = vec![0.0f64; n];
 
     let mut merged_layer =
         Layer::new("Merge_levels".to_string()).with_geom_type(GeometryType::Polygon);
@@ -910,11 +962,32 @@ pub fn delineate_catchment_hierarchy(
         merged_layer.schema.add_field(FieldDef::new(name, ftype));
     }
 
-    for (level, path) in &level_files {
+    // Reusable per-level buffers for O(D) compressed routing and flat watershed stamping.
+    let mut dep_target = vec![DEP_NONE; d_count];
+    let mut d_path: Vec<u32> = Vec::new();
+    let mut ws_arr = Array2D::from_vec(w, h, vec![0u32; n])?;
+    ws_arr.copy_metadata_from(&flowdirs);
+    ws_arr.set_no_data(0);
+    let dem_data = dem.data();
+
+    struct ZonalAcc {
+        count: usize,
+        zmin: f64,
+        zmax: f64,
+        mean: f64,
+        m2: f64,
+        z_ref: f64,
+        sum_shifted: f64,
+    }
+
+    // Pass 2: reload one level at a time (O(1) peak level memory), route in O(D),
+    // compute exact zonal stats, stamp watersheds, and export shapefiles.
+    for &(level, ref path) in &level_files {
         let stem_name = path
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("Single_level");
+            .unwrap_or("Single_level")
+            .to_string();
         let cat_name = format!("{}.shp", stem_name.replacen("Single", "Catchment", 1));
         let lvl_name = format!("{stem_name}.shp");
         let out_cat_shp = out_shp_dir.join(&cat_name);
@@ -937,7 +1010,7 @@ pub fn delineate_catchment_hierarchy(
                 &PolygonizeOptions {
                     band: 0,
                     field_name: "id".to_string(),
-                    layer_name: stem_name.to_string(),
+                    layer_name: stem_name.clone(),
                     connectedness8: false,
                     ignore_nodata: false,
                     mask: None,
@@ -948,29 +1021,166 @@ pub fn delineate_catchment_hierarchy(
             rasterize_vector_to_labels(path, &dem)?
         };
 
-        let stats = compute_level_catchment_stats(&dem, &flowdirs, cell_area, *level, &labels)?;
-        paint_unclaimed_catchment_area(&mut hir_data_f64, &labels, &stats.cat_area_by_id, 0.0);
+        dep_target.fill(DEP_NONE);
+        let mut max_fid = 0u32;
+        for (idx, &fid) in labels.iter().enumerate() {
+            if fid > 0 {
+                if fid > max_fid {
+                    max_fid = fid;
+                }
+                let d = graph.grid_to_dep[idx];
+                if d != DEP_NONE {
+                    dep_target[d as usize] = fid;
+                }
+            }
+        }
 
-        let mut area_ratio_by_id: HashMap<u32, (f64, f64)> = HashMap::new();
-        let mut rec_by_id: HashMap<u32, CatchmentHierarchyRecord> = HashMap::new();
-        for rec in stats.records {
-            area_ratio_by_id.insert(rec.level_fid, (rec.cat_area, rec.dep_to_cat_ratio));
+        let mut cat_counts = vec![0usize; max_fid as usize + 1];
+        for start_d in 0..d_count {
+            let fid = if dep_target[start_d] != DEP_NONE {
+                dep_target[start_d]
+            } else {
+                d_path.clear();
+                let mut cur = start_d as u32;
+                let resolved = loop {
+                    let st = dep_target[cur as usize];
+                    if st != DEP_NONE {
+                        break if st == DEP_VISITING { 0 } else { st };
+                    }
+                    dep_target[cur as usize] = DEP_VISITING;
+                    d_path.push(cur);
+                    let nxt = graph.next_dep[cur as usize];
+                    if nxt >= DEP_EXITS {
+                        break 0;
+                    }
+                    cur = nxt;
+                };
+                for &p in &d_path {
+                    dep_target[p as usize] = resolved;
+                }
+                resolved
+            };
+            if fid > 0 && (fid as usize) < cat_counts.len() {
+                cat_counts[fid as usize] += 1 + graph.upland_weight[start_d] as usize;
+            }
+        }
+
+        // Compute zonal DEM statistics over this level's labeled cells.
+        let mut zonal: BTreeMap<u32, ZonalAcc> = BTreeMap::new();
+        for (idx, &fid) in labels.iter().enumerate() {
+            if fid == 0 {
+                continue;
+            }
+            let z = dem_data[idx];
+            if is_missing(&dem, z) {
+                continue;
+            }
+            let e = zonal.entry(fid).or_insert(ZonalAcc {
+                count: 0,
+                zmin: f64::INFINITY,
+                zmax: f64::NEG_INFINITY,
+                mean: 0.0,
+                m2: 0.0,
+                z_ref: z,
+                sum_shifted: 0.0,
+            });
+            e.count += 1;
+            if z < e.zmin {
+                e.zmin = z;
+            }
+            if z > e.zmax {
+                e.zmax = z;
+            }
+            let delta = z - e.mean;
+            e.mean += delta / e.count as f64;
+            let delta2 = z - e.mean;
+            e.m2 += delta * delta2;
+            e.sum_shifted += z - e.z_ref;
+        }
+
+        let mut area_ratio_by_id: HashMap<u32, (f64, f64)> = HashMap::with_capacity(zonal.len());
+        let mut cat_area_by_id: HashMap<u32, f64> = HashMap::with_capacity(zonal.len());
+        let mut rec_by_id: HashMap<u32, CatchmentHierarchyRecord> =
+            HashMap::with_capacity(zonal.len());
+
+        for (fid, acc) in zonal {
+            let count = acc.count;
+            if count == 0 {
+                continue;
+            }
+            let c_cells = cat_counts
+                .get(fid as usize)
+                .copied()
+                .unwrap_or(count)
+                .max(count);
+            let area = count as f64 * cell_area;
+            let cat_area = c_cells as f64 * cell_area;
+            let dep_to_cat_ratio = if cat_area > 0.0 { area / cat_area } else { 0.0 };
+            let mean_elev = acc.mean;
+            let variance = (acc.m2 / count as f64).max(0.0);
+            let std_elev = variance.sqrt();
+            let range = acc.zmax - acc.zmin;
+            let zsum = (count as f64) * acc.z_ref + acc.sum_shifted;
+            let volume =
+                ((count as f64) * (acc.zmax - acc.z_ref) - acc.sum_shifted).max(0.0) * cell_area;
+            let mean_depth = if area > 0.0 { volume / area } else { 0.0 };
+
+            cat_area_by_id.insert(fid, cat_area);
+            area_ratio_by_id.insert(fid, (cat_area, dep_to_cat_ratio));
+            let rec = CatchmentHierarchyRecord {
+                level,
+                level_fid: fid,
+                count,
+                area,
+                cat_area,
+                dep_to_cat_ratio,
+                min_elev: acc.zmin,
+                max_elev: acc.zmax,
+                range,
+                mean_elev,
+                std_elev,
+                sum_elev: zsum,
+                volume,
+                mean_depth,
+            };
             all_records.push(rec.clone());
-            rec_by_id.insert(rec.level_fid, rec);
+            rec_by_id.insert(fid, rec);
+        }
+
+        // Paint unclaimed cells in `hir_data_f64` (ascending levels give lowest-level precedence).
+        for (idx, &fid) in labels.iter().enumerate() {
+            if fid > 0
+                && hir_data_f64[idx] == 0.0
+                && let Some(&area) = cat_area_by_id.get(&fid)
+                && area > 0.0
+            {
+                hir_data_f64[idx] = area;
+            }
+        }
+        drop(labels);
+
+        // Reconstruct watershed raster via O(1)-per-cell flat lookup (zero D8 tracing).
+        let ws_data = ws_arr.data_mut();
+        for (idx, dst) in ws_data.iter_mut().enumerate() {
+            let d = graph.grid_to_dep[idx];
+            *dst = if d != DEP_NONE {
+                dep_target[d as usize]
+            } else {
+                let ue = graph.upland_entry[idx];
+                if ue < DEP_EXITS {
+                    dep_target[ue as usize]
+                } else {
+                    0
+                }
+            };
         }
 
         // Write Catchment_level_*.shp
-        polygonize_u32_with_records(
-            &stats.watershed,
-            &out_cat_shp,
-            "catchment",
-            &area_ratio_by_id,
-        )?;
+        polygonize_u32_with_records(&ws_arr, &out_cat_shp, "catchment", &area_ratio_by_id)?;
         catchment_shapefiles.push(out_cat_shp);
 
         // Write enriched Single_level_*.shp and append to Merge_levels.shp
-        let mut out_lvl_layer =
-            Layer::new(stem_name.to_string()).with_geom_type(GeometryType::Polygon);
+        let mut out_lvl_layer = Layer::new(stem_name).with_geom_type(GeometryType::Polygon);
         out_lvl_layer.crs = src_layer.crs.clone();
         if out_lvl_layer.crs.is_none()
             && !dem.projection.is_empty()
@@ -1077,7 +1287,29 @@ pub fn delineate_catchment_hierarchy_in_memory(
     depression_level: &Array2D<i32>,
     min_size: usize,
 ) -> Result<(Array2D<f64>, Vec<CatchmentHierarchyRecord>)> {
-    delineate_catchment_hierarchy_impl(dem, depression_level, min_size, None)
+    let res = delineate_catchment_hierarchy_impl(dem, depression_level, min_size, None, None)?;
+    Ok((res.catchment_hierarchy, res.records))
+}
+
+/// Delineates the nested catchment hierarchy in memory with optional spatially variable
+/// runoff coefficients (`runoff_coeff`, values clamped to `[0.0, 1.0]`).
+///
+/// When `runoff_coeff` is `Some(rc)`, accumulates true upland catchment-weighted effective
+/// contributing area `sum(cell_area * C_i.clamp(0.0, 1.0))` along the `O(N + L * D)`
+/// compressed upland D8 + DSU engine so every depression cell in
+/// `InMemoryCatchmentHierarchy::catchment_hierarchy` stores its catchment-weighted effective
+/// contributing area (while `unweighted_catchment_hierarchy` retains geometric `cat_area`).
+///
+/// NoData or non-finite cells in `runoff_coeff` default to `1.0` (matching the uniform-forcing
+/// default). Callers passing partially masked runoff-coefficient rasters should fill upland
+/// NoData cells with `0.0` if excluded areas are meant to contribute zero runoff.
+pub fn delineate_catchment_hierarchy_weighted_in_memory(
+    dem: &Array2D<f64>,
+    depression_level: &Array2D<i32>,
+    min_size: usize,
+    runoff_coeff: Option<&Array2D<f64>>,
+) -> Result<InMemoryCatchmentHierarchy> {
+    delineate_catchment_hierarchy_impl(dem, depression_level, min_size, runoff_coeff, None)
 }
 
 /// Internal variant of [`delineate_catchment_hierarchy_in_memory`] reusing precomputed
@@ -1088,6 +1320,25 @@ pub(crate) fn delineate_catchment_hierarchy_with_flowdirs(
     min_size: usize,
     flowdirs: &Array2D<D8Flowdir>,
 ) -> Result<(Array2D<f64>, Vec<CatchmentHierarchyRecord>)> {
+    let res = delineate_catchment_hierarchy_weighted_with_flowdirs(
+        dem,
+        depression_level,
+        min_size,
+        None,
+        flowdirs,
+    )?;
+    Ok((res.catchment_hierarchy, res.records))
+}
+
+/// Internal weighted variant reusing precomputed resolved D8 flow directions across
+/// pipeline stages.
+pub(crate) fn delineate_catchment_hierarchy_weighted_with_flowdirs(
+    dem: &Array2D<f64>,
+    depression_level: &Array2D<i32>,
+    min_size: usize,
+    runoff_coeff: Option<&Array2D<f64>>,
+    flowdirs: &Array2D<D8Flowdir>,
+) -> Result<InMemoryCatchmentHierarchy> {
     if flowdirs.width() != dem.width() || flowdirs.height() != dem.height() {
         return Err(Error::DimensionMismatch(format!(
             "flowdirs ({}x{}) does not match DEM ({}x{})",
@@ -1097,16 +1348,26 @@ pub(crate) fn delineate_catchment_hierarchy_with_flowdirs(
             dem.height()
         )));
     }
-    delineate_catchment_hierarchy_impl(dem, depression_level, min_size, Some(flowdirs))
+    delineate_catchment_hierarchy_impl(
+        dem,
+        depression_level,
+        min_size,
+        runoff_coeff,
+        Some(flowdirs),
+    )
 }
 
 fn delineate_catchment_hierarchy_impl(
     dem: &Array2D<f64>,
     depression_level: &Array2D<i32>,
     min_size: usize,
+    runoff_coeff: Option<&Array2D<f64>>,
     precomputed_flowdirs: Option<&Array2D<D8Flowdir>>,
-) -> Result<(Array2D<f64>, Vec<CatchmentHierarchyRecord>)> {
+) -> Result<InMemoryCatchmentHierarchy> {
     crate::inundation::validate_grid_alignment(dem, depression_level, "depression_level")?;
+    if let Some(rc) = runoff_coeff {
+        crate::inundation::validate_grid_alignment(dem, rc, "runoff_coeff")?;
+    }
     let w = dem.width();
     let h = dem.height();
     let n = w * h;
@@ -1116,7 +1377,11 @@ fn delineate_catchment_hierarchy_impl(
         let mut empty = Array2D::from_vec(w, h, vec![0.0; n])?;
         empty.copy_metadata_from(dem);
         empty.set_no_data(0.0);
-        return Ok((empty, Vec::new()));
+        return Ok(InMemoryCatchmentHierarchy {
+            catchment_hierarchy: empty.clone(),
+            unweighted_catchment_hierarchy: empty,
+            records: Vec::new(),
+        });
     }
 
     let cell_area = affine_cell_area(&dem.geotransform);
@@ -1132,17 +1397,13 @@ fn delineate_catchment_hierarchy_impl(
     let dem_data = dem.data();
 
     // 1. Index all depression cells (level > 0) compactly as 0..d_count.
-    const NONE: u32 = u32::MAX;
-    const EXITS: u32 = u32::MAX - 1;
-    const VISITING: u32 = u32::MAX - 2;
-
     if max_level as usize > n {
         return Err(Error::InvalidArgument(format!(
             "depression_level contains invalid level {max_level} exceeding grid cell count {n}"
         )));
     }
 
-    let mut grid_to_dep = vec![NONE; n];
+    let mut grid_to_dep = vec![DEP_NONE; n];
     let mut dep_to_grid: Vec<usize> = Vec::new();
     let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); max_level as usize + 1];
     for (idx, &lv) in ldata.iter().enumerate() {
@@ -1155,71 +1416,10 @@ fn delineate_catchment_hierarchy_impl(
     }
     let d_count = dep_to_grid.len();
 
-    // 2. Compress all upland (level <= 0) D8 chains in one O(N) pass:
-    //    `upland_entry[idx]` stores the first depression cell index `0..d_count` reached
-    //    from `idx` (or `EXITS` if the path drains off-grid / into a non-depression pit).
-    let mut upland_entry = vec![NONE; n];
-    let mut upland_weight = vec![0u32; d_count];
-    let mut path_buf: Vec<usize> = Vec::new();
-
-    let step_d8 = |idx: usize| -> Option<usize> {
-        let dir = fdata[idx] as usize;
-        if dir == 0 || dir > 8 {
-            return None;
-        }
-        let r = (idx / w) as isize + D8Y[dir] as isize;
-        let c = (idx % w) as isize + D8X[dir] as isize;
-        if r < 0 || c < 0 || r >= h as isize || c >= w as isize {
-            None
-        } else {
-            Some((r as usize) * w + (c as usize))
-        }
-    };
-
-    for start in 0..n {
-        if grid_to_dep[start] != NONE || upland_entry[start] != NONE {
-            continue;
-        }
-        path_buf.clear();
-        let mut cur = start;
-        let resolved = loop {
-            if grid_to_dep[cur] != NONE {
-                break grid_to_dep[cur];
-            }
-            let st = upland_entry[cur];
-            if st != NONE {
-                break if st == VISITING { EXITS } else { st };
-            }
-            upland_entry[cur] = VISITING;
-            path_buf.push(cur);
-            match step_d8(cur) {
-                Some(nxt) => cur = nxt,
-                None => break EXITS,
-            }
-        };
-        for &p in &path_buf {
-            upland_entry[p] = resolved;
-        }
-        if resolved < EXITS {
-            upland_weight[resolved as usize] += path_buf.len() as u32;
-        }
-    }
-
-    // 3. Build compressed downstream link `next_dep[d]` from each depression cell `d`
-    //    across any intermediate upland cells to the next depression cell (or `EXITS`).
-    let mut next_dep = vec![EXITS; d_count];
-    for d in 0..d_count {
-        let idx = dep_to_grid[d];
-        if let Some(nxt) = step_d8(idx) {
-            let nd_dep = grid_to_dep[nxt];
-            next_dep[d] = if nd_dep != NONE {
-                nd_dep
-            } else {
-                upland_entry[nxt]
-            };
-        }
-    }
-    drop(upland_entry);
+    // 2-3. Compress all upland (level <= 0) D8 chains in one O(N) pass and build `next_dep`.
+    let graph =
+        CompressedUplandGraph::build(w, h, fdata, grid_to_dep, dep_to_grid, runoff_coeff, false);
+    let has_rc = runoff_coeff.is_some();
 
     // 4. Incremental Union-Find (4-connected) over 0..d_count from level 1..=max_level,
     //    maintaining component size, max level, earliest row-major pixel index, and
@@ -1247,8 +1447,9 @@ fn delineate_catchment_hierarchy_impl(
 
     let mut all_records = Vec::new();
     let mut hir_data = vec![0.0f64; n];
+    let mut weighted_hir_data = if has_rc { vec![0.0f64; n] } else { Vec::new() };
     let mut root_to_fid = vec![0u32; d_count];
-    let mut dep_target = vec![NONE; d_count];
+    let mut dep_target = vec![DEP_NONE; d_count];
     let mut d_path: Vec<u32> = Vec::new();
     // Track all candidate roots touched up to the current level (kept deduplicated per level).
     let mut touched_roots: Vec<u32> = Vec::new();
@@ -1260,7 +1461,7 @@ fn delineate_catchment_hierarchy_impl(
         // Activate all cells at this exact level and merge with active 4-neighbors.
         for &d in &buckets[level as usize] {
             let du = d as usize;
-            let g_idx = dep_to_grid[du];
+            let g_idx = graph.dep_to_grid[du];
             active[du] = true;
             uf_size[du] = 1;
             uf_max_lvl[du] = level_i32;
@@ -1284,8 +1485,8 @@ fn delineate_catchment_hierarchy_impl(
                 if c + 1 < w { Some(g_idx + 1) } else { None },
             ];
             for n_idx in nbrs.into_iter().flatten() {
-                let nb = grid_to_dep[n_idx];
-                if nb != NONE && active[nb as usize] {
+                let nb = graph.grid_to_dep[n_idx];
+                if nb != DEP_NONE && active[nb as usize] {
                     let ra = dsu_find(&mut uf_parent, d) as usize;
                     let rb = dsu_find(&mut uf_parent, nb) as usize;
                     if ra != rb {
@@ -1365,7 +1566,12 @@ fn delineate_catchment_hierarchy_impl(
         // Route only the compressed D depression cells (instead of W*H) along `next_dep`.
         let num_fids = active_roots.len();
         let mut cat_counts = vec![0usize; num_fids + 1];
-        dep_target.fill(NONE);
+        let mut cat_eff_counts = if has_rc {
+            vec![0.0f64; num_fids + 1]
+        } else {
+            Vec::new()
+        };
+        dep_target.fill(DEP_NONE);
 
         // Seed all cells belonging to an active level-L component directly.
         for d in 0..d_count {
@@ -1380,20 +1586,20 @@ fn delineate_catchment_hierarchy_impl(
 
         // Trace remaining depression cells (both level > L and smaller finished components with max_lv < L).
         for start_d in 0..d_count {
-            let fid = if dep_target[start_d] != NONE {
+            let fid = if dep_target[start_d] != DEP_NONE {
                 dep_target[start_d]
             } else {
                 d_path.clear();
                 let mut cur = start_d as u32;
                 let resolved = loop {
                     let st = dep_target[cur as usize];
-                    if st != NONE {
-                        break if st == VISITING { 0 } else { st };
+                    if st != DEP_NONE {
+                        break if st == DEP_VISITING { 0 } else { st };
                     }
-                    dep_target[cur as usize] = VISITING;
+                    dep_target[cur as usize] = DEP_VISITING;
                     d_path.push(cur);
-                    let nxt = next_dep[cur as usize];
-                    if nxt >= EXITS {
+                    let nxt = graph.next_dep[cur as usize];
+                    if nxt >= DEP_EXITS {
                         break 0;
                     }
                     cur = nxt;
@@ -1404,12 +1610,21 @@ fn delineate_catchment_hierarchy_impl(
                 resolved
             };
             if fid > 0 {
-                cat_counts[fid as usize] += 1 + upland_weight[start_d] as usize;
+                cat_counts[fid as usize] += 1 + graph.upland_weight[start_d] as usize;
+                if has_rc {
+                    cat_eff_counts[fid as usize] +=
+                        graph.dep_self_eff[start_d] + graph.upland_eff_weight[start_d];
+                }
             }
         }
 
-        // Emit records and paint unclaimed cells in `hir_data`.
+        // Emit records and paint unclaimed cells in `hir_data` (and `weighted_hir_data`).
         let mut fid_cat_area = vec![0.0f64; num_fids + 1];
+        let mut fid_eff_cat_area = if has_rc {
+            vec![0.0f64; num_fids + 1]
+        } else {
+            Vec::new()
+        };
         for (i, &root) in active_roots.iter().enumerate() {
             let fid = (i + 1) as u32;
             let ru = root as usize;
@@ -1433,6 +1648,10 @@ fn delineate_catchment_hierarchy_impl(
             let mean_depth = if area > 0.0 { volume / area } else { 0.0 };
 
             fid_cat_area[fid as usize] = cat_area;
+            if has_rc {
+                fid_eff_cat_area[fid as usize] =
+                    (cat_eff_counts[fid as usize] * cell_area).max(0.0);
+            }
             all_records.push(CatchmentHierarchyRecord {
                 level,
                 level_fid: fid,
@@ -1452,9 +1671,10 @@ fn delineate_catchment_hierarchy_impl(
         }
 
         // Paint unclaimed cells belonging to active components at this level.
+        // Check `hir_data[g_idx] == 0.0` so lowest-level precedence holds even if `eff_cat_area == 0.0`.
         for d in 0..d_count {
             if active[d] {
-                let g_idx = dep_to_grid[d];
+                let g_idx = graph.dep_to_grid[d];
                 if hir_data[g_idx] == 0.0 {
                     let root = dsu_find(&mut uf_parent, d as u32) as usize;
                     let fid = root_to_fid[root];
@@ -1462,6 +1682,9 @@ fn delineate_catchment_hierarchy_impl(
                         let ca = fid_cat_area[fid as usize];
                         if ca > 0.0 {
                             hir_data[g_idx] = ca;
+                            if has_rc {
+                                weighted_hir_data[g_idx] = fid_eff_cat_area[fid as usize];
+                            }
                         }
                     }
                 }
@@ -1474,10 +1697,24 @@ fn delineate_catchment_hierarchy_impl(
         }
     }
 
-    let mut hir_arr = Array2D::from_vec(w, h, hir_data)?;
-    hir_arr.copy_metadata_from(dem);
-    hir_arr.set_no_data(0.0);
-    Ok((hir_arr, all_records))
+    let mut unweighted_arr = Array2D::from_vec(w, h, hir_data)?;
+    unweighted_arr.copy_metadata_from(dem);
+    unweighted_arr.set_no_data(0.0);
+
+    let catchment_hierarchy = if has_rc {
+        let mut weighted_arr = Array2D::from_vec(w, h, weighted_hir_data)?;
+        weighted_arr.copy_metadata_from(dem);
+        weighted_arr.set_no_data(0.0);
+        weighted_arr
+    } else {
+        unweighted_arr.clone()
+    };
+
+    Ok(InMemoryCatchmentHierarchy {
+        catchment_hierarchy,
+        unweighted_catchment_hierarchy: unweighted_arr,
+        records: all_records,
+    })
 }
 
 /// Writes `catchment_hierarchy.csv`.
