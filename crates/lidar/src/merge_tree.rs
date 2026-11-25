@@ -12,9 +12,11 @@
 //!
 //! - **Merge-tree sweep:** `O(M log M)` time and `O(M)` memory per sink region of `M`
 //!   occupied pixels (using sparse indexing whenever a region's bounding box is sparse).
-//! - **Per-node morphometrics and exact rating curves:** `O(sum_v |subtree(v)|)` time
-//!   and `O(M)` peak memory per region (`O(M * depth)` in the worst case for deep nested
-//!   chains), without allocating bounding-box-sized dense grids for sparse regions.
+//! - **Per-node morphometrics and exact rating curves:** `O(sum_v (k_v log k_v + S_v))`
+//!   time where `k_v = |subtree(v)|` and `S_v <= k_v + 2` is the number of retained
+//!   rating-curve stages for node `v` (sorting each node's subtree elevations and stages,
+//!   followed by a single linear sweep to compute interval-by-interval storage), and `O(M)`
+//!   peak working memory per region without bounding-box-sized dense grids for sparse regions.
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -505,6 +507,7 @@ fn build_region_merge_tree(
     let mut batch_start = 0usize;
     let mut plateau_parent: Vec<usize> = Vec::new();
     let mut pre_root_to_slot: HashMap<usize, usize> = HashMap::new();
+    let mut pre_root_first_contact: HashMap<usize, usize> = HashMap::new();
     let mut slot_to_pre_root: Vec<usize> = Vec::new();
     let mut touched_edges: Vec<(usize, usize)> = Vec::new();
 
@@ -528,8 +531,10 @@ fn build_region_merge_tree(
         }
 
         // 2. Discover all connections between plateau cells (`0..batch_len`) and
-        //    pre-existing strictly-lower UF roots (`< batch_start`).
+        //    pre-existing strictly-lower UF roots (`< batch_start`), recording each
+        //    pre-root's deterministic first plateau contact cell in `O(1)` amortized time.
         pre_root_to_slot.clear();
+        pre_root_first_contact.clear();
         slot_to_pre_root.clear();
         touched_edges.clear();
 
@@ -543,6 +548,7 @@ fn build_region_merge_tree(
                 };
                 if n_sorted < batch_start {
                     let pre_root = uf_find(&mut uf_parent, n_sorted);
+                    pre_root_first_contact.entry(pre_root).or_insert(i);
                     let slot = *pre_root_to_slot.entry(pre_root).or_insert_with(|| {
                         let s = batch_len + slot_to_pre_root.len();
                         slot_to_pre_root.push(pre_root);
@@ -623,31 +629,28 @@ fn build_region_merge_tree(
                         .then(uf_min_idx[a].cmp(&uf_min_idx[b]))
                 });
 
-                // Deterministic pour point: earliest plateau cell (in row-major order)
-                // that directly touches at least one significant branch, else `batch_cells[0]`.
-                let mut pp_cell = cells[batch_cells[0]];
-                'find_pp: for &ci in &batch_cells {
-                    let c = cells[ci];
-                    for &(dr, dc) in offsets {
-                        if let Some(n_sorted) = cell_index.get(c.r as isize + dr, c.c as isize + dc)
-                            && n_sorted < batch_start
-                        {
-                            let pr = uf_find(&mut uf_parent, n_sorted);
-                            if sig_roots.contains(&pr) {
-                                pp_cell = c;
-                                break 'find_pp;
-                            }
-                        }
-                    }
-                }
-
+                // Each finalized child receives its own deterministic plateau contact cell
+                // recorded in `pre_root_first_contact` (two children bordering the same saddle
+                // cell naturally share that coordinate, while distinct contact saddles keep
+                // their respective coordinates without any linear membership scan).
+                let fallback_pp = cells[batch_cells[0]];
+                let mut parent_pp = fallback_pp;
+                let mut parent_pp_idx = usize::MAX;
                 let mut child_nidxs = Vec::with_capacity(sig_roots.len());
                 for &sr in &sig_roots {
+                    let contact_idx = pre_root_first_contact.get(&sr).copied();
+                    let child_pp = contact_idx.map_or(fallback_pp, |ci| cells[ci]);
+                    if let Some(ci) = contact_idx
+                        && ci < parent_pp_idx
+                    {
+                        parent_pp_idx = ci;
+                        parent_pp = child_pp;
+                    }
                     let cn = finalize_component(
                         sr,
                         z_batch,
-                        pp_cell.r,
-                        pp_cell.c,
+                        child_pp.r,
+                        child_pp.c,
                         &uf_count,
                         &uf_min_elev,
                         &mut uf_active_node,
@@ -706,8 +709,8 @@ fn build_region_merge_tree(
                     level: 1,
                     min_elev: min_z,
                     saddle_elev: z_batch,
-                    pour_point_row: pp_cell.r,
-                    pour_point_col: pp_cell.c,
+                    pour_point_row: parent_pp.r,
+                    pour_point_col: parent_pp.c,
                     count: total_cnt,
                     area: total_cnt as f64 * cell_area,
                     max_depth: 0.0,
@@ -903,40 +906,34 @@ fn build_region_merge_tree(
             }
         }
 
-        // Exact sorted elevations and prefix sums relative to this component's OWN floor `node_min`.
+        // Sort subtree elevations and stages, deduplicating numerically equal stages
+        // (`*a == *b`, collapsing -0.0 and +0.0 while retaining distinct tight saddles).
         subtree_elevs.sort_unstable_by(f64::total_cmp);
-        let mut prefix_sum = Vec::with_capacity(subtree_elevs.len() + 1);
-        prefix_sum.push(0.0f64);
-        let mut acc = 0.0f64;
-        for &z in &subtree_elevs {
-            acc += z - node_min;
-            prefix_sum.push(acc);
-        }
-
-        // Exact storage volume below `node_saddle` using this node's own local floor reference.
-        let k_end = subtree_elevs.partition_point(|&z| z <= node_saddle);
-        let node_volume = ((k_end as f64) * (node_saddle - node_min).max(0.0) - prefix_sum[k_end])
-            .max(0.0)
-            * cell_area;
-        let node_avg_depth = if node_area > 0.0 {
-            node_volume / node_area
-        } else {
-            0.0
-        };
-        nodes[node_idx].volume = node_volume;
-        nodes[node_idx].avg_depth = node_avg_depth;
-
-        // Retain EVERY distinct cell elevation breakpoint (no downsampling) and deduplicate
-        // only exact equal stages so closely spaced representable saddles are never merged.
         stages.extend_from_slice(&subtree_elevs);
         stages.sort_unstable_by(f64::total_cmp);
-        stages.dedup_by(|a, b| a.total_cmp(b).is_eq());
+        stages.dedup_by(|a, b| *a == *b);
 
-        for &stage in &stages {
-            let k = subtree_elevs.partition_point(|&z| z <= stage);
+        // Accumulate storage interval-by-interval across consecutive sorted stages using
+        // a monotone pointer so extreme elevations (e.g. [0, 1e308]) never overflow
+        // `k * depth - prefix_sum[k]`, and reuse the spill-stage volume for the node itself.
+        let mut cum_vol = 0.0f64;
+        let mut node_volume = 0.0f64;
+        let mut k = 0usize;
+        let mut prev_stage = stages[0];
+        let mut prev_k = 0usize;
+        for (s_idx, &stage) in stages.iter().enumerate() {
+            if s_idx > 0 {
+                let dz = (stage - prev_stage).max(0.0);
+                cum_vol += (prev_k as f64) * dz * cell_area;
+            }
+            while k < subtree_elevs.len() && subtree_elevs[k] <= stage {
+                k += 1;
+            }
             let area = k as f64 * cell_area;
             let depth = (stage - node_min).max(0.0);
-            let vol = ((k as f64) * depth - prefix_sum[k]).max(0.0) * cell_area;
+            if stage <= node_saddle {
+                node_volume = cum_vol;
+            }
             rating_curves.push(RatingCurvePoint {
                 dep_id: node_id,
                 level: node_level,
@@ -944,9 +941,18 @@ fn build_region_merge_tree(
                 stage,
                 depth,
                 area,
-                volume: vol,
+                volume: cum_vol,
             });
+            prev_stage = stage;
+            prev_k = k;
         }
+        let node_avg_depth = if node_area > 0.0 {
+            node_volume / node_area
+        } else {
+            0.0
+        };
+        nodes[node_idx].volume = node_volume;
+        nodes[node_idx].avg_depth = node_avg_depth;
 
         let props = region_props_from_sparse_cells(
             node_id,
@@ -1403,7 +1409,59 @@ mod tests {
             let child = &res.nodes[(cid - 1) as usize];
             assert_eq!(child.level, 1);
             assert!((child.saddle_elev - 5.0).abs() < 1e-12);
+            if (child.min_elev - 2.0).abs() < 1e-12 {
+                // Basin at col 4 contacts the plateau at col 3 (not col 1).
+                assert_eq!((child.pour_point_row, child.pour_point_col), (0, 3));
+            } else {
+                // Basins at cols 0 and 2 border the saddle at col 1.
+                assert_eq!((child.pour_point_row, child.pour_point_col), (0, 1));
+            }
         }
+    }
+
+    #[test]
+    fn interval_storage_stays_finite_for_extreme_range_and_collapses_signed_zero_stages() {
+        // 1. Extreme [0.0, 1e308] basin: exact storage at stage 1e308 is 1e308 (no overflow).
+        let mut ext = Array2D::from_vec(2, 1, vec![0.0, 1e308]).unwrap();
+        ext.set_no_data(-9999.0);
+        ext.geotransform = [0.0, 1.0, 0.0, 1.0, 0.0, -1.0];
+        let res_ext = delineate_depressions_merge_tree_in_memory(
+            &ext,
+            &MergeTreeOptions {
+                min_size: 1,
+                min_depth: 1.0,
+                topology: Topology::D4,
+            },
+        )
+        .unwrap();
+        assert_eq!(res_ext.nodes.len(), 1);
+        assert!(res_ext.nodes[0].volume.is_finite());
+        assert_eq!(res_ext.nodes[0].volume, 1e308);
+        assert_eq!(res_ext.rating_curves.last().unwrap().volume, 1e308);
+
+        // 2. [-0.0, +0.0, 1.0]: -0.0 and +0.0 collapse into one rating-curve point.
+        let mut sz = Array2D::from_vec(3, 1, vec![-0.0, 0.0, 1.0]).unwrap();
+        sz.set_no_data(-9999.0);
+        sz.geotransform = [0.0, 1.0, 0.0, 1.0, 0.0, -1.0];
+        let res_sz = delineate_depressions_merge_tree_in_memory(
+            &sz,
+            &MergeTreeOptions {
+                min_size: 1,
+                min_depth: 0.5,
+                topology: Topology::D4,
+            },
+        )
+        .unwrap();
+        assert_eq!(res_sz.nodes.len(), 1);
+        assert_eq!(
+            res_sz.rating_curves.len(),
+            2,
+            "expected -0.0 and +0.0 to collapse into 1 stage, got {:?}",
+            res_sz.rating_curves
+        );
+        assert_eq!(res_sz.rating_curves[0].stage, 0.0);
+        assert_eq!(res_sz.rating_curves[1].stage, 1.0);
+        assert!((res_sz.nodes[0].volume - 2.0).abs() < 1e-12);
     }
 
     #[test]

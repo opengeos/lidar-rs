@@ -635,6 +635,11 @@ fn build_layer_from_parts(
 /// Builds the `"depressions_full"` vector layer containing complete, child-hole-free
 /// enclosing polygons for every compound depression (`level >= 2`) as well as all leaf
 /// depressions (`level == 1`).
+///
+/// Complexity note: leaf polygons are reused from a single full-raster polygonization pass,
+/// while each compound depression (`level >= 2`) rasterizes and polygonizes its subtree
+/// bounding box, so total work scales with the sum of compound subtree bounding-box areas
+/// across hierarchy levels.
 pub fn build_enclosing_depressions_layer(
     depression_id: &Array2D<i32>,
     depressions: &[NestedDepression],
@@ -735,9 +740,60 @@ fn build_enclosing_layer_inner(
         }
     }
 
-    // Generation-stamped flat lookup array avoids per-pixel HashSet hashing.
-    let mut member_stamp = vec![0u32; max_id + 1];
-    let mut cur_stamp = 0u32;
+    // Adaptive subtree membership lookup: use a flat generation-stamped vec when IDs are
+    // compact relative to depression count, and fall back to a HashSet for sparse/large IDs
+    // so arbitrary external IDs (e.g. 1 and 1_000_000_000) never cause huge allocations.
+    enum SubtreeLookup {
+        Dense { stamp: Vec<u32>, cur: u32 },
+        Sparse(std::collections::HashSet<u32>),
+    }
+
+    impl SubtreeLookup {
+        fn new(max_id: usize, num_deps: usize) -> Self {
+            let dense_cap = (num_deps.max(1).saturating_mul(4)).max(65_536);
+            if max_id <= dense_cap {
+                Self::Dense {
+                    stamp: vec![0u32; max_id + 1],
+                    cur: 0,
+                }
+            } else {
+                Self::Sparse(std::collections::HashSet::new())
+            }
+        }
+
+        fn begin_subtree(&mut self) {
+            match self {
+                Self::Dense { cur, .. } => *cur += 1,
+                Self::Sparse(set) => set.clear(),
+            }
+        }
+
+        #[inline]
+        fn insert(&mut self, id: u32) -> bool {
+            match self {
+                Self::Dense { stamp, cur } => {
+                    let idx = id as usize;
+                    if idx >= stamp.len() || stamp[idx] == *cur {
+                        false
+                    } else {
+                        stamp[idx] = *cur;
+                        true
+                    }
+                }
+                Self::Sparse(set) => set.insert(id),
+            }
+        }
+
+        #[inline]
+        fn contains(&self, id: u32) -> bool {
+            match self {
+                Self::Dense { stamp, cur } => stamp.get(id as usize).is_some_and(|&s| s == *cur),
+                Self::Sparse(set) => set.contains(&id),
+            }
+        }
+    }
+
+    let mut lookup = SubtreeLookup::new(max_id, depressions.len());
     let mut stack: Vec<u32> = Vec::new();
     let mut subtree_ids: Vec<u32> = Vec::new();
 
@@ -745,16 +801,14 @@ fn build_enclosing_layer_inner(
         if d.children_ids.is_empty() {
             continue;
         }
-        cur_stamp += 1;
+        lookup.begin_subtree();
         stack.clear();
         subtree_ids.clear();
         stack.push(d.id);
         while let Some(cur) = stack.pop() {
-            let idx = cur as usize;
-            if idx >= member_stamp.len() || member_stamp[idx] == cur_stamp {
+            if !lookup.insert(cur) {
                 continue;
             }
-            member_stamp[idx] = cur_stamp;
             subtree_ids.push(cur);
             if let Some(node) = dep_map.get(&cur) {
                 for &cid in &node.children_ids {
@@ -795,7 +849,7 @@ fn build_enclosing_layer_inner(
             let dst_off = (r - r0) * bw;
             for c in c0..c1 {
                 let v = id_data[src_off + c];
-                if v > 0 && member_stamp[v as usize] == cur_stamp {
+                if v > 0 && lookup.contains(v as u32) {
                     mask_vec[dst_off + (c - c0)] = 1;
                 }
             }
@@ -870,6 +924,10 @@ fn build_enclosing_layer_inner(
 /// enclosing footprint polygons for compound `level >= 2` and leaf `level == 1` depressions)
 /// and requires GeoPackage (`.gpkg`); passing `.geojson`/`.json`/`.shp` with
 /// `include_enclosing = true` returns [`Error::InvalidArgument`] before building any layers.
+///
+/// Complexity note: when `include_enclosing = true`, each compound depression (`level >= 2`)
+/// rasterizes and polygonizes its subtree bounding box, so work scales with the sum of
+/// compound subtree bounding-box areas across hierarchy levels.
 pub fn write_depressions_vector_with_enclosing(
     depression_id: &Array2D<i32>,
     depressions: &[NestedDepression],
@@ -1421,5 +1479,51 @@ mod tests {
         let mut tiny = Array2D::from_vec(2, 2, vec![10.0, 10.0, 11.0, 11.0]).unwrap();
         tiny.set_no_data(0.0);
         assert!(delineate_depressions_in_memory(&tiny, 0, 0.0, 1e-30).is_err());
+    }
+
+    #[test]
+    fn enclosing_layer_handles_sparse_large_depression_ids_without_huge_allocation() {
+        // Two-cell raster with IDs 1 (parent) and 1_000_000_000 (child): must use sparse
+        // lookup instead of allocating a 4 GB stamp vector.
+        let mut id_arr = Array2D::from_vec(2, 1, vec![1i32, 1_000_000_000i32]).unwrap();
+        id_arr.geotransform = [0.0, 1.0, 0.0, 1.0, 0.0, -1.0];
+        id_arr.set_no_data(0);
+
+        let make_dep =
+            |id: u32, level: u32, parent_id: u32, children_ids: Vec<u32>, count: usize| {
+                NestedDepression {
+                    id,
+                    level,
+                    count,
+                    area: count as f64,
+                    volume: count as f64,
+                    avg_depth: 1.0,
+                    max_depth: 1.0,
+                    min_elev: 10.0,
+                    max_elev: 11.0,
+                    children_ids,
+                    region_id: 1,
+                    perimeter: 4.0,
+                    major_axis: 1.0,
+                    minor_axis: 1.0,
+                    elongatedness: 1.0,
+                    eccentricity: 0.0,
+                    orientation: 0.0,
+                    area_bbox_ratio: 1.0,
+                    parent_id,
+                    circularity: 0.78,
+                    depth_diam_ratio: 0.5,
+                    hypsometric_integral: 0.5,
+                    rim_slope_deg: 45.0,
+                    artifact_flag: false,
+                }
+            };
+        let deps = vec![
+            make_dep(1, 2, 0, vec![1_000_000_000], 2),
+            make_dep(1_000_000_000, 1, 1, vec![], 1),
+        ];
+        let layer = build_enclosing_depressions_layer(&id_arr, &deps).unwrap();
+        assert_eq!(layer.name, "depressions_full");
+        assert_eq!(layer.features.len(), 2);
     }
 }

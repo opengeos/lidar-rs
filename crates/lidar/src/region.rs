@@ -363,8 +363,54 @@ pub(crate) fn benkrid_crookes_perimeter_affine(
         }
     }
 
-    // 2. Convolve border with [[10, 2, 10], [2, 1, 2], [10, 2, 10]] (constant 0 border)
-    // and weight each segment by its true map-unit step length along vx, vy, vx+vy, vx-vy.
+    benkrid_crookes_perimeter_affine_inner(&border, bw, bh, vx, vy)
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn benkrid_crookes_cell_weight(
+    horiz: u8,
+    vert: u8,
+    d_pos: u8,
+    d_neg: u8,
+    res_x: f64,
+    res_y: f64,
+    diag_pos: f64,
+    diag_neg: f64,
+) -> f64 {
+    let ortho = horiz + vert;
+    let diag = d_pos + d_neg;
+    let code = 1u8 + 2 * ortho + 10 * diag;
+    let ortho_len = if horiz > vert {
+        res_x
+    } else if vert > horiz {
+        res_y
+    } else {
+        0.5 * (res_x + res_y)
+    };
+    let diag_len = if d_pos > d_neg {
+        diag_pos
+    } else if d_neg > d_pos {
+        diag_neg
+    } else {
+        0.5 * (diag_pos + diag_neg)
+    };
+    match code {
+        5 | 7 | 15 | 17 | 25 | 27 => ortho_len,
+        21 | 33 => diag_len,
+        13 | 23 => 0.5 * (ortho_len + diag_len),
+        _ => 0.0,
+    }
+}
+
+/// Computes Benkrid & Crookes affine-aware perimeter over a dense binary mask.
+fn benkrid_crookes_perimeter_affine_inner(
+    border: &[u8],
+    bw: usize,
+    bh: usize,
+    vx: (f64, f64),
+    vy: (f64, f64),
+) -> f64 {
     let res_x = vx.0.hypot(vx.1);
     let res_y = vy.0.hypot(vy.1);
     let diag_pos = (vx.0 + vy.0).hypot(vx.1 + vy.1);
@@ -388,31 +434,11 @@ pub(crate) fn benkrid_crookes_perimeter_affine(
             let ci = c as isize;
             let horiz = get(ri, ci - 1) + get(ri, ci + 1);
             let vert = get(ri - 1, ci) + get(ri + 1, ci);
-            let ortho = horiz + vert;
             let d_pos = get(ri - 1, ci - 1) + get(ri + 1, ci + 1);
             let d_neg = get(ri - 1, ci + 1) + get(ri + 1, ci - 1);
-            let diag = d_pos + d_neg;
-            let code = 1u8 + 2 * ortho + 10 * diag;
-            let ortho_len = if horiz > vert {
-                res_x
-            } else if vert > horiz {
-                res_y
-            } else {
-                0.5 * (res_x + res_y)
-            };
-            let diag_len = if d_pos > d_neg {
-                diag_pos
-            } else if d_neg > d_pos {
-                diag_neg
-            } else {
-                0.5 * (diag_pos + diag_neg)
-            };
-            perim += match code {
-                5 | 7 | 15 | 17 | 25 | 27 => ortho_len,
-                21 | 33 => diag_len,
-                13 | 23 => 0.5 * (ortho_len + diag_len),
-                _ => 0.0,
-            };
+            perim += benkrid_crookes_cell_weight(
+                horiz, vert, d_pos, d_neg, res_x, res_y, diag_pos, diag_neg,
+            );
         }
     }
 
@@ -716,31 +742,11 @@ fn benkrid_crookes_perimeter_sparse(
     for &(ri, ci) in &border {
         let horiz = get(ri, ci - 1) + get(ri, ci + 1);
         let vert = get(ri - 1, ci) + get(ri + 1, ci);
-        let ortho = horiz + vert;
         let d_pos = get(ri - 1, ci - 1) + get(ri + 1, ci + 1);
         let d_neg = get(ri - 1, ci + 1) + get(ri + 1, ci - 1);
-        let diag = d_pos + d_neg;
-        let code = 1u8 + 2 * ortho + 10 * diag;
-        let ortho_len = if horiz > vert {
-            res_x
-        } else if vert > horiz {
-            res_y
-        } else {
-            0.5 * (res_x + res_y)
-        };
-        let diag_len = if d_pos > d_neg {
-            diag_pos
-        } else if d_neg > d_pos {
-            diag_neg
-        } else {
-            0.5 * (diag_pos + diag_neg)
-        };
-        perim += match code {
-            5 | 7 | 15 | 17 | 25 | 27 => ortho_len,
-            21 | 33 => diag_len,
-            13 | 23 => 0.5 * (ortho_len + diag_len),
-            _ => 0.0,
-        };
+        perim += benkrid_crookes_cell_weight(
+            horiz, vert, d_pos, d_neg, res_x, res_y, diag_pos, diag_neg,
+        );
     }
     perim
 }
@@ -862,10 +868,7 @@ pub(crate) fn region_props_from_sparse_cells(
     let l2 = (0.5 * (mu20 + mu02 - common)).max(0.0);
 
     let major_axis = 4.0 * l1.sqrt();
-    let mut minor_axis = 4.0 * l2.sqrt();
-    if minor_axis == 0.0 {
-        minor_axis = min_res;
-    }
+    let minor_axis = (4.0 * l2.sqrt()).max(min_res);
     let elongatedness = if minor_axis > 0.0 {
         major_axis / minor_axis
     } else {
@@ -974,10 +977,7 @@ pub(crate) fn region_props_for_single_label(
     let l2 = (0.5 * (mu20 + mu02 - common)).max(0.0);
 
     let major_axis = 4.0 * l1.sqrt();
-    let mut minor_axis = 4.0 * l2.sqrt();
-    if minor_axis == 0.0 {
-        minor_axis = min_res;
-    }
+    let minor_axis = (4.0 * l2.sqrt()).max(min_res);
     let elongatedness = if minor_axis > 0.0 {
         major_axis / minor_axis
     } else {
