@@ -265,11 +265,12 @@ fn mean_2d_scaled(
 
 /// Applies a `kernel_size x kernel_size` box mean filter to a DEM.
 ///
-/// Uses a banded separable 2-pass formulation with true `O(1)` per-pixel sliding-window
-/// updates (periodic exact resynchronization and catastrophic-cancellation fallback) in
-/// both horizontal and vertical interior passes, achieving `O(N)` total work independent of
-/// `kernel_size` while excluding NoData / non-finite cells identically to a 2D window and
-/// bounding scratch memory to `O(min(H, 256 + k - 1) * W)`.
+/// Uses a banded separable 2-pass formulation carrying valid sums and valid counts across
+/// both passes so NoData / non-finite cells are excluded identically to a 2D window while
+/// bounding scratch memory to `O(min(H, 256 + k - 1) * W)`. Ordinary interior sliding-window
+/// updates run in `O(1)` per pixel in both the horizontal and vertical passes; reflected
+/// border pixels, per-band sliding-window initialization, and periodic or cancellation-triggered
+/// exact rescans cost up to `O(kernel_size)` per pixel.
 ///
 /// Boundary pixels use symmetric reflection (`scipy.ndimage` `mode='reflect'`).
 /// NoData and non-finite cells are preserved untouched and excluded from
@@ -1291,7 +1292,6 @@ pub fn bilateral_filter(
     let ksize = 2 * radius_u + 1;
 
     let inv_two_sigma_s2 = 1.0 / (2.0 * sigma_spatial * sigma_spatial);
-    let inv_two_sigma_r2 = 1.0 / (2.0 * sigma_range * sigma_range);
     let mut spatial_w = Vec::with_capacity(ksize * ksize);
     for dy in -radius..=radius {
         for dx in -radius..=radius {
@@ -1305,6 +1305,19 @@ pub fn bilateral_filter(
     let mut out = vec![0.0f64; w * h];
     let int_start = radius_u.min(w);
     let int_end = w.saturating_sub(radius_u).max(int_start);
+
+    // Compute range weight scaling `dz / sigma_range` before squaring so large finite
+    // elevations (e.g. [0, 1e180] with sigma_range=1e200) and tiny positive sigmas never
+    // produce NaN weights.
+    #[inline]
+    fn bilateral_range_weight(dz: f64, sigma_range: f64) -> f64 {
+        if dz == 0.0 {
+            1.0
+        } else {
+            let scaled = dz / sigma_range;
+            (-0.5 * scaled * scaled).exp()
+        }
+    }
 
     let compute_row = |(y, out_row): (usize, &mut [f64])| {
         let src_row = &src[y * w..(y + 1) * w];
@@ -1328,7 +1341,9 @@ pub fn bilateral_filter(
             if is_missing_val(no_data, center) {
                 return center;
             }
-            let mut num = 0.0f64;
+            // Accumulate weighted deltas relative to `center` to keep constant extreme
+            // rasters (e.g. 1e308) exact and finite without unnormalized numerator overflow.
+            let mut num_dz = 0.0f64;
             let mut den = 0.0f64;
             let xi = x as isize;
             for (ky, &ro) in offs.iter().enumerate() {
@@ -1338,13 +1353,39 @@ pub fn bilateral_filter(
                     let v = src[ro + nx];
                     if !is_missing_val(no_data, v) {
                         let dz = v - center;
-                        let wt = ws * (-dz * dz * inv_two_sigma_r2).exp();
-                        num += wt * v;
-                        den += wt;
+                        let wt = ws * bilateral_range_weight(dz, sigma_range);
+                        if wt > 0.0 {
+                            num_dz += wt * dz;
+                            den += wt;
+                        }
                     }
                 }
             }
-            if den > 0.0 { num / den } else { center }
+            if den <= 0.0 {
+                return center;
+            }
+            let res = center + num_dz / den;
+            if res.is_finite() {
+                return res;
+            }
+            // Overflow-safe normalized-weight fallback when `wt * dz` overflows f64.
+            let inv_den = 1.0 / den;
+            let mut scaled = 0.0f64;
+            for (ky, &ro) in offs.iter().enumerate() {
+                let w_row = &spatial_w[ky * ksize..(ky + 1) * ksize];
+                for (kx, &ws) in w_row.iter().enumerate() {
+                    let nx = reflect_index(xi + (kx as isize - radius), w);
+                    let v = src[ro + nx];
+                    if !is_missing_val(no_data, v) {
+                        let dz = v - center;
+                        let wt = ws * bilateral_range_weight(dz, sigma_range);
+                        if wt > 0.0 {
+                            scaled += (wt * inv_den) * v;
+                        }
+                    }
+                }
+            }
+            if scaled.is_finite() { scaled } else { center }
         };
 
         for (x, slot) in out_row.iter_mut().enumerate().take(int_start) {
@@ -1356,7 +1397,7 @@ pub fn bilateral_filter(
                 out_row[x] = center;
                 continue;
             }
-            let mut num = 0.0f64;
+            let mut num_dz = 0.0f64;
             let mut den = 0.0f64;
             let x0 = x - radius_u;
             for (ky, &ro) in offs.iter().enumerate() {
@@ -1365,13 +1406,39 @@ pub fn bilateral_filter(
                 for (&v, &ws) in s_slice.iter().zip(w_row.iter()) {
                     if !is_missing_val(no_data, v) {
                         let dz = v - center;
-                        let wt = ws * (-dz * dz * inv_two_sigma_r2).exp();
-                        num += wt * v;
-                        den += wt;
+                        let wt = ws * bilateral_range_weight(dz, sigma_range);
+                        if wt > 0.0 {
+                            num_dz += wt * dz;
+                            den += wt;
+                        }
                     }
                 }
             }
-            out_row[x] = if den > 0.0 { num / den } else { center };
+            if den <= 0.0 {
+                out_row[x] = center;
+                continue;
+            }
+            let res = center + num_dz / den;
+            if res.is_finite() {
+                out_row[x] = res;
+            } else {
+                let inv_den = 1.0 / den;
+                let mut scaled = 0.0f64;
+                for (ky, &ro) in offs.iter().enumerate() {
+                    let w_row = &spatial_w[ky * ksize..(ky + 1) * ksize];
+                    let s_slice = &src[ro + x0..ro + x0 + ksize];
+                    for (&v, &ws) in s_slice.iter().zip(w_row.iter()) {
+                        if !is_missing_val(no_data, v) {
+                            let dz = v - center;
+                            let wt = ws * bilateral_range_weight(dz, sigma_range);
+                            if wt > 0.0 {
+                                scaled += (wt * inv_den) * v;
+                            }
+                        }
+                    }
+                }
+                out_row[x] = if scaled.is_finite() { scaled } else { center };
+            }
         }
         for (x, slot) in out_row.iter_mut().enumerate().skip(int_end) {
             *slot = eval_border(x);
@@ -1417,7 +1484,8 @@ pub fn bilateral_filter_file(
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct FeaturePreservingOptions {
-    /// Square window size in pixels for normal-vector smoothing (default `11`).
+    /// Odd centered square window size in pixels for normal-vector smoothing (default `11`).
+    /// Must be an odd integer in `1..=1025`.
     pub filter_size: usize,
     /// Maximum angle threshold in degrees between neighboring surface normals for
     /// smoothing across a facet (`acos(n_i . n_j) < norm_diff_deg`, default `15.0`).
@@ -1446,17 +1514,27 @@ impl Default for FeaturePreservingOptions {
 /// noise while preserving sharp breaklines such as road embankments, channel banks, and
 /// depression rims.
 ///
+/// Requires an odd `options.filter_size` (centered symmetric window).
+///
 /// Algorithm stages:
-/// 1. Compute per-cell unit surface normals from NoData-safe local elevation gradients.
-/// 2. Smooth the normal vector field over the `filter_size x filter_size` neighborhood using
-///    only neighboring normals within `norm_diff_deg` degrees (`n_i . n_j >= cos(norm_diff_deg)`).
+/// 1. Compute per-cell unit surface normals in true map coordinates using the full 2x2
+///    affine geotransform Jacobian (accurately handling orthogonal, rotated, and sheared grids).
+/// 2. Smooth the normal vector field over the centered `filter_size x filter_size` neighborhood
+///    using only neighboring normals within `norm_diff_deg` degrees (`n_i . n_j >= cos(norm_diff_deg)`).
 /// 3. Iteratively update cell elevations (`num_iter` passes) to fit the smoothed normal field
-///    across compatible neighbors, optionally clamping per-cell change to `max_z_change`.
+///    across compatible neighbors using map-space affine displacements and overflow-safe
+///    delta accumulation, optionally clamping per-cell change to `max_z_change`.
 pub fn feature_preserving_smoothing(
     dem: &Array2D<f64>,
     options: &FeaturePreservingOptions,
 ) -> Result<Array2D<f64>> {
     validate_kernel_size(options.filter_size)?;
+    if options.filter_size.is_multiple_of(2) {
+        return Err(Error::InvalidArgument(format!(
+            "filter_size must be odd, got {}",
+            options.filter_size
+        )));
+    }
     if !options.norm_diff_deg.is_finite()
         || options.norm_diff_deg <= 0.0
         || options.norm_diff_deg > 180.0
@@ -1480,13 +1558,18 @@ pub fn feature_preserving_smoothing(
         return Ok(dem.clone());
     }
 
+    // Full 2x2 affine basis: col step vx = (a, d), row step vy = (b, e).
     let (vx, vy, _) = affine_basis(&dem.geotransform);
-    let cell_x = vx.0.hypot(vx.1).max(1e-9);
-    let cell_y = vy.0.hypot(vy.1).max(1e-9);
+    let (a, d) = vx;
+    let (b, e) = vy;
+    let det = a * e - b * d;
     let no_data = dem.no_data();
     let src = dem.data();
 
-    // Stage 1: Compute per-cell unit surface normals (nx, ny, nz) from local gradients.
+    // Stage 1: Compute per-cell unit surface normals (nx, ny, nz) in map space.
+    // Given grid-space directional derivatives (dz/dc, dz/dr), map-space gradient satisfies
+    //   [a d; b e] [gx; gy] = [dz/dc; dz/dr]
+    // so gx = (e * dz/dc - d * dz/dr) / det, gy = (-b * dz/dc + a * dz/dr) / det.
     let mut normals = vec![[0.0f64; 3]; w * h];
     let compute_normal_row = |(y, nrow): (usize, &mut [[f64; 3]])| {
         let row_off = y * w;
@@ -1508,10 +1591,10 @@ pub fn feature_preserving_smoothing(
             } else {
                 None
             };
-            let gx = match (z_w, z_e) {
-                (Some(zw), Some(ze)) => (ze - zw) / (2.0 * cell_x),
-                (Some(zw), None) => (zc - zw) / cell_x,
-                (None, Some(ze)) => (ze - zc) / cell_x,
+            let dz_dc = match (z_w, z_e) {
+                (Some(zw), Some(ze)) => 0.5 * (ze - zw),
+                (Some(zw), None) => zc - zw,
+                (None, Some(ze)) => ze - zc,
                 (None, None) => 0.0,
             };
 
@@ -1527,15 +1610,21 @@ pub fn feature_preserving_smoothing(
             } else {
                 None
             };
-            let gy = match (z_n, z_s) {
-                (Some(zn), Some(zs)) => (zs - zn) / (2.0 * cell_y),
-                (Some(zn), None) => (zc - zn) / cell_y,
-                (None, Some(zs)) => (zs - zc) / cell_y,
+            let dz_dr = match (z_n, z_s) {
+                (Some(zn), Some(zs)) => 0.5 * (zs - zn),
+                (Some(zn), None) => zc - zn,
+                (None, Some(zs)) => zs - zc,
                 (None, None) => 0.0,
             };
 
+            let gx = (e * dz_dc - d * dz_dr) / det;
+            let gy = (-b * dz_dc + a * dz_dr) / det;
             let inv_len = 1.0 / (gx * gx + gy * gy + 1.0).sqrt();
-            *slot = [-gx * inv_len, -gy * inv_len, inv_len];
+            *slot = if inv_len.is_finite() {
+                [-gx * inv_len, -gy * inv_len, inv_len]
+            } else {
+                [0.0, 0.0, 1.0]
+            };
         }
     };
 
@@ -1642,13 +1731,18 @@ pub fn feature_preserving_smoothing(
                     *slot = z0;
                     continue;
                 }
+                let z_cur = cur_ref[idx];
                 let ni = sn_ref[idx];
                 if ni[2] <= 1e-12 {
-                    *slot = cur_ref[idx];
+                    *slot = z_cur;
                     continue;
                 }
-                let mut sum_z = 0.0f64;
+                // Accumulate predicted deltas relative to `z_cur` so flat extreme terrain
+                // (e.g. constant 1e308) stays finite and exact without sum overflow.
+                let mut sum_dz = 0.0f64;
                 let mut sum_w = 0.0f64;
+                let mut preds = [(0.0f64, 0.0f64); 8];
+                let mut n_preds = 0usize;
                 for &(ox, oy) in &NBR8 {
                     let nx_i = x as isize + ox;
                     let ny_i = y as isize + oy;
@@ -1672,18 +1766,36 @@ pub fn feature_preserving_smoothing(
                         } else {
                             1.0
                         };
-                        // Vector from neighbor j to center i in map coordinates.
-                        let dx_ij = -(ox as f64) * cell_x;
-                        let dy_ij = -(oy as f64) * cell_y;
-                        let z_pred = zj - (nj[0] * dx_ij + nj[1] * dy_ij) / nj[2];
-                        sum_z += wt * z_pred;
-                        sum_w += wt;
+                        // Full affine map-space displacement from neighbor j to center i.
+                        let dc_ij = -(ox as f64);
+                        let dr_ij = -(oy as f64);
+                        let dx_ij = dc_ij * a + dr_ij * b;
+                        let dy_ij = dc_ij * d + dr_ij * e;
+                        let slope_term = (nj[0] * dx_ij + nj[1] * dy_ij) / nj[2];
+                        let delta_pred = (zj - z_cur) - slope_term;
+                        if delta_pred.is_finite() {
+                            sum_dz += wt * delta_pred;
+                            sum_w += wt;
+                            preds[n_preds] = (wt, delta_pred);
+                            n_preds += 1;
+                        }
                     }
                 }
                 let mut z_new = if sum_w > 0.0 {
-                    sum_z / sum_w
+                    let cand = z_cur + sum_dz / sum_w;
+                    if cand.is_finite() {
+                        cand
+                    } else {
+                        let inv_w = 1.0 / sum_w;
+                        let mut scaled_dz = 0.0f64;
+                        for &(wt, dp) in &preds[..n_preds] {
+                            scaled_dz += (wt * inv_w) * dp;
+                        }
+                        let fb = z_cur + scaled_dz;
+                        if fb.is_finite() { fb } else { z_cur }
+                    }
                 } else {
-                    cur_ref[idx]
+                    z_cur
                 };
                 if let Some(max_dz) = max_dz_opt {
                     z_new = z_new.clamp(z0 - max_dz, z0 + max_dz);
@@ -2029,12 +2141,16 @@ mod tests {
             state
         };
 
-        // Test 2,000 random binary vectors (zero-one principle spot checks) and 2,000 continuous vectors.
+        // Test 2,000 diverse binary masks drawn from high LCG bits (not the alternating low bit)
+        // plus 2,000 continuous vectors including signed zeros.
+        let mut distinct_masks = std::collections::HashSet::new();
         for _ in 0..2000 {
+            let mask = (next() >> 39) as u32;
+            distinct_masks.insert(mask);
             let mut arr = [0.0f64; 25];
             let mut ones = 0usize;
-            for slot in &mut arr {
-                if (next() & 1) == 1 {
+            for (i, slot) in arr.iter_mut().enumerate() {
+                if ((mask >> i) & 1) == 1 {
                     *slot = 1.0;
                     ones += 1;
                 }
@@ -2042,22 +2158,155 @@ mod tests {
             let expected = if ones >= 13 { 1.0 } else { 0.0 };
             assert_eq!(median25(arr), expected);
         }
+        assert!(distinct_masks.len() > 1900);
         for _ in 0..2000 {
             let mut arr = [0.0f64; 25];
             for slot in &mut arr {
-                let r = next() % 11;
+                let r = (next() >> 32) % 11;
                 *slot = if r == 0 {
                     -0.0
                 } else if r == 1 {
                     0.0
                 } else {
-                    ((next() % 1000) as f64) - 500.0
+                    (((next() >> 32) % 1000) as f64) - 500.0
                 };
             }
             let mut sorted = arr;
             sorted.sort_by(f64::total_cmp);
             assert_eq!(median25(arr).to_bits(), sorted[12].to_bits());
         }
+    }
+
+    #[test]
+    fn feature_preserving_smoothing_rejects_even_filter_size() {
+        let dem = Array2D::from_vec(5, 5, vec![10.0; 25]).unwrap();
+        for even in [2usize, 4, 10] {
+            let err = feature_preserving_smoothing(
+                &dem,
+                &FeaturePreservingOptions {
+                    filter_size: even,
+                    ..Default::default()
+                },
+            );
+            assert!(err.is_err(), "expected even filter_size={even} to fail");
+        }
+    }
+
+    #[test]
+    fn bilateral_and_feature_preserving_handle_extreme_finite_values() {
+        // Bilateral: large elevations [0, 1e180] with sigma_range=1e200 must blend smoothly without NaN.
+        let mut big = Array2D::from_vec(2, 1, vec![0.0, 1e180]).unwrap();
+        big.set_no_data(-9999.0);
+        let b_big = bilateral_filter(&big, 1.0, 1e200).unwrap();
+        assert!(
+            b_big.get(0, 0).is_finite() && b_big.get(0, 0) > 0.0,
+            "expected finite blended > 0.0, got {}",
+            b_big.get(0, 0)
+        );
+        assert!(
+            b_big.get(1, 0).is_finite() && b_big.get(1, 0) < 1e180,
+            "expected finite blended < 1e180, got {}",
+            b_big.get(1, 0)
+        );
+
+        // Bilateral and FPS: constant 3x3 raster of 1e308 must stay finite 1e308.
+        let mut flat_max = Array2D::from_vec(3, 3, vec![1e308; 9]).unwrap();
+        flat_max.set_no_data(-9999.0);
+        let b_max = bilateral_filter(&flat_max, 1.0, 1.0).unwrap();
+        let fps_max = feature_preserving_smoothing(
+            &flat_max,
+            &FeaturePreservingOptions {
+                filter_size: 3,
+                norm_diff_deg: 15.0,
+                num_iter: 3,
+                max_z_change: None,
+                compress: false,
+            },
+        )
+        .unwrap();
+        for (&bv, &fv) in b_max.data().iter().zip(fps_max.data().iter()) {
+            assert_eq!(bv, 1e308);
+            assert_eq!(fv, 1e308);
+        }
+    }
+
+    #[test]
+    fn feature_preserving_smoothing_uses_full_affine_basis_on_sheared_grid() {
+        // Sheared grid with vx = (1.0, 0.0), vy = (0.6, 0.8).
+        // 1. Any tilted plane z(c, r) = 10 + 1.5*c - 0.7*r must be an exact fixed point.
+        let (w, h) = (13usize, 13usize);
+        let mut plane = Vec::with_capacity(w * h);
+        for r in 0..h {
+            for c in 0..w {
+                plane.push(10.0 + 1.5 * c as f64 - 0.7 * r as f64);
+            }
+        }
+        let mut plane_dem = Array2D::from_vec(w, h, plane).unwrap();
+        plane_dem.set_no_data(-9999.0);
+        plane_dem.geotransform = [0.0, 1.0, 0.6, 0.0, 0.0, 0.8];
+        let plane_out = feature_preserving_smoothing(
+            &plane_dem,
+            &FeaturePreservingOptions {
+                filter_size: 5,
+                norm_diff_deg: 15.0,
+                num_iter: 4,
+                max_z_change: None,
+                compress: false,
+            },
+        )
+        .unwrap();
+        for (&orig, &out) in plane_dem.data().iter().zip(plane_out.data().iter()) {
+            assert!(
+                (orig - out).abs() < 1e-10,
+                "sheared affine plane must be a fixed point: orig={orig}, out={out}"
+            );
+        }
+
+        // 2. Two facets with grid slopes (1, 0) and (0, 1) on sheared basis (1, 0) & (0.6, 0.8)
+        // have true map-space normal angle ~88.6 deg (vs 60 deg if shear were ignored).
+        // Separated by a 1-column NoData strip at c = 7 so both sides keep exact one-sided
+        // facet normals, a 5x5 normal-smoothing window reaches across c = 7: with norm_diff_deg = 75.0,
+        // the full affine basis keeps the two facets completely unblended (whereas ignoring shear
+        // would blend them because 60 deg < 75 deg).
+        let (sw, sh) = (15usize, 15usize);
+        let mut ridge = vec![0.0f64; sw * sh];
+        for r in 0..sh {
+            for c in 0..sw {
+                ridge[r * sw + c] = if c < 7 {
+                    c as f64
+                } else if c == 7 {
+                    -9999.0
+                } else {
+                    r as f64
+                };
+            }
+        }
+        let mut ridge_dem = Array2D::from_vec(sw, sh, ridge).unwrap();
+        ridge_dem.set_no_data(-9999.0);
+        ridge_dem.geotransform = [0.0, 1.0, 0.6, 0.0, 0.0, 0.8];
+        let ridge_out = feature_preserving_smoothing(
+            &ridge_dem,
+            &FeaturePreservingOptions {
+                filter_size: 5,
+                norm_diff_deg: 75.0,
+                num_iter: 2,
+                max_z_change: None,
+                compress: false,
+            },
+        )
+        .unwrap();
+        // Cell (6, 7) sees right-facet normals at c=8 inside its 5x5 window; true angle is 88.6 deg > 75 deg.
+        assert!(
+            (ridge_out.get(6, 7) - 6.0).abs() < 1e-10,
+            "left facet should not blend with right facet at 75 deg cutoff, got {}",
+            ridge_out.get(6, 7)
+        );
+        // Cell (8, 7) sees left-facet normals at c=6 inside its 5x5 window; true angle is 88.6 deg > 75 deg.
+        assert!(
+            (ridge_out.get(8, 7) - 7.0).abs() < 1e-10,
+            "right facet should not blend with left facet at 75 deg cutoff, got {}",
+            ridge_out.get(8, 7)
+        );
     }
 
     #[test]

@@ -5,7 +5,6 @@
 //! slicing, and `terrio` for GeoTIFF and Shapefile output.
 
 use std::collections::{BTreeMap, HashMap};
-use std::f64::consts::PI;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -25,7 +24,7 @@ use terrio::{
 use crate::error::{Error, Result};
 use crate::raster_ops::{ensure_no_path_collision, polygonize};
 use crate::region::{
-    RegionProps, region_basic_stats, region_group, region_group_slice,
+    RegionProps, extended_morphometrics, region_basic_stats, region_group, region_group_slice,
     region_props_for_single_label,
 };
 
@@ -167,45 +166,6 @@ pub struct InMemoryDepressions {
     pub max_level: u32,
     /// Number of top-level sink regions processed.
     pub num_regions: u32,
-}
-
-fn extended_morphometrics(
-    area: f64,
-    perimeter: f64,
-    avg_depth: f64,
-    max_depth: f64,
-    elongatedness: f64,
-    area_bbox_ratio: f64,
-) -> (f64, f64, f64, f64, bool) {
-    let circularity = if perimeter > 0.0 && area > 0.0 {
-        (4.0 * PI * area / (perimeter * perimeter)).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let eq_radius = if area > 0.0 { (area / PI).sqrt() } else { 0.0 };
-    let depth_diam_ratio = if eq_radius > 0.0 {
-        max_depth / (2.0 * eq_radius)
-    } else {
-        0.0
-    };
-    let hypsometric_integral = if max_depth > 0.0 {
-        (avg_depth / max_depth).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let rim_slope_deg = if eq_radius > 0.0 && max_depth > 0.0 {
-        (max_depth / eq_radius).atan().to_degrees()
-    } else {
-        0.0
-    };
-    let artifact_flag = elongatedness > 6.0 && area_bbox_ratio < 0.25;
-    (
-        circularity,
-        depth_diam_ratio,
-        hypsometric_integral,
-        rim_slope_deg,
-        artifact_flag,
-    )
 }
 
 fn depression_from_props(id: u32, region_id: u32, p: &RegionProps) -> NestedDepression {
@@ -742,14 +702,18 @@ fn build_enclosing_layer_inner(
     let id_data = depression_id.data();
     let gt = depression_id.geotransform;
 
-    // Single pass to gather per-ID bounding boxes over `depression_id`.
+    // Single pass to gather per-ID bounding boxes over `depression_id` and max ID for O(1) lookup.
     let mut id_bboxes: HashMap<u32, (usize, usize, usize, usize)> = HashMap::new();
+    let mut max_id = depressions.iter().map(|d| d.id).max().unwrap_or(0) as usize;
     for r in 0..h {
         let off = r * w;
         for c in 0..w {
             let v = id_data[off + c];
             if v > 0 {
                 let did = v as u32;
+                if did as usize > max_id {
+                    max_id = did as usize;
+                }
                 id_bboxes
                     .entry(did)
                     .and_modify(|b| {
@@ -771,17 +735,27 @@ fn build_enclosing_layer_inner(
         }
     }
 
+    // Generation-stamped flat lookup array avoids per-pixel HashSet hashing.
+    let mut member_stamp = vec![0u32; max_id + 1];
+    let mut cur_stamp = 0u32;
+    let mut stack: Vec<u32> = Vec::new();
+    let mut subtree_ids: Vec<u32> = Vec::new();
+
     for d in depressions {
         if d.children_ids.is_empty() {
             continue;
         }
-        // Collect complete descendant set (including self), guarded against cycles.
-        let mut subtree: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        let mut stack = vec![d.id];
+        cur_stamp += 1;
+        stack.clear();
+        subtree_ids.clear();
+        stack.push(d.id);
         while let Some(cur) = stack.pop() {
-            if !subtree.insert(cur) {
+            let idx = cur as usize;
+            if idx >= member_stamp.len() || member_stamp[idx] == cur_stamp {
                 continue;
             }
+            member_stamp[idx] = cur_stamp;
+            subtree_ids.push(cur);
             if let Some(node) = dep_map.get(&cur) {
                 for &cid in &node.children_ids {
                     stack.push(cid);
@@ -793,7 +767,7 @@ fn build_enclosing_layer_inner(
         let mut c0 = usize::MAX;
         let mut r1 = 0usize;
         let mut c1 = 0usize;
-        for &sid in &subtree {
+        for &sid in &subtree_ids {
             if let Some(&(sr0, sc0, sr1, sc1)) = id_bboxes.get(&sid) {
                 if sr0 < r0 {
                     r0 = sr0;
@@ -821,7 +795,7 @@ fn build_enclosing_layer_inner(
             let dst_off = (r - r0) * bw;
             for c in c0..c1 {
                 let v = id_data[src_off + c];
-                if v > 0 && subtree.contains(&(v as u32)) {
+                if v > 0 && member_stamp[v as usize] == cur_stamp {
                     mask_vec[dst_off + (c - c0)] = 1;
                 }
             }
@@ -887,12 +861,15 @@ fn build_enclosing_layer_inner(
     ))
 }
 
-/// Exports all nested depressions into a unified multi-level vector file (`.gpkg` or `.geojson`)
-/// with full untrimmed attribute names.
+/// Exports all nested depressions into a unified multi-level vector file with full
+/// untrimmed attribute names.
 ///
-/// When `include_enclosing` is `true`, a second layer named `"depressions_full"` is written
-/// alongside `"depressions"` containing the complete, child-hole-free enclosing footprint
-/// polygons for all compound (`level >= 2`) and leaf (`level == 1`) depressions.
+/// Single-layer export (`include_enclosing = false`) supports GeoPackage (`.gpkg`),
+/// GeoJSON (`.geojson`), and Shapefile (`.shp`). Two-layer export (`include_enclosing = true`)
+/// writes both `"depressions"` and `"depressions_full"` (containing complete, child-hole-free
+/// enclosing footprint polygons for compound `level >= 2` and leaf `level == 1` depressions)
+/// and requires GeoPackage (`.gpkg`); passing `.geojson`/`.json`/`.shp` with
+/// `include_enclosing = true` returns [`Error::InvalidArgument`] before building any layers.
 pub fn write_depressions_vector_with_enclosing(
     depression_id: &Array2D<i32>,
     depressions: &[NestedDepression],
@@ -900,6 +877,18 @@ pub fn write_depressions_vector_with_enclosing(
     include_enclosing: bool,
 ) -> Result<()> {
     let out_path = out_path.as_ref();
+    if include_enclosing {
+        let ext = out_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase());
+        if matches!(ext.as_deref(), Some("geojson" | "json" | "shp")) {
+            return Err(Error::InvalidArgument(format!(
+                "two-layer export (include_enclosing = true) requires GeoPackage (.gpkg), got '{}'",
+                out_path.display()
+            )));
+        }
+    }
     if let Some(parent) = out_path.parent()
         && !parent.as_os_str().is_empty()
     {

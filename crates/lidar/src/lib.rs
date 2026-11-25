@@ -126,6 +126,7 @@ pub use inundation::{
 };
 pub use merge_tree::{
     MergeTreeNode, MergeTreeOptions, MergeTreeResult, delineate_depressions_merge_tree_in_memory,
+    delineate_depressions_merge_tree_with_dem_in_memory,
 };
 pub use mounts::{
     DelineateMountsResult, delineate_mounts, delineate_mounts_in_memory, flip_dem, flip_dem_file,

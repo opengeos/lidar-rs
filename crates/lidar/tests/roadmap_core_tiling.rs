@@ -707,7 +707,8 @@ fn bilateral_and_feature_preserving_denoise_planar_terrain_and_preserve_step_edg
         }
     }
 
-    // Verify file wrappers round-trip cleanly.
+    // Verify file wrappers round-trip cleanly by reopening from disk and comparing cells,
+    // NoData sentinel, and geotransform against the in-memory filtered rasters.
     let tmp = tempfile::tempdir().unwrap();
     let in_tif = tmp.path().join("noisy.tif");
     let bilat_tif = tmp.path().join("bilat.tif");
@@ -717,6 +718,30 @@ fn bilateral_and_feature_preserving_denoise_planar_terrain_and_preserve_step_edg
     feature_preserving_smoothing_file(&in_tif, &fps_opts, Some(&fps_tif)).unwrap();
     assert!(bilat_tif.exists());
     assert!(fps_tif.exists());
+
+    let bilat_disk = load_raster::<f64>(&bilat_tif, None).unwrap();
+    let fps_disk = load_raster::<f64>(&fps_tif, None).unwrap();
+    assert_eq!(bilat_disk.no_data(), bilat.no_data());
+    assert_eq!(bilat_disk.geotransform, bilat.geotransform);
+    assert_eq!(fps_disk.no_data(), fps.no_data());
+    assert_eq!(fps_disk.geotransform, fps.geotransform);
+    for (idx, (&d, &m)) in bilat_disk
+        .data()
+        .iter()
+        .zip(bilat.data().iter())
+        .enumerate()
+    {
+        assert!(
+            (d - m).abs() < 1e-12,
+            "bilateral disk mismatch at {idx}: disk={d}, mem={m}"
+        );
+    }
+    for (idx, (&d, &m)) in fps_disk.data().iter().zip(fps.data().iter()).enumerate() {
+        assert!(
+            (d - m).abs() < 1e-12,
+            "fps disk mismatch at {idx}: disk={d}, mem={m}"
+        );
+    }
 }
 
 // =============================================================================
@@ -954,6 +979,29 @@ fn gpkg_enclosing_layer_produces_hole_free_full_footprint_for_compound_depressio
         build_enclosing_depressions_layer(&deps.depression_id, &deps.depressions).unwrap();
     assert_eq!(standalone.name, "depressions_full");
     assert_eq!(standalone.features.len(), deps.depressions.len());
+
+    // Two-layer export to GeoJSON must be rejected upfront, while single-layer GeoJSON succeeds.
+    let bad_geojson = tmp.path().join("two_layer.geojson");
+    assert!(
+        write_depressions_vector_with_enclosing(
+            &deps.depression_id,
+            &deps.depressions,
+            &bad_geojson,
+            true
+        )
+        .is_err()
+    );
+    assert!(!bad_geojson.exists());
+
+    let ok_geojson = tmp.path().join("single_layer.geojson");
+    write_depressions_vector_with_enclosing(
+        &deps.depression_id,
+        &deps.depressions,
+        &ok_geojson,
+        false,
+    )
+    .unwrap();
+    assert!(ok_geojson.exists());
 }
 
 #[test]
