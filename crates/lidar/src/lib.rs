@@ -40,6 +40,7 @@
 pub mod animation;
 pub mod catchment;
 pub mod conditioning;
+pub mod derivatives;
 pub mod error;
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
 pub mod federal;
@@ -65,8 +66,9 @@ pub use animation::{
 pub use catchment::{
     CatchmentHierarchyOptions, CatchmentHierarchyRecord, CatchmentHierarchyResult, CatchmentRecord,
     DelineateCatchmentsOptions, DelineateCatchmentsResult, DelineateFlowPathsOptions,
-    DelineateFlowPathsResult, FlowPathRecord, InMemoryCatchments, d8_flow_directions_resolved,
-    d8_watersheds, delineate_catchment_hierarchy, delineate_catchment_hierarchy_in_memory,
+    DelineateFlowPathsResult, FlowPathRecord, InMemoryCatchmentHierarchy, InMemoryCatchments,
+    d8_flow_directions_resolved, d8_watersheds, delineate_catchment_hierarchy,
+    delineate_catchment_hierarchy_in_memory, delineate_catchment_hierarchy_weighted_in_memory,
     delineate_catchments, delineate_catchments_in_memory, delineate_flow_paths,
     extract_sink_labels_from_raster, write_catchment_hierarchy_csv, write_catchments_csv,
     write_flowpaths_csv,
@@ -76,6 +78,10 @@ pub use conditioning::{
     EmbankmentArtifactCandidate, SynthesizeCulvertsOptions, breach_depressions,
     breach_depressions_file, breach_depressions_file_with_no_data, burn_culverts,
     burn_culverts_file, classify_embankment_artifacts, synthesize_culverts,
+};
+pub use derivatives::{
+    BurnStreamsOptions, burn_streams, burn_streams_file, compute_hand, compute_hand_from_threshold,
+    compute_twi, dinf_flow_accumulation, dinf_flow_direction, mfd_flow_accumulation,
 };
 pub use error::{Error, Result};
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
@@ -96,10 +102,11 @@ pub use filtering::{
 };
 pub use fsm::{
     FsmBasinSummary, FsmForcing, FsmHazardRasters, FsmHydrographPoint, FsmMassBalance,
-    FsmSimulationResult, RoutingMode, SpillAttenuationOptions, attenuate_fsm_hydrograph,
-    attenuate_fsm_hydrograph_with_options, compute_fsm_hazard_rasters, estimate_mean_travel_time_h,
-    fsm_basins_to_csv_string, fsm_hydrograph_to_csv_string, integrate_fsm_hydrograph_m3,
-    simulate_fill_spill_merge_in_memory, simulate_fill_spill_merge_with_green_ampt_in_memory,
+    FsmSimulationResult, RecessionCurvePoint, RecessionOptions, RecessionResult, RoutingMode,
+    SpillAttenuationOptions, attenuate_fsm_hydrograph, attenuate_fsm_hydrograph_with_options,
+    compute_fsm_hazard_rasters, estimate_mean_travel_time_h, fsm_basins_to_csv_string,
+    fsm_hydrograph_to_csv_string, integrate_fsm_hydrograph_m3, simulate_fill_spill_merge_in_memory,
+    simulate_fill_spill_merge_with_green_ampt_in_memory, simulate_post_storm_recession,
     write_fsm_basins_csv, write_fsm_hazard_rasters, write_fsm_hydrograph_csv,
 };
 #[cfg(feature = "serde")]
@@ -112,15 +119,17 @@ pub use graph::{
 pub use inundation::{
     ForcingInput, GreenAmptParams, InMemoryFullPipeline, InMemoryFullPipelineOptions,
     InMemoryInundationPipeline, InundationForcing, InundationPipelineOptions, InundationStep,
-    InundationStepSummary, RunPipelineOptions, RunPipelineResult,
+    InundationStepSummary, RunPipelineOptions, RunPipelineResult, ScsStormType,
     SimulateInundationAdvancedOptions, SimulateInundationAdvancedResult, SimulateInundationOptions,
-    SimulateInundationResult, SpillFlowPath, compute_inundation_step_summaries,
-    cumulative_runoff_mm, delineate_spill_flow_paths_in_memory, format_inundation_curve_csv,
-    green_ampt_hyetograph_losses, green_ampt_infiltration_rate_cm_h, run_full_pipeline_in_memory,
-    run_pipeline, scs_cn_incremental_hyetograph, scs_curve_number_runoff, scs_type2_hyetograph,
-    simulate_inundation, simulate_inundation_advanced, simulate_inundation_in_memory,
-    simulate_inundation_pipeline_in_memory, simulate_inundation_with_forcing_in_memory,
-    write_inundation_summary_csv,
+    SimulateInundationResult, SpillFlowPath, alternating_block_hyetograph, chicago_hyetograph,
+    compute_inundation_step_summaries, cumulative_runoff_mm, delineate_spill_flow_paths_in_memory,
+    format_inundation_curve_csv, green_ampt_hyetograph_losses, green_ampt_infiltration_rate_cm_h,
+    load_hyetograph_csv, parse_hyetograph_csv, run_full_pipeline_in_memory, run_pipeline,
+    scale_forcing_by_rainfall_grid, scs_cn_incremental_hyetograph, scs_curve_number_runoff,
+    scs_hyetograph, scs_type2_hyetograph, simulate_inundation, simulate_inundation_advanced,
+    simulate_inundation_in_memory, simulate_inundation_pipeline_in_memory,
+    simulate_inundation_with_forcing_in_memory,
+    simulate_inundation_with_weighted_catchment_in_memory, write_inundation_summary_csv,
 };
 pub use mounts::{
     DelineateMountsResult, delineate_mounts, delineate_mounts_in_memory, flip_dem, flip_dem_file,

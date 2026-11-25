@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::catchment::{
     CatchmentHierarchyRecord, d8_flow_directions_resolved,
+    delineate_catchment_hierarchy_weighted_with_flowdirs,
     delineate_catchment_hierarchy_with_flowdirs, write_catchment_hierarchy_csv,
 };
 use crate::conditioning::{BreachOptions, BurnCulvertsOptions, breach_depressions, burn_culverts};
@@ -1374,9 +1375,49 @@ pub fn scs_curve_number_runoff(cn: &Array2D<f64>, precip_mm: f64) -> Result<Arra
     Ok(out)
 }
 
-/// Generates a piecewise-constant SCS Type II design storm hyetograph as
-/// `(step_duration_h, intensity_cm_h)` pairs whose cumulative depth equals `total_precip_mm`.
-pub fn scs_type2_hyetograph(
+/// Official NRCS TR-55 (1986) 24-hour synthetic rainfall distribution types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum ScsStormType {
+    /// Pacific maritime climate with wet winters and dry summers (peaks near `t/T = 0.417`).
+    TypeI,
+    /// Pacific Northwest coastal climate, least intense peak (peaks near `t/T = 0.333`).
+    TypeIA,
+    /// Interior continental U.S. convective storms, sharpest peak (peaks near `t/T = 0.500`).
+    TypeII,
+    /// Gulf of Mexico and Atlantic coastal tropical storm regime (peaks near `t/T = 0.500`).
+    TypeIII,
+}
+
+impl std::str::FromStr for ScsStormType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "i" | "1" | "type1" | "type_1" | "type-1" | "typei" | "type_i" | "type-i" => {
+                Ok(Self::TypeI)
+            }
+            "ia" | "1a" | "type1a" | "type_1a" | "type-1a" | "typeia" | "type_ia" | "type-ia" => {
+                Ok(Self::TypeIA)
+            }
+            "ii" | "2" | "type2" | "type_2" | "type-2" | "typeii" | "type_ii" | "type-ii" => {
+                Ok(Self::TypeII)
+            }
+            "iii" | "3" | "type3" | "type_3" | "type-3" | "typeiii" | "type_iii" | "type-iii" => {
+                Ok(Self::TypeIII)
+            }
+            other => Err(Error::InvalidArgument(format!(
+                "unknown SCS storm type '{other}'; expected TypeI, TypeIA, TypeII, or TypeIII"
+            ))),
+        }
+    }
+}
+
+/// Generates a piecewise-constant NRCS TR-55 synthetic design storm hyetograph
+/// (`TypeI`, `TypeIA`, `TypeII`, or `TypeIII`) as `(step_duration_h, intensity_cm_h)` pairs
+/// whose cumulative depth equals `total_precip_mm`.
+pub fn scs_hyetograph(
+    storm_type: ScsStormType,
     total_precip_mm: f64,
     duration_h: f64,
     time_step_h: f64,
@@ -1395,7 +1436,50 @@ pub fn scs_type2_hyetograph(
             "duration_h and time_step_h must be finite and > 0".into(),
         ));
     }
-    // Standard 24-h NRCS SCS Type II dimensionless cumulative rainfall curve `(t/T, P/P_tot)`.
+
+    // Standard 24-h NRCS TR-55 Appendix B dimensionless cumulative rainfall tables `(t/T, P/P_tot)`.
+    const TYPE1: &[(f64, f64)] = &[
+        (0.0, 0.000),
+        (2.0 / 24.0, 0.035),
+        (4.0 / 24.0, 0.076),
+        (6.0 / 24.0, 0.125),
+        (7.0 / 24.0, 0.156),
+        (8.0 / 24.0, 0.194),
+        (8.5 / 24.0, 0.219),
+        (9.0 / 24.0, 0.254),
+        (9.5 / 24.0, 0.303),
+        (9.75 / 24.0, 0.362),
+        (10.0 / 24.0, 0.515),
+        (10.5 / 24.0, 0.583),
+        (11.0 / 24.0, 0.624),
+        (11.5 / 24.0, 0.654),
+        (12.0 / 24.0, 0.682),
+        (13.0 / 24.0, 0.727),
+        (14.0 / 24.0, 0.767),
+        (16.0 / 24.0, 0.830),
+        (20.0 / 24.0, 0.926),
+        (1.0, 1.000),
+    ];
+    const TYPE1A: &[(f64, f64)] = &[
+        (0.0, 0.000),
+        (2.0 / 24.0, 0.050),
+        (4.0 / 24.0, 0.116),
+        (6.0 / 24.0, 0.206),
+        (7.0 / 24.0, 0.268),
+        (7.5 / 24.0, 0.310),
+        (8.0 / 24.0, 0.425),
+        (8.5 / 24.0, 0.480),
+        (9.0 / 24.0, 0.520),
+        (9.5 / 24.0, 0.550),
+        (10.0 / 24.0, 0.577),
+        (11.0 / 24.0, 0.624),
+        (12.0 / 24.0, 0.664),
+        (13.0 / 24.0, 0.701),
+        (14.0 / 24.0, 0.736),
+        (16.0 / 24.0, 0.800),
+        (20.0 / 24.0, 0.906),
+        (1.0, 1.000),
+    ];
     const TYPE2: &[(f64, f64)] = &[
         (0.000, 0.000),
         (0.083, 0.022),
@@ -1416,9 +1500,39 @@ pub fn scs_type2_hyetograph(
         (0.917, 0.977),
         (1.000, 1.000),
     ];
+    const TYPE3: &[(f64, f64)] = &[
+        (0.0, 0.000),
+        (2.0 / 24.0, 0.020),
+        (4.0 / 24.0, 0.043),
+        (6.0 / 24.0, 0.072),
+        (8.0 / 24.0, 0.114),
+        (9.0 / 24.0, 0.148),
+        (10.0 / 24.0, 0.189),
+        (11.0 / 24.0, 0.250),
+        (11.5 / 24.0, 0.298),
+        (11.75 / 24.0, 0.339),
+        (12.0 / 24.0, 0.500),
+        (12.25 / 24.0, 0.661),
+        (12.5 / 24.0, 0.702),
+        (13.0 / 24.0, 0.751),
+        (14.0 / 24.0, 0.811),
+        (16.0 / 24.0, 0.886),
+        (18.0 / 24.0, 0.928),
+        (20.0 / 24.0, 0.957),
+        (22.0 / 24.0, 0.980),
+        (1.0, 1.000),
+    ];
+
+    let table: &[(f64, f64)] = match storm_type {
+        ScsStormType::TypeI => TYPE1,
+        ScsStormType::TypeIA => TYPE1A,
+        ScsStormType::TypeII => TYPE2,
+        ScsStormType::TypeIII => TYPE3,
+    };
+
     let interp = |u: f64| -> f64 {
         let u = u.clamp(0.0, 1.0);
-        for w in TYPE2.windows(2) {
+        for w in table.windows(2) {
             if u <= w[1].0 {
                 let f = if w[1].0 > w[0].0 {
                     (u - w[0].0) / (w[1].0 - w[0].0)
@@ -1466,6 +1580,403 @@ pub fn scs_type2_hyetograph(
             "duration_h={duration_h} is too short to produce a hyetograph step"
         )));
     }
+    Ok(out)
+}
+
+/// Generates a piecewise-constant SCS Type II design storm hyetograph as
+/// `(step_duration_h, intensity_cm_h)` pairs whose cumulative depth equals `total_precip_mm`.
+pub fn scs_type2_hyetograph(
+    total_precip_mm: f64,
+    duration_h: f64,
+    time_step_h: f64,
+) -> Result<Vec<(f64, f64)>> {
+    scs_hyetograph(
+        ScsStormType::TypeII,
+        total_precip_mm,
+        duration_h,
+        time_step_h,
+    )
+}
+
+/// Generates a Chow, Maidment & Mays (1988) alternating-block design storm hyetograph
+/// `[(time_step_h, intensity_cm_h)]` from an IDF intensity curve sampled at durations
+/// `d_k = (k + 1) * time_step_h`.
+///
+/// Places the largest incremental rainfall block at the storm center `(n - 1) / 2` and
+/// alternates descending blocks to the right and left, conserving total rainfall depth
+/// `idf_intensities_cm_h.last() * n * time_step_h` exactly.
+pub fn alternating_block_hyetograph(
+    idf_intensities_cm_h: &[f64],
+    time_step_h: f64,
+) -> Result<Vec<(f64, f64)>> {
+    if idf_intensities_cm_h.is_empty() {
+        return Err(Error::InvalidArgument(
+            "idf_intensities_cm_h must not be empty".into(),
+        ));
+    }
+    if idf_intensities_cm_h.len() > MAX_SIMULATION_STEPS {
+        return Err(Error::InvalidArgument(format!(
+            "idf_intensities_cm_h length ({}) exceeds MAX_SIMULATION_STEPS ({MAX_SIMULATION_STEPS})",
+            idf_intensities_cm_h.len()
+        )));
+    }
+    if !time_step_h.is_finite() || time_step_h <= 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "time_step_h must be finite and > 0, got {time_step_h}"
+        )));
+    }
+
+    let n = idf_intensities_cm_h.len();
+    let mut blocks_cm_h = Vec::with_capacity(n);
+    let mut prev_cum_cm = 0.0f64;
+    for (k, &intensity) in idf_intensities_cm_h.iter().enumerate() {
+        if !intensity.is_finite() || intensity < 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "invalid IDF intensity at index {k}: {intensity} (must be finite and >= 0)"
+            )));
+        }
+        let dur_h = (k + 1) as f64 * time_step_h;
+        let cum_cm = intensity * dur_h;
+        if cum_cm + 1e-12 < prev_cum_cm {
+            return Err(Error::InvalidArgument(format!(
+                "IDF cumulative rainfall decreased at step {k}: {cum_cm:.6} cm < {prev_cum_cm:.6} cm"
+            )));
+        }
+        let inc_cm = (cum_cm - prev_cum_cm).max(0.0);
+        blocks_cm_h.push(inc_cm / time_step_h);
+        prev_cum_cm = cum_cm.max(prev_cum_cm);
+    }
+
+    // Sort descending so the largest incremental block sits at storm center.
+    blocks_cm_h.sort_by(|a, b| b.total_cmp(a));
+
+    let mut ordered = vec![0.0f64; n];
+    let center = (n - 1) / 2;
+    ordered[center] = blocks_cm_h[0];
+    let mut idx = 1usize;
+    let mut offset = 1usize;
+    while idx < n {
+        if center + offset < n {
+            ordered[center + offset] = blocks_cm_h[idx];
+            idx += 1;
+        }
+        if idx < n && center >= offset {
+            ordered[center - offset] = blocks_cm_h[idx];
+            idx += 1;
+        }
+        offset += 1;
+    }
+
+    Ok(ordered
+        .into_iter()
+        .map(|inten| (time_step_h, inten))
+        .collect())
+}
+
+/// Generates a Keifer & Chu (1957) Chicago design storm hyetograph
+/// `[(dt_h, intensity_cm_h)]` from a Sherman IDF curve `i(t_min) = a / (t_min + b)^c`
+/// (with `i` in `cm/h` and `t_min` in minutes) and storm advancement coefficient
+/// `r in (0, 1)`.
+///
+/// Uses the exact analytical cumulative integral of the Chicago storm so total rainfall
+/// depth equals `duration_h * a / (duration_h * 60 + b)^c` to machine precision across
+/// all valid parameters (including `b == 0.0`).
+pub fn chicago_hyetograph(
+    a: f64,
+    b: f64,
+    c: f64,
+    r: f64,
+    duration_h: f64,
+    time_step_h: f64,
+) -> Result<Vec<(f64, f64)>> {
+    if !a.is_finite() || a <= 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "Chicago IDF parameter a must be finite and > 0, got {a}"
+        )));
+    }
+    if !b.is_finite() || b < 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "Chicago IDF parameter b must be finite and >= 0, got {b}"
+        )));
+    }
+    if !c.is_finite() || c <= 0.0 || c >= 1.0 {
+        return Err(Error::InvalidArgument(format!(
+            "Chicago IDF parameter c must be finite and in (0, 1), got {c}"
+        )));
+    }
+    if !r.is_finite() || r <= 0.0 || r >= 1.0 {
+        return Err(Error::InvalidArgument(format!(
+            "Chicago peak-time ratio r must be finite and in (0, 1), got {r}"
+        )));
+    }
+    if !duration_h.is_finite()
+        || duration_h <= 0.0
+        || !time_step_h.is_finite()
+        || time_step_h <= 0.0
+    {
+        return Err(Error::InvalidArgument(
+            "duration_h and time_step_h must be finite and > 0".into(),
+        ));
+    }
+
+    let raw_steps = ((duration_h / time_step_h) - 1e-12).ceil().max(1.0);
+    if !raw_steps.is_finite() || raw_steps > MAX_SIMULATION_STEPS as f64 {
+        return Err(Error::InvalidArgument(format!(
+            "chicago_hyetograph requires {raw_steps} steps, exceeding MAX_SIMULATION_STEPS ({MAX_SIMULATION_STEPS})"
+        )));
+    }
+    let n_steps = raw_steps as usize;
+    let total_min = duration_h * 60.0;
+    let t_peak_min = r * total_min;
+
+    // Exact cumulative IDF rainfall depth in cm for duration `d_min` minutes:
+    // P_idf(d_min) = (d_min / 60) * a / (d_min + b)^c.
+    let p_idf_cm = |d_min: f64| -> f64 {
+        if d_min <= 0.0 {
+            0.0
+        } else {
+            (d_min / 60.0) * a / (d_min + b).powf(c)
+        }
+    };
+    let p_tot_cm = p_idf_cm(total_min);
+    let cum_cm = |t_min: f64| -> f64 {
+        let t_clamped = t_min.clamp(0.0, total_min);
+        if t_clamped <= t_peak_min {
+            r * p_tot_cm - r * p_idf_cm((t_peak_min - t_clamped) / r)
+        } else {
+            r * p_tot_cm + (1.0 - r) * p_idf_cm((t_clamped - t_peak_min) / (1.0 - r))
+        }
+    };
+
+    let t_eps = 1e-12 * duration_h.max(1.0);
+    let mut out = Vec::with_capacity(n_steps);
+    let mut prev_t_h = 0.0f64;
+    let mut prev_p_cm = 0.0f64;
+    for k in 1..=n_steps {
+        if prev_t_h >= duration_h - t_eps {
+            break;
+        }
+        let t_h = if k == n_steps {
+            duration_h
+        } else {
+            (k as f64 * time_step_h).min(duration_h)
+        };
+        let dt_h = t_h - prev_t_h;
+        if dt_h <= 0.0 {
+            break;
+        }
+        let p_cm = cum_cm(t_h * 60.0);
+        let dp_cm = (p_cm - prev_p_cm).max(0.0);
+        out.push((dt_h, dp_cm / dt_h));
+        prev_t_h = t_h;
+        prev_p_cm = p_cm;
+    }
+    if out.is_empty() {
+        return Err(Error::InvalidArgument(format!(
+            "duration_h={duration_h} is too short to produce a hyetograph step"
+        )));
+    }
+    Ok(out)
+}
+
+/// Parses a rain-gauge hyetograph CSV string into `(dt_h, intensity_cm_h)` pairs.
+///
+/// Supported header formats (case-insensitive, whitespace trimmed, blank and `#` comment
+/// lines ignored):
+/// - `dt_h,intensity_cm_h`: step duration in hours (`> 0`) and rainfall intensity in `cm/h` (`>= 0`).
+/// - `time_h,precip_mm`: strictly increasing elapsed timestamps in hours (an optional initial
+///   `0.0,0.0` anchor row is accepted) and incremental precipitation depth in `mm` (`>= 0`)
+///   over each interval `(prev_time_h, time_h]`.
+pub fn parse_hyetograph_csv(csv_text: &str) -> Result<Vec<(f64, f64)>> {
+    #[derive(Clone, Copy)]
+    enum CsvMode {
+        DtIntensity,
+        TimePrecip,
+    }
+
+    let trimmed_text = csv_text.strip_prefix('\u{feff}').unwrap_or(csv_text);
+    let mut mode: Option<CsvMode> = None;
+    let mut out: Vec<(f64, f64)> = Vec::new();
+    let mut prev_time_h = 0.0f64;
+    let mut saw_first_time_row = false;
+
+    for (line_idx, raw_line) in trimmed_text.lines().enumerate() {
+        let line_no = line_idx + 1;
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = line.split(',').map(str::trim).collect();
+        if parts.len() != 2 {
+            return Err(Error::InvalidArgument(format!(
+                "hyetograph CSV line {line_no}: expected 2 columns, got {}",
+                parts.len()
+            )));
+        }
+
+        let Some(active_mode) = mode else {
+            let h0 = parts[0].to_ascii_lowercase();
+            let h1 = parts[1].to_ascii_lowercase();
+            mode = match (h0.as_str(), h1.as_str()) {
+                ("dt_h", "intensity_cm_h") => Some(CsvMode::DtIntensity),
+                ("time_h", "precip_mm") => Some(CsvMode::TimePrecip),
+                _ => {
+                    return Err(Error::InvalidArgument(format!(
+                        "hyetograph CSV line {line_no}: unrecognized header '{},{}'; expected 'dt_h,intensity_cm_h' or 'time_h,precip_mm'",
+                        parts[0], parts[1]
+                    )));
+                }
+            };
+            continue;
+        };
+
+        let v0: f64 = parts[0].parse().map_err(|_| {
+            Error::InvalidArgument(format!(
+                "hyetograph CSV line {line_no}: invalid numeric value '{}'",
+                parts[0]
+            ))
+        })?;
+        let v1: f64 = parts[1].parse().map_err(|_| {
+            Error::InvalidArgument(format!(
+                "hyetograph CSV line {line_no}: invalid numeric value '{}'",
+                parts[1]
+            ))
+        })?;
+        if !v0.is_finite() || !v1.is_finite() {
+            return Err(Error::InvalidArgument(format!(
+                "hyetograph CSV line {line_no}: values must be finite"
+            )));
+        }
+
+        match active_mode {
+            CsvMode::DtIntensity => {
+                if v0 <= 0.0 || v1 < 0.0 {
+                    return Err(Error::InvalidArgument(format!(
+                        "hyetograph CSV line {line_no}: require dt_h > 0 and intensity_cm_h >= 0, got ({v0}, {v1})"
+                    )));
+                }
+                out.push((v0, v1));
+            }
+            CsvMode::TimePrecip => {
+                if v1 < 0.0 {
+                    return Err(Error::InvalidArgument(format!(
+                        "hyetograph CSV line {line_no}: precip_mm must be >= 0, got {v1}"
+                    )));
+                }
+                if !saw_first_time_row && v0 == 0.0 {
+                    if v1 > 0.0 {
+                        return Err(Error::InvalidArgument(format!(
+                            "hyetograph CSV line {line_no}: non-zero precip_mm ({v1}) at time_h = 0"
+                        )));
+                    }
+                    saw_first_time_row = true;
+                    prev_time_h = 0.0;
+                    continue;
+                }
+                if v0 <= prev_time_h {
+                    return Err(Error::InvalidArgument(format!(
+                        "hyetograph CSV line {line_no}: time_h ({v0}) must strictly increase past {prev_time_h}"
+                    )));
+                }
+                let dt_h = v0 - prev_time_h;
+                let intensity_cm_h = (v1 / 10.0) / dt_h;
+                out.push((dt_h, intensity_cm_h));
+                prev_time_h = v0;
+                saw_first_time_row = true;
+            }
+        }
+
+        if out.len() > MAX_SIMULATION_STEPS {
+            return Err(Error::InvalidArgument(format!(
+                "hyetograph CSV exceeds MAX_SIMULATION_STEPS ({MAX_SIMULATION_STEPS})"
+            )));
+        }
+    }
+
+    if out.is_empty() {
+        return Err(Error::InvalidArgument(
+            "hyetograph CSV contains no rainfall steps".into(),
+        ));
+    }
+    Ok(out)
+}
+
+/// Loads a rain-gauge hyetograph CSV file (`dt_h,intensity_cm_h` or `time_h,precip_mm`)
+/// into `(dt_h, intensity_cm_h)` pairs.
+pub fn load_hyetograph_csv(path: impl AsRef<Path>) -> Result<Vec<(f64, f64)>> {
+    let text = std::fs::read_to_string(path.as_ref())?;
+    parse_hyetograph_csv(&text)
+}
+
+/// Scales an optional base runoff-coefficient raster by a spatially variable storm
+/// precipitation grid (`rainfall_grid_mm / reference_precip_mm`).
+///
+/// For each valid cell `(r, c)`:
+/// `out(r, c) = C_base(r, c) * (rainfall_grid_mm(r, c) / reference_precip_mm)`,
+/// where `C_base` defaults to `1.0` when `base_runoff_coeff` is `None`.
+///
+/// Validates grid alignment between `base_runoff_coeff` and `rainfall_grid_mm`, requires
+/// `reference_precip_mm` to be finite and `> 0.0`, and validates that all non-NoData cells
+/// in `rainfall_grid_mm` are finite and `>= 0.0`. To avoid clipping when passing the output
+/// into `InundationForcing::runoff_coeff` (which clamps to `[0.0, 1.0]`), normalize with
+/// `reference_precip_mm >= max(rainfall_grid_mm)` and pair with a hyetograph scaled to
+/// `reference_precip_mm`.
+pub fn scale_forcing_by_rainfall_grid(
+    base_runoff_coeff: Option<&Array2D<f64>>,
+    rainfall_grid_mm: &Array2D<f64>,
+    reference_precip_mm: f64,
+) -> Result<Array2D<f64>> {
+    if !reference_precip_mm.is_finite() || reference_precip_mm <= 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "reference_precip_mm must be finite and > 0, got {reference_precip_mm}"
+        )));
+    }
+    if let Some(base) = base_runoff_coeff {
+        validate_grid_alignment(rainfall_grid_mm, base, "base_runoff_coeff")?;
+    }
+
+    const OUT_NODATA: f64 = -9999.0;
+    let p_nd = rainfall_grid_mm.no_data();
+    let p_data = rainfall_grid_mm.data();
+    let base_info = base_runoff_coeff.map(|b| (b.data(), b.no_data()));
+
+    let mut out_data = Vec::with_capacity(p_data.len());
+    for (idx, &p) in p_data.iter().enumerate() {
+        if p.rd_eq(p_nd) {
+            out_data.push(OUT_NODATA);
+            continue;
+        }
+        if !p.is_finite() || p < 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "rainfall_grid_mm contains invalid value {p} at cell {idx} (must be finite and >= 0)"
+            )));
+        }
+        let c_base = match base_info {
+            Some((bdata, bnd)) => {
+                let bv = bdata[idx];
+                if bv.rd_eq(bnd) {
+                    out_data.push(OUT_NODATA);
+                    continue;
+                }
+                if !bv.is_finite() || bv < 0.0 {
+                    return Err(Error::InvalidArgument(format!(
+                        "base_runoff_coeff contains invalid value {bv} at cell {idx} (must be finite and >= 0)"
+                    )));
+                }
+                bv.clamp(0.0, 1.0)
+            }
+            None => 1.0,
+        };
+        out_data.push(c_base * (p / reference_precip_mm));
+    }
+
+    let mut out = Array2D::from_vec(
+        rainfall_grid_mm.width(),
+        rainfall_grid_mm.height(),
+        out_data,
+    )?;
+    out.copy_metadata_from(rainfall_grid_mm);
+    out.set_no_data(OUT_NODATA);
     Ok(out)
 }
 
@@ -1819,6 +2330,7 @@ struct ForcedRegionFillTask {
     bbox: (usize, usize, usize, usize),
     roi_elev: Vec<f64>,
     roi_catchment: Vec<f64>,
+    roi_weighted_catchment: Option<Vec<f64>>,
     roi_runoff_coeff: Option<Vec<f64>>,
     roi_infil_m_h: Option<Vec<f64>>,
     roi_antecedent: Option<Vec<f64>>,
@@ -1903,6 +2415,7 @@ fn region_fill_times_forced(
             // pick an inner child's catchment area from `first_pixel`) while computing remaining
             // unfilled volume (deducting antecedent water) and mean C / infiltration.
             let mut raw_cat = 0.0f64;
+            let mut raw_eff_cat = 0.0f64;
             let mut ant_vol = 0.0f64;
             let mut c_sum = 0.0f64;
             let mut c_cnt = 0usize;
@@ -1917,6 +2430,12 @@ fn region_fill_times_forced(
                     let cv = task.roi_catchment[off + c];
                     if cv.is_finite() && cv > raw_cat {
                         raw_cat = cv;
+                    }
+                    if let Some(ref wcat) = task.roi_weighted_catchment {
+                        let wv = wcat[off + c];
+                        if wv.is_finite() && wv > raw_eff_cat {
+                            raw_eff_cat = wv;
+                        }
                     }
                     if let Some(ref ant) = task.roi_antecedent {
                         let h0 = ant[off + c].max(0.0);
@@ -1950,7 +2469,17 @@ fn region_fill_times_forced(
             } else {
                 0.0
             };
-            let eff_cat = cat_area * mean_c;
+            // When an upland catchment-weighted effective area raster is available, use it
+            // directly instead of approximating upland runoff with the depression floor's mean C.
+            let eff_cat = if task.roi_weighted_catchment.is_some() {
+                if raw_cat > 0.0 {
+                    raw_eff_cat
+                } else {
+                    obj.area * mean_c
+                }
+            } else {
+                cat_area * mean_c
+            };
 
             let t_fill = if rem_vol <= 0.0 {
                 0.0
@@ -2052,7 +2581,31 @@ pub fn simulate_inundation_with_forcing_in_memory(
     options: &SimulateInundationOptions,
     forcing: &InundationForcing<'_>,
 ) -> Result<(Array2D<f64>, usize)> {
-    if forcing.runoff_coeff.is_none()
+    simulate_inundation_with_weighted_catchment_in_memory(
+        sink,
+        catchment_area,
+        None,
+        options,
+        forcing,
+    )
+}
+
+/// Computes per-pixel inundation times in memory with optional upland catchment-weighted
+/// effective area raster (from [`crate::delineate_catchment_hierarchy_weighted_in_memory`])
+/// and hydrologic forcing.
+///
+/// When `weighted_catchment_area` is `Some`, each depression slice uses its true upland
+/// catchment-weighted effective contributing area `sum(cell_area * C_i)` rather than
+/// multiplying total `catchment_area` by the local depression floor's average `C`.
+pub fn simulate_inundation_with_weighted_catchment_in_memory(
+    sink: &Array2D<f64>,
+    catchment_area: &Array2D<f64>,
+    weighted_catchment_area: Option<&Array2D<f64>>,
+    options: &SimulateInundationOptions,
+    forcing: &InundationForcing<'_>,
+) -> Result<(Array2D<f64>, usize)> {
+    if weighted_catchment_area.is_none()
+        && forcing.runoff_coeff.is_none()
         && forcing.infiltration_cm_h.is_none()
         && forcing.antecedent_depth.is_none()
         && forcing.hyetograph.is_none()
@@ -2077,11 +2630,15 @@ pub fn simulate_inundation_with_forcing_in_memory(
     let w = sink.width();
     let h = sink.height();
     validate_grid_alignment(sink, catchment_area, "catchment raster")?;
+    if let Some(wcat) = weighted_catchment_area {
+        validate_grid_alignment(sink, wcat, "weighted catchment raster")?;
+    }
     validate_forcing_grids(sink, forcing)?;
 
     let metrics = affine_metrics(&sink.geotransform);
     let nd = sink.no_data();
     let c_nd = catchment_area.no_data();
+    let wc_nd = weighted_catchment_area.map(|wc| wc.no_data());
 
     let (labels, nb_regions_u32) = region_group(sink.data(), w, h, options.min_size, |v| {
         v.is_finite() && !v.rd_eq(nd)
@@ -2113,6 +2670,7 @@ pub fn simulate_inundation_with_forcing_in_memory(
 
     let sdata = sink.data();
     let cdata = catchment_area.data();
+    let wcdata = weighted_catchment_area.map(|wc| wc.data());
     let tasks: Vec<ForcedRegionFillTask> = (0..nb_regions)
         .map(|ri| {
             let lbl = (ri + 1) as u32;
@@ -2122,6 +2680,7 @@ pub fn simulate_inundation_with_forcing_in_memory(
             let bw = c1 - c0;
             let mut roi_elev = vec![f64::NAN; bw * bh];
             let mut roi_catchment = vec![0.0f64; bw * bh];
+            let mut roi_wcat = weighted_catchment_area.map(|_| vec![0.0f64; bw * bh]);
             let mut roi_rc = forcing.runoff_coeff.map(|_| vec![1.0f64; bw * bh]);
             let mut roi_inf = forcing.infiltration_cm_h.map(|_| vec![0.0f64; bw * bh]);
             let mut roi_ant = forcing.antecedent_depth.map(|_| vec![0.0f64; bw * bh]);
@@ -2139,6 +2698,12 @@ pub fn simulate_inundation_with_forcing_in_memory(
                         } else {
                             0.0
                         };
+                        if let (Some(dst), Some(src), Some(wnd)) = (&mut roi_wcat, wcdata, wc_nd) {
+                            let wv = src[gi];
+                            if wv.is_finite() && !wv.rd_eq(wnd) && wv > 0.0 {
+                                dst[li] = wv;
+                            }
+                        }
                         if let (Some(dst), Some(src)) = (&mut roi_rc, forcing.runoff_coeff) {
                             let v = src.get_i(gi);
                             if v.is_finite() && !v.rd_eq(src.no_data()) {
@@ -2164,6 +2729,7 @@ pub fn simulate_inundation_with_forcing_in_memory(
                 bbox,
                 roi_elev,
                 roi_catchment,
+                roi_weighted_catchment: roi_wcat,
                 roi_runoff_coeff: roi_rc,
                 roi_infil_m_h: roi_inf,
                 roi_antecedent: roi_ant,
@@ -2305,19 +2871,37 @@ pub fn run_full_pipeline_in_memory(
         sim_opts.interval,
     )?;
     let flowdirs = d8_flow_directions_resolved(&sinks.dem_refined)?;
-    let (catchment_hierarchy, catchment_records) = delineate_catchment_hierarchy_with_flowdirs(
-        &sinks.dem_refined,
-        &depressions.depression_level,
-        sim_opts.min_size,
-        &flowdirs,
-    )?;
+    let (catchment_hierarchy, weighted_catchment_hierarchy, catchment_records) =
+        if options.routing == RoutingMode::Static && options.forcing.runoff_coeff.is_some() {
+            let w_res = delineate_catchment_hierarchy_weighted_with_flowdirs(
+                &sinks.dem_refined,
+                &depressions.depression_level,
+                sim_opts.min_size,
+                options.forcing.runoff_coeff,
+                &flowdirs,
+            )?;
+            (
+                w_res.unweighted_catchment_hierarchy,
+                Some(w_res.catchment_hierarchy),
+                w_res.records,
+            )
+        } else {
+            let (ch, recs) = delineate_catchment_hierarchy_with_flowdirs(
+                &sinks.dem_refined,
+                &depressions.depression_level,
+                sim_opts.min_size,
+                &flowdirs,
+            )?;
+            (ch, None, recs)
+        };
 
     let (fill_time, num_regions, spill_paths, fsm_basins, fsm_mass_balance, fsm_hydrograph) =
         match options.routing {
             RoutingMode::Static => {
-                let (ft, nr) = simulate_inundation_with_forcing_in_memory(
+                let (ft, nr) = simulate_inundation_with_weighted_catchment_in_memory(
                     &sinks.sink,
                     &catchment_hierarchy,
+                    weighted_catchment_hierarchy.as_ref(),
                     sim_opts,
                     &options.forcing,
                 )?;
@@ -2642,14 +3226,6 @@ pub fn run_pipeline(
         sim_opts.min_depth,
         sim_opts.interval,
     )?;
-    let flowdirs = d8_flow_directions_resolved(&sinks.dem_refined)?;
-    let (catchment_hierarchy, catchment_records) = delineate_catchment_hierarchy_with_flowdirs(
-        &sinks.dem_refined,
-        &depressions.depression_level,
-        sim_opts.min_size,
-        &flowdirs,
-    )?;
-
     let rc_arr = match &options.runoff_coeff_path {
         Some(p) => Some(load_raster::<f64>(p, None)?),
         None => None,
@@ -2662,6 +3238,30 @@ pub fn run_pipeline(
         Some(p) => Some(load_raster::<f64>(p, None)?),
         None => None,
     };
+    let flowdirs = d8_flow_directions_resolved(&sinks.dem_refined)?;
+    let (catchment_hierarchy, weighted_catchment_hierarchy, catchment_records) =
+        if options.routing == RoutingMode::Static && rc_arr.is_some() {
+            let w_res = delineate_catchment_hierarchy_weighted_with_flowdirs(
+                &sinks.dem_refined,
+                &depressions.depression_level,
+                sim_opts.min_size,
+                rc_arr.as_ref(),
+                &flowdirs,
+            )?;
+            (
+                w_res.unweighted_catchment_hierarchy,
+                Some(w_res.catchment_hierarchy),
+                w_res.records,
+            )
+        } else {
+            let (ch, recs) = delineate_catchment_hierarchy_with_flowdirs(
+                &sinks.dem_refined,
+                &depressions.depression_level,
+                sim_opts.min_size,
+                &flowdirs,
+            )?;
+            (ch, None, recs)
+        };
     let forcing = InundationForcing {
         runoff_coeff: rc_arr.as_ref(),
         infiltration_cm_h: inf_arr.as_ref(),
@@ -2671,9 +3271,10 @@ pub fn run_pipeline(
     let (fill_time, spill_paths, fsm_basins, fsm_basins_csv, fsm_hydrograph_csv, fsm_mass_balance) =
         match options.routing {
             RoutingMode::Static => {
-                let (ft, _num_sim_regions) = simulate_inundation_with_forcing_in_memory(
+                let (ft, _num_sim_regions) = simulate_inundation_with_weighted_catchment_in_memory(
                     &sinks.sink,
                     &catchment_hierarchy,
+                    weighted_catchment_hierarchy.as_ref(),
                     sim_opts,
                     &forcing,
                 )?;

@@ -3498,6 +3498,363 @@ pub fn write_fsm_hazard_rasters(
     Ok((max_depth_path, wse_path, duration_path))
 }
 
+/// Parameters controlling post-storm vertical drainage and recession modeling
+/// ([`simulate_post_storm_recession`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct RecessionOptions {
+    /// Evapotranspiration loss rate in `cm/h` (must be finite and `>= 0.0`, default `0.05`).
+    pub et_cm_h: f64,
+    /// Vertical seepage / percolation loss rate in `cm/h` (must be finite and `>= 0.0`, default `0.10`).
+    pub seepage_cm_h: f64,
+    /// Maximum post-storm recession duration to simulate in hours (must be finite and `> 0.0`, default `168.0`).
+    pub max_recession_h: f64,
+}
+
+impl Default for RecessionOptions {
+    fn default() -> Self {
+        Self {
+            et_cm_h: 0.05,
+            seepage_cm_h: 0.10,
+            max_recession_h: 168.0,
+        }
+    }
+}
+
+impl RecessionOptions {
+    /// Validates post-storm recession parameters.
+    pub fn validate(&self) -> Result<()> {
+        if !self.et_cm_h.is_finite() || self.et_cm_h < 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "et_cm_h must be finite and >= 0, got {}",
+                self.et_cm_h
+            )));
+        }
+        if !self.seepage_cm_h.is_finite() || self.seepage_cm_h < 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "seepage_cm_h must be finite and >= 0, got {}",
+                self.seepage_cm_h
+            )));
+        }
+        if !self.max_recession_h.is_finite() || self.max_recession_h <= 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "max_recession_h must be finite and > 0, got {}",
+                self.max_recession_h
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// One sample point along the post-storm recession curve.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct RecessionCurvePoint {
+    /// Elapsed hours after storm end (`>= 0.0`).
+    pub time_h: f64,
+    /// Total remaining ponded water volume across all depressions (`m^3`).
+    pub stored_vol_m3: f64,
+    /// Total currently inundated surface area across all wet depressions (`m^2`).
+    pub inundated_area_m2: f64,
+    /// Number of active basins still holding ponded water (`stored_vol > 0`).
+    pub wet_basin_count: usize,
+}
+
+/// Output of [`simulate_post_storm_recession`].
+#[derive(Debug, Clone)]
+pub struct RecessionResult {
+    /// Per-cell drain time in hours after storm end:
+    /// `-1.0` (NoData) if never wet at storm end, finite `>= 0.0` if drained within
+    /// `max_recession_h`, or `f64::INFINITY` if still inundated at `max_recession_h`.
+    pub drain_time_h: Array2D<f64>,
+    /// Total remaining stored water volume across all depressions at `t = max_recession_h` (`m^3`).
+    pub remaining_volume_m3: f64,
+    /// Total water volume drained via ET and seepage over `[0, max_recession_h]` (`m^3`).
+    pub total_drained_m3: f64,
+    /// Number of initially wet basins that drained completely within `max_recession_h`.
+    pub drained_basin_count: usize,
+    /// Time-series recession curve starting at `t = 0.0` (storm end).
+    pub curve: Vec<RecessionCurvePoint>,
+}
+
+/// Evaluates exact `(stored_volume_m3, wet_cell_count)` inside a sorted hypsometric basin
+/// at water surface elevation `wse`.
+fn hypso_state_at_wse(elevs: &[f64], pref_v: &[f64], cell_area: f64, wse: f64) -> (f64, usize) {
+    if elevs.is_empty() || wse <= elevs[0] + 1e-12 {
+        return (0.0, 0);
+    }
+    let wet_cnt = elevs.partition_point(|&z| z < wse);
+    if wet_cnt == 0 {
+        return (0.0, 0);
+    }
+    let idx = wet_cnt - 1;
+    let vol = pref_v[idx] + (wet_cnt as f64) * cell_area * (wse - elevs[idx]).max(0.0);
+    (vol.max(0.0), wet_cnt)
+}
+
+/// Simulates post-storm vertical drainage and pond recession starting from the storm-end
+/// stored volumes produced by [`simulate_fill_spill_merge_in_memory`].
+///
+/// Over any wet surface area `A_wet(W)`, vertical losses at rate `r = (et_cm_h + seepage_cm_h) / 100`
+/// satisfy `dV/dt = -r * A_wet(W)` while hypsometric storage satisfies `dV/dW = A_wet(W)`,
+/// yielding exact piecewise-analytical stage recession `dW/dt = -r` across every cell's
+/// hypsometric step. A cell at elevation `z < W_0` dries at exact time `(W_0 - z) / r` after
+/// storm end, conserving volume `total_drained_m3 + remaining_volume_m3 == initial_stored_m3`
+/// to machine precision.
+pub fn simulate_post_storm_recession(
+    dem: &Array2D<f64>,
+    depressions: &InMemoryDepressions,
+    fsm: &FsmSimulationResult,
+    options: &RecessionOptions,
+) -> Result<RecessionResult> {
+    options.validate()?;
+    validate_grid_alignment(dem, &depressions.depression_id, "depression_id")?;
+    validate_grid_alignment(dem, &fsm.fill_time, "fill_time")?;
+
+    let w = dem.width();
+    let h = dem.height();
+    let n = w * h;
+    let zdata = dem.data();
+    let z_nd = dem.no_data();
+    let dep_ids = depressions.depression_id.data();
+    let (_, _, cell_area) = affine_metrics(&dem.geotransform);
+
+    let mut drain_data = vec![-1.0f64; n];
+    if n == 0 || depressions.depressions.is_empty() || fsm.basins.is_empty() {
+        let mut drain_time_h = Array2D::from_vec(w, h, drain_data)?;
+        drain_time_h.copy_metadata_from(dem);
+        drain_time_h.set_no_data(-1.0);
+        return Ok(RecessionResult {
+            drain_time_h,
+            remaining_volume_m3: 0.0,
+            total_drained_m3: 0.0,
+            drained_basin_count: 0,
+            curve: vec![RecessionCurvePoint {
+                time_h: 0.0,
+                stored_vol_m3: 0.0,
+                inundated_area_m2: 0.0,
+                wet_basin_count: 0,
+            }],
+        });
+    }
+
+    let mut children_map: HashMap<u32, Vec<u32>> =
+        HashMap::with_capacity(depressions.depressions.len());
+    for d in &depressions.depressions {
+        children_map.insert(d.id, d.children_ids.clone());
+    }
+    let mut merged_in_storm: HashSet<u32> = HashSet::new();
+    for b in &fsm.basins {
+        if b.merge_time_h.is_some() {
+            merged_in_storm.insert(b.dep_id);
+        }
+    }
+    let mut pixels_by_id: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (idx, &did) in dep_ids.iter().enumerate() {
+        if did > 0 {
+            pixels_by_id.entry(did as u32).or_default().push(idx);
+        }
+    }
+
+    let rate_m_h = (options.et_cm_h + options.seepage_cm_h) / 100.0;
+    let max_t = options.max_recession_h;
+
+    struct WetBasinRecession {
+        elevs: Vec<f64>,
+        pref_v: Vec<f64>,
+        v0: f64,
+        w0: f64,
+        t_empty: f64,
+    }
+
+    let mut wet_basins: Vec<WetBasinRecession> = Vec::new();
+    let mut total_drained_m3 = 0.0f64;
+    let mut remaining_volume_m3 = 0.0f64;
+    let mut drained_basin_count = 0usize;
+
+    for b in &fsm.basins {
+        if b.merge_time_h.is_some() {
+            continue;
+        }
+        let v0 = b.final_volume_m3.min(b.capacity_m3);
+        if !v0.is_finite() || v0 <= 1e-12 {
+            continue;
+        }
+
+        // Collect cells owned by this basin plus any descendants that merged into it during
+        // the storm (unmerged children retain their own separate pools).
+        let mut owned_ids: Vec<u32> = vec![b.dep_id];
+        let mut stack: Vec<u32> = children_map
+            .get(&b.dep_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|cid| merged_in_storm.contains(cid))
+            .collect();
+        let mut seen: HashSet<u32> = HashSet::new();
+        seen.insert(b.dep_id);
+        while let Some(cid) = stack.pop() {
+            if seen.insert(cid) {
+                owned_ids.push(cid);
+                if let Some(kids) = children_map.get(&cid) {
+                    for &gc in kids {
+                        if merged_in_storm.contains(&gc) {
+                            stack.push(gc);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut cells: Vec<(f64, usize)> = Vec::new();
+        for id in owned_ids {
+            if let Some(pts) = pixels_by_id.get(&id) {
+                for &gi in pts {
+                    let z = zdata[gi];
+                    if z.is_finite() && !z.rd_eq(z_nd) {
+                        cells.push((z, gi));
+                    }
+                }
+            }
+        }
+        if cells.is_empty() {
+            continue;
+        }
+        cells.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let k = cells.len();
+        let elevs: Vec<f64> = cells.iter().map(|&(z, _)| z).collect();
+        let mut pref_v = Vec::with_capacity(k);
+        pref_v.push(0.0);
+        let mut v_cum = 0.0f64;
+        for i in 1..k {
+            v_cum += (i as f64) * cell_area * (elevs[i] - elevs[i - 1]);
+            pref_v.push(v_cum);
+        }
+
+        let pos = pref_v.partition_point(|&v| v <= v0).saturating_sub(1);
+        let extra = (v0 - pref_v[pos]).max(0.0);
+        let w0 = elevs[pos] + extra / (((pos + 1) as f64) * cell_area);
+
+        // Assign per-cell drain times for all cells wet at storm end (`z < w0`).
+        for &(z, gi) in &cells {
+            if z < w0 - 1e-12 {
+                if rate_m_h <= 0.0 {
+                    drain_data[gi] = f64::INFINITY;
+                } else {
+                    let t_dry = ((w0 - z) / rate_m_h).max(0.0);
+                    drain_data[gi] = if t_dry <= max_t + 1e-12 {
+                        t_dry.min(max_t)
+                    } else {
+                        f64::INFINITY
+                    };
+                }
+            }
+        }
+
+        let t_empty = if rate_m_h > 0.0 {
+            ((w0 - elevs[0]) / rate_m_h).max(0.0)
+        } else {
+            f64::INFINITY
+        };
+
+        let v_rem = if rate_m_h <= 0.0 {
+            v0
+        } else {
+            let w_end = w0 - rate_m_h * max_t;
+            let (vr, _) = hypso_state_at_wse(&elevs, &pref_v, cell_area, w_end);
+            vr.min(v0)
+        };
+        if v_rem <= 1e-12 {
+            drained_basin_count += 1;
+            total_drained_m3 += v0;
+        } else {
+            remaining_volume_m3 += v_rem;
+            total_drained_m3 += (v0 - v_rem).max(0.0);
+        }
+
+        wet_basins.push(WetBasinRecession {
+            elevs,
+            pref_v,
+            v0,
+            w0,
+            t_empty,
+        });
+    }
+
+    // Construct strictly increasing sample timestamps combining a uniform grid across
+    // `[0, t_horizon]` with exact basin drain-completion timestamps.
+    let t_horizon = if wet_basins.is_empty() {
+        0.0
+    } else {
+        let max_empty = wet_basins.iter().map(|b| b.t_empty).fold(0.0f64, f64::max);
+        max_empty.min(max_t)
+    };
+
+    let mut sample_times: Vec<f64> = Vec::with_capacity(wet_basins.len() + 32);
+    sample_times.push(0.0);
+    if t_horizon > 0.0 {
+        const NUM_UNIFORM_STEPS: usize = 24;
+        for step in 1..=NUM_UNIFORM_STEPS {
+            sample_times.push(t_horizon * (step as f64 / NUM_UNIFORM_STEPS as f64));
+        }
+        for b in &wet_basins {
+            if b.t_empty.is_finite() && b.t_empty > 0.0 && b.t_empty <= max_t {
+                sample_times.push(b.t_empty);
+            }
+        }
+    }
+    sample_times.sort_by(f64::total_cmp);
+    let mut dedup_times: Vec<f64> = Vec::with_capacity(sample_times.len());
+    for t in sample_times {
+        if dedup_times
+            .last()
+            .is_none_or(|&prev| (t - prev).abs() > 1e-9)
+        {
+            dedup_times.push(t);
+        }
+    }
+
+    let mut curve = Vec::with_capacity(dedup_times.len());
+    for t in dedup_times {
+        let mut stored_vol_m3 = 0.0f64;
+        let mut wet_cells = 0usize;
+        let mut wet_basin_count = 0usize;
+        for b in &wet_basins {
+            let (vol, cnt) = if rate_m_h <= 0.0 {
+                let cnt = b.elevs.partition_point(|&z| z < b.w0 - 1e-12);
+                (b.v0, cnt)
+            } else {
+                let w_cur = b.w0 - rate_m_h * t;
+                let (v, c) = hypso_state_at_wse(&b.elevs, &b.pref_v, cell_area, w_cur);
+                (v.min(b.v0), c)
+            };
+            if vol > 1e-12 {
+                stored_vol_m3 += vol;
+                wet_cells += cnt;
+                wet_basin_count += 1;
+            }
+        }
+        curve.push(RecessionCurvePoint {
+            time_h: t,
+            stored_vol_m3,
+            inundated_area_m2: wet_cells as f64 * cell_area,
+            wet_basin_count,
+        });
+    }
+
+    let mut drain_time_h = Array2D::from_vec(w, h, drain_data)?;
+    drain_time_h.copy_metadata_from(dem);
+    drain_time_h.set_no_data(-1.0);
+
+    Ok(RecessionResult {
+        drain_time_h,
+        remaining_volume_m3,
+        total_drained_m3,
+        drained_basin_count,
+        curve,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
