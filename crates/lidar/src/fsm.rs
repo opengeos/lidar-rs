@@ -28,9 +28,9 @@
 //!
 //! Outlet discovery checks out grid-sized scratch buffers (~25 bytes per cell) from a small pool
 //! bounded by active worker concurrency and releases them immediately once outlets are found.
-//! The event-driven routing loop performs `O(m)` passes per fill/merge event (`O(m^2)` worst case
-//! for `m` depressions) and retains sorted hypsometric cell tables (`16` bytes per entry,
-//! `O(N * max_level)` memory across `N` valid sink pixels).
+//! Sorted hypsometric cell tables store only each depression's own cells (`O(N)` total memory
+//! across `N` valid sink pixels, down from `O(N * max_level)`), and the event-driven routing loop
+//! tracks only live/waiting basins with reusable buffers to avoid redundant scans and allocations.
 
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs::File;
@@ -40,7 +40,7 @@ use std::str::FromStr;
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
-use richdem::{Array2D, D8X, D8Y, DemNum, NO_FLOW};
+use richdem::{Array2D, D8Flowdir, D8X, D8Y, DemNum, NO_FLOW};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
@@ -220,7 +220,8 @@ struct BasinNode {
     children_ids: Vec<u32>,
     min_elev: f64,
     capacity_m3: f64,
-    /// Exact sorted cells across this basin + all descendants (for continuous stage-volume timing).
+    /// Exact sorted cells owned by this basin (`dep_id == id`), storing each cell's cumulative
+    /// subtree storage threshold volume (total memory across all basins is `O(N)`).
     hypso_cells: Vec<HypsoCell>,
     /// Cursor into `hypso_cells` of the next cell not yet inundated.
     hypso_cursor: usize,
@@ -270,26 +271,28 @@ struct BasinNode {
 /// Checked out from a pool bounded by concurrent worker count (or allocated once sequentially)
 /// and reused across depressions via generation stamps so outlet discovery never re-allocates
 /// `O(N)` buffers per depression or per Rayon work-stealing split.
-struct OutletSearchScratch {
-    in_source: Vec<bool>,
-    visited_pf: Vec<u32>,
-    drains_to_source: Vec<u32>,
-    trapped_in_pit: Vec<u32>,
-    parent_cell: Vec<usize>,
-    trace_seen: Vec<u32>,
-    pf_gen: u32,
-    trace_gen: u32,
-    heap: BinaryHeap<HeapCell>,
+pub(crate) struct OutletSearchScratch {
+    pub(crate) in_source: Vec<bool>,
+    pub(crate) visited_pf: Vec<u32>,
+    pub(crate) drains_to_source: Vec<u32>,
+    pub(crate) trapped_in_pit: Vec<u32>,
+    pub(crate) parent_cell: Vec<usize>,
+    pub(crate) trace_seen: Vec<u32>,
+    pub(crate) pf_gen: u32,
+    pub(crate) trace_gen: u32,
+    pub(crate) heap: BinaryHeap<HeapCell>,
 }
 
 impl OutletSearchScratch {
-    fn new(n: usize) -> Self {
+    pub(crate) fn new(n: usize) -> Self {
         Self {
             in_source: vec![false; n],
             visited_pf: vec![0u32; n],
             drains_to_source: vec![0u32; n],
             trapped_in_pit: vec![0u32; n],
-            parent_cell: vec![usize::MAX; n],
+            // Zero-initialized (uses OS zero pages lazily); source cells are explicitly set
+            // to `usize::MAX` and every pushed non-source cell is written before it is read.
+            parent_cell: vec![0usize; n],
             trace_seen: vec![0u32; n],
             pf_gen: 0,
             trace_gen: 0,
@@ -625,32 +628,34 @@ fn lowest_active_descendant(
 fn evaluate_topological_routing(
     basins: &mut [BasinNode],
     id_to_idx: &[usize],
+    live_indices: &[usize],
     rain_m_h: f64,
     allow_drain_revert: bool,
     q_in: &mut [f64],
     routed_cat: &mut [f64],
     indegree: &mut [usize],
     target_idx_buf: &mut [usize],
+    queue: &mut VecDeque<usize>,
 ) -> f64 {
-    let m = basins.len();
     loop {
-        q_in.fill(0.0);
-        routed_cat.fill(0.0);
-        indegree.fill(0);
-        target_idx_buf.fill(usize::MAX);
         let mut q_boundary_spill = 0.0;
+        let mut spilling_count = 0usize;
 
-        for i in 0..m {
-            match basins[i].state {
-                BasinState::Active | BasinState::FullSpilling => {
-                    q_in[i] = basins[i].local_eff_cat_area_m2 * rain_m_h;
-                    routed_cat[i] = basins[i].local_cat_area_m2;
-                }
-                BasinState::Waiting | BasinState::Merged => {}
+        for &i in live_indices {
+            q_in[i] = basins[i].local_eff_cat_area_m2 * rain_m_h;
+            routed_cat[i] = basins[i].local_cat_area_m2;
+            indegree[i] = 0;
+            target_idx_buf[i] = usize::MAX;
+            if basins[i].state == BasinState::FullSpilling {
+                spilling_count += 1;
             }
         }
 
-        for i in 0..m {
+        if spilling_count == 0 {
+            return 0.0;
+        }
+
+        for &i in live_indices {
             if basins[i].state != BasinState::FullSpilling {
                 continue;
             }
@@ -668,8 +673,8 @@ fn evaluate_topological_routing(
             }
         }
 
-        let mut queue: VecDeque<usize> = VecDeque::new();
-        for i in 0..m {
+        queue.clear();
+        for &i in live_indices {
             if basins[i].state == BasinState::FullSpilling && indegree[i] == 0 {
                 queue.push_back(i);
             }
@@ -772,6 +777,46 @@ pub fn simulate_fill_spill_merge_in_memory(
     depressions: &InMemoryDepressions,
     options: &SimulateInundationOptions,
     forcing: &InundationForcing<'_>,
+) -> Result<FsmSimulationResult> {
+    simulate_fill_spill_merge_impl(dem_refined, sink, depressions, options, forcing, None)
+}
+
+/// Internal variant of [`simulate_fill_spill_merge_in_memory`] reusing precomputed
+/// resolved D8 flow directions (`d8_flow_directions_resolved`) across pipeline stages.
+pub(crate) fn simulate_fill_spill_merge_with_flowdirs(
+    dem_refined: &Array2D<f64>,
+    sink: &Array2D<f64>,
+    depressions: &InMemoryDepressions,
+    options: &SimulateInundationOptions,
+    forcing: &InundationForcing<'_>,
+    flowdirs: &Array2D<D8Flowdir>,
+) -> Result<FsmSimulationResult> {
+    if flowdirs.width() != dem_refined.width() || flowdirs.height() != dem_refined.height() {
+        return Err(Error::DimensionMismatch(format!(
+            "flowdirs ({}x{}) does not match DEM ({}x{})",
+            flowdirs.width(),
+            flowdirs.height(),
+            dem_refined.width(),
+            dem_refined.height()
+        )));
+    }
+    simulate_fill_spill_merge_impl(
+        dem_refined,
+        sink,
+        depressions,
+        options,
+        forcing,
+        Some(flowdirs),
+    )
+}
+
+fn simulate_fill_spill_merge_impl(
+    dem_refined: &Array2D<f64>,
+    sink: &Array2D<f64>,
+    depressions: &InMemoryDepressions,
+    options: &SimulateInundationOptions,
+    forcing: &InundationForcing<'_>,
+    precomputed_flowdirs: Option<&Array2D<D8Flowdir>>,
 ) -> Result<FsmSimulationResult> {
     let _ = validate_options_with_hyetograph(options, forcing.hyetograph.is_some())?;
     if let Some(hyeto) = forcing.hyetograph {
@@ -889,8 +934,15 @@ pub fn simulate_fill_spill_merge_in_memory(
         }
     }
 
-    // 2. Compute D8 flow directions on dem_refined once (`O(N)`).
-    let flowdirs = d8_flow_directions_resolved(dem_refined)?;
+    // 2. Reuse precomputed D8 flow directions on dem_refined, or compute them once (`O(N)`).
+    let owned_flowdirs;
+    let flowdirs = match precomputed_flowdirs {
+        Some(f) => f,
+        None => {
+            owned_flowdirs = d8_flow_directions_resolved(dem_refined)?;
+            &owned_flowdirs
+        }
+    };
     let fdata = flowdirs.data();
     let zdata = dem_refined.data();
     let z_nd = dem_refined.no_data();
@@ -1061,117 +1113,284 @@ pub fn simulate_fill_spill_merge_in_memory(
             .collect()
     };
 
-    // 5. Build exact hypsometric storage curves, infiltration rates, and antecedent volumes.
-    // Collect sorted footprint cells and initial rim elevations first, incorporating each
-    // basin's discovered saddle elevation (`outlet.spill_elev`), then propagate rim elevations
-    // bottom-up so every parent's `z_rim >= max(z_rim(children))` and `V_cap(P) >= sum(V_cap(c))`.
-    let mut all_cells_by_dep: Vec<Vec<(f64, usize)>> =
-        Vec::with_capacity(depressions.depressions.len());
-    let mut z_rims: Vec<f64> = Vec::with_capacity(depressions.depressions.len());
-
-    for (dep_idx, d) in depressions.depressions.iter().enumerate() {
-        let mut all_cells: Vec<(f64, usize)> = Vec::new();
-        let mut stack = vec![d.id];
-        let mut visited_ids = HashSet::new();
-        while let Some(cur_id) = stack.pop() {
-            if !visited_ids.insert(cur_id) {
-                continue;
-            }
-            if let Some(pts) = pixels_by_id.get(&cur_id) {
-                for &gi in pts {
-                    let sv = sdata[gi];
-                    let z = if sv.is_finite() && !sv.rd_eq(s_nd) {
-                        sv
-                    } else {
-                        zdata[gi]
-                    };
-                    if z.is_finite() && !z.rd_eq(z_nd) {
-                        all_cells.push((z, gi));
+    // 5. Build O(N) exact hypsometric storage curves, infiltration rates, and antecedent volumes.
+    // Every sink pixel belongs to exactly one depression (`pixels_by_id`), so each depression
+    // collects and sorts ONLY its own cells (`O(N)` total memory, sorted in parallel with Rayon).
+    // Subtree capacities, rim elevations, and infiltration loss rates propagate bottom-up in O(m),
+    // and each compound parent's owned rim cells receive their exact subtree `threshold_vol`.
+    let m = depressions.depressions.len();
+    type OwnedCellData = (Vec<(f64, usize)>, Vec<f64>, f64);
+    let collect_owned = |d: &NestedDepression| -> OwnedCellData {
+        let mut cells: Vec<(f64, usize)> = Vec::new();
+        let mut owned_loss = 0.0f64;
+        if let Some(pts) = pixels_by_id.get(&d.id) {
+            cells.reserve(pts.len());
+            for &gi in pts {
+                let sv = sdata[gi];
+                let z = if sv.is_finite() && !sv.rd_eq(s_nd) {
+                    sv
+                } else {
+                    zdata[gi]
+                };
+                if z.is_finite() && !z.rd_eq(z_nd) {
+                    cells.push((z, gi));
+                    if let Some(inf) = forcing.infiltration_cm_h {
+                        let v = inf.get_i(gi);
+                        if v.is_finite() && !v.rd_eq(inf.no_data()) && v > 0.0 {
+                            owned_loss += (v / 100.0) * cell_area;
+                        }
                     }
                 }
             }
-            if let Some(kids) = children_map.get(&cur_id) {
-                stack.extend(kids.iter().copied());
+        }
+        cells.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let mut prefix = Vec::with_capacity(cells.len() + 1);
+        prefix.push(0.0f64);
+        if let Some(&(z0, _)) = cells.first() {
+            let mut acc = 0.0f64;
+            for &(z, _) in &cells {
+                acc += z - z0;
+                prefix.push(acc);
             }
         }
-        all_cells.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        (cells, prefix, owned_loss)
+    };
 
-        let mut z_rim = d
-            .max_elev
-            .max(all_cells.last().map_or(d.max_elev, |&(z, _)| z));
-        if let Some(outlet) = &outlets[dep_idx]
-            && outlet.spill_elev.is_finite()
-        {
-            z_rim = z_rim.max(outlet.spill_elev);
+    #[cfg(feature = "parallel")]
+    let owned_data: Vec<OwnedCellData> = depressions
+        .depressions
+        .par_iter()
+        .map(collect_owned)
+        .collect();
+    #[cfg(not(feature = "parallel"))]
+    let owned_data: Vec<OwnedCellData> =
+        depressions.depressions.iter().map(collect_owned).collect();
+
+    let mut owned_cells: Vec<Vec<(f64, usize)>> = Vec::with_capacity(m);
+    let mut owned_prefix: Vec<Vec<f64>> = Vec::with_capacity(m);
+    let mut owned_min_z = vec![f64::INFINITY; m];
+    let mut owned_max_z = vec![f64::NEG_INFINITY; m];
+    let mut subtree_count = vec![0usize; m];
+    let mut subtree_min_z = vec![f64::INFINITY; m];
+    let mut subtree_max_z = vec![f64::NEG_INFINITY; m];
+    let mut subtree_z_sum_above_min = vec![0.0f64; m];
+    let mut subtree_loss_rate = vec![0.0f64; m];
+
+    for (idx, (cells, prefix, loss)) in owned_data.into_iter().enumerate() {
+        let cnt = cells.len();
+        if cnt > 0 {
+            let zmin = cells[0].0;
+            let zmax = cells[cnt - 1].0;
+            owned_min_z[idx] = zmin;
+            owned_max_z[idx] = zmax;
+            subtree_count[idx] = cnt;
+            subtree_min_z[idx] = zmin;
+            subtree_max_z[idx] = zmax;
+            subtree_z_sum_above_min[idx] = prefix[cnt];
         }
-        all_cells_by_dep.push(all_cells);
-        z_rims.push(z_rim);
+        subtree_loss_rate[idx] = loss;
+        owned_cells.push(cells);
+        owned_prefix.push(prefix);
     }
 
-    let mut level_order: Vec<usize> = (0..depressions.depressions.len()).collect();
+    let mut level_order: Vec<usize> = (0..m).collect();
     level_order.sort_by_key(|&idx| {
         (
             depressions.depressions[idx].level,
             depressions.depressions[idx].id,
         )
     });
+
+    // Propagate subtree cell counts, min/max elevations, shifted elevation sums, loss rates,
+    // and rim elevations bottom-up so every parent satisfies `z_rim(P) >= max(z_rim(c))` and
+    // `V_cap(P) >= sum(V_cap(c))`.
+    let mut z_rims = vec![f64::NEG_INFINITY; m];
     for &dep_idx in &level_order {
         let d = &depressions.depressions[dep_idx];
-        let pid = parent_map.get(&d.id).copied().unwrap_or(d.parent_id);
-        if pid > 0 {
-            let pidx = id_to_idx.get(pid as usize).copied().unwrap_or(usize::MAX);
-            if pidx != usize::MAX && z_rims[dep_idx] > z_rims[pidx] {
-                z_rims[pidx] = z_rims[dep_idx];
+        let mut z_rim = d.max_elev;
+        if subtree_max_z[dep_idx].is_finite() {
+            z_rim = z_rim.max(subtree_max_z[dep_idx]);
+        }
+        if let Some(outlet) = &outlets[dep_idx]
+            && outlet.spill_elev.is_finite()
+        {
+            z_rim = z_rim.max(outlet.spill_elev);
+        }
+
+        for &cid in &d.children_ids {
+            let cidx = id_to_idx.get(cid as usize).copied().unwrap_or(usize::MAX);
+            if cidx == usize::MAX {
+                continue;
+            }
+            if z_rims[cidx] > z_rim {
+                z_rim = z_rims[cidx];
+            }
+            subtree_loss_rate[dep_idx] += subtree_loss_rate[cidx];
+            let n_b = subtree_count[cidx];
+            if n_b == 0 {
+                continue;
+            }
+            let n_a = subtree_count[dep_idx];
+            if n_a == 0 {
+                subtree_count[dep_idx] = n_b;
+                subtree_min_z[dep_idx] = subtree_min_z[cidx];
+                subtree_max_z[dep_idx] = subtree_max_z[cidx];
+                subtree_z_sum_above_min[dep_idx] = subtree_z_sum_above_min[cidx];
+            } else {
+                let new_min = subtree_min_z[dep_idx].min(subtree_min_z[cidx]);
+                subtree_z_sum_above_min[dep_idx] = (subtree_z_sum_above_min[dep_idx]
+                    + (n_a as f64) * (subtree_min_z[dep_idx] - new_min))
+                    + (subtree_z_sum_above_min[cidx]
+                        + (n_b as f64) * (subtree_min_z[cidx] - new_min));
+                subtree_min_z[dep_idx] = new_min;
+                if subtree_max_z[cidx] > subtree_max_z[dep_idx] {
+                    subtree_max_z[dep_idx] = subtree_max_z[cidx];
+                }
+                subtree_count[dep_idx] = n_a + n_b;
+            }
+            if subtree_max_z[dep_idx].is_finite() && subtree_max_z[dep_idx] > z_rim {
+                z_rim = subtree_max_z[dep_idx];
             }
         }
+        z_rims[dep_idx] = z_rim;
     }
 
-    let mut basins: Vec<BasinNode> = Vec::with_capacity(depressions.depressions.len());
-    let mut total_antecedent_m3 = 0.0f64;
+    // Build exact per-depression `hypso_cells` containing ONLY owned cells (`dep_id == d.id`)
+    // in parallel. Total entries across all depressions equals the number of valid sink cells.
+    let build_hypso = |dep_idx: usize| -> Vec<HypsoCell> {
+        let d = &depressions.depressions[dep_idx];
+        let owned = &owned_cells[dep_idx];
+        if owned.is_empty() {
+            return Vec::new();
+        }
+        let mut hypso: Vec<HypsoCell> = Vec::with_capacity(owned.len());
+        if d.children_ids.is_empty() {
+            let z_base = owned[0].0;
+            let pref = &owned_prefix[dep_idx];
+            for (i, &(z, gi)) in owned.iter().enumerate() {
+                let thresh = if i == 0 {
+                    0.0
+                } else if (z - owned[i - 1].0).abs() <= 1e-12 {
+                    hypso[i - 1].threshold_vol
+                } else {
+                    ((i as f64) * (z - z_base) - pref[i]).max(0.0) * cell_area
+                };
+                hypso.push(HypsoCell {
+                    grid_idx: gi,
+                    threshold_vol: thresh,
+                });
+            }
+            return hypso;
+        }
 
-    for (dep_idx, (d, all_cells)) in depressions
-        .depressions
-        .iter()
-        .zip(all_cells_by_dep)
-        .enumerate()
-    {
-        let z_rim = z_rims[dep_idx];
+        // Compound parent: fold all descendant subtrees whose max elevation <= z_min_owned
+        // in O(1), and track two-pointer cursors only for descendants with overlapping elevations.
+        let z_min_owned = owned[0].0;
+        let z_base = subtree_min_z[dep_idx];
+        let mut base_cnt = 0usize;
+        let mut base_sum_above_zbase = 0.0f64;
+        let mut overlap_nodes: Vec<usize> = Vec::new();
+        let mut stack: Vec<usize> = d
+            .children_ids
+            .iter()
+            .filter_map(|&cid| {
+                let ci = id_to_idx.get(cid as usize).copied().unwrap_or(usize::MAX);
+                (ci != usize::MAX).then_some(ci)
+            })
+            .collect();
 
-        let mut hypso_cells: Vec<HypsoCell> = Vec::with_capacity(all_cells.len());
-        let z_base = all_cells.first().map_or(0.0, |&(z, _)| z);
-        let mut prefix_sum = 0.0f64;
-        let mut capacity_m3 = 0.0f64;
-        for (i, &(z, gi)) in all_cells.iter().enumerate() {
-            let dz = z - z_base;
-            let thresh = if i == 0 {
-                0.0
-            } else if (z - all_cells[i - 1].0).abs() <= 1e-12 {
-                hypso_cells[i - 1].threshold_vol
+        while let Some(u) = stack.pop() {
+            if subtree_count[u] == 0 {
+                continue;
+            }
+            if subtree_max_z[u] <= z_min_owned {
+                base_cnt += subtree_count[u];
+                base_sum_above_zbase += subtree_z_sum_above_min[u]
+                    + (subtree_count[u] as f64) * (subtree_min_z[u] - z_base);
             } else {
-                ((i as f64) * dz - prefix_sum).max(0.0) * cell_area
+                if !owned_cells[u].is_empty() {
+                    if owned_max_z[u] <= z_min_owned {
+                        let clen = owned_cells[u].len();
+                        base_cnt += clen;
+                        base_sum_above_zbase +=
+                            owned_prefix[u][clen] + (clen as f64) * (owned_min_z[u] - z_base);
+                    } else {
+                        overlap_nodes.push(u);
+                    }
+                }
+                for &cid in &depressions.depressions[u].children_ids {
+                    let ci = id_to_idx.get(cid as usize).copied().unwrap_or(usize::MAX);
+                    if ci != usize::MAX {
+                        stack.push(ci);
+                    }
+                }
+            }
+        }
+
+        let mut ptrs = vec![0usize; overlap_nodes.len()];
+        let pref_self = &owned_prefix[dep_idx];
+        let self_min_shift = owned_min_z[dep_idx] - z_base;
+
+        for (i, &(z, gi)) in owned.iter().enumerate() {
+            let thresh = if i > 0 && (z - owned[i - 1].0).abs() <= 1e-12 {
+                hypso[i - 1].threshold_vol
+            } else {
+                let mut overlap_cnt = 0usize;
+                let mut overlap_sum_dz = 0.0f64;
+                for (k, &u) in overlap_nodes.iter().enumerate() {
+                    let u_cells = &owned_cells[u];
+                    let mut p = ptrs[k];
+                    while p < u_cells.len() && u_cells[p].0 < z {
+                        p += 1;
+                    }
+                    ptrs[k] = p;
+                    if p > 0 {
+                        overlap_cnt += p;
+                        overlap_sum_dz +=
+                            owned_prefix[u][p] + (p as f64) * (owned_min_z[u] - z_base);
+                    }
+                }
+                let total_cnt = base_cnt + i + overlap_cnt;
+                if total_cnt == 0 {
+                    0.0
+                } else {
+                    let total_sum_dz = base_sum_above_zbase
+                        + (pref_self[i] + (i as f64) * self_min_shift)
+                        + overlap_sum_dz;
+                    ((total_cnt as f64) * (z - z_base) - total_sum_dz).max(0.0) * cell_area
+                }
             };
-            hypso_cells.push(HypsoCell {
+            hypso.push(HypsoCell {
                 grid_idx: gi,
                 threshold_vol: thresh,
             });
-            prefix_sum += dz;
-            capacity_m3 += (z_rim - z).max(0.0) * cell_area;
         }
+        hypso
+    };
 
-        // Compute total infiltration loss rate over this depression's entire footprint.
-        let loss_rate_m3_h = if let Some(inf) = forcing.infiltration_cm_h {
-            let inf_nd = inf.no_data();
-            let mut sum_m_h = 0.0f64;
-            for &(_, gi) in &all_cells {
-                let v = inf.get_i(gi);
-                if v.is_finite() && !v.rd_eq(inf_nd) && v > 0.0 {
-                    sum_m_h += (v / 100.0) * cell_area;
-                }
-            }
-            sum_m_h
+    #[cfg(feature = "parallel")]
+    let hypso_by_dep: Vec<Vec<HypsoCell>> = (0..m).into_par_iter().map(build_hypso).collect();
+    #[cfg(not(feature = "parallel"))]
+    let hypso_by_dep: Vec<Vec<HypsoCell>> = (0..m).map(build_hypso).collect();
+
+    drop(owned_cells);
+    drop(owned_prefix);
+
+    let mut basins: Vec<BasinNode> = Vec::with_capacity(m);
+    let mut total_antecedent_m3 = 0.0f64;
+
+    for (dep_idx, (d, hypso_cells)) in depressions.depressions.iter().zip(hypso_by_dep).enumerate()
+    {
+        let z_rim = z_rims[dep_idx];
+        let capacity_m3 = if subtree_count[dep_idx] > 0 {
+            ((subtree_count[dep_idx] as f64) * (z_rim - subtree_min_z[dep_idx])
+                - subtree_z_sum_above_min[dep_idx])
+                .max(0.0)
+                * cell_area
         } else {
             0.0
         };
+        let loss_rate_m3_h = subtree_loss_rate[dep_idx];
 
         // Compute initial antecedent ponded water over OWNED cells (`dep_id == d.id`) only,
         // so children and parents never double-count antecedent water; upon merge, children's
@@ -1286,20 +1505,50 @@ pub fn simulate_fill_spill_merge_in_memory(
         last_storm.3 = true;
     }
 
+    // Track `live_indices` (Active | FullSpilling) and `waiting_indices` (Waiting) in ascending
+    // index order so every event-loop pass skips Merged/Waiting basins with deterministic order.
+    let mut live_indices: Vec<usize> = Vec::with_capacity(m);
+    let mut waiting_indices: Vec<usize> = Vec::new();
+    for (idx, b) in basins.iter().enumerate() {
+        match b.state {
+            BasinState::Active | BasinState::FullSpilling => live_indices.push(idx),
+            BasinState::Waiting => waiting_indices.push(idx),
+            BasinState::Merged => {}
+        }
+    }
+
     // Helper: resolve all ready parent merges and break any full spill cycles so the
     // `FullSpilling` routing graph is guaranteed to be a DAG.
-    let mut cycle_color = vec![0u8; basins.len()];
-    let resolve_merges_and_cycles = |basins: &mut [BasinNode],
-                                     id_to_idx: &[usize],
-                                     t_now: f64,
-                                     num_merge_events: &mut usize,
-                                     fill_time_data: &mut [f64],
-                                     color: &mut [u8]| {
+    let mut cycle_color = vec![0u8; m];
+    let mut chain_buf: Vec<usize> = Vec::with_capacity(32);
+    let mut q_in = vec![0.0f64; m];
+    let mut routed_cat = vec![0.0f64; m];
+    let mut indegree = vec![0usize; m];
+    let mut target_idx_buf = vec![usize::MAX; m];
+    let mut topo_queue: VecDeque<usize> = VecDeque::with_capacity(m.min(256));
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_merges_and_cycles(
+        basins: &mut [BasinNode],
+        id_to_idx: &[usize],
+        live_indices: &mut Vec<usize>,
+        waiting_indices: &mut Vec<usize>,
+        t_now: f64,
+        num_merge_events: &mut usize,
+        fill_time_data: &mut [f64],
+        color: &mut [u8],
+        chain: &mut Vec<usize>,
+        q_in: &mut [f64],
+        routed_cat: &mut [f64],
+        indegree: &mut [usize],
+        target_idx_buf: &mut [usize],
+    ) {
         loop {
             let mut changed = false;
+            let mut merged_any = false;
 
-            // (a) Check if any `Waiting` parent now has all direct children FullSpilling/Merged.
-            for idx in 0..basins.len() {
+            // (a) Check only `Waiting` parents to see if all direct children are FullSpilling/Merged.
+            for &idx in waiting_indices.iter() {
                 if basins[idx].state != BasinState::Waiting || basins[idx].children_ids.is_empty() {
                     continue;
                 }
@@ -1319,7 +1568,7 @@ pub fn simulate_fill_spill_merge_in_memory(
                 let mut merged_vol = basins[idx].stored_vol_m3;
                 let mut merged_cat = basins[idx].local_cat_area_m2;
                 let mut merged_eff_cat = basins[idx].local_eff_cat_area_m2;
-                for cid in child_ids {
+                for &cid in &child_ids {
                     let cidx = id_to_idx.get(cid as usize).copied().unwrap_or(usize::MAX);
                     if cidx != usize::MAX && basins[cidx].state == BasinState::FullSpilling {
                         merged_vol += basins[cidx].stored_vol_m3;
@@ -1327,6 +1576,28 @@ pub fn simulate_fill_spill_merge_in_memory(
                         merged_eff_cat += basins[cidx].local_eff_cat_area_m2;
                         basins[cidx].state = BasinState::Merged;
                         basins[cidx].merge_time_h = Some(t_now);
+                        q_in[cidx] = 0.0;
+                        routed_cat[cidx] = 0.0;
+                        indegree[cidx] = 0;
+                        target_idx_buf[cidx] = usize::MAX;
+                    }
+                }
+                // Flush any un-marked cells of degenerate 0-capacity flat children when the
+                // merged parent has positive volume.
+                if merged_vol > 0.0 {
+                    for &cid in &child_ids {
+                        let cidx = id_to_idx.get(cid as usize).copied().unwrap_or(usize::MAX);
+                        if cidx != usize::MAX
+                            && basins[cidx].hypso_cursor < basins[cidx].hypso_cells.len()
+                        {
+                            for cell in &basins[cidx].hypso_cells[basins[cidx].hypso_cursor..] {
+                                let slot = &mut fill_time_data[cell.grid_idx];
+                                if *slot < 0.0 || t_now < *slot {
+                                    *slot = t_now;
+                                }
+                            }
+                            basins[cidx].hypso_cursor = basins[cidx].hypso_cells.len();
+                        }
                     }
                 }
                 let p = &mut basins[idx];
@@ -1346,22 +1617,41 @@ pub fn simulate_fill_spill_merge_in_memory(
                     mark_cells_at_instant(p, t_now, fill_time_data);
                 }
                 changed = true;
+                merged_any = true;
+            }
+
+            if merged_any {
+                waiting_indices.retain(|&i| basins[i].state == BasinState::Waiting);
+                live_indices.clear();
+                for (i, b) in basins.iter().enumerate() {
+                    if matches!(b.state, BasinState::Active | BasinState::FullSpilling) {
+                        live_indices.push(i);
+                    }
+                }
             }
 
             if changed {
                 continue;
             }
 
-            // (b) Detect and break any cycle among `FullSpilling` nodes.
-            let m = basins.len();
-            color.fill(0); // 0 = unvisited, 1 = visiting, 2 = done
-            let mut cycle_nodes: Option<Vec<u32>> = None;
+            // (b) Detect and break any cycle among `FullSpilling` nodes (scanning only live nodes).
+            let mut has_spilling = false;
+            for &i in live_indices.iter() {
+                color[i] = 0; // 0 = unvisited, 1 = visiting, 2 = done
+                if basins[i].state == BasinState::FullSpilling {
+                    has_spilling = true;
+                }
+            }
+            if !has_spilling {
+                break;
+            }
 
-            for start_idx in 0..m {
+            let mut cycle_nodes: Option<Vec<u32>> = None;
+            for &start_idx in live_indices.iter() {
                 if basins[start_idx].state != BasinState::FullSpilling || color[start_idx] != 0 {
                     continue;
                 }
-                let mut chain: Vec<usize> = Vec::new();
+                chain.clear();
                 let mut cur_idx = start_idx;
                 loop {
                     if color[cur_idx] == 2 {
@@ -1392,7 +1682,7 @@ pub fn simulate_fill_spill_merge_in_memory(
                     }
                     cur_idx = next_idx;
                 }
-                for &ci in &chain {
+                for &ci in chain.iter() {
                     color[ci] = 2;
                 }
                 if cycle_nodes.is_some() {
@@ -1441,10 +1731,9 @@ pub fn simulate_fill_spill_merge_in_memory(
                 break;
             }
         }
-    };
+    }
 
     // 7. Event-driven integration loop.
-    let m = basins.len();
     let mut t_cur = 0.0f64;
     let mut total_runoff_storm_m3 = 0.0f64;
     let mut total_infiltration_storm_m3 = 0.0f64;
@@ -1452,19 +1741,16 @@ pub fn simulate_fill_spill_merge_in_memory(
     let mut num_merge_events = 0usize;
     let mut snapshot_taken = false;
     let mut last_rain_m_h = 0.0f64;
-
-    let mut q_in = vec![0.0f64; m];
-    let mut routed_cat = vec![0.0f64; m];
-    let mut indegree = vec![0usize; m];
-    let mut target_idx_buf = vec![usize::MAX; m];
+    let mut topology_dirty = true;
 
     for (seg_idx, (seg_dt, rain_m_h, in_storm_window, snapshot_after_segment)) in
         segments.into_iter().enumerate()
     {
         if seg_idx > 0 && rain_m_h < last_rain_m_h - 1e-15 {
-            for b in &mut basins {
-                b.spill_override = None;
+            for &i in &live_indices {
+                basins[i].spill_override = None;
             }
+            topology_dirty = true;
         }
         last_rain_m_h = rain_m_h;
         let t_seg_end = if seg_dt.is_finite() {
@@ -1479,14 +1765,24 @@ pub fn simulate_fill_spill_merge_in_memory(
         while t_cur < t_seg_end - 1e-12 && iter_guard < max_iters {
             iter_guard += 1;
 
-            resolve_merges_and_cycles(
-                &mut basins,
-                &id_to_idx,
-                t_cur,
-                &mut num_merge_events,
-                &mut fill_time_data,
-                &mut cycle_color,
-            );
+            if topology_dirty {
+                resolve_merges_and_cycles(
+                    &mut basins,
+                    &id_to_idx,
+                    &mut live_indices,
+                    &mut waiting_indices,
+                    t_cur,
+                    &mut num_merge_events,
+                    &mut fill_time_data,
+                    &mut cycle_color,
+                    &mut chain_buf,
+                    &mut q_in,
+                    &mut routed_cat,
+                    &mut indegree,
+                    &mut target_idx_buf,
+                );
+                topology_dirty = false;
+            }
 
             // Evaluate topological spill inflows; if a FullSpilling basin loses more to
             // infiltration than it receives during a dry/low-rain step, revert it to Active
@@ -1494,49 +1790,53 @@ pub fn simulate_fill_spill_merge_in_memory(
             let q_boundary_spill = evaluate_topological_routing(
                 &mut basins,
                 &id_to_idx,
+                &live_indices,
                 rain_m_h,
                 true,
                 &mut q_in,
                 &mut routed_cat,
                 &mut indegree,
                 &mut target_idx_buf,
+                &mut topo_queue,
             );
 
-            // Record realized spill targets and start times for newly spilling basins.
-            for i in 0..m {
-                if basins[i].state == BasinState::FullSpilling {
-                    let q_out = (q_in[i] - basins[i].loss_rate_m3_h).max(0.0);
-                    if q_out > 1e-15 {
-                        if basins[i].first_spill_time_h.is_none() {
-                            basins[i].first_spill_time_h = Some(t_cur);
-                        }
-                        if basins[i].realized_spill_to.is_none() {
-                            let dst = target_idx_buf[i];
-                            let dst_id = if dst != usize::MAX { basins[dst].id } else { 0 };
-                            basins[i].realized_spill_to = Some(dst_id);
-                        }
-                        if in_storm_window && q_out > basins[i].peak_spill_rate_m3_h {
-                            basins[i].peak_spill_rate_m3_h = q_out;
-                        }
-                    }
-                }
-            }
-
-            // Determine next event time step `dt`.
+            // Record realized spill targets, determine next event time step `dt_next`, and
+            // sum live effective catchment area in a single pass over `live_indices`.
             let mut dt_next = t_seg_end - t_cur;
             let mut any_filling = false;
-            for i in 0..m {
-                if basins[i].state != BasinState::Active {
-                    continue;
-                }
-                let q_net = q_in[i] - basins[i].loss_rate_m3_h;
-                if q_net > 1e-15 {
-                    any_filling = true;
-                    let rem = (basins[i].capacity_m3 - basins[i].stored_vol_m3).max(0.0);
-                    let dt_fill = rem / q_net;
-                    if dt_fill < dt_next {
-                        dt_next = dt_fill;
+            let mut total_local_eff_cat = boundary_eff_cat_area;
+
+            for &i in &live_indices {
+                total_local_eff_cat += basins[i].local_eff_cat_area_m2;
+                match basins[i].state {
+                    BasinState::FullSpilling => {
+                        let q_out = (q_in[i] - basins[i].loss_rate_m3_h).max(0.0);
+                        if q_out > 1e-15 {
+                            if basins[i].first_spill_time_h.is_none() {
+                                basins[i].first_spill_time_h = Some(t_cur);
+                            }
+                            if basins[i].realized_spill_to.is_none() {
+                                let dst = target_idx_buf[i];
+                                let dst_id = if dst != usize::MAX { basins[dst].id } else { 0 };
+                                basins[i].realized_spill_to = Some(dst_id);
+                            }
+                            if in_storm_window && q_out > basins[i].peak_spill_rate_m3_h {
+                                basins[i].peak_spill_rate_m3_h = q_out;
+                            }
+                        }
                     }
+                    BasinState::Active => {
+                        let q_net = q_in[i] - basins[i].loss_rate_m3_h;
+                        if q_net > 1e-15 {
+                            any_filling = true;
+                            let rem = (basins[i].capacity_m3 - basins[i].stored_vol_m3).max(0.0);
+                            let dt_fill = rem / q_net;
+                            if dt_fill < dt_next {
+                                dt_next = dt_fill;
+                            }
+                        }
+                    }
+                    BasinState::Waiting | BasinState::Merged => {}
                 }
             }
 
@@ -1550,23 +1850,17 @@ pub fn simulate_fill_spill_merge_in_memory(
                 break;
             }
 
-            // Advance all basins by `dt_next`.
+            // Advance all live basins by `dt_next`.
             let t_start = t_cur;
             let t_end = t_cur + dt_next;
 
             if in_storm_window {
-                let mut total_local_eff_cat = boundary_eff_cat_area;
-                for b in &basins {
-                    if matches!(b.state, BasinState::Active | BasinState::FullSpilling) {
-                        total_local_eff_cat += b.local_eff_cat_area_m2;
-                    }
-                }
                 total_runoff_storm_m3 += total_local_eff_cat * rain_m_h * dt_next;
                 total_boundary_outflow_storm_m3 +=
                     (boundary_eff_cat_area * rain_m_h + q_boundary_spill) * dt_next;
             }
 
-            for i in 0..m {
+            for &i in &live_indices {
                 match basins[i].state {
                     BasinState::Active => {
                         let q_net = q_in[i] - basins[i].loss_rate_m3_h;
@@ -1595,6 +1889,7 @@ pub fn simulate_fill_spill_merge_in_memory(
                         {
                             basins[i].stored_vol_m3 = basins[i].capacity_m3;
                             basins[i].state = BasinState::FullSpilling;
+                            topology_dirty = true;
                             if basins[i].first_fill_time_h.is_none() {
                                 basins[i].first_fill_time_h = Some(t_end);
                             }
@@ -1625,23 +1920,35 @@ pub fn simulate_fill_spill_merge_in_memory(
 
         // Snapshot storm-end volumes and routed contributing areas right when the storm window ends.
         if snapshot_after_segment && !snapshot_taken {
-            resolve_merges_and_cycles(
-                &mut basins,
-                &id_to_idx,
-                t_cur,
-                &mut num_merge_events,
-                &mut fill_time_data,
-                &mut cycle_color,
-            );
+            if topology_dirty {
+                resolve_merges_and_cycles(
+                    &mut basins,
+                    &id_to_idx,
+                    &mut live_indices,
+                    &mut waiting_indices,
+                    t_cur,
+                    &mut num_merge_events,
+                    &mut fill_time_data,
+                    &mut cycle_color,
+                    &mut chain_buf,
+                    &mut q_in,
+                    &mut routed_cat,
+                    &mut indegree,
+                    &mut target_idx_buf,
+                );
+                topology_dirty = false;
+            }
             let _ = evaluate_topological_routing(
                 &mut basins,
                 &id_to_idx,
+                &live_indices,
                 rain_m_h,
                 false,
                 &mut q_in,
                 &mut routed_cat,
                 &mut indegree,
                 &mut target_idx_buf,
+                &mut topo_queue,
             );
             for i in 0..m {
                 basins[i].storm_end_vol_m3 = basins[i].stored_vol_m3;
@@ -1657,23 +1964,34 @@ pub fn simulate_fill_spill_merge_in_memory(
     }
 
     if !snapshot_taken {
-        resolve_merges_and_cycles(
-            &mut basins,
-            &id_to_idx,
-            t_cur,
-            &mut num_merge_events,
-            &mut fill_time_data,
-            &mut cycle_color,
-        );
+        if topology_dirty {
+            resolve_merges_and_cycles(
+                &mut basins,
+                &id_to_idx,
+                &mut live_indices,
+                &mut waiting_indices,
+                t_cur,
+                &mut num_merge_events,
+                &mut fill_time_data,
+                &mut cycle_color,
+                &mut chain_buf,
+                &mut q_in,
+                &mut routed_cat,
+                &mut indegree,
+                &mut target_idx_buf,
+            );
+        }
         let _ = evaluate_topological_routing(
             &mut basins,
             &id_to_idx,
+            &live_indices,
             last_rain_m_h,
             false,
             &mut q_in,
             &mut routed_cat,
             &mut indegree,
             &mut target_idx_buf,
+            &mut topo_queue,
         );
         for i in 0..m {
             basins[i].storm_end_vol_m3 = basins[i].stored_vol_m3;
@@ -2776,5 +3094,149 @@ mod tests {
             b.local_cat_area_m2
         );
         assert!(res.mass_balance.mass_balance_error_m3.abs() < 1e-9);
+    }
+
+    #[test]
+    fn fsm_owned_hypso_handles_overlapping_parent_rim_pocket_and_conserves_mass() {
+        // Compound depression (id=1) with two child bowls (id=2, id=3) plus a sub-threshold
+        // pocket owned directly by parent (id=1) whose floor (10.5) is lower than the child
+        // rims (12.0), verifying exact subtree threshold_vol computation in O(N) memory.
+        let (w, h) = (10usize, 8usize);
+        let mut z = vec![20.0f64; w * h];
+        let mut sink_data = vec![0.0f64; w * h];
+        let mut dep_id = vec![0i32; w * h];
+        let mut dep_lvl = vec![0i32; w * h];
+
+        for r in 1..7 {
+            for c in 1..9 {
+                let idx = r * w + c;
+                dep_id[idx] = 1;
+                dep_lvl[idx] = 2;
+                z[idx] = 13.0;
+                sink_data[idx] = 13.0;
+            }
+        }
+        // Child 2 (left bowl): floor 9.0, rim 12.0
+        for r in 2..5 {
+            for c in 2..4 {
+                let idx = r * w + c;
+                dep_id[idx] = 2;
+                dep_lvl[idx] = 1;
+                let elev = if r == 3 && c == 2 { 9.0 } else { 11.5 };
+                z[idx] = elev;
+                sink_data[idx] = elev;
+            }
+        }
+        // Child 3 (right bowl): floor 8.0, rim 12.0
+        for r in 2..5 {
+            for c in 6..8 {
+                let idx = r * w + c;
+                dep_id[idx] = 3;
+                dep_lvl[idx] = 1;
+                let elev = if r == 3 && c == 6 { 8.0 } else { 11.5 };
+                z[idx] = elev;
+                sink_data[idx] = elev;
+            }
+        }
+        // Sub-threshold pocket owned by parent (id=1) with elevation 10.5 < child rim 12.0.
+        let pocket_idx = 5 * w + 4;
+        z[pocket_idx] = 10.5;
+        sink_data[pocket_idx] = 10.5;
+
+        let mut dem = Array2D::from_vec(w, h, z).unwrap();
+        dem.set_no_data(-9999.0);
+        dem.geotransform = [0.0, 1.0, 0.0, h as f64, 0.0, -1.0];
+
+        let mut sink = Array2D::from_vec(w, h, sink_data).unwrap();
+        sink.set_no_data(0.0);
+        sink.geotransform = dem.geotransform;
+
+        let mut id_arr = Array2D::from_vec(w, h, dep_id).unwrap();
+        id_arr.set_no_data(0);
+        id_arr.geotransform = dem.geotransform;
+
+        let mut lvl_arr = Array2D::from_vec(w, h, dep_lvl).unwrap();
+        lvl_arr.set_no_data(0);
+        lvl_arr.geotransform = dem.geotransform;
+
+        let make_dep = |id: u32,
+                        level: u32,
+                        parent_id: u32,
+                        children_ids: Vec<u32>,
+                        min_elev: f64,
+                        max_elev: f64,
+                        count: usize| NestedDepression {
+            id,
+            level,
+            count,
+            area: count as f64,
+            volume: (max_elev - min_elev) * count as f64,
+            avg_depth: max_elev - min_elev,
+            max_depth: max_elev - min_elev,
+            min_elev,
+            max_elev,
+            children_ids,
+            region_id: 1,
+            perimeter: 8.0,
+            major_axis: 2.0,
+            minor_axis: 2.0,
+            elongatedness: 1.0,
+            eccentricity: 0.0,
+            orientation: 0.0,
+            area_bbox_ratio: 1.0,
+            parent_id,
+            circularity: 1.0,
+            depth_diam_ratio: 0.5,
+            hypsometric_integral: 1.0,
+            rim_slope_deg: 45.0,
+            artifact_flag: false,
+        };
+
+        let deps = InMemoryDepressions {
+            depression_id: id_arr,
+            depression_level: lvl_arr,
+            depressions: vec![
+                make_dep(1, 2, 0, vec![2, 3], 8.0, 13.0, 48),
+                make_dep(2, 1, 1, vec![], 9.0, 12.0, 6),
+                make_dep(3, 1, 1, vec![], 8.0, 12.0, 6),
+            ],
+            max_level: 2,
+            num_regions: 1,
+        };
+
+        let opts = SimulateInundationOptions {
+            min_size: 2,
+            min_depth: 0.1,
+            interval: 0.5,
+            rain_intensity_cm_h: 50.0,
+            rain_duration_h: 10.0,
+            time_step_h: 1.0,
+            compress: false,
+        };
+
+        let res = simulate_fill_spill_merge_in_memory(
+            &dem,
+            &sink,
+            &deps,
+            &opts,
+            &InundationForcing::default(),
+        )
+        .unwrap();
+
+        assert!(
+            res.mass_balance.mass_balance_error_m3.abs() < 1e-9,
+            "mass balance error too large: {}",
+            res.mass_balance.mass_balance_error_m3
+        );
+        let parent_sum = res.basins.iter().find(|b| b.dep_id == 1).unwrap();
+        let child2 = res.basins.iter().find(|b| b.dep_id == 2).unwrap();
+        let child3 = res.basins.iter().find(|b| b.dep_id == 3).unwrap();
+        assert!(parent_sum.capacity_m3 > child2.capacity_m3 + child3.capacity_m3);
+        let pocket_ft = res.fill_time.get_i(pocket_idx);
+        let rim_ft = res.fill_time.get_i(w + 1);
+        assert!(
+            pocket_ft >= 0.0 && rim_ft >= pocket_ft,
+            "pocket fill_time ({pocket_ft}) should be finite and <= rim fill_time ({rim_ft})"
+        );
     }
 }

@@ -1077,6 +1077,35 @@ pub fn delineate_catchment_hierarchy_in_memory(
     depression_level: &Array2D<i32>,
     min_size: usize,
 ) -> Result<(Array2D<f64>, Vec<CatchmentHierarchyRecord>)> {
+    delineate_catchment_hierarchy_impl(dem, depression_level, min_size, None)
+}
+
+/// Internal variant of [`delineate_catchment_hierarchy_in_memory`] reusing precomputed
+/// resolved D8 flow directions (`d8_flow_directions_resolved`) across pipeline stages.
+pub(crate) fn delineate_catchment_hierarchy_with_flowdirs(
+    dem: &Array2D<f64>,
+    depression_level: &Array2D<i32>,
+    min_size: usize,
+    flowdirs: &Array2D<D8Flowdir>,
+) -> Result<(Array2D<f64>, Vec<CatchmentHierarchyRecord>)> {
+    if flowdirs.width() != dem.width() || flowdirs.height() != dem.height() {
+        return Err(Error::DimensionMismatch(format!(
+            "flowdirs ({}x{}) does not match DEM ({}x{})",
+            flowdirs.width(),
+            flowdirs.height(),
+            dem.width(),
+            dem.height()
+        )));
+    }
+    delineate_catchment_hierarchy_impl(dem, depression_level, min_size, Some(flowdirs))
+}
+
+fn delineate_catchment_hierarchy_impl(
+    dem: &Array2D<f64>,
+    depression_level: &Array2D<i32>,
+    min_size: usize,
+    precomputed_flowdirs: Option<&Array2D<D8Flowdir>>,
+) -> Result<(Array2D<f64>, Vec<CatchmentHierarchyRecord>)> {
     crate::inundation::validate_grid_alignment(dem, depression_level, "depression_level")?;
     let w = dem.width();
     let h = dem.height();
@@ -1091,7 +1120,14 @@ pub fn delineate_catchment_hierarchy_in_memory(
     }
 
     let cell_area = affine_cell_area(&dem.geotransform);
-    let flowdirs = d8_flow_directions_resolved(dem)?;
+    let owned_flowdirs;
+    let flowdirs = match precomputed_flowdirs {
+        Some(f) => f,
+        None => {
+            owned_flowdirs = d8_flow_directions_resolved(dem)?;
+            &owned_flowdirs
+        }
+    };
     let fdata = flowdirs.data();
     let dem_data = dem.data();
 

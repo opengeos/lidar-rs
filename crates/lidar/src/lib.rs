@@ -126,7 +126,7 @@ pub use raster_ops::{
     add_crs, clip_image, csv_points_to_vector, image_to_cog, join_csv_to_vector, mosaic,
     parse_resampling, polygonize, polygonize_array, reproject_image, resample,
 };
-pub use region::{RegionProps, region_group, region_props, region_props_xy};
+pub use region::{RegionProps, region_group, region_group_slice, region_props, region_props_xy};
 pub use slicing::{
     DelineateOptions, DelineateResult, InMemoryDepressions, NestedDepression,
     delineate_depressions, delineate_depressions_in_memory, write_depressions_csv,

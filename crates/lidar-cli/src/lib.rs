@@ -1837,7 +1837,8 @@ fn dispatch(command: Commands, lidar_cmd: Option<Vec<OsString>>) -> lidar::Resul
                     "--hour must be finite and >= 0, got {h}"
                 )));
             }
-            let dem_arr = load_raster::<f64>(&dem, None)?;
+            let allow_overview = max_dim > 0 && fill_time.is_none() && depth.is_none();
+            let dem_arr = load_preview_dem(&dem, max_dim, allow_overview)?;
             let opts = AnimateInundationOptions {
                 water_alpha,
                 max_dimension: if max_dim == 0 { None } else { Some(max_dim) },
@@ -1918,6 +1919,50 @@ fn dispatch(command: Commands, lidar_cmd: Option<Vec<OsString>>) -> lidar::Resul
     }
 
     Ok(())
+}
+
+/// Loads a DEM raster for `lidar preview`, reading a matching COG/GeoTIFF overview via
+/// `terrio::open_raster_lazy` when `allow_overview` is true, `max_dim > 0`, and an overview
+/// exists whose largest dimension is still `>= max_dim` and smaller than native resolution.
+/// Falls back cleanly to full-resolution `load_raster` otherwise.
+fn load_preview_dem(
+    path: &Path,
+    max_dim: usize,
+    allow_overview: bool,
+) -> lidar::Result<lidar::Array2D<f64>> {
+    if allow_overview
+        && max_dim > 0
+        && let Some(p_str) = path.to_str()
+        && let Ok(mut lazy) = terrio::open_raster_lazy(p_str)
+    {
+        let native_w = lazy.width();
+        let native_h = lazy.height();
+        if native_w.max(native_h) > max_dim {
+            let overviews = lazy.overviews();
+            // `overviews()` is ordered largest first; pick the smallest overview whose
+            // max dimension is still >= max_dim and strictly smaller than native size.
+            let chosen = overviews
+                .iter()
+                .enumerate()
+                .rfind(|&(_, &(ow, oh))| {
+                    ow > 0 && oh > 0 && ow.max(oh) >= max_dim && (ow < native_w || oh < native_h)
+                })
+                .map(|(idx, &dims)| (idx, dims));
+            if let Some((ov_idx, (ow, oh))) = chosen {
+                let win = terrio::Window::full(ow, oh);
+                let opts = terrio::WindowOptions {
+                    bands: vec![1],
+                    overview: Some(ov_idx),
+                };
+                if let Ok(ds) = lazy.read_window(win, &opts)
+                    && let Ok(dyn_arr) = richdem::dataset_to_dynamic(ds, "dem")
+                {
+                    return Ok(dyn_arr.to_f64());
+                }
+            }
+        }
+    }
+    Ok(load_raster::<f64>(path, None)?)
 }
 
 /// Runs the `lidar` CLI with `args` (program name first) and returns a process exit code
@@ -2103,5 +2148,75 @@ mod tests {
         ]);
         assert_eq!(code_bad_hour, 1);
         assert!(!nested_out_dir.exists());
+    }
+
+    #[test]
+    fn preview_uses_cog_overview_when_available_and_produces_valid_png() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_tif = tmp.path().join("dem_1024.tif");
+        let cog_tif = tmp.path().join("dem_1024_cog.tif");
+        let out_png = tmp.path().join("preview_256.png");
+
+        let (w, h) = (1024usize, 1024usize);
+        let mut data = Vec::with_capacity(w * h);
+        for r in 0..h {
+            for c in 0..w {
+                let dx = c as f64 - 512.0;
+                let dy = r as f64 - 512.0;
+                data.push(100.0 + 0.02 * (dx * dx + dy * dy).sqrt());
+            }
+        }
+        let mut dem = lidar::Array2D::from_vec(w, h, data).unwrap();
+        dem.set_no_data(-9999.0);
+        dem.geotransform = [500_000.0, 1.0, 0.0, 4_001_024.0, 0.0, -1.0];
+        lidar::save_raster(&dem, &src_tif, None, false).unwrap();
+
+        image_to_cog(&src_tif, &cog_tif, None).unwrap();
+
+        // Confirm the generated COG has overviews and `load_preview_dem` picks one < 1024 and >= 256.
+        let lazy = terrio::open_raster_lazy(cog_tif.to_str().unwrap()).unwrap();
+        assert!(
+            !lazy.overviews().is_empty(),
+            "expected COG overviews for 1024x1024 raster"
+        );
+        let ov_arr = load_preview_dem(&cog_tif, 256, true).unwrap();
+        assert!(
+            ov_arr.width() < w && ov_arr.height() < h,
+            "expected overview smaller than native 1024x1024, got {}x{}",
+            ov_arr.width(),
+            ov_arr.height()
+        );
+        assert!(
+            ov_arr.width().max(ov_arr.height()) >= 256,
+            "expected overview >= max_dim (256), got {}x{}",
+            ov_arr.width(),
+            ov_arr.height()
+        );
+
+        // When allow_overview is false (e.g. overlay alignment), full resolution is loaded.
+        let full_arr = load_preview_dem(&cog_tif, 256, false).unwrap();
+        assert_eq!((full_arr.width(), full_arr.height()), (w, h));
+
+        // End-to-end `lidar preview` CLI run on the COG produces a valid PNG of expected dimensions.
+        let code = run(vec![
+            "lidar".into(),
+            "preview".into(),
+            cog_tif.as_os_str().to_os_string(),
+            "--max-dim".into(),
+            "256".into(),
+            "-o".into(),
+            out_png.as_os_str().to_os_string(),
+        ]);
+        assert_eq!(code, 0);
+        let bytes = std::fs::read(&out_png).unwrap();
+        assert!(
+            bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "preview output must be a valid PNG"
+        );
+        // PNG IHDR width/height are big-endian u32 at bytes 16..24.
+        let png_w = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+        let png_h = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+        assert_eq!(png_w, 256);
+        assert_eq!(png_h, 256);
     }
 }

@@ -800,20 +800,20 @@ pub fn animate_inundation(
     }
     let _ = compute_gif_dimensions(sw, sh, options)?;
 
-    // Validate dimensions of every flood frame upfront (dropping each raster immediately)
-    // so errors never leave a truncated GIF and peak memory stays O(pixels) rather than
-    // O(frames * pixels).
+    // Validate dimensions of every flood frame upfront using lazy metadata inspection
+    // (zero pixel decoding) so errors never leave a truncated GIF and each frame raster
+    // is decoded only once during rendering.
     for fpath in &frames {
         let p_str = fpath.to_str().ok_or_else(|| {
             Error::InvalidArgument(format!("non-UTF-8 path: {}", fpath.display()))
         })?;
-        let ds = terrio::open_raster(p_str)?;
-        if ds.raster.cols != sw || ds.raster.rows != sh {
+        let lazy = terrio::open_raster_lazy(p_str)?;
+        if lazy.width() != sw || lazy.height() != sh {
             return Err(Error::DimensionMismatch(format!(
                 "flood frame {} ({}x{}) does not match DEM ({sw}x{sh})",
                 fpath.display(),
-                ds.raster.cols,
-                ds.raster.rows
+                lazy.width(),
+                lazy.height()
             )));
         }
     }
