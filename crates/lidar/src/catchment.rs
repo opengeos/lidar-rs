@@ -894,88 +894,33 @@ pub fn delineate_catchment_hierarchy(
     let cell_area = affine_cell_area(&dem.geotransform);
     let flowdirs = d8_flow_directions_resolved(&dem)?;
 
-    struct PreparedLevel {
-        level: u32,
-        stem_name: String,
-        out_cat_shp: PathBuf,
-        out_lvl_shp: PathBuf,
-        is_raster_level: bool,
-        src_layer: Layer,
-        sparse_labels: Vec<(usize, u32)>,
-        max_fid: u32,
-    }
-
-    // Pass 1: rasterize/load each level file into sparse `(grid_idx, fid)` pairs and build
-    // the compact union index `grid_to_dep` over all depression pixels across all levels.
+    // Pass 1: scan each level file one at a time (O(1) peak level memory) to build the
+    // compact union index `grid_to_dep` over all depression pixels across all levels.
     let mut grid_to_dep = vec![DEP_NONE; n];
     let mut dep_to_grid: Vec<usize> = Vec::new();
-    let mut prepared_levels: Vec<PreparedLevel> = Vec::with_capacity(level_files.len());
 
-    for (level, path) in &level_files {
-        let stem_name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("Single_level")
-            .to_string();
-        let cat_name = format!("{}.shp", stem_name.replacen("Single", "Catchment", 1));
-        let lvl_name = format!("{stem_name}.shp");
-        let out_cat_shp = out_shp_dir.join(&cat_name);
-        let out_lvl_shp = out_level_dir.join(&lvl_name);
-
-        let is_raster_level = is_raster_extension(path);
-        let (labels, src_layer) = if is_raster_level {
+    for (_level, path) in &level_files {
+        if is_raster_extension(path) {
             let r = load_raster::<f64>(path, None)?;
             validate_same_grid(&dem, &r, "level raster")?;
             let nd = r.no_data();
-            let (lbls, _) = region_group(r.data(), w, h, 0, |v| {
-                v.is_finite() && !v.rd_eq(nd) && v > 0.0
-            });
-            let mut lbl_arr = Array2D::from_vec(w, h, lbls.clone())?;
-            lbl_arr.copy_metadata_from(&dem);
-            lbl_arr.set_no_data(0);
-            let ds = array2d_to_dataset(&lbl_arr)?;
-            let lyr = terrio_polygonize(
-                &ds,
-                &PolygonizeOptions {
-                    band: 0,
-                    field_name: "id".to_string(),
-                    layer_name: stem_name.clone(),
-                    connectedness8: false,
-                    ignore_nodata: false,
-                    mask: None,
-                },
-            )?;
-            (lbls, lyr)
-        } else {
-            rasterize_vector_to_labels(path, &dem)?
-        };
-
-        let mut sparse_labels = Vec::new();
-        let mut max_fid = 0u32;
-        for (idx, &fid) in labels.iter().enumerate() {
-            if fid > 0 {
-                if fid > max_fid {
-                    max_fid = fid;
-                }
-                if grid_to_dep[idx] == DEP_NONE {
+            for (idx, &v) in r.data().iter().enumerate() {
+                if v.is_finite() && !v.rd_eq(nd) && v > 0.0 && grid_to_dep[idx] == DEP_NONE {
                     let d = dep_to_grid.len() as u32;
                     grid_to_dep[idx] = d;
                     dep_to_grid.push(idx);
                 }
-                sparse_labels.push((idx, fid));
+            }
+        } else {
+            let (labels, _layer) = rasterize_vector_to_labels(path, &dem)?;
+            for (idx, &fid) in labels.iter().enumerate() {
+                if fid > 0 && grid_to_dep[idx] == DEP_NONE {
+                    let d = dep_to_grid.len() as u32;
+                    grid_to_dep[idx] = d;
+                    dep_to_grid.push(idx);
+                }
             }
         }
-
-        prepared_levels.push(PreparedLevel {
-            level: *level,
-            stem_name,
-            out_cat_shp,
-            out_lvl_shp,
-            is_raster_level,
-            src_layer,
-            sparse_labels,
-            max_fid,
-        });
     }
 
     // Single O(N) upland compression pass shared across all hierarchy levels.
@@ -983,8 +928,8 @@ pub fn delineate_catchment_hierarchy(
         CompressedUplandGraph::build(w, h, flowdirs.data(), grid_to_dep, dep_to_grid, None, true);
     let d_count = graph.dep_to_grid.len();
 
-    let mut catchment_shapefiles = Vec::with_capacity(prepared_levels.len());
-    let mut level_shapefiles = Vec::with_capacity(prepared_levels.len());
+    let mut catchment_shapefiles = Vec::with_capacity(level_files.len());
+    let mut level_shapefiles = Vec::with_capacity(level_files.len());
     let mut all_records: Vec<CatchmentHierarchyRecord> = Vec::new();
     let mut hir_data_f64 = vec![0.0f64; n];
 
@@ -1032,17 +977,62 @@ pub fn delineate_catchment_hierarchy(
         sum_shifted: f64,
     }
 
-    // Pass 2: route each level in O(D), compute exact zonal stats, stamp watersheds, and export.
-    for prep in prepared_levels {
+    // Pass 2: reload one level at a time (O(1) peak level memory), route in O(D),
+    // compute exact zonal stats, stamp watersheds, and export shapefiles.
+    for &(level, ref path) in &level_files {
+        let stem_name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Single_level")
+            .to_string();
+        let cat_name = format!("{}.shp", stem_name.replacen("Single", "Catchment", 1));
+        let lvl_name = format!("{stem_name}.shp");
+        let out_cat_shp = out_shp_dir.join(&cat_name);
+        let out_lvl_shp = out_level_dir.join(&lvl_name);
+
+        let is_raster_level = is_raster_extension(path);
+        let (labels, src_layer) = if is_raster_level {
+            let r = load_raster::<f64>(path, None)?;
+            validate_same_grid(&dem, &r, "level raster")?;
+            let nd = r.no_data();
+            let (lbls, _) = region_group(r.data(), w, h, 0, |v| {
+                v.is_finite() && !v.rd_eq(nd) && v > 0.0
+            });
+            let mut lbl_arr = Array2D::from_vec(w, h, lbls.clone())?;
+            lbl_arr.copy_metadata_from(&dem);
+            lbl_arr.set_no_data(0);
+            let ds = array2d_to_dataset(&lbl_arr)?;
+            let lyr = terrio_polygonize(
+                &ds,
+                &PolygonizeOptions {
+                    band: 0,
+                    field_name: "id".to_string(),
+                    layer_name: stem_name.clone(),
+                    connectedness8: false,
+                    ignore_nodata: false,
+                    mask: None,
+                },
+            )?;
+            (lbls, lyr)
+        } else {
+            rasterize_vector_to_labels(path, &dem)?
+        };
+
         dep_target.fill(DEP_NONE);
-        for &(idx, fid) in &prep.sparse_labels {
-            let d = graph.grid_to_dep[idx];
-            if d != DEP_NONE {
-                dep_target[d as usize] = fid;
+        let mut max_fid = 0u32;
+        for (idx, &fid) in labels.iter().enumerate() {
+            if fid > 0 {
+                if fid > max_fid {
+                    max_fid = fid;
+                }
+                let d = graph.grid_to_dep[idx];
+                if d != DEP_NONE {
+                    dep_target[d as usize] = fid;
+                }
             }
         }
 
-        let mut cat_counts = vec![0usize; prep.max_fid as usize + 1];
+        let mut cat_counts = vec![0usize; max_fid as usize + 1];
         for start_d in 0..d_count {
             let fid = if dep_target[start_d] != DEP_NONE {
                 dep_target[start_d]
@@ -1072,9 +1062,12 @@ pub fn delineate_catchment_hierarchy(
             }
         }
 
-        // Compute zonal DEM statistics over only this level's sparse cells.
+        // Compute zonal DEM statistics over this level's labeled cells.
         let mut zonal: BTreeMap<u32, ZonalAcc> = BTreeMap::new();
-        for &(idx, fid) in &prep.sparse_labels {
+        for (idx, &fid) in labels.iter().enumerate() {
+            if fid == 0 {
+                continue;
+            }
             let z = dem_data[idx];
             if is_missing(&dem, z) {
                 continue;
@@ -1132,7 +1125,7 @@ pub fn delineate_catchment_hierarchy(
             cat_area_by_id.insert(fid, cat_area);
             area_ratio_by_id.insert(fid, (cat_area, dep_to_cat_ratio));
             let rec = CatchmentHierarchyRecord {
-                level: prep.level,
+                level,
                 level_fid: fid,
                 count,
                 area,
@@ -1152,14 +1145,16 @@ pub fn delineate_catchment_hierarchy(
         }
 
         // Paint unclaimed cells in `hir_data_f64` (ascending levels give lowest-level precedence).
-        for &(idx, fid) in &prep.sparse_labels {
-            if hir_data_f64[idx] == 0.0
+        for (idx, &fid) in labels.iter().enumerate() {
+            if fid > 0
+                && hir_data_f64[idx] == 0.0
                 && let Some(&area) = cat_area_by_id.get(&fid)
                 && area > 0.0
             {
                 hir_data_f64[idx] = area;
             }
         }
+        drop(labels);
 
         // Reconstruct watershed raster via O(1)-per-cell flat lookup (zero D8 tracing).
         let ws_data = ws_arr.data_mut();
@@ -1178,13 +1173,12 @@ pub fn delineate_catchment_hierarchy(
         }
 
         // Write Catchment_level_*.shp
-        polygonize_u32_with_records(&ws_arr, &prep.out_cat_shp, "catchment", &area_ratio_by_id)?;
-        catchment_shapefiles.push(prep.out_cat_shp);
+        polygonize_u32_with_records(&ws_arr, &out_cat_shp, "catchment", &area_ratio_by_id)?;
+        catchment_shapefiles.push(out_cat_shp);
 
         // Write enriched Single_level_*.shp and append to Merge_levels.shp
-        let mut out_lvl_layer =
-            Layer::new(prep.stem_name.clone()).with_geom_type(GeometryType::Polygon);
-        out_lvl_layer.crs = prep.src_layer.crs.clone();
+        let mut out_lvl_layer = Layer::new(stem_name).with_geom_type(GeometryType::Polygon);
+        out_lvl_layer.crs = src_layer.crs.clone();
         if out_lvl_layer.crs.is_none()
             && !dem.projection.is_empty()
             && let Ok(srs) = SpatialRef::parse(&dem.projection)
@@ -1195,8 +1189,8 @@ pub fn delineate_catchment_hierarchy(
             out_lvl_layer.schema.add_field(f.clone());
         }
 
-        for (idx, feat) in prep.src_layer.features.iter().enumerate() {
-            let fid = if prep.is_raster_level {
+        for (idx, feat) in src_layer.features.iter().enumerate() {
+            let fid = if is_raster_level {
                 match feat.attributes.first() {
                     Some(FieldValue::Integer(i)) if *i > 0 => *i as u32,
                     Some(FieldValue::Float(f)) if *f > 0.0 && f.is_finite() => *f as u32,
@@ -1237,11 +1231,11 @@ pub fn delineate_catchment_hierarchy(
             });
         }
 
-        let lvl_str = prep.out_lvl_shp.to_str().ok_or_else(|| {
-            Error::InvalidArgument(format!("non-UTF-8 path: {}", prep.out_lvl_shp.display()))
+        let lvl_str = out_lvl_shp.to_str().ok_or_else(|| {
+            Error::InvalidArgument(format!("non-UTF-8 path: {}", out_lvl_shp.display()))
         })?;
         terrio::write_vector(&[out_lvl_layer], lvl_str, &VectorWriteOptions::default())?;
-        level_shapefiles.push(prep.out_lvl_shp);
+        level_shapefiles.push(out_lvl_shp);
     }
 
     // Write Merge_levels.shp
@@ -1305,9 +1299,10 @@ pub fn delineate_catchment_hierarchy_in_memory(
 pub fn delineate_catchment_hierarchy_weighted_in_memory(
     dem: &Array2D<f64>,
     depression_level: &Array2D<i32>,
+    min_size: usize,
     runoff_coeff: Option<&Array2D<f64>>,
 ) -> Result<InMemoryCatchmentHierarchy> {
-    delineate_catchment_hierarchy_impl(dem, depression_level, 0, runoff_coeff, None)
+    delineate_catchment_hierarchy_impl(dem, depression_level, min_size, runoff_coeff, None)
 }
 
 /// Internal variant of [`delineate_catchment_hierarchy_in_memory`] reusing precomputed

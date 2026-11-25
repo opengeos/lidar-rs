@@ -127,18 +127,21 @@ fn weighted_catchment_hierarchy_controls_static_fill_time_by_upland_c() {
     let w_none = delineate_catchment_hierarchy_weighted_in_memory(
         &sinks.dem_refined,
         &deps.depression_level,
+        10,
         None,
     )
     .unwrap();
     let w_a = delineate_catchment_hierarchy_weighted_in_memory(
         &sinks.dem_refined,
         &deps.depression_level,
+        10,
         Some(&rc_a),
     )
     .unwrap();
     let w_b = delineate_catchment_hierarchy_weighted_in_memory(
         &sinks.dem_refined,
         &deps.depression_level,
+        10,
         Some(&rc_b),
     )
     .unwrap();
@@ -224,6 +227,7 @@ fn weighted_catchment_hierarchy_controls_static_fill_time_by_upland_c() {
     let w_zero = delineate_catchment_hierarchy_weighted_in_memory(
         &sinks.dem_refined,
         &deps.depression_level,
+        10,
         Some(&rc_zero),
     )
     .unwrap();
@@ -628,6 +632,22 @@ fn post_storm_recession_drains_analytical_cylinder_and_conserves_volume() {
     assert!(rec_full.curve.last().unwrap().stored_vol_m3.abs() < 1e-9);
     assert_eq!(rec_full.curve.last().unwrap().wet_basin_count, 0);
 
+    // Independent physical flux integration: integrate `rate_m_h * A_wet(t) dt` across the
+    // sampled recession curve (using the active wet area during each interval `[t_k, t_{k+1}]`)
+    // and verify it matches both analytical cylinder volume `init_stored` and `total_drained_m3`.
+    let rate_m_h = (2.0 + 8.0) / 100.0;
+    let integrated_full_drain_m3: f64 = rec_full
+        .curve
+        .windows(2)
+        .map(|w| rate_m_h * w[0].inundated_area_m2 * (w[1].time_h - w[0].time_h))
+        .sum();
+    assert!(
+        (integrated_full_drain_m3 - init_stored).abs() < 1e-6
+            && (integrated_full_drain_m3 - rec_full.total_drained_m3).abs() < 1e-6,
+        "integrated vertical flux ({integrated_full_drain_m3:.6} m^3) must match initial volume ({init_stored:.6} m^3) and total_drained_m3 ({:.6} m^3)",
+        rec_full.total_drained_m3
+    );
+
     // Partial drainage (10 h = half of 20 h): exact half volume remains and cells stay INFINITY.
     let rec_half = simulate_post_storm_recession(
         &sinks.dem_refined,
@@ -644,6 +664,17 @@ fn post_storm_recession_drains_analytical_cylinder_and_conserves_volume() {
     assert!((rec_half.remaining_volume_m3 - 0.5 * init_stored).abs() < 1e-6);
     assert!((rec_half.total_drained_m3 - 0.5 * init_stored).abs() < 1e-6);
     assert!(rec_half.drain_time_h.get(5, 5).is_infinite());
+    let integrated_half_drain_m3: f64 = rec_half
+        .curve
+        .windows(2)
+        .map(|w| rate_m_h * w[0].inundated_area_m2 * (w[1].time_h - w[0].time_h))
+        .sum();
+    assert!(
+        (integrated_half_drain_m3 - 0.5 * init_stored).abs() < 1e-6
+            && (integrated_half_drain_m3 - rec_half.total_drained_m3).abs() < 1e-6,
+        "integrated half-recession flux ({integrated_half_drain_m3:.6} m^3) must match half initial volume ({:.6} m^3)",
+        0.5 * init_stored
+    );
 
     // Zero loss rate conserves full volume.
     let rec_zero = simulate_post_storm_recession(

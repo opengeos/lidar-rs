@@ -1901,10 +1901,35 @@ pub fn parse_hyetograph_csv(csv_text: &str) -> Result<Vec<(f64, f64)>> {
     Ok(out)
 }
 
+/// Maximum CSV file size (64 MiB) accepted by [`load_hyetograph_csv`] to prevent
+/// unbounded memory allocation on malformed or oversized inputs.
+const MAX_HYETOGRAPH_CSV_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Loads a rain-gauge hyetograph CSV file (`dt_h,intensity_cm_h` or `time_h,precip_mm`)
 /// into `(dt_h, intensity_cm_h)` pairs.
 pub fn load_hyetograph_csv(path: impl AsRef<Path>) -> Result<Vec<(f64, f64)>> {
-    let text = std::fs::read_to_string(path.as_ref())?;
+    use std::io::Read as _;
+    let path = path.as_ref();
+    let file = File::open(path)?;
+    if let Ok(meta) = file.metadata()
+        && meta.len() > MAX_HYETOGRAPH_CSV_BYTES
+    {
+        return Err(Error::InvalidArgument(format!(
+            "hyetograph CSV '{}' ({} bytes) exceeds maximum allowed size ({MAX_HYETOGRAPH_CSV_BYTES} bytes)",
+            path.display(),
+            meta.len()
+        )));
+    }
+    let mut text = String::new();
+    let read_bytes = file
+        .take(MAX_HYETOGRAPH_CSV_BYTES + 1)
+        .read_to_string(&mut text)?;
+    if read_bytes as u64 > MAX_HYETOGRAPH_CSV_BYTES {
+        return Err(Error::InvalidArgument(format!(
+            "hyetograph CSV '{}' exceeds maximum allowed size ({MAX_HYETOGRAPH_CSV_BYTES} bytes)",
+            path.display()
+        )));
+    }
     parse_hyetograph_csv(&text)
 }
 

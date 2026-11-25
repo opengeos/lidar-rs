@@ -642,15 +642,19 @@ pub fn compute_twi(dem: &Array2D<f64>, flow_acc: Option<&Array2D<f64>>) -> Resul
     let cell_size = 0.5 * (dx + dy);
     let sca_scale = cell_area / cell_size.max(1e-12);
 
-    let (owned_acc, slopes) = if flow_acc.is_some() {
-        let cells = solve_dinf_grid(dem, out_nd);
-        let slopes: Vec<f64> = cells.into_iter().map(|c| c.slope).collect();
-        (None, slopes)
-    } else {
-        let (acc, slopes) = dinf_flow_accumulation_and_slope(dem)?;
-        (Some(acc), slopes)
+    let computed_acc;
+    let (acc_ref, slopes) = match flow_acc {
+        Some(fa) => {
+            let cells = solve_dinf_grid(dem, out_nd);
+            let slopes: Vec<f64> = cells.into_iter().map(|c| c.slope).collect();
+            (fa, slopes)
+        }
+        None => {
+            let (acc, slopes) = dinf_flow_accumulation_and_slope(dem)?;
+            computed_acc = acc;
+            (&computed_acc, slopes)
+        }
     };
-    let acc_ref = flow_acc.unwrap_or_else(|| owned_acc.as_ref().expect("computed dinf acc"));
     let acc_data = acc_ref.data();
     let acc_nd = acc_ref.no_data();
 
