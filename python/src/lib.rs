@@ -1236,37 +1236,8 @@ fn breach_depressions(
     opts.fill_remaining = fill_remaining;
     opts.compress = compress;
     let out_ret = out_dem_s.clone();
-    py.detach(move || -> lidar::Result<()> {
-        if let Some(nd) = no_data {
-            let in_path = Path::new(&in_dem);
-            let out_path = Path::new(&out_dem_s);
-            if in_path == out_path
-                || (out_path.exists()
-                    && in_path
-                        .canonicalize()
-                        .ok()
-                        .zip(out_path.canonicalize().ok())
-                        .is_some_and(|(a, b)| a == b))
-            {
-                return Err(lidar::Error::InvalidArgument(format!(
-                    "output path collides with input path: {}",
-                    out_path.display()
-                )));
-            }
-            if let Some(parent) = out_path.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                std::fs::create_dir_all(parent)?;
-            }
-            let mut dem = lidar::load_raster::<f64>(in_path, None)?;
-            dem.set_no_data(nd);
-            let out = lidar::breach_depressions(&dem, &opts)?;
-            lidar::save_raster(&out, out_path, Some("breach_depressions"), opts.compress)?;
-            Ok(())
-        } else {
-            lidar::breach_depressions_file(&in_dem, &out_dem_s, &opts)?;
-            Ok(())
-        }
+    py.detach(move || {
+        lidar::breach_depressions_file_with_no_data(&in_dem, &out_dem_s, &opts, no_data)
     })
     .map_err(to_py_err)?;
     Ok(out_ret)

@@ -19,8 +19,16 @@ parallel = ["dep:rayon", "richdem/parallel"]
 pointcloud = ["terrio/pointcloud"]
 ## Serialization of depression and result structs via `serde`
 serde = ["dep:serde", "dep:serde_json", "richdem/serde"]
-## Opt-in U.S. federal data download utilities (USGS 3DEP, WBD, NHD, Transportation, USFWS NWI, NOAA Atlas 14; non-WASM only, pulls `ureq` with `rustls`/`ring`)
-download = ["dep:ureq", "dep:serde", "dep:serde_json", "dep:tempfile"]
+## Opt-in U.S. federal data download utilities (USGS 3DEP, WBD, NHD, Transportation, USFWS NWI, NOAA Atlas 14; non-WASM only, pulls `ureq` with `rustls`/`ring` and `terrio/remote` for HTTP range reads of remote COGs, COPC/EPT, and STAC)
+download = ["dep:ureq", "dep:serde", "dep:serde_json", "dep:tempfile", "terrio/remote"]
+## Pure-Rust GeoParquet vector reading and writing via `terrio/parquet`
+parquet = ["terrio/parquet"]
+## Pure-Rust FlatGeobuf vector reading and writing via `terrio/flatgeobuf`
+flatgeobuf = ["terrio/flatgeobuf"]
+## Pure-Rust LERC-compressed GeoTIFF/COG reading via `terrio/lerc`
+lerc = ["terrio/lerc"]
+## Pure-Rust PMTiles and MBTiles export via `terrio/tiles`
+tiles = ["terrio/tiles"]
 
 [dependencies]
 gif.workspace = true
