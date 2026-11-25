@@ -1062,4 +1062,13 @@ fn burn_streams_lowers_channel_and_agree_buffer_without_touching_far_cells() {
     assert_eq!(file_cnt, 17);
     assert!((file_out.get(10, 10) - 99.0).abs() < 1e-12);
     assert!(out_dem_path.exists());
+
+    // 4. Invalid non-empty DEM CRS metadata must return Error::InvalidArgument
+    let mut bad_crs_dem = dem.clone();
+    bad_crs_dem.projection = "NOT_A_VALID_CRS_STRING".to_string();
+    let bad_res = burn_streams(&bad_crs_dem, &stream_path, &BurnStreamsOptions::default());
+    assert!(
+        matches!(bad_res, Err(lidar::Error::InvalidArgument(_))),
+        "invalid non-empty DEM CRS must return Error::InvalidArgument, got {bad_res:?}"
+    );
 }

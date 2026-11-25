@@ -2622,6 +2622,10 @@ pub fn simulate_inundation_with_forcing_in_memory(
 /// When `weighted_catchment_area` is `Some`, each depression slice uses its true upland
 /// catchment-weighted effective contributing area `sum(cell_area * C_i)` rather than
 /// multiplying total `catchment_area` by the local depression floor's average `C`.
+///
+/// Note on `forcing.runoff_coeff`: NoData or non-finite cells in `runoff_coeff` default to
+/// `1.0` (matching the uniform-forcing default). Callers passing partially masked rasters
+/// should fill upland NoData cells with `0.0` if excluded areas should contribute zero runoff.
 pub fn simulate_inundation_with_weighted_catchment_in_memory(
     sink: &Array2D<f64>,
     catchment_area: &Array2D<f64>,

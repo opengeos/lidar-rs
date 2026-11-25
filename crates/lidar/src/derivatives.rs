@@ -627,7 +627,11 @@ pub fn mfd_flow_accumulation(dem: &Array2D<f64>, exponent: f64) -> Result<Array2
 ///   computed from [`dinf_flow_accumulation`] when `flow_acc` is `None`, or from the provided
 ///   cell-count `flow_acc` raster when `Some`.
 /// - `tan(beta)` is the local D-Infinity steepest downslope gradient, clamped to a positive
-///   floor of `1e-4` to prevent `ln(inf)` on flat cells.
+///   floor of `TWI_MIN_TAN_SLOPE = 1e-4` to prevent `ln(inf)`.
+///
+/// Flat and pit cells have D-Infinity slope `0.0` and are clamped to `1e-4`, producing a
+/// baseline boost of `~ln(1e4) ~= 9.21` on unresolved flats. When flat-resolved downslope
+/// gradients are needed, pre-condition the DEM with [`crate::breach_depressions`] first.
 pub fn compute_twi(dem: &Array2D<f64>, flow_acc: Option<&Array2D<f64>>) -> Result<Array2D<f64>> {
     if let Some(fa) = flow_acc {
         validate_grid_alignment(dem, fa, "flow_acc")?;
@@ -1089,7 +1093,10 @@ fn euclidean_distance_2d(seeds: &[bool], w: usize, h: usize) -> Vec<f64> {
 /// lowering (`buffer_cells`, `smooth_drop`).
 ///
 /// Accepts any polyline vector format supported by `terrio` (`.gpkg`, `.shp`, `.geojson`,
-/// etc.) in the same CRS as `dem`. Returns `(conditioned_dem, modified_cell_count)`.
+/// etc.) in the same CRS as `dem`. When `dem.projection` is non-empty it must parse as a
+/// recognized CRS and match every stream layer's CRS; if `dem.projection` is empty (no CRS
+/// metadata), stream coordinates are assumed to already be aligned with the DEM's coordinate
+/// system. Returns `(conditioned_dem, modified_cell_count)`.
 pub fn burn_streams(
     dem: &Array2D<f64>,
     streams_path: impl AsRef<Path>,
@@ -1103,12 +1110,22 @@ pub fn burn_streams(
         ))
     })?;
     let ds = terrio::open_vector(vec_str, &VectorOpenOptions::default())?;
-    let dem_srs = if dem.projection.is_empty() {
+    let dem_srs = if dem.projection.trim().is_empty() {
         None
     } else {
-        SpatialRef::parse(&dem.projection)
-            .ok()
-            .filter(|s| !s.is_unknown())
+        let parsed = SpatialRef::parse(&dem.projection).map_err(|e| {
+            Error::InvalidArgument(format!(
+                "invalid DEM CRS metadata '{}': {e}",
+                dem.projection
+            ))
+        })?;
+        if parsed.is_unknown() {
+            return Err(Error::InvalidArgument(format!(
+                "unrecognized DEM CRS metadata '{}'",
+                dem.projection
+            )));
+        }
+        Some(parsed)
     };
 
     let mut polylines: Vec<Vec<(f64, f64)>> = Vec::new();
@@ -1205,6 +1222,10 @@ pub fn burn_streams(
 }
 
 /// File-based wrapper around [`burn_streams`] with input/output path collision checks.
+///
+/// Inherits [`burn_streams`] CRS validation: non-empty DEM CRS metadata must parse and match
+/// the stream vector CRS, while an empty DEM `projection` assumes stream coordinates are
+/// already aligned with the DEM coordinate system.
 pub fn burn_streams_file(
     in_dem: impl AsRef<Path>,
     streams_path: impl AsRef<Path>,

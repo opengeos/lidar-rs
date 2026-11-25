@@ -817,8 +817,11 @@ fn parse_single_level_number(path: &Path) -> Option<u32> {
 /// Delineates the nested catchment hierarchy across all depression levels produced by
 /// [`crate::delineate_depressions`].
 ///
-/// Pure-Rust port of `5_Catchment_Hierarchy.py` powered by the `O(N + L * D)` compressed
-/// upland D8 + DSU engine:
+/// Pure-Rust port of `5_Catchment_Hierarchy.py` powered by the compressed upland D8 engine
+/// (`O(N * L + D * L)` overall because each level still scans/paints the raster for shapefile
+/// export, while D8 flow routing runs once and peak per-level memory stays `O(1)`; contrast
+/// with [`delineate_catchment_hierarchy_in_memory`], which avoids per-level full-grid output
+/// and runs in `O(N + L * D)`):
 /// 1. Computes D8 flow directions (with Barnes flat resolution) once from `in_dem`.
 /// 2. Compresses all non-depression upland cells in a single `O(N)` pass onto their
 ///    receiving depression cells so each `Single_level_*.shp` (or `Single_level_*.tif`)
@@ -1296,6 +1299,10 @@ pub fn delineate_catchment_hierarchy_in_memory(
 /// compressed upland D8 + DSU engine so every depression cell in
 /// `InMemoryCatchmentHierarchy::catchment_hierarchy` stores its catchment-weighted effective
 /// contributing area (while `unweighted_catchment_hierarchy` retains geometric `cat_area`).
+///
+/// NoData or non-finite cells in `runoff_coeff` default to `1.0` (matching the uniform-forcing
+/// default). Callers passing partially masked runoff-coefficient rasters should fill upland
+/// NoData cells with `0.0` if excluded areas are meant to contribute zero runoff.
 pub fn delineate_catchment_hierarchy_weighted_in_memory(
     dem: &Array2D<f64>,
     depression_level: &Array2D<i32>,
