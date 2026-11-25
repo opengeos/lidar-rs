@@ -658,6 +658,17 @@ fn in_memory_gridding_matches_file_outputs_and_writes_deflate_and_cog() {
         chm_disk.data()
     );
 
+    // Verify CRS (EPSG:32615) and geotransform survive GeoTIFF round-trip in lidar_to_chm.
+    assert_eq!(chm_disk.geotransform, chm_mem.geotransform);
+    let chm_lazy = terrio::open_raster_lazy(chm_deflate.to_str().unwrap()).unwrap();
+    let expected_crs = terrio::crs::SpatialRef::parse("EPSG:32615").unwrap();
+    assert!(
+        chm_lazy.crs().same_as(&expected_crs),
+        "lidar_to_chm GeoTIFF must preserve EPSG:32615 CRS (got {:?})",
+        chm_lazy.crs()
+    );
+    assert_eq!(chm_lazy.geo_transform(), chm_mem.geotransform);
+
     // DEFLATE-compressed GeoTIFF should be smaller than uncompressed GeoTIFF for smooth terrain.
     let uncomp_bytes = std::fs::metadata(&dsm_uncomp).unwrap().len();
     let deflate_bytes = std::fs::metadata(&dsm_deflate).unwrap().len();

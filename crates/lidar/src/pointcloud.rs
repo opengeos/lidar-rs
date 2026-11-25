@@ -289,6 +289,11 @@ pub struct LidarReadOptions {
     /// Optional target point spacing in CRS units for COPC LOD selection (ignored for non-COPC formats).
     pub resolution: Option<f64>,
     /// Optional approximate maximum point count (COPC chooses octree level; other formats thin by stride).
+    ///
+    /// When [`Self::polygon_path`] is set, the reader fetches the polygon bounding box without
+    /// reader-level point capping (still applying COPC octree chunk pruning against the bbox) and
+    /// applies `max_points` after exact polygon clipping so small polygons inside large tiles are
+    /// not starved by bbox-level thinning.
     pub max_points: Option<usize>,
     /// Optional ASPRS classification codes to keep (empty keeps all).
     pub classifications: Vec<u8>,
@@ -649,8 +654,9 @@ fn cap_point_cloud(cloud: &PointCloud, max_points: usize) -> PointCloud {
 /// are automatically reprojected into the point cloud's CRS. The polygon's 2D bounding box is
 /// intersected with `opts.bounds` and forwarded into `PointFilter::bounds` so COPC octree
 /// readers only fetch chunks overlapping the polygon extent before exact ray-casting
-/// point-in-polygon filtering. Any `max_points` cap is applied after polygon clipping so small
-/// polygons are not starved by bbox-level thinning.
+/// point-in-polygon filtering. In this mode, all points inside the polygon bounding box are read
+/// first (without reader-level `max_points` thinning) and `opts.max_points` caps the post-clip
+/// output point count so small polygons inside large tiles are not starved.
 pub fn read_lidar_windowed(path: impl AsRef<Path>, opts: &LidarReadOptions) -> Result<PointCloud> {
     if let Some([x0, y0, x1, y1]) = opts.bounds {
         if !x0.is_finite() || !y0.is_finite() || !x1.is_finite() || !y1.is_finite() {
@@ -1820,6 +1826,7 @@ fn delaunay_triangulate_2d(pts: &[(f64, f64, f64)]) -> Vec<[usize; 3]> {
     });
 
     let mut tris: Vec<DelaunayTri> = Vec::with_capacity(2 * n + 4);
+    let mut free_slots: Vec<usize> = Vec::new();
     tris.push(DelaunayTri {
         v: [n, n + 1, n + 2],
         adj: [None, None, None],
@@ -1829,91 +1836,141 @@ fn delaunay_triangulate_2d(pts: &[(f64, f64, f64)]) -> Vec<[usize; 3]> {
 
     let mut bad_set: HashSet<usize> = HashSet::new();
     let mut queue: VecDeque<usize> = VecDeque::new();
-    let mut boundary: Vec<(usize, usize, Option<usize>, usize)> = Vec::new();
+    // Each boundary edge stores `(a, b, outer_tri, outer_adj_slot)`.
+    let mut boundary: Vec<(usize, usize, Option<usize>, Option<usize>)> = Vec::new();
+    let mut new_indices: Vec<usize> = Vec::new();
 
     for &p in &order {
-        let (px, py) = coords[p];
+        let base_nx = (pts[p].0 - cx) * inv_span;
+        let base_ny = (pts[p].1 - cy) * inv_span;
 
-        // 1. Locate a triangle containing `p` via visibility walk from `last_tri`.
-        let mut cur = last_tri;
-        if !tris[cur].alive {
-            cur = tris.iter().rposition(|t| t.alive).unwrap_or(0);
-        }
-        let mut found_walk = false;
-        let max_steps = tris.len().min(4096) + 16;
-        for _ in 0..max_steps {
-            let tv = tris[cur].v;
-            let mut stepped = false;
-            for k in 0..3 {
-                let a = tv[(k + 1) % 3];
-                let b = tv[(k + 2) % 3];
-                let (ax, ay) = coords[a];
-                let (bx, by) = coords[b];
-                if orient2d(ax, ay, bx, by, px, py) < 0.0
-                    && let Some(next) = tris[cur].adj[k]
-                    && tris[next].alive
-                {
-                    cur = next;
-                    stepped = true;
+        // Retry up to 4 times with alternative deterministic jitter offsets if a rare numerical
+        // degeneracy causes the enclosing triangle search or cavity star-shape check to fail.
+        // Duplicate or coincident XY points (zero-area degeneracy) that cannot form positive-area
+        // triangles after all retries are skipped.
+        const MAX_JITTER_RETRIES: u64 = 4;
+        for attempt in 0..=MAX_JITTER_RETRIES {
+            if attempt > 0 {
+                let seed_base = (p as u64)
+                    .wrapping_mul(17)
+                    .wrapping_add(attempt.wrapping_mul(0x9E37_79B9));
+                let scale = JITTER_SCALE * (1.0 + attempt as f64);
+                let jx = deterministic_jitter(seed_base.wrapping_add(1)) * scale;
+                let jy = deterministic_jitter(seed_base.wrapping_add(2)) * scale;
+                coords[p] = (base_nx + jx, base_ny + jy);
+            }
+            let (px, py) = coords[p];
+
+            // 1. Locate a triangle containing `p` via visibility walk from `last_tri`.
+            let mut cur = last_tri;
+            if !tris[cur].alive {
+                cur = tris.iter().rposition(|t| t.alive).unwrap_or(0);
+            }
+            let mut found_walk = false;
+            let max_steps = tris.len().min(4096) + 16;
+            for _ in 0..max_steps {
+                let tv = tris[cur].v;
+                let mut stepped = false;
+                for k in 0..3 {
+                    let a = tv[(k + 1) % 3];
+                    let b = tv[(k + 2) % 3];
+                    let (ax, ay) = coords[a];
+                    let (bx, by) = coords[b];
+                    if orient2d(ax, ay, bx, by, px, py) < 0.0
+                        && let Some(next) = tris[cur].adj[k]
+                        && tris[next].alive
+                    {
+                        cur = next;
+                        stepped = true;
+                        break;
+                    }
+                }
+                if !stepped {
+                    found_walk = true;
                     break;
                 }
             }
-            if !stepped {
-                found_walk = true;
-                break;
-            }
-        }
 
-        // Fallback linear scan if walk hit a numerical cycle.
-        let start_tri = if found_walk {
-            cur
-        } else {
-            let mut candidate = None;
-            for (ti, t) in tris.iter().enumerate() {
-                if !t.alive {
-                    continue;
+            // Fallback linear scan if walk hit a numerical cycle.
+            let start_tri = if found_walk {
+                cur
+            } else {
+                let mut candidate = None;
+                for (ti, t) in tris.iter().enumerate() {
+                    if !t.alive {
+                        continue;
+                    }
+                    let (a, b, c) = (t.v[0], t.v[1], t.v[2]);
+                    let (ax, ay) = coords[a];
+                    let (bx, by) = coords[b];
+                    let (cx0, cy0) = coords[c];
+                    if orient2d(ax, ay, bx, by, px, py) >= 0.0
+                        && orient2d(bx, by, cx0, cy0, px, py) >= 0.0
+                        && orient2d(cx0, cy0, ax, ay, px, py) >= 0.0
+                    {
+                        candidate = Some(ti);
+                        break;
+                    }
                 }
-                let (a, b, c) = (t.v[0], t.v[1], t.v[2]);
-                let (ax, ay) = coords[a];
-                let (bx, by) = coords[b];
-                let (cx0, cy0) = coords[c];
-                if orient2d(ax, ay, bx, by, px, py) >= 0.0
-                    && orient2d(bx, by, cx0, cy0, px, py) >= 0.0
-                    && orient2d(cx0, cy0, ax, ay, px, py) >= 0.0
-                {
-                    candidate = Some(ti);
-                    break;
+                match candidate {
+                    Some(ti) => ti,
+                    None => continue,
                 }
-            }
-            match candidate {
-                Some(ti) => ti,
-                None => continue,
-            }
-        };
+            };
 
-        // 2. BFS from `start_tri` to collect all triangles whose circumcircle strictly contains `p`.
-        bad_set.clear();
-        queue.clear();
-        bad_set.insert(start_tri);
-        queue.push_back(start_tri);
-        while let Some(ti) = queue.pop_front() {
-            for nb in tris[ti].adj.into_iter().flatten() {
-                if !tris[nb].alive || bad_set.contains(&nb) {
-                    continue;
-                }
-                let tv = tris[nb].v;
-                if in_circumcircle_strict(coords[tv[0]], coords[tv[1]], coords[tv[2]], (px, py)) {
-                    bad_set.insert(nb);
-                    queue.push_back(nb);
+            // 2. BFS from `start_tri` to collect all triangles whose circumcircle strictly contains `p`.
+            bad_set.clear();
+            queue.clear();
+            bad_set.insert(start_tri);
+            queue.push_back(start_tri);
+            while let Some(ti) = queue.pop_front() {
+                for nb in tris[ti].adj.into_iter().flatten() {
+                    if !tris[nb].alive || bad_set.contains(&nb) {
+                        continue;
+                    }
+                    let tv = tris[nb].v;
+                    if in_circumcircle_strict(coords[tv[0]], coords[tv[1]], coords[tv[2]], (px, py))
+                    {
+                        bad_set.insert(nb);
+                        queue.push_back(nb);
+                    }
                 }
             }
-        }
 
-        // 3. Ensure cavity is star-shaped with respect to `p` (handles points lying on an edge).
-        let mut expanded = true;
-        while expanded {
-            expanded = false;
-            let mut to_add = Vec::new();
+            // 3. Ensure cavity is star-shaped with respect to `p` (handles points lying on an edge).
+            let mut expanded = true;
+            while expanded {
+                expanded = false;
+                let mut to_add = Vec::new();
+                for &ti in &bad_set {
+                    let tv = tris[ti].v;
+                    for k in 0..3 {
+                        let nb = tris[ti].adj[k];
+                        if nb.is_some_and(|n_idx| bad_set.contains(&n_idx)) {
+                            continue;
+                        }
+                        let a = tv[(k + 1) % 3];
+                        let b = tv[(k + 2) % 3];
+                        let (ax, ay) = coords[a];
+                        let (bx, by) = coords[b];
+                        if orient2d(ax, ay, bx, by, px, py) <= 0.0
+                            && let Some(outer) = nb
+                            && tris[outer].alive
+                        {
+                            to_add.push(outer);
+                        }
+                    }
+                }
+                for outer in to_add {
+                    if bad_set.insert(outer) {
+                        expanded = true;
+                    }
+                }
+            }
+
+            // 4. Extract boundary edges `(a, b, outer_neighbor, outer_adj_slot)`.
+            boundary.clear();
+            let mut all_positive = true;
             for &ti in &bad_set {
                 let tv = tris[ti].v;
                 for k in 0..3 {
@@ -1925,88 +1982,65 @@ fn delaunay_triangulate_2d(pts: &[(f64, f64, f64)]) -> Vec<[usize; 3]> {
                     let b = tv[(k + 2) % 3];
                     let (ax, ay) = coords[a];
                     let (bx, by) = coords[b];
-                    if orient2d(ax, ay, bx, by, px, py) <= 0.0
-                        && let Some(outer) = nb
-                        && tris[outer].alive
-                    {
-                        to_add.push(outer);
+                    if orient2d(ax, ay, bx, by, px, py) <= 0.0 {
+                        all_positive = false;
                     }
+                    let outer_slot = nb.and_then(|o_idx| {
+                        tris[o_idx].adj.iter().position(|&slot| slot == Some(ti))
+                    });
+                    boundary.push((a, b, nb, outer_slot));
                 }
             }
-            for outer in to_add {
-                if bad_set.insert(outer) {
-                    expanded = true;
-                }
+            if !all_positive || boundary.len() < 3 {
+                continue;
             }
-        }
 
-        // 4. Extract ordered boundary edges `(a, b, outer_neighbor, old_tri)`.
-        boundary.clear();
-        let mut all_positive = true;
-        for &ti in &bad_set {
-            let tv = tris[ti].v;
-            for k in 0..3 {
-                let nb = tris[ti].adj[k];
-                if nb.is_some_and(|n_idx| bad_set.contains(&n_idx)) {
-                    continue;
-                }
-                let a = tv[(k + 1) % 3];
-                let b = tv[(k + 2) % 3];
-                let (ax, ay) = coords[a];
-                let (bx, by) = coords[b];
-                if orient2d(ax, ay, bx, by, px, py) <= 0.0 {
-                    all_positive = false;
-                }
-                boundary.push((a, b, nb, ti));
+            // 5. Remove bad triangles into the free list and stitch new triangles around `p`.
+            for &ti in &bad_set {
+                tris[ti].alive = false;
+                free_slots.push(ti);
             }
-        }
-        if !all_positive || boundary.len() < 3 {
-            continue;
-        }
 
-        // 5. Remove bad triangles and stitch new triangles around `p`.
-        for &ti in &bad_set {
-            tris[ti].alive = false;
-        }
+            new_indices.clear();
+            for &(a, b, outer, outer_slot) in &boundary {
+                let tri = DelaunayTri {
+                    v: [a, b, p],
+                    // adj[0] opposite a -> edge (b, p); adj[1] opposite b -> edge (p, a); adj[2] opposite p -> edge (a, b).
+                    adj: [None, None, outer],
+                    alive: true,
+                };
+                let new_idx = if let Some(slot) = free_slots.pop() {
+                    tris[slot] = tri;
+                    slot
+                } else {
+                    let idx = tris.len();
+                    tris.push(tri);
+                    idx
+                };
+                if let (Some(o_idx), Some(o_slot)) = (outer, outer_slot) {
+                    tris[o_idx].adj[o_slot] = Some(new_idx);
+                }
+                new_indices.push(new_idx);
+            }
 
-        let first_new = tris.len();
-        let m = boundary.len();
-        for &(a, b, outer, old_ti) in &boundary {
-            let new_idx = tris.len();
-            tris.push(DelaunayTri {
-                v: [a, b, p],
-                // adj[0] opposite a -> edge (b, p); adj[1] opposite b -> edge (p, a); adj[2] opposite p -> edge (a, b).
-                adj: [None, None, outer],
-                alive: true,
-            });
-            if let Some(o_idx) = outer {
-                for slot in &mut tris[o_idx].adj {
-                    if *slot == Some(old_ti) {
-                        *slot = Some(new_idx);
+            // Pair radial edges between newly created triangles:
+            // Triangle `t_i = (a_i, b_i, p)` shares edge `(b_i, p)` with `t_j = (a_j, b_j, p)` where `a_j == b_i`.
+            for (i, &ti) in new_indices.iter().enumerate() {
+                let bi = tris[ti].v[1];
+                for (j, &tj) in new_indices.iter().enumerate() {
+                    if i == j {
+                        continue;
+                    }
+                    if tris[tj].v[0] == bi {
+                        tris[ti].adj[0] = Some(tj);
+                        tris[tj].adj[1] = Some(ti);
                         break;
                     }
                 }
             }
+            last_tri = new_indices[0];
+            break;
         }
-
-        // Pair radial edges between newly created triangles:
-        // Triangle `t_i = (a_i, b_i, p)` shares edge `(b_i, p)` with the triangle `t_j = (a_j, b_j, p)` where `a_j == b_i`.
-        for i in 0..m {
-            let ti = first_new + i;
-            let bi = tris[ti].v[1];
-            for j in 0..m {
-                if i == j {
-                    continue;
-                }
-                let tj = first_new + j;
-                if tris[tj].v[0] == bi {
-                    tris[ti].adj[0] = Some(tj);
-                    tris[tj].adj[1] = Some(ti);
-                    break;
-                }
-            }
-        }
-        last_tri = first_new;
     }
 
     tris.into_iter()
@@ -2182,7 +2216,9 @@ fn rasterize_tin_max(
 /// Steps:
 /// 1. Apply configured outlier filters (`options.dtm`), classify ground points, and build a
 ///    bare-earth DTM on the point cloud's exact extent at `options.resolution`.
-/// 2. Compute Height Above Ground (`h = max(0, z - dtm(x, y))`) for every point.
+/// 2. Compute Height Above Ground (`h = max(0, z - dtm(x, y))`) for every point. Canopy returns
+///    falling over DTM NoData cells (where no valid bilinear or 3x3 neighbor exists) are excluded
+///    from the CHM TIN rather than fabricating ground elevations.
 /// 3. Construct the base CHM TIN from all normalized returns (`h >= 0.0`, no edge-length cutoff).
 /// 4. For each positive height threshold `h_k > 0.0` in `options.height_thresholds`, build a
 ///    partial Delaunay TIN from returns with `h >= h_k`, skipping triangles with any 2D edge
@@ -2341,6 +2377,9 @@ pub fn points_to_chm_pit_free(
 /// Generates a pit-free Canopy Height Model (Khosravipour et al. 2014) from a LiDAR file,
 /// writes it to `out_tif` (supporting DEFLATE compression and Cloud Optimized GeoTIFF output),
 /// and returns the resulting [`Array2D<f64>`].
+///
+/// Canopy returns falling over DTM NoData cells (where no valid bilinear or 3x3 neighbor exists)
+/// are excluded from the CHM TIN rather than fabricating ground elevations.
 pub fn lidar_to_chm_pit_free(
     source: impl AsRef<Path>,
     out_tif: impl AsRef<Path>,
@@ -2562,6 +2601,87 @@ mod tests {
         assert_eq!(
             dropped, 0,
             "regular integer grid triangulation must drop zero points"
+        );
+    }
+
+    #[test]
+    fn pit_free_chm_skips_canopy_points_over_dtm_nodata_hole() {
+        let nd = -9999.0;
+        let mut dtm = Array2D::new(10, 10, 100.0);
+        dtm.geotransform = [500_000.0, 1.0, 0.0, 4_000_010.0, 0.0, -1.0];
+        dtm.set_no_data(nd);
+        // Carve a 5x5 NoData hole in the middle so the center cell (5, 5) has no valid 3x3 neighbor.
+        for r in 3..8 {
+            for c in 3..8 {
+                dtm.set(c, r, nd);
+            }
+        }
+        // Center of the NoData hole returns None (excluded cleanly rather than fabricating ground).
+        assert!(sample_dtm_bilinear(&dtm, 500_005.5, 4_000_004.5).is_none());
+        // Valid area outside the hole returns 100.0.
+        assert_eq!(
+            sample_dtm_bilinear(&dtm, 500_001.5, 4_000_008.5),
+            Some(100.0)
+        );
+
+        // End-to-end check: ground points only on x in [0..5], canopy point far away at x = 25
+        // over a DTM NoData region (GridMethod::Statistics, window_size=0, radius=1.0).
+        let mut xs = Vec::new();
+        let mut ys = Vec::new();
+        let mut zs = Vec::new();
+        let mut cls = Vec::new();
+        for r in 0..6 {
+            for c in 0..6 {
+                xs.push(500_000.0 + c as f64 + 0.5);
+                ys.push(4_000_000.0 + r as f64 + 0.5);
+                zs.push(100.0);
+                cls.push(2u8);
+            }
+        }
+        // Valid canopy point over valid ground.
+        xs.push(500_003.5);
+        ys.push(4_000_003.5);
+        zs.push(115.0);
+        cls.push(5u8);
+        // Isolated canopy return far outside ground coverage (over DTM NoData hole).
+        xs.push(500_025.5);
+        ys.push(4_000_003.5);
+        zs.push(150.0);
+        cls.push(5u8);
+
+        let cloud = PointCloud::new(
+            vec![
+                Dimension::new("x", Values::F64(xs)),
+                Dimension::new("y", Values::F64(ys)),
+                Dimension::new("z", Values::F64(zs)),
+                Dimension::new("classification", Values::U8(cls)),
+            ],
+            terrio::crs::SpatialRef::parse("EPSG:32615").unwrap(),
+        );
+        let chm = points_to_chm_pit_free(
+            &cloud,
+            &PitFreeChmOptions {
+                resolution: 1.0,
+                dtm: LidarToDtmOptions {
+                    ground_method: GroundFilterMethod::Preclassified,
+                    method: GridMethod::Statistics,
+                    stat: GridStat::Mean,
+                    radius: Some(1.0),
+                    window_size: 0,
+                    nodata: nd,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let gt = chm.geotransform;
+        let hole_c = ((500_025.5 - gt[0]) / gt[1]).floor() as usize;
+        let hole_r = ((4_000_003.5 - gt[3]) / gt[5]).floor() as usize;
+        assert!(
+            chm.get(hole_c, hole_r).rd_eq(nd),
+            "canopy point over DTM NoData hole must remain NoData (got {})",
+            chm.get(hole_c, hole_r)
         );
     }
 }
