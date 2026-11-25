@@ -639,7 +639,7 @@ pub struct DepressionsOutput {
     max_level: u32,
     num_regions: usize,
     depressions_json: String,
-    depression_id: Vec<i32>,
+    depression_id: Array2D<i32>,
     id_tif: Vec<u8>,
     level_tif: Vec<u8>,
     geojson: String,
@@ -680,12 +680,12 @@ impl DepressionsOutput {
     /// Per-cell depression/mount ID grid (`Int32Array`, `0` outside features) for interactive inspection.
     #[wasm_bindgen(js_name = depressionIdValues)]
     pub fn depression_id_values(&self) -> Vec<i32> {
-        self.depression_id.clone()
+        self.depression_id.data().to_vec()
     }
     /// Alias of [`Self::depression_id_values`] for mount delineation outputs.
     #[wasm_bindgen(js_name = mountIdValues)]
     pub fn mount_id_values(&self) -> Vec<i32> {
-        self.depression_id.clone()
+        self.depression_id.data().to_vec()
     }
     #[wasm_bindgen(js_name = idTif)]
     pub fn id_tif(&self) -> Vec<u8> {
@@ -705,7 +705,7 @@ impl DepressionsOutput {
 }
 
 fn marshal_depressions(
-    mem: &lidar::InMemoryDepressions,
+    mem: lidar::InMemoryDepressions,
     id_name: &str,
     level_name: &str,
 ) -> Result<DepressionsOutput, JsValue> {
@@ -714,14 +714,17 @@ fn marshal_depressions(
     let level_tif = write_array2d_tif(&mem.depression_level, level_name)?;
     let geojson = polygonize_depressions_to_geojson(&mem.depression_id, &mem.depressions)?;
     let level_rgba = colorize_i32_rgba(&mem.depression_level);
+    let width = mem.depression_id.width();
+    let height = mem.depression_id.height();
+    let projection = mem.depression_id.projection.clone();
     Ok(DepressionsOutput {
-        width: mem.depression_id.width(),
-        height: mem.depression_id.height(),
-        projection: mem.depression_id.projection.clone(),
+        width,
+        height,
+        projection,
         max_level: mem.max_level,
         num_regions: mem.num_regions as usize,
         depressions_json,
-        depression_id: mem.depression_id.data().to_vec(),
+        depression_id: mem.depression_id,
         id_tif,
         level_tif,
         geojson,
@@ -741,7 +744,7 @@ pub fn delineate_depressions(
     let sink = read_array2d_f64(sink_bytes, filename)?;
     let mem =
         delineate_depressions_in_memory(&sink, min_size, min_depth, interval).map_err(to_js_err)?;
-    marshal_depressions(&mem, "depression_id.tif", "depression_level.tif")
+    marshal_depressions(mem, "depression_id.tif", "depression_level.tif")
 }
 
 /// Delineates nested elevated features (mounts / buildings / tree canopies) from a DSM buffer.
@@ -756,7 +759,7 @@ pub fn delineate_mounts(
     let dsm = read_array2d_f64(dsm_bytes, filename)?;
     let mem =
         delineate_mounts_in_memory(&dsm, min_size, min_height, interval).map_err(to_js_err)?;
-    marshal_depressions(&mem, "mount_id.tif", "mount_level.tif")
+    marshal_depressions(mem, "mount_id.tif", "mount_level.tif")
 }
 
 /// Output container returned by [`delineate_catchments`].

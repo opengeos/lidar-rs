@@ -214,32 +214,62 @@ fn elm_and_statistical_outlier_filters_strip_low_and_high_noise_and_clean_dtm() 
     };
     assert!(sz.iter().all(|&z| z > 90.0 && z < 110.0));
 
-    // lidar_to_dtm with remove_outliers=true avoids the 50 m low spike pulling down the bare-earth DTM.
+    // lidar_to_dtm with remove_outliers=true avoids the 50 m low spike pulling down the bare-earth DTM
+    // across both Preclassified and SMRF ground classification modes, respecting custom ELM parameters.
     let tmp = tempfile::tempdir().unwrap();
     let las_path = tmp.path().join("noisy.las");
-    let dtm_path = tmp.path().join("dtm_clean.tif");
+    let dtm_pre_path = tmp.path().join("dtm_clean_pre.tif");
+    let dtm_smrf_path = tmp.path().join("dtm_clean_smrf.tif");
     write_lidar(&cloud, &las_path, &PointWriteOptions::default()).unwrap();
-    lidar_to_dtm(
-        &las_path,
-        &dtm_path,
-        &LidarToDtmOptions {
-            resolution: 1.0,
-            ground_method: GroundFilterMethod::Preclassified,
-            remove_outliers: true,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let dtm = load_raster::<f64>(&dtm_path, None).unwrap();
-    let min_dtm = dtm
-        .data()
-        .iter()
-        .copied()
-        .filter(|&v| v.is_finite() && v != dtm.no_data())
-        .fold(f64::INFINITY, f64::min);
+
+    for (method, out_path) in [
+        (GroundFilterMethod::Preclassified, &dtm_pre_path),
+        (GroundFilterMethod::Smrf, &dtm_smrf_path),
+    ] {
+        lidar_to_dtm(
+            &las_path,
+            out_path,
+            &LidarToDtmOptions {
+                resolution: 1.0,
+                ground_method: method,
+                remove_outliers: true,
+                outlier_cell: 8.0,
+                outlier_threshold: 1.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let dtm = load_raster::<f64>(out_path, None).unwrap();
+        let min_dtm = dtm
+            .data()
+            .iter()
+            .copied()
+            .filter(|&v| v.is_finite() && v != dtm.no_data())
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            min_dtm > 99.0,
+            "remove_outliers=true ({method:?}) must prevent low-noise pit from distorting DTM (min={min_dtm})"
+        );
+    }
+}
+
+#[test]
+fn simulate_inundation_advanced_rejects_dem_with_static_routing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_data/sink.tif");
+    let dem_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_data/dem.tif");
+    let out_dir = tmp.path().join("sim_invalid");
+    let opts = lidar::SimulateInundationAdvancedOptions {
+        routing: lidar::RoutingMode::Static,
+        dem_path: Some(dem_path),
+        ..Default::default()
+    };
+    let err = lidar::simulate_inundation_advanced(&sink_path, &sink_path, &out_dir, &opts)
+        .expect_err("--dem with static routing must fail");
     assert!(
-        min_dtm > 99.0,
-        "remove_outliers=true must prevent low-noise pit from distorting DTM (min={min_dtm})"
+        err.to_string().contains("--dem"),
+        "expected error mentioning --dem, got: {err}"
     );
 }
 

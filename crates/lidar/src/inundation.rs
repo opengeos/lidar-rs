@@ -36,7 +36,7 @@ use crate::filling::{InMemorySinks, extract_sinks_in_memory};
 use crate::filtering::median_filter;
 use crate::fsm::{
     FsmBasinSummary, FsmForcing, FsmHydrographPoint, FsmMassBalance, OutletSearchScratch,
-    RoutingMode, simulate_fill_spill_merge_with_flowdirs,
+    RoutingMode, simulate_fill_spill_merge_in_memory, simulate_fill_spill_merge_with_flowdirs,
     simulate_fill_spill_merge_with_forcing_and_flowdirs, write_fsm_basins_csv,
     write_fsm_hydrograph_csv,
 };
@@ -2866,43 +2866,113 @@ pub fn run_pipeline(
     Ok(result)
 }
 
-/// Simulates surface inundation dynamics over time and writes `flood_*.tif`,
-/// `fill_time.tif`, and `inundation_summary.csv` into `out_dir`.
-///
-/// Pure-Rust port of `6_Simulate Inundation.py`.
-pub fn simulate_inundation(
-    in_sink: impl AsRef<Path>,
-    in_catchment: impl AsRef<Path>,
-    out_dir: impl AsRef<Path>,
+/// A hydrologic forcing parameter supplied either as a spatially uniform scalar or a
+/// path to an aligned GeoTIFF raster.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum ForcingInput {
+    /// Spatially uniform scalar value applied across the entire grid.
+    Scalar(f64),
+    /// Path to an aligned GeoTIFF raster.
+    Raster(PathBuf),
+}
+
+impl ForcingInput {
+    /// Parses a string specification as either a finite scalar value or an existing raster path.
+    pub fn parse_spec(spec: &str) -> Result<Self> {
+        let trimmed = spec.trim();
+        if let Ok(val) = trimmed.parse::<f64>()
+            && val.is_finite()
+        {
+            return Ok(Self::Scalar(val));
+        }
+        let path = Path::new(trimmed);
+        if path.exists() {
+            return Ok(Self::Raster(path.to_path_buf()));
+        }
+        Err(Error::InvalidArgument(format!(
+            "invalid forcing input '{spec}': expected a finite number or an existing GeoTIFF path"
+        )))
+    }
+}
+
+/// Options for [`simulate_inundation_advanced`], extending [`SimulateInundationOptions`]
+/// with optional Fill-Spill-Merge routing, SCS Type II design storms, and spatially
+/// variable or uniform scalar hydrologic forcing.
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct SimulateInundationAdvancedOptions {
+    /// Base level-set and timestep simulation parameters.
+    pub simulation: SimulateInundationOptions,
+    /// Hydrologic routing strategy (`RoutingMode::Static` by default, or `RoutingMode::FillSpillMerge`).
+    pub routing: RoutingMode,
+    /// Optional refined DEM raster path (`dem.tif`) used for `RoutingMode::FillSpillMerge` overland routing.
+    /// Must be `None` when `routing == RoutingMode::Static`.
+    pub dem_path: Option<PathBuf>,
+    /// Optional SCS Type II design storm total precipitation in millimeters.
+    pub scs_type2_mm: Option<f64>,
+    /// Optional effective runoff coefficient (`0.0..=1.0`, scalar or aligned GeoTIFF).
+    pub runoff_coeff: Option<ForcingInput>,
+    /// Optional vertical infiltration loss rate (`cm/h`, `>= 0.0`, scalar or aligned GeoTIFF).
+    pub infiltration_cm_h: Option<ForcingInput>,
+    /// Optional antecedent ponded water depth (vertical DEM units `>= 0.0`, scalar or aligned GeoTIFF).
+    pub antecedent_depth: Option<ForcingInput>,
+}
+
+/// Output summary and generated file paths from [`simulate_inundation_advanced`].
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct SimulateInundationAdvancedResult {
+    /// Core inundation outputs (`fill_time.tif`, `flood_*.tif`, `inundation_summary.csv`, steps).
+    #[cfg_attr(feature = "serde", serde(flatten))]
+    pub simulation: SimulateInundationResult,
+    /// Routing strategy executed (`Static` or `FillSpillMerge`).
+    pub routing: RoutingMode,
+    /// Path to `fsm_basins.csv` when `routing == RoutingMode::FillSpillMerge`.
+    pub fsm_basins_csv: Option<PathBuf>,
+    /// Watershed-scale mass balance summary when `routing == RoutingMode::FillSpillMerge`.
+    pub fsm_mass_balance: Option<FsmMassBalance>,
+}
+
+fn load_forcing_input(
+    input: &ForcingInput,
+    template: &Array2D<f64>,
+    label: &str,
+    min_val: f64,
+    max_val: Option<f64>,
+) -> Result<Array2D<f64>> {
+    match input {
+        ForcingInput::Scalar(val) => {
+            if !val.is_finite() || *val < min_val || max_val.is_some_and(|hi| *val > hi) {
+                return Err(Error::InvalidArgument(format!(
+                    "invalid {label} scalar {val}: out of valid range"
+                )));
+            }
+            let mut arr = Array2D::from_vec(
+                template.width(),
+                template.height(),
+                vec![*val; template.data().len()],
+            )?;
+            arr.copy_metadata_from(template);
+            arr.set_no_data(f64::NAN);
+            Ok(arr)
+        }
+        ForcingInput::Raster(path) => Ok(load_raster::<f64>(path, None)?),
+    }
+}
+
+/// Removes stale `flood_*.tif(f)` frames, writes `fill_time.tif`, each `flood_<step>.tif` frame,
+/// and `inundation_summary.csv` into `out_dir`.
+fn write_inundation_frames_and_summary(
+    sink: &Array2D<f64>,
+    fill_time: &Array2D<f64>,
+    num_regions: usize,
+    out_dir: &Path,
+    frame_paths: Vec<PathBuf>,
     options: &SimulateInundationOptions,
 ) -> Result<SimulateInundationResult> {
-    let n_steps = validate_options(options)?;
-    let in_sink = in_sink.as_ref();
-    let in_catchment = in_catchment.as_ref();
-    let out_dir = out_dir.as_ref();
-    std::fs::create_dir_all(out_dir)?;
-
     let fill_time_path = out_dir.join("fill_time.tif");
     let summary_csv_path = out_dir.join("inundation_summary.csv");
-
-    let digits = (n_steps as f64).log10().floor() as usize + 1;
-    let frame_paths: Vec<PathBuf> = (1..=n_steps)
-        .map(|k| out_dir.join(format!("flood_{k:0digits$}.tif")))
-        .collect();
-
-    let mut protected: Vec<&Path> = Vec::with_capacity(frame_paths.len() + 2);
-    protected.push(&fill_time_path);
-    protected.push(&summary_csv_path);
-    for p in &frame_paths {
-        protected.push(p.as_path());
-    }
-    ensure_no_path_collision(in_sink, &protected)?;
-    ensure_no_path_collision(in_catchment, &protected)?;
-
-    let sink = load_raster::<f64>(in_sink, None)?;
-    let catchment = load_raster::<f64>(in_catchment, None)?;
-    let (fill_time, num_regions) = simulate_inundation_in_memory(&sink, &catchment, options)?;
-
     // Remove stale flood_*.tif(f) frames from any prior run in out_dir so rerun outputs
     // with a different step count cannot interleave with old frames.
     if let Ok(entries) = std::fs::read_dir(out_dir) {
@@ -2922,7 +2992,7 @@ pub fn simulate_inundation(
     }
 
     save_raster(
-        &fill_time,
+        fill_time,
         &fill_time_path,
         Some("simulate_inundation: fill_time_hours"),
         options.compress,
@@ -2939,9 +3009,9 @@ pub fn simulate_inundation(
         .count();
 
     let ft_data = fill_time.data();
-    let mut steps = Vec::with_capacity(n_steps);
+    let mut steps = Vec::with_capacity(frame_paths.len());
     let mut frame_arr = Array2D::from_vec(w, h, vec![0u32; w * h])?;
-    frame_arr.copy_metadata_from(&sink);
+    frame_arr.copy_metadata_from(sink);
     frame_arr.set_no_data(0);
 
     for (i, frame_path) in frame_paths.iter().enumerate() {
@@ -2987,6 +3057,187 @@ pub fn simulate_inundation(
         summary_csv_path,
         num_regions,
         steps,
+    })
+}
+
+/// Simulates surface inundation dynamics over time and writes `flood_*.tif`,
+/// `fill_time.tif`, and `inundation_summary.csv` into `out_dir`.
+///
+/// Pure-Rust port of `6_Simulate Inundation.py`.
+pub fn simulate_inundation(
+    in_sink: impl AsRef<Path>,
+    in_catchment: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+    options: &SimulateInundationOptions,
+) -> Result<SimulateInundationResult> {
+    let n_steps = validate_options(options)?;
+    let in_sink = in_sink.as_ref();
+    let in_catchment = in_catchment.as_ref();
+    let out_dir = out_dir.as_ref();
+    std::fs::create_dir_all(out_dir)?;
+
+    let fill_time_path = out_dir.join("fill_time.tif");
+    let summary_csv_path = out_dir.join("inundation_summary.csv");
+
+    let digits = (n_steps as f64).log10().floor() as usize + 1;
+    let frame_paths: Vec<PathBuf> = (1..=n_steps)
+        .map(|k| out_dir.join(format!("flood_{k:0digits$}.tif")))
+        .collect();
+
+    let mut protected: Vec<&Path> = Vec::with_capacity(frame_paths.len() + 2);
+    protected.push(&fill_time_path);
+    protected.push(&summary_csv_path);
+    for p in &frame_paths {
+        protected.push(p.as_path());
+    }
+    ensure_no_path_collision(in_sink, &protected)?;
+    ensure_no_path_collision(in_catchment, &protected)?;
+
+    let sink = load_raster::<f64>(in_sink, None)?;
+    let catchment = load_raster::<f64>(in_catchment, None)?;
+    let (fill_time, num_regions) = simulate_inundation_in_memory(&sink, &catchment, options)?;
+
+    write_inundation_frames_and_summary(
+        &sink,
+        &fill_time,
+        num_regions,
+        out_dir,
+        frame_paths,
+        options,
+    )
+}
+
+/// Simulates surface inundation dynamics with optional dynamic Fill-Spill-Merge routing,
+/// SCS Type II design storm hyetograph, and spatially variable or uniform scalar forcing
+/// (runoff coefficient, infiltration, antecedent water depth).
+pub fn simulate_inundation_advanced(
+    in_sink: impl AsRef<Path>,
+    in_catchment: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+    options: &SimulateInundationAdvancedOptions,
+) -> Result<SimulateInundationAdvancedResult> {
+    if options.dem_path.is_some() && options.routing == RoutingMode::Static {
+        return Err(Error::InvalidArgument(
+            "--dem is only supported with --routing fsm".into(),
+        ));
+    }
+    let sim_opts = &options.simulation;
+    let n_steps = validate_options_with_hyetograph(sim_opts, options.scs_type2_mm.is_some())?;
+    let hyetograph = options
+        .scs_type2_mm
+        .map(|mm| scs_type2_hyetograph(mm, sim_opts.rain_duration_h, sim_opts.time_step_h))
+        .transpose()?;
+
+    let in_sink = in_sink.as_ref();
+    let in_catchment = in_catchment.as_ref();
+    let out_dir = out_dir.as_ref();
+    std::fs::create_dir_all(out_dir)?;
+
+    let fill_time_path = out_dir.join("fill_time.tif");
+    let summary_csv_path = out_dir.join("inundation_summary.csv");
+    let fsm_csv_path = out_dir.join("fsm_basins.csv");
+    let digits = (n_steps as f64).log10().floor() as usize + 1;
+    let frame_paths: Vec<PathBuf> = (1..=n_steps)
+        .map(|k| out_dir.join(format!("flood_{k:0digits$}.tif")))
+        .collect();
+
+    let mut protected: Vec<&Path> = Vec::with_capacity(frame_paths.len() + 3);
+    protected.push(&fill_time_path);
+    protected.push(&summary_csv_path);
+    if options.routing == RoutingMode::FillSpillMerge {
+        protected.push(&fsm_csv_path);
+    }
+    for p in &frame_paths {
+        protected.push(p.as_path());
+    }
+    ensure_no_path_collision(in_sink, &protected)?;
+    ensure_no_path_collision(in_catchment, &protected)?;
+    if let Some(ref dem_p) = options.dem_path {
+        ensure_no_path_collision(dem_p, &protected)?;
+    }
+    for forcing_in in [
+        &options.runoff_coeff,
+        &options.infiltration_cm_h,
+        &options.antecedent_depth,
+    ] {
+        if let Some(ForcingInput::Raster(p)) = forcing_in {
+            ensure_no_path_collision(p, &protected)?;
+        }
+    }
+
+    let sink = load_raster::<f64>(in_sink, None)?;
+    let rc_arr = options
+        .runoff_coeff
+        .as_ref()
+        .map(|f| load_forcing_input(f, &sink, "runoff_coeff", 0.0, Some(1.0)))
+        .transpose()?;
+    let infil_arr = options
+        .infiltration_cm_h
+        .as_ref()
+        .map(|f| load_forcing_input(f, &sink, "infiltration", 0.0, None))
+        .transpose()?;
+    let ant_arr = options
+        .antecedent_depth
+        .as_ref()
+        .map(|f| load_forcing_input(f, &sink, "antecedent_depth", 0.0, None))
+        .transpose()?;
+
+    let forcing = InundationForcing {
+        runoff_coeff: rc_arr.as_ref(),
+        infiltration_cm_h: infil_arr.as_ref(),
+        antecedent_depth: ant_arr.as_ref(),
+        hyetograph: hyetograph.as_deref(),
+    };
+
+    let (fill_time, num_regions, fsm_basins_csv, fsm_mass_balance) = match options.routing {
+        RoutingMode::Static => {
+            let catchment = load_raster::<f64>(in_catchment, None)?;
+            let (ft, nr) =
+                simulate_inundation_with_forcing_in_memory(&sink, &catchment, sim_opts, &forcing)?;
+            (ft, nr, None, None)
+        }
+        RoutingMode::FillSpillMerge => {
+            let dem_refined = match options.dem_path.as_deref() {
+                Some(p) => load_raster::<f64>(p, None)?,
+                None => sink.clone(),
+            };
+            let deps = delineate_depressions_in_memory(
+                &sink,
+                sim_opts.min_size,
+                sim_opts.min_depth,
+                sim_opts.interval,
+            )?;
+            let fsm = simulate_fill_spill_merge_in_memory(
+                &dem_refined,
+                &sink,
+                &deps,
+                sim_opts,
+                &forcing,
+            )?;
+            write_fsm_basins_csv(&fsm.basins, &fsm_csv_path)?;
+            (
+                fsm.fill_time,
+                fsm.num_regions,
+                Some(fsm_csv_path),
+                Some(fsm.mass_balance),
+            )
+        }
+    };
+
+    let simulation = write_inundation_frames_and_summary(
+        &sink,
+        &fill_time,
+        num_regions,
+        out_dir,
+        frame_paths,
+        sim_opts,
+    )?;
+
+    Ok(SimulateInundationAdvancedResult {
+        simulation,
+        routing: options.routing,
+        fsm_basins_csv,
+        fsm_mass_balance,
     })
 }
 

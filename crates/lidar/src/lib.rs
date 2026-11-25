@@ -110,15 +110,17 @@ pub use graph::{
     write_connectivity_graphml, write_rating_curves_csv, write_spill_paths_vector,
 };
 pub use inundation::{
-    GreenAmptParams, InMemoryFullPipeline, InMemoryFullPipelineOptions, InMemoryInundationPipeline,
-    InundationForcing, InundationPipelineOptions, InundationStep, InundationStepSummary,
-    RunPipelineOptions, RunPipelineResult, SimulateInundationOptions, SimulateInundationResult,
-    SpillFlowPath, compute_inundation_step_summaries, cumulative_runoff_mm,
-    delineate_spill_flow_paths_in_memory, format_inundation_curve_csv,
+    ForcingInput, GreenAmptParams, InMemoryFullPipeline, InMemoryFullPipelineOptions,
+    InMemoryInundationPipeline, InundationForcing, InundationPipelineOptions, InundationStep,
+    InundationStepSummary, RunPipelineOptions, RunPipelineResult,
+    SimulateInundationAdvancedOptions, SimulateInundationAdvancedResult, SimulateInundationOptions,
+    SimulateInundationResult, SpillFlowPath, compute_inundation_step_summaries,
+    cumulative_runoff_mm, delineate_spill_flow_paths_in_memory, format_inundation_curve_csv,
     green_ampt_hyetograph_losses, green_ampt_infiltration_rate_cm_h, run_full_pipeline_in_memory,
     run_pipeline, scs_cn_incremental_hyetograph, scs_curve_number_runoff, scs_type2_hyetograph,
-    simulate_inundation, simulate_inundation_in_memory, simulate_inundation_pipeline_in_memory,
-    simulate_inundation_with_forcing_in_memory, write_inundation_summary_csv,
+    simulate_inundation, simulate_inundation_advanced, simulate_inundation_in_memory,
+    simulate_inundation_pipeline_in_memory, simulate_inundation_with_forcing_in_memory,
+    write_inundation_summary_csv,
 };
 pub use mounts::{
     DelineateMountsResult, delineate_mounts, delineate_mounts_in_memory, flip_dem, flip_dem_file,

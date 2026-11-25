@@ -167,8 +167,12 @@ pub struct LidarToDtmOptions {
     pub window_size: usize,
     /// Output NoData value (`-9999.0` by default).
     pub nodata: f64,
-    /// Strip ASPRS low/high noise outliers (classes 7 and 18) via ELM before gridding (default `false`).
+    /// Strip ASPRS low/high noise outliers (classes 7 and 18) via ELM before ground selection (default `false`).
     pub remove_outliers: bool,
+    /// ELM grid cell size in CRS horizontal units when `remove_outliers` is `true` (default `10.0`).
+    pub outlier_cell: f64,
+    /// ELM elevation threshold in CRS vertical units when `remove_outliers` is `true` (default `1.0`).
+    pub outlier_threshold: f64,
 }
 
 impl Default for LidarToDtmOptions {
@@ -183,6 +187,8 @@ impl Default for LidarToDtmOptions {
             window_size: 5,
             nodata: -9999.0,
             remove_outliers: false,
+            outlier_cell: 10.0,
+            outlier_threshold: 1.0,
         }
     }
 }
@@ -687,27 +693,26 @@ pub fn lidar_to_dtm(
     ensure_parent_dir(out_path)?;
     let out_str = path_to_str(out_path)?;
 
-    let ground = match options.ground_method {
-        GroundFilterMethod::Preclassified => {
-            let filter = PointFilter {
-                classes: vec![options.ground_class],
-                ..Default::default()
-            };
-            let pts = read_lidar_filtered(in_lidar, filter)?;
-            if options.remove_outliers {
-                filter_outliers_elm(&pts, 10.0, 1.0, true)?
-            } else {
-                pts
+    let ground = if options.remove_outliers {
+        // Always run ELM on the full raw point set prior to ground selection so
+        // `remove_outliers` behaves identically across Preclassified, CSF, PMF, and SMRF.
+        let raw = read_lidar(in_lidar)?;
+        let cleaned =
+            filter_outliers_elm(&raw, options.outlier_cell, options.outlier_threshold, true)?;
+        select_ground_points(&cleaned, options.ground_method, options.ground_class)?
+    } else {
+        match options.ground_method {
+            GroundFilterMethod::Preclassified => {
+                let filter = PointFilter {
+                    classes: vec![options.ground_class],
+                    ..Default::default()
+                };
+                read_lidar_filtered(in_lidar, filter)?
             }
-        }
-        method => {
-            let raw = read_lidar(in_lidar)?;
-            let cleaned = if options.remove_outliers {
-                filter_outliers_elm(&raw, 10.0, 1.0, true)?
-            } else {
-                raw
-            };
-            select_ground_points(&cleaned, method, options.ground_class)?
+            method => {
+                let raw = read_lidar(in_lidar)?;
+                select_ground_points(&raw, method, options.ground_class)?
+            }
         }
     };
 
@@ -760,7 +765,7 @@ pub fn lidar_to_chm(
 
     let raw = read_lidar(in_lidar)?;
     let raw = if options.remove_outliers {
-        filter_outliers_elm(&raw, 10.0, 1.0, true)?
+        filter_outliers_elm(&raw, options.outlier_cell, options.outlier_threshold, true)?
     } else {
         raw
     };

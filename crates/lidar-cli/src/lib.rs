@@ -15,22 +15,20 @@ use lidar::pointcloud::{
     lidar_to_dtm, read_lidar, write_lidar,
 };
 use lidar::{
-    AnimateInundationOptions, Array2D, BreachMode, BreachOptions, BurnCulvertsOptions,
+    AnimateInundationOptions, BreachMode, BreachOptions, BurnCulvertsOptions,
     CatchmentHierarchyOptions, DelineateCatchmentsOptions, DelineateFlowPathsOptions,
-    DelineateOptions, ExtractSinksOptions, HillshadeOptions, InundationForcing, InundationStep,
-    RoutingMode, RunPipelineOptions, SimulateInundationOptions, SimulateInundationResult,
+    DelineateOptions, ExtractSinksOptions, ForcingInput, HillshadeOptions, RoutingMode,
+    RunPipelineOptions, SimulateInundationAdvancedOptions, SimulateInundationOptions,
     SynthesizeCulvertsOptions, TiledDelineationOptions, Topology, add_crs, animate_inundation,
     breach_depressions_file, burn_culverts_file, clip_image, csv_points_to_vector,
     delineate_catchment_hierarchy, delineate_catchments, delineate_depressions,
-    delineate_depressions_in_memory, delineate_depressions_tiled, delineate_flow_paths,
-    delineate_mounts, export_inundation_frames_png, extract_sinks, flip_dem_file,
-    gaussian_filter_file, image_to_cog, join_csv_to_vector, load_dem_for_preview, load_raster,
-    mean_filter_file, median_filter_file, mosaic, parse_resampling, polygonize,
-    render_dem_preview_png_bytes, render_inundation_frame_png_bytes, reproject_image, resample,
-    run_pipeline, save_raster, scs_curve_number_runoff, scs_type2_hyetograph,
-    simulate_fill_spill_merge_in_memory, simulate_inundation,
-    simulate_inundation_with_forcing_in_memory, synthesize_culverts, write_fsm_basins_csv,
-    write_inundation_summary_csv,
+    delineate_depressions_tiled, delineate_flow_paths, delineate_mounts,
+    export_inundation_frames_png, extract_sinks, flip_dem_file, gaussian_filter_file, image_to_cog,
+    join_csv_to_vector, load_dem_for_preview, load_raster, mean_filter_file, median_filter_file,
+    mosaic, parse_resampling, polygonize, render_dem_preview_png_bytes,
+    render_inundation_frame_png_bytes, reproject_image, resample, run_pipeline, save_raster,
+    scs_curve_number_runoff, scs_type2_hyetograph, simulate_inundation,
+    simulate_inundation_advanced, synthesize_culverts,
 };
 #[cfg(feature = "download")]
 use lidar::{
@@ -173,38 +171,6 @@ fn parse_u32_list(s: &str) -> lidar::Result<Vec<u32>> {
         ));
     }
     Ok(parsed)
-}
-
-fn load_scalar_or_raster(
-    spec: &str,
-    template: &Array2D<f64>,
-    label: &str,
-    min_val: f64,
-    max_val: Option<f64>,
-) -> lidar::Result<Array2D<f64>> {
-    let trimmed = spec.trim();
-    if let Ok(val) = trimmed.parse::<f64>() {
-        if !val.is_finite() || val < min_val || max_val.is_some_and(|hi| val > hi) {
-            return Err(lidar::Error::InvalidArgument(format!(
-                "invalid {label} scalar '{spec}': out of valid range"
-            )));
-        }
-        let mut arr = Array2D::from_vec(
-            template.width(),
-            template.height(),
-            vec![val; template.data().len()],
-        )?;
-        arr.copy_metadata_from(template);
-        arr.set_no_data(f64::NAN);
-        return Ok(arr);
-    }
-    let path = Path::new(trimmed);
-    if path.exists() {
-        return Ok(load_raster::<f64>(path, None)?);
-    }
-    Err(lidar::Error::InvalidArgument(format!(
-        "invalid {label} '{spec}': expected a finite number or an existing GeoTIFF path"
-    )))
 }
 
 fn parse_u8_list(s: &str) -> lidar::Result<Vec<u8>> {
@@ -597,9 +563,15 @@ enum Commands {
         /// Gap-filling window size in cells
         #[arg(long, default_value_t = 5)]
         window_size: usize,
-        /// Strip ASPRS low/high noise outliers via ELM before gridding
+        /// Strip ASPRS low/high noise outliers via ELM before ground selection
         #[arg(long)]
         remove_outliers: bool,
+        /// ELM cell size in CRS horizontal units when --remove-outliers is set
+        #[arg(long, default_value_t = 10.0)]
+        outlier_cell: f64,
+        /// ELM elevation drop threshold in CRS vertical units when --remove-outliers is set
+        #[arg(long, default_value_t = 1.0)]
+        outlier_threshold: f64,
         /// Print summary as JSON
         #[arg(long)]
         json: bool,
@@ -625,9 +597,15 @@ enum Commands {
         /// Gap-filling window size in cells
         #[arg(long, default_value_t = 5)]
         window_size: usize,
-        /// Strip ASPRS low/high noise outliers via ELM before gridding
+        /// Strip ASPRS low/high noise outliers via ELM before ground selection
         #[arg(long)]
         remove_outliers: bool,
+        /// ELM cell size in CRS horizontal units when --remove-outliers is set
+        #[arg(long, default_value_t = 10.0)]
+        outlier_cell: f64,
+        /// ELM elevation drop threshold in CRS vertical units when --remove-outliers is set
+        #[arg(long, default_value_t = 1.0)]
+        outlier_threshold: f64,
         /// Print summary as JSON
         #[arg(long)]
         json: bool,
@@ -1611,6 +1589,8 @@ fn dispatch(command: Commands, lidar_cmd: Option<Vec<OsString>>) -> lidar::Resul
             stat,
             window_size,
             remove_outliers,
+            outlier_cell,
+            outlier_threshold,
             json,
         } => {
             let opts = LidarToDtmOptions {
@@ -1622,6 +1602,8 @@ fn dispatch(command: Commands, lidar_cmd: Option<Vec<OsString>>) -> lidar::Resul
                 stat: GridStat::parse(&stat)?,
                 window_size,
                 remove_outliers,
+                outlier_cell,
+                outlier_threshold,
                 ..Default::default()
             };
             let (cols, rows) = lidar_to_dtm(&input, &output, &opts)?;
@@ -1646,6 +1628,8 @@ fn dispatch(command: Commands, lidar_cmd: Option<Vec<OsString>>) -> lidar::Resul
             radius,
             window_size,
             remove_outliers,
+            outlier_cell,
+            outlier_threshold,
             json,
         } => {
             let opts = LidarToDtmOptions {
@@ -1655,6 +1639,8 @@ fn dispatch(command: Commands, lidar_cmd: Option<Vec<OsString>>) -> lidar::Resul
                 radius,
                 window_size,
                 remove_outliers,
+                outlier_cell,
+                outlier_threshold,
                 ..Default::default()
             };
             let (cols, rows) = lidar_to_chm(&input, &output, &opts)?;
@@ -2089,45 +2075,43 @@ fn dispatch(command: Commands, lidar_cmd: Option<Vec<OsString>>) -> lidar::Resul
                     );
                 }
             } else {
-                let (res, fsm_basins_csv, fsm_mass_balance) = run_simulate_inundation_advanced(
-                    &sink,
-                    &catchment,
-                    &out_dir,
-                    &opts,
-                    routing_mode,
-                    dem.as_deref(),
+                let adv_opts = SimulateInundationAdvancedOptions {
+                    simulation: opts,
+                    routing: routing_mode,
+                    dem_path: dem,
                     scs_type2_mm,
-                    runoff_coeff.as_deref(),
-                    infiltration.as_deref(),
-                    antecedent_depth.as_deref(),
-                )?;
+                    runoff_coeff: runoff_coeff
+                        .as_deref()
+                        .map(ForcingInput::parse_spec)
+                        .transpose()?,
+                    infiltration_cm_h: infiltration
+                        .as_deref()
+                        .map(ForcingInput::parse_spec)
+                        .transpose()?,
+                    antecedent_depth: antecedent_depth
+                        .as_deref()
+                        .map(ForcingInput::parse_spec)
+                        .transpose()?,
+                };
+                let adv = simulate_inundation_advanced(&sink, &catchment, &out_dir, &adv_opts)?;
                 if json {
-                    if let Some(mb) = fsm_mass_balance {
-                        print_json(&json!({
-                            "routing": "fsm",
-                            "frame_paths": res.frame_paths,
-                            "fill_time_path": res.fill_time_path,
-                            "summary_csv_path": res.summary_csv_path,
-                            "num_regions": res.num_regions,
-                            "steps": res.steps,
-                            "fsm_basins_csv": fsm_basins_csv,
-                            "fsm_mass_balance": mb,
-                        }))?;
+                    if adv.routing == RoutingMode::FillSpillMerge {
+                        print_json(&adv)?;
                     } else {
-                        print_json(&res)?;
+                        print_json(&adv.simulation)?;
                     }
                 } else {
                     println!(
                         "Simulated {} timestep(s) across {} region(s):\n  fill_time: {}\n  summary:   {}",
-                        res.steps.len(),
-                        res.num_regions,
-                        res.fill_time_path.display(),
-                        res.summary_csv_path.display(),
+                        adv.simulation.steps.len(),
+                        adv.simulation.num_regions,
+                        adv.simulation.fill_time_path.display(),
+                        adv.simulation.summary_csv_path.display(),
                     );
-                    if let Some(ref p) = fsm_basins_csv {
+                    if let Some(ref p) = adv.fsm_basins_csv {
                         println!("  fsm_csv:   {}", p.display());
                     }
-                    if let Some(ref mb) = fsm_mass_balance {
+                    if let Some(ref mb) = adv.fsm_mass_balance {
                         println!(
                             "  FSM mass balance ({:.2} h): runoff={:.2} m³, stored={:.2} m³, infil={:.2} m³, outflow={:.2} m³, err={:.2e} m³",
                             mb.duration_h,
@@ -2554,206 +2538,6 @@ fn ensure_no_cli_path_collision(input: &Path, output: &Path) -> lidar::Result<()
         )));
     }
     Ok(())
-}
-
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
-fn run_simulate_inundation_advanced(
-    in_sink: &Path,
-    in_catchment: &Path,
-    out_dir: &Path,
-    options: &SimulateInundationOptions,
-    routing: RoutingMode,
-    dem_path: Option<&Path>,
-    scs_type2_mm: Option<f64>,
-    runoff_coeff_spec: Option<&str>,
-    infiltration_spec: Option<&str>,
-    antecedent_spec: Option<&str>,
-) -> lidar::Result<(
-    SimulateInundationResult,
-    Option<PathBuf>,
-    Option<lidar::FsmMassBalance>,
-)> {
-    if !options.rain_duration_h.is_finite()
-        || options.rain_duration_h <= 0.0
-        || !options.time_step_h.is_finite()
-        || options.time_step_h <= 0.0
-    {
-        return Err(lidar::Error::InvalidArgument(
-            "duration and time_step must be finite and > 0".into(),
-        ));
-    }
-    let n_steps_f = ((options.rain_duration_h + 1e-9) / options.time_step_h).floor();
-    if !n_steps_f.is_finite() || n_steps_f < 1.0 || n_steps_f > 10_000.0 {
-        return Err(lidar::Error::InvalidArgument(format!(
-            "simulation produces {n_steps_f} steps; must be between 1 and 10000"
-        )));
-    }
-    let n_steps = n_steps_f as usize;
-
-    let hyetograph = scs_type2_mm
-        .map(|mm| scs_type2_hyetograph(mm, options.rain_duration_h, options.time_step_h))
-        .transpose()?;
-
-    std::fs::create_dir_all(out_dir)?;
-    let fill_time_path = out_dir.join("fill_time.tif");
-    let summary_csv_path = out_dir.join("inundation_summary.csv");
-    let digits = (n_steps as f64).log10().floor() as usize + 1;
-    let frame_paths: Vec<PathBuf> = (1..=n_steps)
-        .map(|k| out_dir.join(format!("flood_{k:0digits$}.tif")))
-        .collect();
-
-    for p in std::iter::once(fill_time_path.as_path())
-        .chain(std::iter::once(summary_csv_path.as_path()))
-        .chain(frame_paths.iter().map(PathBuf::as_path))
-    {
-        ensure_no_cli_path_collision(in_sink, p)?;
-        ensure_no_cli_path_collision(in_catchment, p)?;
-        if let Some(d) = dem_path {
-            ensure_no_cli_path_collision(d, p)?;
-        }
-    }
-
-    let sink = load_raster::<f64>(in_sink, None)?;
-    let rc_arr = runoff_coeff_spec
-        .map(|s| load_scalar_or_raster(s, &sink, "runoff-coeff", 0.0, Some(1.0)))
-        .transpose()?;
-    let infil_arr = infiltration_spec
-        .map(|s| load_scalar_or_raster(s, &sink, "infiltration", 0.0, None))
-        .transpose()?;
-    let ant_arr = antecedent_spec
-        .map(|s| load_scalar_or_raster(s, &sink, "antecedent-depth", 0.0, None))
-        .transpose()?;
-
-    let forcing = InundationForcing {
-        runoff_coeff: rc_arr.as_ref(),
-        infiltration_cm_h: infil_arr.as_ref(),
-        antecedent_depth: ant_arr.as_ref(),
-        hyetograph: hyetograph.as_deref(),
-    };
-
-    let (fill_time, num_regions, fsm_basins_csv, fsm_mass_balance) = match routing {
-        RoutingMode::Static => {
-            let catchment = load_raster::<f64>(in_catchment, None)?;
-            let (ft, nr) =
-                simulate_inundation_with_forcing_in_memory(&sink, &catchment, options, &forcing)?;
-            (ft, nr, None, None)
-        }
-        RoutingMode::FillSpillMerge => {
-            let dem_refined = match dem_path {
-                Some(p) => load_raster::<f64>(p, None)?,
-                None => sink.clone(),
-            };
-            let deps = delineate_depressions_in_memory(
-                &sink,
-                options.min_size,
-                options.min_depth,
-                options.interval,
-            )?;
-            let fsm =
-                simulate_fill_spill_merge_in_memory(&dem_refined, &sink, &deps, options, &forcing)?;
-            let basins_csv = out_dir.join("fsm_basins.csv");
-            write_fsm_basins_csv(&fsm.basins, &basins_csv)?;
-            (
-                fsm.fill_time,
-                fsm.num_regions,
-                Some(basins_csv),
-                Some(fsm.mass_balance),
-            )
-        }
-    };
-
-    if let Ok(entries) = std::fs::read_dir(out_dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_file()
-                && let Some(name) = p.file_name().and_then(|n| n.to_str())
-            {
-                let lower = name.to_ascii_lowercase();
-                if lower.starts_with("flood_")
-                    && (lower.ends_with(".tif") || lower.ends_with(".tiff"))
-                {
-                    let _ = std::fs::remove_file(&p);
-                }
-            }
-        }
-    }
-
-    save_raster(
-        &fill_time,
-        &fill_time_path,
-        Some("simulate_inundation: fill_time_hours"),
-        options.compress,
-    )?;
-
-    let w = sink.width();
-    let h = sink.height();
-    let gt = sink.geotransform;
-    let det = (gt[1] * gt[5] - gt[2] * gt[4]).abs();
-    let cell_area = if det > 0.0 && det.is_finite() {
-        det
-    } else {
-        1.0
-    };
-    let nd = sink.no_data();
-    let total_sink_cells = sink
-        .data()
-        .iter()
-        .filter(|&&v| v.is_finite() && !v.rd_eq(nd))
-        .count();
-
-    let ft_data = fill_time.data();
-    let mut steps = Vec::with_capacity(n_steps);
-    let mut frame_arr = Array2D::from_vec(w, h, vec![0u32; w * h])?;
-    frame_arr.copy_metadata_from(&sink);
-    frame_arr.set_no_data(0);
-
-    for (i, frame_path) in frame_paths.iter().enumerate() {
-        let step_num = i + 1;
-        let t_hours = (step_num as f64) * options.time_step_h;
-        let mut inundated_cells = 0usize;
-        for (dst, &ft) in frame_arr.data_mut().iter_mut().zip(ft_data.iter()) {
-            if ft >= 0.0 && ft.is_finite() && ft <= t_hours {
-                *dst = 1;
-                inundated_cells += 1;
-            } else {
-                *dst = 0;
-            }
-        }
-        save_raster(
-            &frame_arr,
-            frame_path,
-            Some(&format!("simulate_inundation(t={t_hours:.2}h)")),
-            options.compress,
-        )?;
-        let inundated_area = inundated_cells as f64 * cell_area;
-        let inundated_fraction = if total_sink_cells > 0 {
-            inundated_cells as f64 / total_sink_cells as f64
-        } else {
-            0.0
-        };
-        steps.push(InundationStep {
-            step: step_num,
-            time_hours: t_hours,
-            inundated_cells,
-            inundated_area,
-            inundated_fraction,
-            raster_path: frame_path.clone(),
-        });
-    }
-
-    write_inundation_summary_csv(&steps, &summary_csv_path)?;
-
-    Ok((
-        SimulateInundationResult {
-            frame_paths,
-            fill_time_path,
-            summary_csv_path,
-            num_regions,
-            steps,
-        },
-        fsm_basins_csv,
-        fsm_mass_balance,
-    ))
 }
 
 /// Runs the `lidar` CLI with `args` (program name first) and returns a process exit code
@@ -3287,7 +3071,8 @@ mod tests {
         let dem = load_raster::<f64>(&dem_path, None).unwrap();
         let cn_path = tmp.path().join("cn.tif");
         let mut cn =
-            Array2D::from_vec(dem.width(), dem.height(), vec![80.0; dem.data().len()]).unwrap();
+            lidar::Array2D::from_vec(dem.width(), dem.height(), vec![80.0; dem.data().len()])
+                .unwrap();
         cn.copy_metadata_from(&dem);
         cn.set_no_data(-9999.0);
         save_raster(&cn, &cn_path, None, false).unwrap();
@@ -3351,5 +3136,22 @@ mod tests {
         assert!(sim_dir.join("fill_time.tif").exists());
         assert!(sim_dir.join("fsm_basins.csv").exists());
         assert!(sim_dir.join("inundation_summary.csv").exists());
+
+        // 4. simulate-inundation with --dem and --routing static must return an error
+        let invalid_dir = tmp.path().join("sim_static_dem");
+        assert_eq!(
+            run(vec![
+                "lidar".into(),
+                "simulate-inundation".into(),
+                sink_path.as_os_str().to_os_string(),
+                sink_path.as_os_str().to_os_string(),
+                invalid_dir.as_os_str().to_os_string(),
+                "--routing".into(),
+                "static".into(),
+                "--dem".into(),
+                dem_path.as_os_str().to_os_string(),
+            ]),
+            1
+        );
     }
 }
