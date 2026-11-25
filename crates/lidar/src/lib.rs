@@ -72,8 +72,10 @@ pub use catchment::{
     write_flowpaths_csv,
 };
 pub use conditioning::{
-    BreachMode, BreachOptions, BurnCulvertsOptions, SynthesizeCulvertsOptions, breach_depressions,
-    breach_depressions_file, burn_culverts, burn_culverts_file, synthesize_culverts,
+    ArtifactClassifierOptions, BreachMode, BreachOptions, BurnCulvertsOptions,
+    EmbankmentArtifactCandidate, SynthesizeCulvertsOptions, breach_depressions,
+    breach_depressions_file, breach_depressions_file_with_no_data, burn_culverts,
+    burn_culverts_file, classify_embankment_artifacts, synthesize_culverts,
 };
 pub use error::{Error, Result};
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
@@ -93,8 +95,12 @@ pub use filtering::{
     median_filter_file,
 };
 pub use fsm::{
-    FsmBasinSummary, FsmMassBalance, FsmSimulationResult, RoutingMode, fsm_basins_to_csv_string,
-    simulate_fill_spill_merge_in_memory, write_fsm_basins_csv,
+    FsmBasinSummary, FsmForcing, FsmHazardRasters, FsmHydrographPoint, FsmMassBalance,
+    FsmSimulationResult, RoutingMode, SpillAttenuationOptions, attenuate_fsm_hydrograph,
+    attenuate_fsm_hydrograph_with_options, compute_fsm_hazard_rasters, estimate_mean_travel_time_h,
+    fsm_basins_to_csv_string, fsm_hydrograph_to_csv_string, integrate_fsm_hydrograph_m3,
+    simulate_fill_spill_merge_in_memory, simulate_fill_spill_merge_with_green_ampt_in_memory,
+    write_fsm_basins_csv, write_fsm_hazard_rasters, write_fsm_hydrograph_csv,
 };
 #[cfg(feature = "serde")]
 pub use graph::write_connectivity_graph_json;
@@ -104,13 +110,14 @@ pub use graph::{
     write_connectivity_graphml, write_rating_curves_csv, write_spill_paths_vector,
 };
 pub use inundation::{
-    InMemoryFullPipeline, InMemoryFullPipelineOptions, InMemoryInundationPipeline,
+    GreenAmptParams, InMemoryFullPipeline, InMemoryFullPipelineOptions, InMemoryInundationPipeline,
     InundationForcing, InundationPipelineOptions, InundationStep, InundationStepSummary,
     RunPipelineOptions, RunPipelineResult, SimulateInundationOptions, SimulateInundationResult,
     SpillFlowPath, compute_inundation_step_summaries, cumulative_runoff_mm,
-    delineate_spill_flow_paths_in_memory, format_inundation_curve_csv, run_full_pipeline_in_memory,
-    run_pipeline, scs_curve_number_runoff, scs_type2_hyetograph, simulate_inundation,
-    simulate_inundation_in_memory, simulate_inundation_pipeline_in_memory,
+    delineate_spill_flow_paths_in_memory, format_inundation_curve_csv,
+    green_ampt_hyetograph_losses, green_ampt_infiltration_rate_cm_h, run_full_pipeline_in_memory,
+    run_pipeline, scs_cn_incremental_hyetograph, scs_curve_number_runoff, scs_type2_hyetograph,
+    simulate_inundation, simulate_inundation_in_memory, simulate_inundation_pipeline_in_memory,
     simulate_inundation_with_forcing_in_memory, write_inundation_summary_csv,
 };
 pub use mounts::{
@@ -127,7 +134,10 @@ pub use raster_ops::{
     add_crs, clip_image, csv_points_to_vector, image_to_cog, join_csv_to_vector, mosaic,
     parse_resampling, polygonize, polygonize_array, reproject_image, resample,
 };
-pub use region::{RegionProps, region_group, region_group_slice, region_props, region_props_xy};
+pub use region::{
+    CrsMetricScale, RegionProps, crs_metric_scale, region_group, region_group_slice, region_props,
+    region_props_xy,
+};
 pub use slicing::{
     DelineateOptions, DelineateResult, InMemoryDepressions, NestedDepression,
     delineate_depressions, delineate_depressions_in_memory, write_depressions_csv,
