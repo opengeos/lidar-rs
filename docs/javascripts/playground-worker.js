@@ -10,6 +10,7 @@ let activeSim = null;
 let activeSimRunId = 0;
 let activeMounts = null;
 let activeMountsRunId = 0;
+const inFlightIds = new Set();
 const cancelledIds = new Set();
 
 function postProgress(id, stage, fraction, message) {
@@ -161,54 +162,62 @@ async function handleRun(msg) {
       return;
     }
 
-    postProgress(id, "extract", 0.84, "Extracting raster layers and hydrological telemetry...");
+    let result;
+    try {
+      postProgress(id, "extract", 0.84, "Extracting raster layers and hydrological telemetry...");
+
+      const hill = sim.hillshadeRgba();
+      const depth = sim.depthRgba();
+      const level = sim.levelRgba();
+      const fill = sim.fillTimeRgba();
+      const fillTimes = sim.fillTimeValues();
+      const depIds =
+        typeof sim.depressionIdValues === "function" ? sim.depressionIdValues() : null;
+      const rawBounds = typeof sim.boundsWgs84 === "function" ? sim.boundsWgs84() : undefined;
+      const boundsWgs84 = rawBounds && rawBounds.length === 4 ? Array.from(rawBounds) : null;
+
+      collectTransferable(transfer, seen, hill);
+      collectTransferable(transfer, seen, depth);
+      collectTransferable(transfer, seen, level);
+      collectTransferable(transfer, seen, fill);
+      collectTransferable(transfer, seen, fillTimes);
+      collectTransferable(transfer, seen, depIds);
+
+      result = {
+        width: sim.width,
+        height: sim.height,
+        projection: sim.projection,
+        boundsWgs84,
+        maxLevel: sim.maxLevel,
+        numRegions: sim.numRegions,
+        numSteps: sim.numSteps,
+        runoffCoeff: typeof sim.runoffCoeff === "number" ? sim.runoffCoeff : runoffCoeff,
+        hill,
+        depth,
+        level,
+        fill,
+        fillTimes,
+        depIds,
+        depressionsJson: sim.depressionsJson(),
+        ratingCurvesJson:
+          typeof sim.ratingCurvesJson === "function" ? sim.ratingCurvesJson() : "[]",
+        stepsJson: sim.stepsJson(),
+        spillPathsJson: sim.spillPathsJson(),
+        inundationCurveCsv:
+          typeof sim.inundationCurveCsv === "function" ? sim.inundationCurveCsv() : "",
+        fsmMassBalanceJson:
+          typeof sim.fsmMassBalanceJson === "function" ? sim.fsmMassBalanceJson() : "null",
+        fsmBasinsJson: typeof sim.fsmBasinsJson === "function" ? sim.fsmBasinsJson() : "[]",
+        hasFsmBasinsCsv: typeof sim.fsmBasinsCsv === "function",
+      };
+    } catch (err) {
+      sim.free();
+      throw err;
+    }
 
     releaseOutputs();
     activeSim = sim;
     activeSimRunId = runId;
-
-    const hill = sim.hillshadeRgba();
-    const depth = sim.depthRgba();
-    const level = sim.levelRgba();
-    const fill = sim.fillTimeRgba();
-    const fillTimes = sim.fillTimeValues();
-    const depIds = typeof sim.depressionIdValues === "function" ? sim.depressionIdValues() : null;
-    const rawBounds = typeof sim.boundsWgs84 === "function" ? sim.boundsWgs84() : undefined;
-    const boundsWgs84 = rawBounds && rawBounds.length === 4 ? Array.from(rawBounds) : null;
-
-    collectTransferable(transfer, seen, hill);
-    collectTransferable(transfer, seen, depth);
-    collectTransferable(transfer, seen, level);
-    collectTransferable(transfer, seen, fill);
-    collectTransferable(transfer, seen, fillTimes);
-    collectTransferable(transfer, seen, depIds);
-
-    const result = {
-      width: sim.width,
-      height: sim.height,
-      projection: sim.projection,
-      boundsWgs84,
-      maxLevel: sim.maxLevel,
-      numRegions: sim.numRegions,
-      numSteps: sim.numSteps,
-      runoffCoeff: typeof sim.runoffCoeff === "number" ? sim.runoffCoeff : runoffCoeff,
-      hill,
-      depth,
-      level,
-      fill,
-      fillTimes,
-      depIds,
-      depressionsJson: sim.depressionsJson(),
-      ratingCurvesJson: typeof sim.ratingCurvesJson === "function" ? sim.ratingCurvesJson() : "[]",
-      stepsJson: sim.stepsJson(),
-      spillPathsJson: sim.spillPathsJson(),
-      inundationCurveCsv:
-        typeof sim.inundationCurveCsv === "function" ? sim.inundationCurveCsv() : "",
-      fsmMassBalanceJson:
-        typeof sim.fsmMassBalanceJson === "function" ? sim.fsmMassBalanceJson() : "null",
-      fsmBasinsJson: typeof sim.fsmBasinsJson === "function" ? sim.fsmBasinsJson() : "[]",
-      hasFsmBasinsCsv: typeof sim.fsmBasinsCsv === "function",
-    };
 
     const elapsedMs = performance.now() - t0;
     postProgress(id, "done", 1.0, "Simulation complete.");
@@ -251,40 +260,46 @@ async function handleRun(msg) {
       return;
     }
 
-    postProgress(id, "extract", 0.85, "Extracting mount hierarchy layers and attributes...");
+    let result;
+    try {
+      postProgress(id, "extract", 0.85, "Extracting mount hierarchy layers and attributes...");
+
+      const level = mounts.levelRgba();
+      const mountIds =
+        typeof mounts.mountIdValues === "function"
+          ? mounts.mountIdValues()
+          : typeof mounts.depressionIdValues === "function"
+            ? mounts.depressionIdValues()
+            : null;
+      const rawBounds = typeof mounts.boundsWgs84 === "function" ? mounts.boundsWgs84() : undefined;
+      const boundsWgs84 = rawBounds && rawBounds.length === 4 ? Array.from(rawBounds) : null;
+      const featuresJson =
+        typeof mounts.mountsJson === "function" ? mounts.mountsJson() : mounts.depressionsJson();
+
+      collectTransferable(transfer, seen, hill);
+      collectTransferable(transfer, seen, level);
+      collectTransferable(transfer, seen, mountIds);
+
+      result = {
+        width: mounts.width,
+        height: mounts.height,
+        projection: typeof mounts.projection === "string" ? mounts.projection : "",
+        boundsWgs84,
+        maxLevel: mounts.maxLevel,
+        numRegions: mounts.numRegions,
+        hill,
+        level,
+        mountIds,
+        featuresJson,
+      };
+    } catch (err) {
+      mounts.free();
+      throw err;
+    }
 
     releaseOutputs();
     activeMounts = mounts;
     activeMountsRunId = runId;
-
-    const level = mounts.levelRgba();
-    const mountIds =
-      typeof mounts.mountIdValues === "function"
-        ? mounts.mountIdValues()
-        : typeof mounts.depressionIdValues === "function"
-          ? mounts.depressionIdValues()
-          : null;
-    const rawBounds = typeof mounts.boundsWgs84 === "function" ? mounts.boundsWgs84() : undefined;
-    const boundsWgs84 = rawBounds && rawBounds.length === 4 ? Array.from(rawBounds) : null;
-    const featuresJson =
-      typeof mounts.mountsJson === "function" ? mounts.mountsJson() : mounts.depressionsJson();
-
-    collectTransferable(transfer, seen, hill);
-    collectTransferable(transfer, seen, level);
-    collectTransferable(transfer, seen, mountIds);
-
-    const result = {
-      width: mounts.width,
-      height: mounts.height,
-      projection: typeof mounts.projection === "string" ? mounts.projection : "",
-      boundsWgs84,
-      maxLevel: mounts.maxLevel,
-      numRegions: mounts.numRegions,
-      hill,
-      level,
-      mountIds,
-      featuresJson,
-    };
 
     const elapsedMs = performance.now() - t0;
     postProgress(id, "done", 1.0, "Mount delineation complete.");
@@ -743,14 +758,20 @@ self.addEventListener("message", async (event) => {
   if (!msg || typeof msg !== "object") return;
   const { type, id } = msg;
 
+  if (type === "cancel") {
+    if (typeof msg.targetId === "number" && inFlightIds.has(msg.targetId)) {
+      cancelledIds.add(msg.targetId);
+    }
+    return;
+  }
+
+  if (typeof id === "number") {
+    inFlightIds.add(id);
+  }
   try {
     if (type === "init") {
       const mod = await ensureWasm(msg.wasmUrl, id || 0);
       self.postMessage({ type: "ready", id, version: mod.version() });
-    } else if (type === "cancel") {
-      if (typeof msg.targetId === "number") {
-        cancelledIds.add(msg.targetId);
-      }
     } else if (type === "release") {
       releaseOutputs();
       self.postMessage({ type: "released", id });
@@ -773,6 +794,7 @@ self.addEventListener("message", async (event) => {
     });
   } finally {
     if (typeof id === "number") {
+      inFlightIds.delete(id);
       cancelledIds.delete(id);
     }
   }

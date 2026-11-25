@@ -17,6 +17,12 @@ assert.equal(jsVersion, wsVersion, "js/Cargo.toml version must match workspace v
 assert.equal(jsPackageJson.version, wsVersion, "js/package.json version must match workspace version");
 assert.equal(jsPackageJson.types, "./lidar_js.d.ts");
 assert.ok(jsPackageJson.exports && jsPackageJson.exports["."], "expected package.json exports");
+assert.equal(
+  jsPackageJson.exports["."].node,
+  undefined,
+  'root "." export must not shadow ESM import with CJS node target (use "./node" instead)',
+);
+assert.ok(jsPackageJson.exports["./node"], 'expected "./node" export entry in package.json');
 assert.ok(jsPackageJson.scripts?.["build:web"], "expected build:web script");
 assert.ok(jsPackageJson.scripts?.["build:node"], "expected build:node script");
 assert.ok(jsPackageJson.scripts?.["build:bundler"], "expected build:bundler script");

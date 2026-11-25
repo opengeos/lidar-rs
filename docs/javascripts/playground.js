@@ -1763,9 +1763,12 @@
           throw createCancelledError();
         }
         const rgba = renderFrameRgba(fi);
-        const copy = new Uint8Array(rgba.buffer, rgba.byteOffset, rgba.byteLength).slice();
-        frames[fi] = copy.buffer;
-        transfer[fi] = copy.buffer;
+        const buf =
+          rgba.byteOffset === 0 && rgba.byteLength === rgba.buffer.byteLength
+            ? rgba.buffer
+            : rgba.slice().buffer;
+        frames[fi] = buf;
+        transfer[fi] = buf;
         if ((fi & 3) === 3 || fi === schedule.length - 1) {
           const frac = 0.05 + 0.4 * ((fi + 1) / schedule.length);
           setProgress(frac, `Rendering frame ${fi + 1}/${schedule.length}`, true);
