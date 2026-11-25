@@ -856,10 +856,6 @@ pub fn animate_inundation(
     writer.flush()?;
     drop(writer);
 
-    #[cfg(windows)]
-    if out_gif.exists() {
-        let _ = std::fs::remove_file(out_gif);
-    }
     std::fs::rename(&tmp_path, out_gif)?;
     guard.0 = None;
 

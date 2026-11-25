@@ -1660,6 +1660,11 @@ fn simulate_fill_spill_merge_impl(
                     }
                     mark_cells_at_instant(p, t_now, fill_time_data);
                 }
+                if basins[idx].state == BasinState::FullSpilling
+                    && basins[idx].has_unmarked_merged_children
+                {
+                    flush_unmarked_descendants(idx, basins, id_to_idx, t_now, fill_time_data);
+                }
                 changed = true;
                 merged_any = true;
             }
