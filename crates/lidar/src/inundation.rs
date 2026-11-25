@@ -1940,12 +1940,17 @@ pub fn load_hyetograph_csv(path: impl AsRef<Path>) -> Result<Vec<(f64, f64)>> {
 /// `out(r, c) = C_base(r, c) * (rainfall_grid_mm(r, c) / reference_precip_mm)`,
 /// where `C_base` defaults to `1.0` when `base_runoff_coeff` is `None`.
 ///
+/// Masked NoData cells in either `rainfall_grid_mm` or `base_runoff_coeff` are written as
+/// `0.0` (zero effective runoff) rather than NoData, preventing downstream
+/// `InundationForcing::runoff_coeff` consumers (which default NoData cells to `C = 1.0`)
+/// from inadvertently attributing full runoff to masked areas.
+///
 /// Validates grid alignment between `base_runoff_coeff` and `rainfall_grid_mm`, requires
 /// `reference_precip_mm` to be finite and `> 0.0`, and validates that all non-NoData cells
-/// in `rainfall_grid_mm` are finite and `>= 0.0`. To avoid clipping when passing the output
-/// into `InundationForcing::runoff_coeff` (which clamps to `[0.0, 1.0]`), normalize with
-/// `reference_precip_mm >= max(rainfall_grid_mm)` and pair with a hyetograph scaled to
-/// `reference_precip_mm`.
+/// in `rainfall_grid_mm` and `base_runoff_coeff` are finite and `>= 0.0`. To avoid clipping
+/// when passing the output into `InundationForcing::runoff_coeff` (which clamps to
+/// `[0.0, 1.0]`), normalize with `reference_precip_mm >= max(rainfall_grid_mm)` and pair
+/// with a hyetograph scaled to `reference_precip_mm`.
 pub fn scale_forcing_by_rainfall_grid(
     base_runoff_coeff: Option<&Array2D<f64>>,
     rainfall_grid_mm: &Array2D<f64>,
@@ -1968,7 +1973,7 @@ pub fn scale_forcing_by_rainfall_grid(
     let mut out_data = Vec::with_capacity(p_data.len());
     for (idx, &p) in p_data.iter().enumerate() {
         if p.rd_eq(p_nd) {
-            out_data.push(OUT_NODATA);
+            out_data.push(0.0);
             continue;
         }
         if !p.is_finite() || p < 0.0 {
@@ -1980,7 +1985,7 @@ pub fn scale_forcing_by_rainfall_grid(
             Some((bdata, bnd)) => {
                 let bv = bdata[idx];
                 if bv.rd_eq(bnd) {
-                    out_data.push(OUT_NODATA);
+                    out_data.push(0.0);
                     continue;
                 }
                 if !bv.is_finite() || bv < 0.0 {

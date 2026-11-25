@@ -507,6 +507,17 @@ fn spatial_rainfall_grid_scaling_composes_with_static_and_fsm() {
     assert!((scaled_hi.get(10, 10) - 0.8).abs() < 1e-12);
     assert!((scaled_lo.get(10, 10) - 0.4).abs() < 1e-12);
 
+    // Masked NoData cells in either rainfall_grid_mm or base_runoff_coeff map to 0.0 effective runoff.
+    let mut masked_rain = rain_hi.clone();
+    masked_rain.set(0, 0, -9999.0);
+    let mut masked_rc = base_rc.clone();
+    masked_rc.set(1, 0, -9999.0);
+    let scaled_masked =
+        scale_forcing_by_rainfall_grid(Some(&masked_rc), &masked_rain, 100.0).unwrap();
+    assert_eq!(scaled_masked.get(0, 0), 0.0);
+    assert_eq!(scaled_masked.get(1, 0), 0.0);
+    assert!((scaled_masked.get(10, 10) - 0.8).abs() < 1e-12);
+
     // Negative rainfall and non-positive reference precip rejected
     let rain_neg = make_dem(w, h, vec![-1.0; w * h], -9999.0, dem.geotransform);
     assert!(scale_forcing_by_rainfall_grid(None, &rain_neg, 100.0).is_err());

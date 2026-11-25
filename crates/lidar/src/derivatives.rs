@@ -1094,9 +1094,10 @@ fn euclidean_distance_2d(seeds: &[bool], w: usize, h: usize) -> Vec<f64> {
 ///
 /// Accepts any polyline vector format supported by `terrio` (`.gpkg`, `.shp`, `.geojson`,
 /// etc.) in the same CRS as `dem`. When `dem.projection` is non-empty it must parse as a
-/// recognized CRS and match every stream layer's CRS; if `dem.projection` is empty (no CRS
-/// metadata), stream coordinates are assumed to already be aligned with the DEM's coordinate
-/// system. Returns `(conditioned_dem, modified_cell_count)`.
+/// recognized CRS, and CRS equivalence is verified whenever both the DEM and the stream
+/// layer carry CRS metadata. Stream layers without CRS metadata (for example, a `.shp`
+/// missing `.prj`) or DEMs with an empty `projection` are assumed to already share the same
+/// coordinate system. Returns `(conditioned_dem, modified_cell_count)`.
 pub fn burn_streams(
     dem: &Array2D<f64>,
     streams_path: impl AsRef<Path>,
@@ -1223,9 +1224,10 @@ pub fn burn_streams(
 
 /// File-based wrapper around [`burn_streams`] with input/output path collision checks.
 ///
-/// Inherits [`burn_streams`] CRS validation: non-empty DEM CRS metadata must parse and match
-/// the stream vector CRS, while an empty DEM `projection` assumes stream coordinates are
-/// already aligned with the DEM coordinate system.
+/// Inherits [`burn_streams`] CRS validation: non-empty DEM CRS metadata must parse as a
+/// recognized CRS, CRS equivalence is verified whenever both the DEM and the stream layer
+/// carry CRS metadata, and layers or DEMs lacking CRS metadata (such as a `.shp` without a
+/// `.prj`) are assumed to already share the same coordinate system.
 pub fn burn_streams_file(
     in_dem: impl AsRef<Path>,
     streams_path: impl AsRef<Path>,
