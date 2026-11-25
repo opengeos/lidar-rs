@@ -488,7 +488,7 @@ def array_to_xarray(
         )
         x2d = gt[0] + col_grid * gt[1] + row_grid * gt[2]
         y2d = gt[3] + col_grid * gt[4] + row_grid * gt[5]
-        coords = {"y": (("y", "x"), y2d), "x": (("y", "x"), x2d)}
+        coords = {"yc": (("y", "x"), y2d), "xc": (("y", "x"), x2d)}
 
     if data.ndim == 3:
         coords["band"] = np.arange(data.shape[2], dtype=np.int64)

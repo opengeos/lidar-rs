@@ -1496,6 +1496,16 @@ def build_connectivity_graph(
             resolved_crs,
         )
 
+    if (
+        fill_time is not None
+        or catchment_records is not None
+        or spill_paths is not None
+    ):
+        raise ValueError(
+            "fill_time, catchment_records, and spill_paths apply only when "
+            "dem_or_depressions is a delineation dict, not a DEM array"
+        )
+
     arr, gt, resolved_crs, nd = extract_spatial_array(
         dem_or_depressions, geotransform=geotransform, crs=crs, no_data=no_data
     )

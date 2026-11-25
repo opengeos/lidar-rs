@@ -442,6 +442,17 @@ def test_output_adapters_import_errors_and_conversion(monkeypatch: pytest.Monkey
         assert sinks_rt["geotransform"] == pytest.approx(gt)
         assert sinks_rt["crs"] == "EPSG:32615"
 
+        # Rotated geotransform uses 2D non-dimension coords ("yc", "xc") to avoid colliding with ("y", "x")
+        rot_gt = (500_000.0, 2.0, 0.5, 4_000_060.0, -0.5, -2.0)
+        da_rot = lidar_rs.array_to_xarray(dem, rot_gt, crs="EPSG:32615")
+        assert da_rot.dims == ("y", "x")
+        assert "yc" in da_rot.coords and "xc" in da_rot.coords
+        assert "y" not in da_rot.coords and "x" not in da_rot.coords
+        assert da_rot.coords["xc"][0] == ("y", "x")
+        assert da_rot.coords["xc"][1].shape == dem.shape
+        assert da_rot.coords["xc"][1][0, 0] == pytest.approx(500_000.0 + 0.5 * 2.0 + 0.5 * 0.5)
+        assert da_rot.coords["yc"][1][0, 0] == pytest.approx(4_000_060.0 + 0.5 * (-0.5) + 0.5 * (-2.0))
+
 
 # ---------------------------------------------------------------------------
 # 3. Rust-to-Python API parity functions
@@ -501,6 +512,14 @@ def test_compute_rating_curves_and_build_connectivity_graph():
     # Connectivity graph from precomputed delineation dict
     graph_parts = lidar_rs.build_connectivity_graph(deps, rain_intensity_cm_h=5.0)
     assert len(graph_parts["nodes"]) == len(deps["depressions"])
+
+    # Parts-only arguments rejected cleanly when passing a DEM array
+    with pytest.raises(ValueError, match="delineation dict"):
+        lidar_rs.build_connectivity_graph(dem_arr, fill_time=np.zeros_like(dem_arr))
+    with pytest.raises(ValueError, match="delineation dict"):
+        lidar_rs.build_connectivity_graph(dem_arr, catchment_records=[])
+    with pytest.raises(ValueError, match="delineation dict"):
+        lidar_rs.build_connectivity_graph(dem_arr, spill_paths=[])
 
 
 def test_delineate_mounts_array_and_compute_hillshade():
