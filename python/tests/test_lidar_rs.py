@@ -610,12 +610,28 @@ def test_raster_and_vector_operations_extended(tmp_path: Path):
     lidar_rs.clip_image(dem, poly_gj, clipped_out)
     assert clipped_out.exists()
 
-    # burn_culverts using a LineString spanning the first polygon's bounding box
-    gj_data = json.loads(poly_gj.read_text())
-    ring = gj_data["features"][0]["geometry"]["coordinates"][0]
-    xs = [pt[0] for pt in ring]
-    ys = [pt[1] for pt in ring]
-    mid_y = 0.5 * (min(ys) + max(ys))
+    # burn_culverts across a synthetic 15 m ridge separating two 10 m flats
+    ridge_asc = tmp_path / "ridge_dem.asc"
+    ridge_rows = []
+    for _ in range(10):
+        row = ["15.0" if 9 <= c <= 10 else "10.0" for c in range(20)]
+        ridge_rows.append(" ".join(row))
+    ridge_asc.write_text(
+        "\n".join(
+            [
+                "ncols 20",
+                "nrows 10",
+                "xllcorner 500000.0",
+                "yllcorner 4000000.0",
+                "cellsize 1.0",
+                "NODATA_value -9999.0",
+                *ridge_rows,
+            ]
+        )
+        + "\n"
+    )
+    ridge_tif = tmp_path / "ridge_dem.tif"
+    lidar_rs.MeanFilter(ridge_asc, kernel_size=1, out_file=ridge_tif)
     culvert_gj = tmp_path / "culvert.geojson"
     culvert_doc = {
         "type": "FeatureCollection",
@@ -625,17 +641,17 @@ def test_raster_and_vector_operations_extended(tmp_path: Path):
                 "properties": {"id": 1},
                 "geometry": {
                     "type": "LineString",
-                    "coordinates": [[min(xs), mid_y], [max(xs), mid_y]],
+                    "coordinates": [[500004.5, 4000005.5], [500015.5, 4000005.5]],
                 },
             }
         ],
     }
-    if "crs" in gj_data:
-        culvert_doc["crs"] = gj_data["crs"]
     culvert_gj.write_text(json.dumps(culvert_doc))
     burned_out = tmp_path / "dem_burned.tif"
-    carved = lidar_rs.burn_culverts(dem, culvert_gj, burned_out)
-    assert carved >= 1 and burned_out.exists()
+    carved = lidar_rs.burn_culverts(ridge_tif, culvert_gj, burned_out)
+    assert carved >= 2 and burned_out.exists()
+    burned_arr = lidar_rs.MeanFilter(burned_out, kernel_size=1)
+    assert burned_arr[4, 9] <= 10.0 + 1e-6 and burned_arr[4, 10] <= 10.0 + 1e-6
 
 
 def test_breach_depressions_file_and_validation(tmp_path: Path):

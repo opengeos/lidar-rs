@@ -227,6 +227,18 @@ pub fn convert_lidar(
     let src_str = path_to_str(src_path)?;
     let dst_str = path_to_str(dst_path)?;
 
+    // Read only the source header (O(1) memory) before converting so we neither re-decode
+    // destination formats like PLY nor mask destination write/open failures. Since
+    // `convert_lidar` applies no filtering or thinning, the converted count equals the source count.
+    let count = terrio::pointcloud::open_points(src_str)?
+        .header()
+        .point_count;
+    let count = usize::try_from(count).map_err(|_| {
+        Error::Algorithm(format!(
+            "converted point count {count} exceeds platform usize"
+        ))
+    })?;
+
     let opts = terrio::pointcloud::ConvertOptions {
         write: PointWriteOptions {
             point_format: point_format_id,
@@ -236,17 +248,7 @@ pub fn convert_lidar(
         ..Default::default()
     };
     terrio::pointcloud::convert(src_str, dst_str, &opts)?;
-
-    // Read only the file header (O(1) memory) to obtain the exact converted point count.
-    let count = terrio::pointcloud::open_points(dst_str)
-        .or_else(|_| terrio::pointcloud::open_points(src_str))?
-        .header()
-        .point_count;
-    usize::try_from(count).map_err(|_| {
-        Error::Algorithm(format!(
-            "converted point count {count} exceeds platform usize"
-        ))
-    })
+    Ok(count)
 }
 
 /// Classifies ground points in a [`PointCloud`] using either Cloth Simulation Filter (CSF)
@@ -366,7 +368,7 @@ pub fn lidar_to_dsm(
         returns: options.return_kinds.clone().unwrap_or_default(),
     };
 
-    let grid_opts = GridOptions {
+    let mut grid_opts = GridOptions {
         resolution: options.resolution,
         method: options.method,
         stats: vec![options.stat],
@@ -391,15 +393,35 @@ pub fn lidar_to_dsm(
             filter,
             ..Default::default()
         };
-        match terrio::pointcloud::grid::grid_reader(&mut reader, &read_opts, &grid_opts, None) {
-            Ok(ds) => ds,
-            Err(terrio::Error::InvalidArgument(msg)) if msg == "no points to grid" => {
+        // When filtering is active (or format bounds require scanning), compute filtered bounds
+        // in one streaming pass up front so an empty filtered cloud returns our typed error
+        // without string-matching `terrio`'s error message and `grid_reader` runs a single pass.
+        let needs_bounds_scan =
+            !read_opts.filter.is_empty() || !matches!(reader.format_name(), "LAS" | "LAZ" | "COPC");
+        if needs_bounds_scan {
+            let mut bounds: Option<[f64; 4]> = None;
+            reader.start_chunks(&read_opts, 0)?;
+            while let Some(chunk) = reader.next_chunk()? {
+                if let Some(c) = chunk.bounds() {
+                    bounds = Some(match bounds {
+                        None => [c[0], c[1], c[3], c[4]],
+                        Some(a) => [
+                            a[0].min(c[0]),
+                            a[1].min(c[1]),
+                            a[2].max(c[3]),
+                            a[3].max(c[4]),
+                        ],
+                    });
+                }
+            }
+            let Some(b) = bounds else {
                 return Err(Error::Algorithm(
                     "no points remain after classification / return / elevation filtering".into(),
                 ));
-            }
-            Err(e) => return Err(e.into()),
+            };
+            grid_opts.bounds = Some(b);
         }
+        terrio::pointcloud::grid::grid_reader(&mut reader, &read_opts, &grid_opts, None)?
     } else {
         let cloud = if filter.is_empty() {
             read_lidar(in_lidar)?
@@ -746,7 +768,8 @@ mod tests {
             assert!((a - b).abs() < 1e-12, "DSM mismatch: {a} vs {b}");
         }
 
-        // Filtered streaming DSM (class 2, z range).
+        // Filtered streaming DSM (class 2, z range): verify exact extent and cell values match
+        // in-memory gridding on the same filtered point cloud.
         let opts_filt = LidarToDsmOptions {
             resolution: 1.0,
             min_z: Some(100.0),
@@ -756,7 +779,39 @@ mod tests {
             ..Default::default()
         };
         let (fc, fr) = lidar_to_dsm(&laz_path, &dsm_filtered, &opts_filt).unwrap();
-        assert!(fc > 0 && fr > 0);
+        let filt_arr = richdem::load_raster::<f64>(&dsm_filtered, None).unwrap();
+        let filt_cloud = read_lidar_filtered(
+            &laz_path,
+            PointFilter {
+                bounds: None,
+                z_range: Some((100.0, 104.0)),
+                classes: vec![2],
+                returns: vec![ReturnKind::Only],
+            },
+        )
+        .unwrap();
+        let filt_ref_ds = terrio::pointcloud::grid::grid(
+            &filt_cloud,
+            &GridOptions {
+                resolution: opts_filt.resolution,
+                method: opts_filt.method,
+                stats: vec![opts_filt.stat],
+                dimension: "z".to_string(),
+                radius: opts_filt.radius,
+                window_size: opts_filt.window_size,
+                nodata: opts_filt.nodata,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let filt_ref_arr = richdem::dataset_to_dynamic(filt_ref_ds, "filt_ref")
+            .unwrap()
+            .to_f64();
+        assert_eq!((fc, fr), (filt_ref_arr.width(), filt_ref_arr.height()));
+        assert_eq!(filt_arr.geotransform, filt_ref_arr.geotransform);
+        for (a, b) in filt_arr.data().iter().zip(filt_ref_arr.data().iter()) {
+            assert!((a - b).abs() < 1e-12, "filtered DSM mismatch: {a} vs {b}");
+        }
 
         // Empty filter result still returns an error.
         let opts_empty = LidarToDsmOptions {

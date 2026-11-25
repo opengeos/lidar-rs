@@ -36,7 +36,7 @@ fn is_missing_val(no_data: f64, val: f64) -> bool {
 
 #[inline]
 fn sort2(a: &mut f64, b: &mut f64) {
-    if *a > *b {
+    if a.total_cmp(b).is_gt() {
         std::mem::swap(a, b);
     }
 }
@@ -141,11 +141,51 @@ fn validate_kernel_size(kernel_size: usize) -> Result<()> {
     Ok(())
 }
 
+/// Output rows processed per horizontal scratch band in [`mean_filter`], bounding scratch
+/// memory to `O(min(H, MEAN_BAND_ROWS + k - 1) * W)` rather than `O(H * W)`.
+const MEAN_BAND_ROWS: usize = 256;
+
+/// Overflow-safe cold fallback for [`mean_filter`] when horizontal partial sums overflow
+/// `f64::MAX` on extreme finite inputs (e.g. `+/-1e308`).
+#[cold]
+#[allow(clippy::too_many_arguments)]
+fn mean_2d_scaled(
+    src: &[f64],
+    w: usize,
+    h: usize,
+    x: usize,
+    y: usize,
+    r_neg: isize,
+    r_pos: isize,
+    no_data: f64,
+    cnt: u32,
+    center: f64,
+) -> f64 {
+    if cnt == 0 {
+        return center;
+    }
+    let inv_cnt = 1.0 / (cnt as f64);
+    let mut scaled_sum = 0.0f64;
+    for dy in -r_neg..=r_pos {
+        let ny = reflect_index(y as isize + dy, h);
+        let row_off = ny * w;
+        for dx in -r_neg..=r_pos {
+            let nx = reflect_index(x as isize + dx, w);
+            let v = src[row_off + nx];
+            if !is_missing_val(no_data, v) {
+                scaled_sum += v * inv_cnt;
+            }
+        }
+    }
+    scaled_sum
+}
+
 /// Applies a `kernel_size × kernel_size` box mean filter to a DEM.
 ///
-/// Uses a separable 2-pass formulation carrying valid sums and valid counts across both
+/// Uses a banded separable 2-pass formulation carrying valid sums and valid counts across both
 /// passes so NoData / non-finite cells are excluded identically to a 2D window while
-/// reducing per-pixel work from `O(k^2)` to `O(2k)`.
+/// reducing per-pixel work from `O(k^2)` to `O(2k)` and bounding scratch memory to
+/// `O(min(H, 256 + k - 1) * W)`.
 ///
 /// Boundary pixels use symmetric reflection (`scipy.ndimage` `mode='reflect'`).
 /// NoData and non-finite cells are preserved untouched and excluded from
@@ -168,11 +208,14 @@ pub fn mean_filter(dem: &Array2D<f64>, kernel_size: usize) -> Result<Array2D<f64
     let interior_start = r_neg_u.min(w);
     let interior_end = w.saturating_sub(r_pos_u).max(interior_start);
 
-    // Pass 1 (horizontal): accumulate (sum, valid_count) for every cell (including missing
-    // cells so valid horizontal neighbors propagate into the vertical pass).
-    let mut horiz = vec![(0.0f64, 0u32); w * h];
-    let h_pass_row = |(y, h_row): (usize, &mut [(f64, u32)])| {
-        let src_row = &src[y * w..(y + 1) * w];
+    // Bounded horizontal scratch reused across bands of output rows.
+    let max_band_src_rows = h.min(MEAN_BAND_ROWS + kernel_size - 1);
+    let mut horiz = vec![(0.0f64, 0u32); max_band_src_rows * w];
+    let mut out = vec![0.0f64; w * h];
+    let mut src_rows: Vec<usize> = Vec::with_capacity(max_band_src_rows);
+
+    let compute_h_row = |src_y: usize, h_row: &mut [(f64, u32)]| {
+        let src_row = &src[src_y * w..(src_y + 1) * w];
         for (x, slot) in h_row.iter_mut().enumerate().take(interior_start) {
             let mut sum = 0.0f64;
             let mut cnt = 0u32;
@@ -219,67 +262,128 @@ pub fn mean_filter(dem: &Array2D<f64>, kernel_size: usize) -> Result<Array2D<f64
         }
     };
 
-    #[cfg(feature = "parallel")]
-    horiz.par_chunks_mut(w).enumerate().for_each(h_pass_row);
-    #[cfg(not(feature = "parallel"))]
-    horiz.chunks_mut(w).enumerate().for_each(h_pass_row);
+    for y_start in (0..h).step_by(MEAN_BAND_ROWS) {
+        let y_end = (y_start + MEAN_BAND_ROWS).min(h);
+        let band_interior = y_start >= r_neg_u && y_end + r_pos_u <= h;
 
-    // Pass 2 (vertical): sum horizontal partials across the vertical window directly into flat output.
-    let mut out = vec![0.0f64; w * h];
-    let v_pass_row = |(y, out_row): (usize, &mut [f64])| {
-        let src_row = &src[y * w..(y + 1) * w];
-        let y_interior = y >= r_neg_u && y + r_pos_u < h;
-        let mut row_offs = [0usize; MAX_KERNEL_SIZE];
-        let offs = &mut row_offs[..kernel_size];
-        if y_interior {
-            let y_base = y - r_neg_u;
-            for (k, slot) in offs.iter_mut().enumerate() {
-                *slot = (y_base + k) * w;
-            }
+        let (src_base, band_src_count) = if band_interior {
+            let base = y_start - r_neg_u;
+            let count = (y_end - y_start) + kernel_size - 1;
+            let horiz_slice = &mut horiz[..count * w];
+            #[cfg(feature = "parallel")]
+            horiz_slice
+                .par_chunks_mut(w)
+                .enumerate()
+                .for_each(|(i, h_row)| compute_h_row(base + i, h_row));
+            #[cfg(not(feature = "parallel"))]
+            horiz_slice
+                .chunks_mut(w)
+                .enumerate()
+                .for_each(|(i, h_row)| compute_h_row(base + i, h_row));
+            (Some(base), count)
         } else {
-            for (k, slot) in offs.iter_mut().enumerate() {
-                let dy = k as isize - r_neg;
-                *slot = reflect_index(y as isize + dy, h) * w;
+            src_rows.clear();
+            for y in y_start..y_end {
+                for dy in -r_neg..=r_pos {
+                    src_rows.push(reflect_index(y as isize + dy, h));
+                }
             }
-        }
+            src_rows.sort_unstable();
+            src_rows.dedup();
+            let count = src_rows.len();
+            let horiz_slice = &mut horiz[..count * w];
+            let src_rows_ref = &src_rows;
+            #[cfg(feature = "parallel")]
+            horiz_slice
+                .par_chunks_mut(w)
+                .enumerate()
+                .for_each(|(i, h_row)| compute_h_row(src_rows_ref[i], h_row));
+            #[cfg(not(feature = "parallel"))]
+            horiz_slice
+                .chunks_mut(w)
+                .enumerate()
+                .for_each(|(i, h_row)| compute_h_row(src_rows_ref[i], h_row));
+            (None, count)
+        };
 
-        if kernel_size == 3 {
-            let r0 = &horiz[offs[0]..offs[0] + w];
-            let r1 = &horiz[offs[1]..offs[1] + w];
-            let r2 = &horiz[offs[2]..offs[2] + w];
-            for x in 0..w {
-                let center = src_row[x];
-                if is_missing_val(no_data, center) {
-                    out_row[x] = center;
-                    continue;
+        let horiz_band = &horiz[..band_src_count * w];
+        let src_rows_ref = &src_rows;
+        let v_pass_row = |(local_y, out_row): (usize, &mut [f64])| {
+            let y = y_start + local_y;
+            let src_row = &src[y * w..(y + 1) * w];
+            let mut row_offs = [0usize; MAX_KERNEL_SIZE];
+            let offs = &mut row_offs[..kernel_size];
+            if let Some(base) = src_base {
+                let y_base = y - r_neg_u - base;
+                for (k, slot) in offs.iter_mut().enumerate() {
+                    *slot = (y_base + k) * w;
                 }
-                let sum = r0[x].0 + r1[x].0 + r2[x].0;
-                let cnt = r0[x].1 + r1[x].1 + r2[x].1;
-                out_row[x] = if cnt > 0 { sum / cnt as f64 } else { center };
+            } else {
+                for (k, slot) in offs.iter_mut().enumerate() {
+                    let dy = k as isize - r_neg;
+                    let ny = reflect_index(y as isize + dy, h);
+                    let pos = src_rows_ref.binary_search(&ny).unwrap();
+                    *slot = pos * w;
+                }
             }
-        } else {
-            for x in 0..w {
-                let center = src_row[x];
-                if is_missing_val(no_data, center) {
-                    out_row[x] = center;
-                    continue;
-                }
-                let mut sum = 0.0f64;
-                let mut cnt = 0u32;
-                for &ro in offs.iter() {
-                    let (hs, hc) = horiz[ro + x];
-                    sum += hs;
-                    cnt += hc;
-                }
-                out_row[x] = if cnt > 0 { sum / cnt as f64 } else { center };
-            }
-        }
-    };
 
-    #[cfg(feature = "parallel")]
-    out.par_chunks_mut(w).enumerate().for_each(v_pass_row);
-    #[cfg(not(feature = "parallel"))]
-    out.chunks_mut(w).enumerate().for_each(v_pass_row);
+            if kernel_size == 3 {
+                let r0 = &horiz_band[offs[0]..offs[0] + w];
+                let r1 = &horiz_band[offs[1]..offs[1] + w];
+                let r2 = &horiz_band[offs[2]..offs[2] + w];
+                for x in 0..w {
+                    let center = src_row[x];
+                    if is_missing_val(no_data, center) {
+                        out_row[x] = center;
+                        continue;
+                    }
+                    let sum = r0[x].0 + r1[x].0 + r2[x].0;
+                    let cnt = r0[x].1 + r1[x].1 + r2[x].1;
+                    out_row[x] = if cnt > 0 {
+                        let avg = sum / cnt as f64;
+                        if avg.is_finite() {
+                            avg
+                        } else {
+                            mean_2d_scaled(src, w, h, x, y, r_neg, r_pos, no_data, cnt, center)
+                        }
+                    } else {
+                        center
+                    };
+                }
+            } else {
+                for x in 0..w {
+                    let center = src_row[x];
+                    if is_missing_val(no_data, center) {
+                        out_row[x] = center;
+                        continue;
+                    }
+                    let mut sum = 0.0f64;
+                    let mut cnt = 0u32;
+                    for &ro in offs.iter() {
+                        let (hs, hc) = horiz_band[ro + x];
+                        sum += hs;
+                        cnt += hc;
+                    }
+                    out_row[x] = if cnt > 0 {
+                        let avg = sum / cnt as f64;
+                        if avg.is_finite() {
+                            avg
+                        } else {
+                            mean_2d_scaled(src, w, h, x, y, r_neg, r_pos, no_data, cnt, center)
+                        }
+                    } else {
+                        center
+                    };
+                }
+            }
+        };
+
+        let out_band = &mut out[y_start * w..y_end * w];
+        #[cfg(feature = "parallel")]
+        out_band.par_chunks_mut(w).enumerate().for_each(v_pass_row);
+        #[cfg(not(feature = "parallel"))]
+        out_band.chunks_mut(w).enumerate().for_each(v_pass_row);
+    }
 
     make_output_template(dem, out)
 }
@@ -953,19 +1057,82 @@ mod tests {
                 }
             }
 
-            // Gaussian filter sanity with interior and border reflection.
+            // Compare Gaussian filter against direct 2D normalized convolution reference.
             for sigma in [0.5, 1.0, 2.5] {
                 let g = gaussian_filter(&dem, sigma).unwrap();
-                for (orig, out) in dem.data().iter().zip(g.data().iter()) {
-                    if orig.is_nan() {
-                        assert!(out.is_nan());
-                    } else if *orig == -9999.0 {
-                        assert_eq!(*out, -9999.0);
-                    } else {
-                        assert!(out.is_finite());
+                let k1d = gaussian_kernel_1d(sigma, 4.0).unwrap();
+                let rad = (k1d.len() / 2) as isize;
+                let nd = dem.no_data();
+                let src_data = dem.data();
+                for y in 0..h {
+                    for x in 0..w {
+                        let orig = src_data[y * w + x];
+                        let out_v = g.data()[y * w + x];
+                        if orig.is_nan() {
+                            assert!(out_v.is_nan());
+                        } else if orig == -9999.0 {
+                            assert_eq!(out_v, -9999.0);
+                        } else {
+                            let mut num = 0.0f64;
+                            let mut den = 0.0f64;
+                            for (ky, &wy) in k1d.iter().enumerate() {
+                                let ny = reflect_index(y as isize + (ky as isize - rad), h);
+                                for (kx, &wx) in k1d.iter().enumerate() {
+                                    let nx = reflect_index(x as isize + (kx as isize - rad), w);
+                                    let v = src_data[ny * w + nx];
+                                    if !is_missing_val(nd, v) {
+                                        let w2 = wy * wx;
+                                        num += v * w2;
+                                        den += w2;
+                                    }
+                                }
+                            }
+                            let expected = if den > 0.0 { num / den } else { orig };
+                            assert!(
+                                (out_v - expected).abs() < 1e-12,
+                                "gaussian mismatch ({w}x{h}, sigma={sigma}) at ({x},{y}): got {out_v}, expected {expected}"
+                            );
+                        }
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn median9_matches_signed_zero_ordering_of_fallback_path() {
+        // 5 entries of -0.0 and 4 entries of +0.0 -> median is -0.0 under total_cmp.
+        let vals_neg = [-0.0, -0.0, -0.0, -0.0, -0.0, 0.0, 0.0, 0.0, 0.0];
+        let mut fallback_neg = vals_neg;
+        assert_eq!(
+            median9(vals_neg).to_bits(),
+            median_small_slice(&mut fallback_neg).to_bits()
+        );
+        assert_eq!(median9(vals_neg).to_bits(), (-0.0f64).to_bits());
+
+        // 3x3 grid with -0.0 at center and +0.0 elsewhere -> median is +0.0 under total_cmp.
+        let mut dem = Array2D::from_vec(3, 3, vec![0.0f64; 9]).unwrap();
+        dem.set_no_data(-9999.0);
+        dem.set(1, 1, -0.0);
+        let med = median_filter(&dem, 3).unwrap();
+        assert_eq!(med.get(1, 1).to_bits(), 0.0f64.to_bits());
+    }
+
+    #[test]
+    fn mean_filter_keeps_finite_result_when_horizontal_partial_overflows() {
+        #[rustfmt::skip]
+        let data = vec![
+            -1e308, 0.0,    0.0,
+             1e308, 1e308,  0.0,
+            -1e308, 0.0,    0.0,
+        ];
+        let mut dem = Array2D::from_vec(3, 3, data).unwrap();
+        dem.set_no_data(-9999.0);
+        let mean = mean_filter(&dem, 3).unwrap();
+        let center = mean.get(1, 1);
+        assert!(
+            center.is_finite() && center.abs() < 1e-12,
+            "expected finite 0.0 mean for balanced extreme values, got {center}"
+        );
     }
 }

@@ -1093,27 +1093,42 @@ fn delineate_spill_flow_paths_impl(
     };
 
     #[cfg(feature = "parallel")]
-    let mut raw_paths: Vec<SpillFlowPath> = if ordered_deps.len() >= 4 {
-        let pool = std::sync::Mutex::new(Vec::<OutletSearchScratch>::new());
-        ordered_deps
-            .par_iter()
-            .filter_map(|&dep| {
-                let mut scratch = pool
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .pop()
-                    .unwrap_or_else(|| OutletSearchScratch::new(n));
-                let res = search_one(dep, &mut scratch);
-                pool.lock().unwrap_or_else(|e| e.into_inner()).push(scratch);
-                res
-            })
-            .collect()
-    } else {
-        let mut scratch = OutletSearchScratch::new(n);
-        ordered_deps
-            .iter()
-            .filter_map(|&dep| search_one(dep, &mut scratch))
-            .collect()
+    let mut raw_paths: Vec<SpillFlowPath> = {
+        // Cap concurrent O(N) Priority-Flood scratch buffers (~25 bytes/cell on 64-bit) to a
+        // fixed memory budget (256 MiB) so large DEMs never OOM from per-thread allocations.
+        const MAX_SPILL_SCRATCH_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+        let per_scratch_bytes = n
+            .saturating_mul(
+                std::mem::size_of::<bool>()
+                    + 4 * std::mem::size_of::<u32>()
+                    + std::mem::size_of::<usize>(),
+            )
+            .max(1);
+        let max_workers = (MAX_SPILL_SCRATCH_BUDGET_BYTES / per_scratch_bytes)
+            .clamp(1, rayon::current_num_threads().min(ordered_deps.len()));
+
+        if max_workers <= 1 || ordered_deps.len() < 4 {
+            let mut scratch = OutletSearchScratch::new(n);
+            ordered_deps
+                .iter()
+                .filter_map(|&dep| search_one(dep, &mut scratch))
+                .collect()
+        } else {
+            let chunk_size = ordered_deps.len().div_ceil(max_workers);
+            ordered_deps
+                .par_chunks(chunk_size)
+                .flat_map_iter(|chunk| {
+                    let mut scratch = OutletSearchScratch::new(n);
+                    let mut local = Vec::with_capacity(chunk.len());
+                    for &dep in chunk {
+                        if let Some(p) = search_one(dep, &mut scratch) {
+                            local.push(p);
+                        }
+                    }
+                    local
+                })
+                .collect()
+        }
     };
     #[cfg(not(feature = "parallel"))]
     let mut raw_paths: Vec<SpillFlowPath> = {

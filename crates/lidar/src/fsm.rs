@@ -263,6 +263,9 @@ struct BasinNode {
     storm_end_merged: bool,
     /// Snapshot of routed contributing area at `t = storm_duration_h`.
     storm_end_routed_cat_m2: f64,
+    /// True when one or more merged zero-capacity descendant basins still hold unmarked cells
+    /// waiting for this parent to gain positive stored volume.
+    has_unmarked_merged_children: bool,
 }
 
 /// Reusable grid-sized scratch buffers (~25 bytes per cell) for outward Priority-Flood outlet
@@ -1455,6 +1458,7 @@ fn simulate_fill_spill_merge_impl(
             storm_end_vol_m3: owned_ant_vol,
             storm_end_merged: false,
             storm_end_routed_cat_m2: local_cat_area[d.id as usize],
+            has_unmarked_merged_children: false,
         };
 
         if is_leaf {
@@ -1527,6 +1531,44 @@ fn simulate_fill_spill_merge_impl(
     let mut target_idx_buf = vec![usize::MAX; m];
     let mut topo_queue: VecDeque<usize> = VecDeque::with_capacity(m.min(256));
 
+    fn flush_unmarked_descendants(
+        root_idx: usize,
+        basins: &mut [BasinNode],
+        id_to_idx: &[usize],
+        t_mark: f64,
+        fill_time_data: &mut [f64],
+    ) {
+        let mut stack: Vec<usize> = basins[root_idx]
+            .children_ids
+            .iter()
+            .filter_map(|&cid| {
+                let ci = id_to_idx.get(cid as usize).copied().unwrap_or(usize::MAX);
+                (ci != usize::MAX).then_some(ci)
+            })
+            .collect();
+        basins[root_idx].has_unmarked_merged_children = false;
+        while let Some(cidx) = stack.pop() {
+            if basins[cidx].hypso_cursor < basins[cidx].hypso_cells.len() {
+                for cell in &basins[cidx].hypso_cells[basins[cidx].hypso_cursor..] {
+                    let slot = &mut fill_time_data[cell.grid_idx];
+                    if *slot < 0.0 || t_mark < *slot {
+                        *slot = t_mark;
+                    }
+                }
+                basins[cidx].hypso_cursor = basins[cidx].hypso_cells.len();
+            }
+            if basins[cidx].has_unmarked_merged_children {
+                basins[cidx].has_unmarked_merged_children = false;
+                for &gcid in &basins[cidx].children_ids {
+                    let gidx = id_to_idx.get(gcid as usize).copied().unwrap_or(usize::MAX);
+                    if gidx != usize::MAX {
+                        stack.push(gidx);
+                    }
+                }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn resolve_merges_and_cycles(
         basins: &mut [BasinNode],
@@ -1582,22 +1624,19 @@ fn simulate_fill_spill_merge_impl(
                         target_idx_buf[cidx] = usize::MAX;
                     }
                 }
-                // Flush any un-marked cells of degenerate 0-capacity flat children when the
-                // merged parent has positive volume.
-                if merged_vol > 0.0 {
-                    for &cid in &child_ids {
-                        let cidx = id_to_idx.get(cid as usize).copied().unwrap_or(usize::MAX);
-                        if cidx != usize::MAX
-                            && basins[cidx].hypso_cursor < basins[cidx].hypso_cells.len()
-                        {
-                            for cell in &basins[cidx].hypso_cells[basins[cidx].hypso_cursor..] {
-                                let slot = &mut fill_time_data[cell.grid_idx];
-                                if *slot < 0.0 || t_now < *slot {
-                                    *slot = t_now;
-                                }
-                            }
-                            basins[cidx].hypso_cursor = basins[cidx].hypso_cells.len();
-                        }
+                // Track or immediately flush any un-marked cells of degenerate 0-capacity flat
+                // children so they receive exact inundation timestamps once the parent holds water.
+                let any_unmarked_child = child_ids.iter().any(|&cid| {
+                    let cidx = id_to_idx.get(cid as usize).copied().unwrap_or(usize::MAX);
+                    cidx != usize::MAX
+                        && (basins[cidx].hypso_cursor < basins[cidx].hypso_cells.len()
+                            || basins[cidx].has_unmarked_merged_children)
+                });
+                if any_unmarked_child {
+                    if merged_vol > 0.0 {
+                        flush_unmarked_descendants(idx, basins, id_to_idx, t_now, fill_time_data);
+                    } else {
+                        basins[idx].has_unmarked_merged_children = true;
                     }
                 }
                 let p = &mut basins[idx];
@@ -1876,6 +1915,15 @@ fn simulate_fill_spill_merge_impl(
                         }
 
                         if q_net > 1e-15 {
+                            if basins[i].has_unmarked_merged_children && vol_new > 0.0 {
+                                flush_unmarked_descendants(
+                                    i,
+                                    &mut basins,
+                                    &id_to_idx,
+                                    t_start,
+                                    &mut fill_time_data,
+                                );
+                            }
                             mark_newly_inundated_cells(
                                 &mut basins[i],
                                 t_start,
@@ -3238,5 +3286,132 @@ mod tests {
             pocket_ft >= 0.0 && rim_ft >= pocket_ft,
             "pocket fill_time ({pocket_ft}) should be finite and <= rim fill_time ({rim_ft})"
         );
+    }
+
+    #[test]
+    fn fsm_zero_capacity_flat_child_marks_cells_when_parent_gains_water() {
+        // Compound parent (id=1, rim=12.0) enclosing two completely flat zero-capacity children
+        // (id=2 and id=3, both flat at z=10.0, max_elev=10.0) with no antecedent water.
+        // At t=0 both children are FullSpilling with stored_vol=0 and merge into parent with
+        // merged_vol=0; once rain begins filling parent, every flat child cell must receive a
+        // finite fill_time >= 0.0 rather than remaining -1.0.
+        let (w, h) = (8usize, 6usize);
+        let mut z = vec![20.0f64; w * h];
+        let mut sink_data = vec![0.0f64; w * h];
+        let mut dep_id = vec![0i32; w * h];
+        let mut dep_lvl = vec![0i32; w * h];
+
+        for r in 1..5 {
+            for c in 1..7 {
+                let idx = r * w + c;
+                dep_id[idx] = 1;
+                dep_lvl[idx] = 2;
+                z[idx] = 12.0;
+                sink_data[idx] = 12.0;
+            }
+        }
+        let child2_cells = [2 * w + 2, 2 * w + 3];
+        let child3_cells = [3 * w + 4, 3 * w + 5];
+        for &idx in &child2_cells {
+            dep_id[idx] = 2;
+            dep_lvl[idx] = 1;
+            z[idx] = 10.0;
+            sink_data[idx] = 10.0;
+        }
+        for &idx in &child3_cells {
+            dep_id[idx] = 3;
+            dep_lvl[idx] = 1;
+            z[idx] = 10.0;
+            sink_data[idx] = 10.0;
+        }
+
+        let mut dem = Array2D::from_vec(w, h, z).unwrap();
+        dem.set_no_data(-9999.0);
+        dem.geotransform = [0.0, 1.0, 0.0, h as f64, 0.0, -1.0];
+
+        let mut sink = Array2D::from_vec(w, h, sink_data).unwrap();
+        sink.set_no_data(0.0);
+        sink.geotransform = dem.geotransform;
+
+        let mut id_arr = Array2D::from_vec(w, h, dep_id).unwrap();
+        id_arr.set_no_data(0);
+        id_arr.geotransform = dem.geotransform;
+
+        let mut lvl_arr = Array2D::from_vec(w, h, dep_lvl).unwrap();
+        lvl_arr.set_no_data(0);
+        lvl_arr.geotransform = dem.geotransform;
+
+        let make_dep = |id: u32,
+                        level: u32,
+                        parent_id: u32,
+                        children_ids: Vec<u32>,
+                        min_elev: f64,
+                        max_elev: f64,
+                        count: usize| NestedDepression {
+            id,
+            level,
+            count,
+            area: count as f64,
+            volume: (max_elev - min_elev) * count as f64,
+            avg_depth: max_elev - min_elev,
+            max_depth: max_elev - min_elev,
+            min_elev,
+            max_elev,
+            children_ids,
+            region_id: 1,
+            perimeter: 6.0,
+            major_axis: 2.0,
+            minor_axis: 1.0,
+            elongatedness: 2.0,
+            eccentricity: 0.5,
+            orientation: 0.0,
+            area_bbox_ratio: 1.0,
+            parent_id,
+            circularity: 1.0,
+            depth_diam_ratio: 0.5,
+            hypsometric_integral: 1.0,
+            rim_slope_deg: 45.0,
+            artifact_flag: false,
+        };
+
+        let deps = InMemoryDepressions {
+            depression_id: id_arr,
+            depression_level: lvl_arr,
+            depressions: vec![
+                make_dep(1, 2, 0, vec![2, 3], 10.0, 12.0, 24),
+                make_dep(2, 1, 1, vec![], 10.0, 10.0, 2),
+                make_dep(3, 1, 1, vec![], 10.0, 10.0, 2),
+            ],
+            max_level: 2,
+            num_regions: 1,
+        };
+
+        let opts = SimulateInundationOptions {
+            min_size: 1,
+            min_depth: 0.0,
+            interval: 0.5,
+            rain_intensity_cm_h: 50.0,
+            rain_duration_h: 5.0,
+            time_step_h: 1.0,
+            compress: false,
+        };
+
+        let res = simulate_fill_spill_merge_in_memory(
+            &dem,
+            &sink,
+            &deps,
+            &opts,
+            &InundationForcing::default(),
+        )
+        .unwrap();
+
+        assert!(res.mass_balance.mass_balance_error_m3.abs() < 1e-9);
+        for &idx in child2_cells.iter().chain(child3_cells.iter()) {
+            let ft = res.fill_time.get_i(idx);
+            assert!(
+                ft >= 0.0 && ft.is_finite(),
+                "zero-capacity flat child cell {idx} must be inundated once parent gains water, got {ft}"
+            );
+        }
     }
 }

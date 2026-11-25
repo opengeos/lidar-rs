@@ -7,7 +7,7 @@
 //! status banner) with zero C/C++ or GDAL dependencies.
 
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use gif::{Encoder, Frame, Repeat};
@@ -824,9 +824,27 @@ pub fn animate_inundation(
         std::fs::create_dir_all(parent)?;
     }
 
-    let file = BufWriter::new(File::create(out_gif)?);
+    // Write the rendered GIF to a unique sibling temporary file and atomically rename into
+    // place only after encoding and flushing succeed, so failures never truncate or corrupt
+    // an existing `out_gif`.
+    let parent_dir = out_gif
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let (tmp_path, tmp_file) = create_sibling_temp_file(parent_dir, ".lidar_gif_", "gif")?;
+    struct TempFileGuard(Option<PathBuf>);
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            if let Some(p) = self.0.take() {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+    let mut guard = TempFileGuard(Some(tmp_path.clone()));
+
+    let mut writer = BufWriter::new(tmp_file);
     let (frame_count, width, height) =
-        render_inundation_gif(&dem, frames.len(), options, &[], file, |src_idx| {
+        render_inundation_gif(&dem, frames.len(), options, &[], &mut writer, |src_idx| {
             let flood = load_raster::<f64>(&frames[src_idx], None)?;
             let fnd = flood.no_data();
             Ok(flood
@@ -835,6 +853,15 @@ pub fn animate_inundation(
                 .map(|&v| v.is_finite() && !v.rd_eq(fnd) && v > 0.0)
                 .collect())
         })?;
+    writer.flush()?;
+    drop(writer);
+
+    #[cfg(windows)]
+    if out_gif.exists() {
+        let _ = std::fs::remove_file(out_gif);
+    }
+    std::fs::rename(&tmp_path, out_gif)?;
+    guard.0 = None;
 
     Ok(AnimateInundationResult {
         gif_path: out_gif.to_path_buf(),
@@ -842,6 +869,90 @@ pub fn animate_inundation(
         width,
         height,
     })
+}
+
+fn create_sibling_temp_file(parent: &Path, prefix: &str, ext: &str) -> Result<(PathBuf, File)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    for _ in 0..1024 {
+        let seq = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!("{prefix}{pid}_{seq}.{ext}"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(f) => return Ok((candidate, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(Error::Io(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "failed to allocate unique temporary file for GIF output",
+    )))
+}
+
+/// Loads a DEM raster for preview rendering, reading a matching GeoTIFF/COG overview via
+/// `terrio::open_raster_lazy` when `allow_overview` is true, `max_dim > 0`, and an overview
+/// exists whose largest dimension is still `>= max_dim` and smaller than native resolution.
+///
+/// When `open_raster_lazy` succeeds but no suitable overview exists, full-resolution band 1
+/// is read directly from the already-opened lazy handle rather than reopening and re-decoding
+/// the raster from disk a second time. Falls back to [`load_raster`] only when
+/// `allow_overview` is false or `open_raster_lazy` cannot open the format (e.g., legacy ESRI
+/// ASCII grids).
+pub fn load_dem_for_preview(
+    path: impl AsRef<Path>,
+    max_dim: usize,
+    allow_overview: bool,
+) -> Result<Array2D<f64>> {
+    let path = path.as_ref();
+    if allow_overview
+        && max_dim > 0
+        && let Some(p_str) = path.to_str()
+        && let Ok(mut lazy) = terrio::open_raster_lazy(p_str)
+    {
+        let native_w = lazy.width();
+        let native_h = lazy.height();
+        let chosen_ov = if native_w.max(native_h) > max_dim {
+            lazy.overviews()
+                .iter()
+                .enumerate()
+                .rfind(|&(_, &(ow, oh))| {
+                    ow > 0 && oh > 0 && ow.max(oh) >= max_dim && (ow < native_w || oh < native_h)
+                })
+                .map(|(idx, &dims)| (idx, dims))
+        } else {
+            None
+        };
+        let ds_res = if let Some((ov_idx, (ow, oh))) = chosen_ov {
+            lazy.read_window(
+                terrio::Window::full(ow, oh),
+                &terrio::WindowOptions {
+                    bands: vec![1],
+                    overview: Some(ov_idx),
+                },
+            )
+        } else if native_w > 0 && native_h > 0 {
+            lazy.read_window(
+                terrio::Window::full(native_w, native_h),
+                &terrio::WindowOptions {
+                    bands: vec![1],
+                    overview: None,
+                },
+            )
+        } else {
+            lazy.read()
+        };
+        if let Ok(ds) = ds_res
+            && let Ok(dyn_arr) = richdem::dataset_to_dynamic(ds, p_str)
+        {
+            return Ok(dyn_arr.to_f64());
+        }
+    }
+    Ok(load_raster::<f64>(path, None)?)
 }
 
 /// Renders an in-memory animated inundation GIF directly from a DEM and a
@@ -1832,5 +1943,56 @@ mod tests {
         )
         .unwrap();
         assert_ne!(depth_default, depth_water);
+    }
+
+    #[test]
+    fn load_dem_for_preview_uses_cog_overview_and_reuses_lazy_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_tif = tmp.path().join("dem_1024.tif");
+        let cog_tif = tmp.path().join("dem_1024_cog.tif");
+
+        let (w, h) = (1024usize, 1024usize);
+        let mut data = Vec::with_capacity(w * h);
+        for r in 0..h {
+            for c in 0..w {
+                let dx = c as f64 - 512.0;
+                let dy = r as f64 - 512.0;
+                data.push(100.0 + 0.02 * (dx * dx + dy * dy).sqrt());
+            }
+        }
+        let mut dem = Array2D::from_vec(w, h, data).unwrap();
+        dem.set_no_data(-9999.0);
+        dem.geotransform = [500_000.0, 1.0, 0.0, 4_001_024.0, 0.0, -1.0];
+        richdem::save_raster(&dem, &src_tif, None, false).unwrap();
+
+        crate::raster_ops::image_to_cog(&src_tif, &cog_tif, None).unwrap();
+
+        let lazy = terrio::open_raster_lazy(cog_tif.to_str().unwrap()).unwrap();
+        assert!(
+            !lazy.overviews().is_empty(),
+            "expected COG overviews for 1024x1024 raster"
+        );
+
+        let ov_arr = load_dem_for_preview(&cog_tif, 256, true).unwrap();
+        assert!(
+            ov_arr.width() < w && ov_arr.height() < h,
+            "expected overview smaller than native 1024x1024, got {}x{}",
+            ov_arr.width(),
+            ov_arr.height()
+        );
+        assert!(
+            ov_arr.width().max(ov_arr.height()) >= 256,
+            "expected overview >= max_dim (256), got {}x{}",
+            ov_arr.width(),
+            ov_arr.height()
+        );
+
+        // Without overviews on src_tif, lazy handle reads full resolution cleanly.
+        let src_arr = load_dem_for_preview(&src_tif, 256, true).unwrap();
+        assert_eq!((src_arr.width(), src_arr.height()), (w, h));
+
+        // When allow_overview is false (e.g. overlay alignment), full resolution is loaded.
+        let full_arr = load_dem_for_preview(&cog_tif, 256, false).unwrap();
+        assert_eq!((full_arr.width(), full_arr.height()), (w, h));
     }
 }
