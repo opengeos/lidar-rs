@@ -1381,20 +1381,38 @@ def _check_aux_grid_alignment(
     aux_crs: str | None,
     dem_gt: Geotransform | None,
     dem_crs: str | None,
+    *,
+    dem_shape: tuple[int, int] | None = None,
+    cell_size: float = 1.0,
 ) -> None:
-    """Validate that an auxiliary spatial input's geotransform and CRS match the DEM when present."""
+    """Validate that an auxiliary spatial input's geotransform and CRS match the DEM."""
+    effective_dem_gt = dem_gt
+    if effective_dem_gt is None and dem_shape is not None:
+        effective_dem_gt = (
+            0.0,
+            float(cell_size),
+            0.0,
+            float(dem_shape[0]) * float(cell_size),
+            0.0,
+            -float(cell_size),
+        )
     if (
         aux_gt is not None
-        and dem_gt is not None
-        and not np.allclose(aux_gt, dem_gt, rtol=0.0, atol=1e-6)
+        and effective_dem_gt is not None
+        and not np.allclose(aux_gt, effective_dem_gt, rtol=0.0, atol=1e-6)
     ):
         raise ValueError(
-            f"{name} geotransform {aux_gt} does not match DEM geotransform {dem_gt}"
+            f"{name} geotransform {aux_gt} does not match DEM geotransform {effective_dem_gt}"
         )
-    if aux_crs is not None and dem_crs is not None and aux_crs.strip() != dem_crs.strip():
-        raise ValueError(
-            f"{name} CRS {aux_crs!r} does not match DEM CRS {dem_crs!r}"
-        )
+    if aux_crs is not None:
+        if dem_crs is None:
+            raise ValueError(
+                f"{name} carries CRS {aux_crs!r} but DEM has no CRS; provide matching crs on DEM"
+            )
+        if aux_crs.strip() != dem_crs.strip():
+            raise ValueError(
+                f"{name} CRS {aux_crs!r} does not match DEM CRS {dem_crs!r}"
+            )
 
 
 def compute_twi(
@@ -1411,15 +1429,15 @@ def compute_twi(
     """Compute the Topographic Wetness Index (`TWI = ln(a / tan(beta))`) from a DEM file or 2D spatial array.
 
     `flow_acc`, if provided, must be a cell-count flow-accumulation grid (not specific
-    catchment area) aligned to `dem`. When `dem` is a file path and `out_file` is provided,
-    writes the TWI GeoTIFF and returns `str(out_file)`. Otherwise returns a 2D `float64`
-    NumPy array.
+    catchment area) aligned to `dem`. `cell_size`, `geotransform`, and `crs` apply only to
+    array inputs. When `dem` is a file path and `out_file` is provided, writes the TWI
+    GeoTIFF and returns `str(out_file)`. Otherwise returns a 2D `float64` NumPy array.
     """
     if isinstance(dem, (str, os.PathLike)):
-        if geotransform is not None or crs is not None:
+        if geotransform is not None or crs is not None or cell_size != 1.0:
             raise ValueError(
-                "geotransform and crs overrides are not supported when dem is a file path; "
-                "geotransform and CRS are read from the input raster file"
+                "cell_size, geotransform, and crs overrides are not supported when dem is a file path; "
+                "spatial metadata is read from the input raster file"
             )
         fa_str: str | None = None
         if flow_acc is not None:
@@ -1449,7 +1467,15 @@ def compute_twi(
         if isinstance(flow_acc, (str, os.PathLike)):
             raise ValueError("flow_acc must be an array when dem is an array")
         fa_raw, fa_gt, fa_crs, fa_nd = extract_spatial_array(flow_acc)
-        _check_aux_grid_alignment("flow_acc", fa_gt, fa_crs, gt, resolved_crs)
+        _check_aux_grid_alignment(
+            "flow_acc",
+            fa_gt,
+            fa_crs,
+            gt,
+            resolved_crs,
+            dem_shape=(int(arr.shape[0]), int(arr.shape[1])),
+            cell_size=float(cell_size),
+        )
         if fa_nd is not None and np.isfinite(fa_nd):
             fa_arr = np.array(fa_raw, dtype=np.float64, copy=True)
             fa_arr[fa_arr == float(fa_nd)] = np.nan
@@ -1506,12 +1532,13 @@ def compute_hand(
 
     Specify exactly one of `stream_mask` (binary raster/array where values > 0 mark drainage
     cells) or `acc_threshold_cells` (D8 flow-accumulation cell threshold to extract streams).
+    `cell_size`, `geotransform`, and `crs` apply only to array inputs.
     """
     if isinstance(dem, (str, os.PathLike)):
-        if geotransform is not None or crs is not None:
+        if geotransform is not None or crs is not None or cell_size != 1.0:
             raise ValueError(
-                "geotransform and crs overrides are not supported when dem is a file path; "
-                "geotransform and CRS are read from the input raster file"
+                "cell_size, geotransform, and crs overrides are not supported when dem is a file path; "
+                "spatial metadata is read from the input raster file"
             )
         mask_str: str | None = None
         if stream_mask is not None:
@@ -1544,7 +1571,15 @@ def compute_hand(
         if isinstance(stream_mask, (str, os.PathLike)):
             raise ValueError("stream_mask must be an array when dem is an array")
         m_raw, m_gt, m_crs, m_nd = extract_spatial_array(stream_mask)
-        _check_aux_grid_alignment("stream_mask", m_gt, m_crs, gt, resolved_crs)
+        _check_aux_grid_alignment(
+            "stream_mask",
+            m_gt,
+            m_crs,
+            gt,
+            resolved_crs,
+            dem_shape=(int(arr.shape[0]), int(arr.shape[1])),
+            cell_size=float(cell_size),
+        )
         if m_nd is not None and np.isfinite(m_nd):
             mask_f64 = np.array(m_raw, dtype=np.float64, copy=True)
             mask_f64[mask_f64 == float(m_nd)] = 0.0
@@ -1578,15 +1613,16 @@ def classify_embankment_artifacts(
     """Score delineated depressions to flag likely road/rail embankment impoundment artifacts.
 
     Accepts a DEM GeoTIFF path or a 2D spatial array (NumPy ndarray, xarray DataArray, or
-    rasterio dataset). For array inputs, pass the dict returned by `delineate_depressions_array`
-    as `depressions` to reuse an existing delineation, or omit `depressions` to extract sinks
-    and delineate automatically.
+    rasterio dataset). `cell_size`, `geotransform`, and `crs` apply only to array inputs.
+    For array inputs, pass the dict returned by `delineate_depressions_array` as `depressions`
+    to reuse an existing delineation, or omit `depressions` to extract sinks and delineate
+    automatically.
     """
     if isinstance(dem, (str, os.PathLike)):
-        if geotransform is not None or crs is not None:
+        if geotransform is not None or crs is not None or cell_size != 1.0:
             raise ValueError(
-                "geotransform and crs overrides are not supported when dem is a file path; "
-                "geotransform and CRS are read from the input raster file"
+                "cell_size, geotransform, and crs overrides are not supported when dem is a file path; "
+                "spatial metadata is read from the input raster file"
             )
         if depressions is not None:
             raise ValueError(
@@ -1610,17 +1646,14 @@ def classify_embankment_artifacts(
         dem, geotransform=geotransform, crs=crs, no_data=no_data
     )
     dep_id_arr: NDArray[np.int32] | None = None
-    dep_lvl_arr: NDArray[np.int32] | None = None
     dep_list: list[DepressionRecord] | None = None
     if depressions is not None:
         dep_id_arr = np.ascontiguousarray(depressions["depression_id"], dtype=np.int32)
-        raw_lvl = depressions.get("depression_level")
-        if raw_lvl is not None:
-            dep_lvl_arr = np.ascontiguousarray(raw_lvl, dtype=np.int32)
         dep_list = list(depressions["depressions"])
-        if gt is None and depressions.get("geotransform") is not None:
+        dep_gt: Geotransform | None = None
+        if depressions.get("geotransform") is not None:
             raw_gt = depressions["geotransform"]
-            gt = (
+            dep_gt = (
                 float(raw_gt[0]),
                 float(raw_gt[1]),
                 float(raw_gt[2]),
@@ -1628,14 +1661,28 @@ def classify_embankment_artifacts(
                 float(raw_gt[4]),
                 float(raw_gt[5]),
             )
-        if resolved_crs is None and depressions.get("crs") is not None:
-            resolved_crs = str(depressions["crs"])
+        dep_crs = (
+            str(depressions["crs"]) if depressions.get("crs") is not None else None
+        )
+        if gt is not None or resolved_crs is not None:
+            _check_aux_grid_alignment(
+                "depressions",
+                dep_gt,
+                dep_crs,
+                gt,
+                resolved_crs,
+                dem_shape=(int(arr.shape[0]), int(arr.shape[1])),
+                cell_size=float(cell_size),
+            )
+        if gt is None and dep_gt is not None:
+            gt = dep_gt
+        if resolved_crs is None and dep_crs is not None:
+            resolved_crs = dep_crs
 
     return list(
         _lidar_rs.classify_embankment_artifacts_array(
             arr,
             dep_id_arr,
-            dep_lvl_arr,
             dep_list,
             float(max_barrier_width_m),
             float(min_exit_drop),

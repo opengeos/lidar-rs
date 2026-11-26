@@ -2335,6 +2335,34 @@ fn from_py_array2_u8_spatial(
     Ok(a)
 }
 
+fn canonical_or_lexical_path(p: &Path) -> PathBuf {
+    if let Ok(c) = std::fs::canonicalize(p) {
+        return c;
+    }
+    if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
+        let base = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(cp) = std::fs::canonicalize(base) {
+            return cp.join(name);
+        }
+    }
+    p.to_path_buf()
+}
+
+fn ensure_no_output_collision(input: &str, output: &str, label: &str) -> PyResult<()> {
+    let in_p = canonical_or_lexical_path(Path::new(input));
+    let out_p = canonical_or_lexical_path(Path::new(output));
+    if in_p == out_p {
+        return Err(PyValueError::new_err(format!(
+            "out_file ({output}) must not overwrite input {label} ({input})"
+        )));
+    }
+    Ok(())
+}
+
 fn save_raster_to_path(
     grid: &Array2D<f64>,
     out_path: &Path,
@@ -2411,6 +2439,12 @@ fn compute_twi_file<'py>(
     no_data: Option<f64>,
     compress: bool,
 ) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
+    if let Some(out) = out_file {
+        ensure_no_output_collision(in_dem, out, "in_dem")?;
+        if let Some(fa) = flow_acc {
+            ensure_no_output_collision(fa, out, "flow_acc")?;
+        }
+    }
     let in_dem = in_dem.to_string();
     let out_file = out_file.map(str::to_string);
     let flow_acc = flow_acc.map(str::to_string);
@@ -2497,6 +2531,12 @@ fn compute_hand_file<'py>(
             "specify either stream_mask or acc_threshold_cells",
         ));
     }
+    if let Some(out) = out_file {
+        ensure_no_output_collision(in_dem, out, "in_dem")?;
+        if let Some(mask) = stream_mask {
+            ensure_no_output_collision(mask, out, "stream_mask")?;
+        }
+    }
     let in_dem = in_dem.to_string();
     let out_file = out_file.map(str::to_string);
     let stream_mask = stream_mask.map(str::to_string);
@@ -2533,13 +2573,12 @@ fn compute_hand_file<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (dem_arr, depression_id=None, depression_level=None, depressions=None, max_barrier_width_m=60.0, min_exit_drop=0.05, score_threshold=0.55, leaves_only=true, min_size=1000, min_depth=0.3, interval=0.3, no_data=None, cell_size=1.0, geotransform=None, crs=None))]
+#[pyo3(signature = (dem_arr, depression_id=None, depressions=None, max_barrier_width_m=60.0, min_exit_drop=0.05, score_threshold=0.55, leaves_only=true, min_size=1000, min_depth=0.3, interval=0.3, no_data=None, cell_size=1.0, geotransform=None, crs=None))]
 #[allow(clippy::too_many_arguments)]
 fn classify_embankment_artifacts_array<'py>(
     py: Python<'py>,
     dem_arr: PyReadonlyArray2<'_, f64>,
     depression_id: Option<PyReadonlyArray2<'_, i32>>,
-    depression_level: Option<PyReadonlyArray2<'_, i32>>,
     depressions: Option<Bound<'py, PyList>>,
     max_barrier_width_m: f64,
     min_exit_drop: f64,
@@ -2566,16 +2605,8 @@ fn classify_embankment_artifacts_array<'py>(
     let precomputed = match (depression_id, depressions) {
         (Some(dep_id_arr), Some(dep_list)) => {
             let id_grid = from_py_array2_i32_spatial(dep_id_arr, cell_size, Some(gt), Some(&proj))?;
-            let lvl_grid = match depression_level {
-                Some(lvl_arr) => {
-                    from_py_array2_i32_spatial(lvl_arr, cell_size, Some(gt), Some(&proj))?
-                }
-                None => {
-                    let mut z = Array2D::new(id_grid.width(), id_grid.height(), 0i32);
-                    z.copy_metadata_from(&id_grid);
-                    z
-                }
-            };
+            let mut lvl_grid = Array2D::new(id_grid.width(), id_grid.height(), 0i32);
+            lvl_grid.copy_metadata_from(&id_grid);
             let mut dep_records = Vec::with_capacity(dep_list.len());
             let mut max_level = 0u32;
             let mut max_region = 0u32;

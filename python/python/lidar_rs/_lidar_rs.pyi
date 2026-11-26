@@ -229,7 +229,6 @@ def compute_hand_file(
 def classify_embankment_artifacts_array(
     dem_arr: NDArray[np.float64],
     depression_id: NDArray[np.int32] | None = None,
-    depression_level: NDArray[np.int32] | None = None,
     depressions: list[DepressionRecord] | None = None,
     max_barrier_width_m: float = 60.0,
     min_exit_drop: float = 0.05,
