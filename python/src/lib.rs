@@ -15,12 +15,12 @@ use lidar::pointcloud::{
     PointWriteOptions, ReturnKind, SmrfOptions, Values,
 };
 use lidar::{
-    AnimateInundationOptions, Array2D, Bbox, BreachMode, BreachOptions, BurnCulvertsOptions,
-    CatchmentHierarchyOptions, CatchmentHierarchyRecord, ConnectivityGraph,
+    AnimateInundationOptions, Array2D, ArtifactClassifierOptions, Bbox, BreachMode, BreachOptions,
+    BurnCulvertsOptions, CatchmentHierarchyOptions, CatchmentHierarchyRecord, ConnectivityGraph,
     DelineateCatchmentsOptions, DelineateFlowPathsOptions, DelineateOptions, DemProduct,
-    DownloadOptions, ExtractSinksOptions, FederalBundleOptions, FsmBasinSummary, FsmMassBalance,
-    GraphEdge, GraphNode, HillshadeOptions, InMemoryDepressions, InundationForcing,
-    NestedDepression, NoaaAtlas14Table, Region, RoutingMode, RunPipelineOptions,
+    DownloadOptions, EmbankmentArtifactCandidate, ExtractSinksOptions, FederalBundleOptions,
+    FsmBasinSummary, FsmMassBalance, GraphEdge, GraphNode, HillshadeOptions, InMemoryDepressions,
+    InundationForcing, NestedDepression, NoaaAtlas14Table, Region, RoutingMode, RunPipelineOptions,
     SimulateInundationOptions, SinkDepression, SpillFlowPath, SynthesizeCulvertsOptions,
     TiledDelineationOptions, TnmProductItem, Topology, WbdLevel,
 };
@@ -123,6 +123,36 @@ fn crs_to_py(projection: &str) -> Option<String> {
     }
 }
 
+fn resolve_spatial_meta(
+    height: usize,
+    cell_size: f64,
+    geotransform: Option<[f64; 6]>,
+    crs: Option<&str>,
+) -> PyResult<([f64; 6], Option<String>)> {
+    let gt = if let Some(gt) = geotransform {
+        validate_geotransform(gt)?
+    } else {
+        if !cell_size.is_finite() || cell_size <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "cell_size must be finite and > 0, got {cell_size}"
+            )));
+        }
+        [
+            0.0,
+            cell_size,
+            0.0,
+            (height as f64) * cell_size,
+            0.0,
+            -cell_size,
+        ]
+    };
+    let proj = crs
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Ok((gt, proj))
+}
+
 fn from_py_array2_spatial(
     arr: PyReadonlyArray2<'_, f64>,
     no_data: Option<f64>,
@@ -131,28 +161,10 @@ fn from_py_array2_spatial(
     crs: Option<&str>,
 ) -> PyResult<Array2D<f64>> {
     let mut a = from_py_array2(arr, no_data)?;
-    if let Some(gt) = geotransform {
-        a.geotransform = validate_geotransform(gt)?;
-    } else {
-        if !cell_size.is_finite() || cell_size <= 0.0 {
-            return Err(PyValueError::new_err(format!(
-                "cell_size must be finite and > 0, got {cell_size}"
-            )));
-        }
-        a.geotransform = [
-            0.0,
-            cell_size,
-            0.0,
-            (a.height() as f64) * cell_size,
-            0.0,
-            -cell_size,
-        ];
-    }
-    if let Some(c) = crs {
-        let trimmed = c.trim();
-        if !trimmed.is_empty() {
-            a.projection = trimmed.to_string();
-        }
+    let (gt, proj) = resolve_spatial_meta(a.height(), cell_size, geotransform, crs)?;
+    a.geotransform = gt;
+    if let Some(p) = proj {
+        a.projection = p;
     }
     Ok(a)
 }
@@ -171,28 +183,10 @@ fn from_py_array2_i32_spatial(
         .unwrap_or_else(|| view.iter().copied().collect());
     let mut a = Array2D::from_vec(w, h, data).map_err(|e| to_py_err(e.into()))?;
     a.set_no_data(0);
-    if let Some(gt) = geotransform {
-        a.geotransform = validate_geotransform(gt)?;
-    } else {
-        if !cell_size.is_finite() || cell_size <= 0.0 {
-            return Err(PyValueError::new_err(format!(
-                "cell_size must be finite and > 0, got {cell_size}"
-            )));
-        }
-        a.geotransform = [
-            0.0,
-            cell_size,
-            0.0,
-            (a.height() as f64) * cell_size,
-            0.0,
-            -cell_size,
-        ];
-    }
-    if let Some(c) = crs {
-        let trimmed = c.trim();
-        if !trimmed.is_empty() {
-            a.projection = trimmed.to_string();
-        }
+    let (gt, proj) = resolve_spatial_meta(a.height(), cell_size, geotransform, crs)?;
+    a.geotransform = gt;
+    if let Some(p) = proj {
+        a.projection = p;
     }
     Ok(a)
 }
@@ -2319,6 +2313,395 @@ fn compute_hillshade_file<'py>(
     to_py_array3_u8(py, h, w, 3, rgb)
 }
 
+fn from_py_array2_u8_spatial(
+    arr: PyReadonlyArray2<'_, u8>,
+    cell_size: f64,
+    geotransform: Option<[f64; 6]>,
+    crs: Option<&str>,
+) -> PyResult<Array2D<u8>> {
+    let view = arr.as_array();
+    let (h, w) = (view.nrows(), view.ncols());
+    let data: Vec<u8> = view
+        .as_slice()
+        .map(|s| s.to_vec())
+        .unwrap_or_else(|| view.iter().copied().collect());
+    let mut a = Array2D::from_vec(w, h, data).map_err(|e| to_py_err(e.into()))?;
+    a.set_no_data(0);
+    let (gt, proj) = resolve_spatial_meta(a.height(), cell_size, geotransform, crs)?;
+    a.geotransform = gt;
+    if let Some(p) = proj {
+        a.projection = p;
+    }
+    Ok(a)
+}
+
+fn canonical_or_lexical_path(p: &Path) -> PathBuf {
+    if let Ok(c) = std::fs::canonicalize(p) {
+        return c;
+    }
+    if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
+        let base = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(cp) = std::fs::canonicalize(base) {
+            return cp.join(name);
+        }
+    }
+    p.to_path_buf()
+}
+
+fn ensure_no_output_collision(input: &str, output: &str, label: &str) -> PyResult<()> {
+    let in_p = canonical_or_lexical_path(Path::new(input));
+    let out_p = canonical_or_lexical_path(Path::new(output));
+    if in_p == out_p {
+        return Err(PyValueError::new_err(format!(
+            "out_file ({output}) must not overwrite input {label} ({input})"
+        )));
+    }
+    Ok(())
+}
+
+fn save_raster_to_path(
+    grid: &Array2D<f64>,
+    out_path: &Path,
+    history: &str,
+    compress: bool,
+) -> lidar::Result<()> {
+    if let Some(parent) = out_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    lidar::save_raster(grid, out_path, Some(history), compress)?;
+    Ok(())
+}
+
+fn embankment_artifact_to_dict<'py>(
+    py: Python<'py>,
+    c: &EmbankmentArtifactCandidate,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("dep_id", c.dep_id)?;
+    d.set_item("level", c.level)?;
+    d.set_item("area_m2", c.area_m2)?;
+    d.set_item("max_depth", c.max_depth)?;
+    d.set_item("elongatedness", c.elongatedness)?;
+    d.set_item("circularity", c.circularity)?;
+    d.set_item("compactness", c.compactness)?;
+    d.set_item("barrier_width_m", c.barrier_width_m)?;
+    d.set_item("barrier_height_ratio", c.barrier_height_ratio)?;
+    d.set_item("rim_linearity", c.rim_linearity)?;
+    d.set_item("artifact_score", c.artifact_score)?;
+    d.set_item("is_likely_artifact", c.is_likely_artifact)?;
+    d.set_item("suggested_breach", c.suggested_breach)?;
+    Ok(d)
+}
+
+#[pyfunction]
+#[pyo3(signature = (dem_arr, flow_acc=None, no_data=None, cell_size=1.0, geotransform=None, crs=None))]
+fn compute_twi_array<'py>(
+    py: Python<'py>,
+    dem_arr: PyReadonlyArray2<'_, f64>,
+    flow_acc: Option<PyReadonlyArray2<'_, f64>>,
+    no_data: Option<f64>,
+    cell_size: f64,
+    geotransform: Option<[f64; 6]>,
+    crs: Option<&str>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let dem = from_py_array2_spatial(dem_arr, no_data, cell_size, geotransform, crs)?;
+    let gt = dem.geotransform;
+    let proj = dem.projection.clone();
+    let fa_grid = match flow_acc {
+        Some(fa) => Some(from_py_array2_spatial(
+            fa,
+            None,
+            cell_size,
+            Some(gt),
+            Some(&proj),
+        )?),
+        None => None,
+    };
+    let out = py
+        .detach(move || lidar::compute_twi(&dem, fa_grid.as_ref()))
+        .map_err(to_py_err)?;
+    to_py_array2(py, out)
+}
+
+#[pyfunction]
+#[pyo3(signature = (in_dem, out_file=None, flow_acc=None, no_data=None, compress=false))]
+fn compute_twi_file<'py>(
+    py: Python<'py>,
+    in_dem: &str,
+    out_file: Option<&str>,
+    flow_acc: Option<&str>,
+    no_data: Option<f64>,
+    compress: bool,
+) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
+    if let Some(out) = out_file {
+        ensure_no_output_collision(in_dem, out, "in_dem")?;
+        if let Some(fa) = flow_acc {
+            ensure_no_output_collision(fa, out, "flow_acc")?;
+        }
+    }
+    let in_dem = in_dem.to_string();
+    let out_file = out_file.map(str::to_string);
+    let flow_acc = flow_acc.map(str::to_string);
+    let out = py
+        .detach(move || -> lidar::Result<Option<Array2D<f64>>> {
+            let mut dem = lidar::load_raster::<f64>(&in_dem, None)?;
+            if let Some(nd) = no_data {
+                dem.set_no_data(nd);
+            }
+            let fa = match flow_acc.as_deref() {
+                Some(p) => Some(lidar::load_raster::<f64>(p, None)?),
+                None => None,
+            };
+            let res = lidar::compute_twi(&dem, fa.as_ref())?;
+            if let Some(out_path) = out_file.as_deref().map(Path::new) {
+                save_raster_to_path(&res, out_path, "compute_twi", compress)?;
+                Ok(None)
+            } else {
+                Ok(Some(res))
+            }
+        })
+        .map_err(to_py_err)?;
+    out.map(|a| to_py_array2(py, a)).transpose()
+}
+
+#[pyfunction]
+#[pyo3(signature = (dem_arr, stream_mask=None, acc_threshold_cells=None, no_data=None, cell_size=1.0, geotransform=None, crs=None))]
+#[allow(clippy::too_many_arguments)]
+fn compute_hand_array<'py>(
+    py: Python<'py>,
+    dem_arr: PyReadonlyArray2<'_, f64>,
+    stream_mask: Option<PyReadonlyArray2<'_, u8>>,
+    acc_threshold_cells: Option<f64>,
+    no_data: Option<f64>,
+    cell_size: f64,
+    geotransform: Option<[f64; 6]>,
+    crs: Option<&str>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let dem = from_py_array2_spatial(dem_arr, no_data, cell_size, geotransform, crs)?;
+    let gt = dem.geotransform;
+    let proj = dem.projection.clone();
+    let out = match (stream_mask, acc_threshold_cells) {
+        (Some(mask_arr), None) => {
+            let mask = from_py_array2_u8_spatial(mask_arr, cell_size, Some(gt), Some(&proj))?;
+            py.detach(move || lidar::compute_hand(&dem, &mask))
+                .map_err(to_py_err)?
+        }
+        (None, Some(thresh)) => py
+            .detach(move || lidar::compute_hand_from_threshold(&dem, thresh))
+            .map_err(to_py_err)?,
+        (Some(_), Some(_)) => {
+            return Err(PyValueError::new_err(
+                "specify either stream_mask or acc_threshold_cells, not both",
+            ));
+        }
+        (None, None) => {
+            return Err(PyValueError::new_err(
+                "specify either stream_mask or acc_threshold_cells",
+            ));
+        }
+    };
+    to_py_array2(py, out)
+}
+
+#[pyfunction]
+#[pyo3(signature = (in_dem, out_file=None, stream_mask=None, acc_threshold_cells=None, no_data=None, compress=false))]
+#[allow(clippy::too_many_arguments)]
+fn compute_hand_file<'py>(
+    py: Python<'py>,
+    in_dem: &str,
+    out_file: Option<&str>,
+    stream_mask: Option<&str>,
+    acc_threshold_cells: Option<f64>,
+    no_data: Option<f64>,
+    compress: bool,
+) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
+    if stream_mask.is_some() && acc_threshold_cells.is_some() {
+        return Err(PyValueError::new_err(
+            "specify either stream_mask or acc_threshold_cells, not both",
+        ));
+    }
+    if stream_mask.is_none() && acc_threshold_cells.is_none() {
+        return Err(PyValueError::new_err(
+            "specify either stream_mask or acc_threshold_cells",
+        ));
+    }
+    if let Some(out) = out_file {
+        ensure_no_output_collision(in_dem, out, "in_dem")?;
+        if let Some(mask) = stream_mask {
+            ensure_no_output_collision(mask, out, "stream_mask")?;
+        }
+    }
+    let in_dem = in_dem.to_string();
+    let out_file = out_file.map(str::to_string);
+    let stream_mask = stream_mask.map(str::to_string);
+    let out = py
+        .detach(move || -> lidar::Result<Option<Array2D<f64>>> {
+            let mut dem = lidar::load_raster::<f64>(&in_dem, None)?;
+            if let Some(nd) = no_data {
+                dem.set_no_data(nd);
+            }
+            let res = if let Some(mask_path) = stream_mask.as_deref() {
+                let mask_f64 = lidar::load_raster::<f64>(mask_path, None)?;
+                let m_nd = mask_f64.no_data();
+                let m_data: Vec<u8> = mask_f64
+                    .data()
+                    .iter()
+                    .map(|&v| u8::from(v.is_finite() && (m_nd.is_nan() || v != m_nd) && v > 0.0))
+                    .collect();
+                let mut mask_u8 = Array2D::from_vec(mask_f64.width(), mask_f64.height(), m_data)?;
+                mask_u8.copy_metadata_from(&mask_f64);
+                mask_u8.set_no_data(0);
+                lidar::compute_hand(&dem, &mask_u8)?
+            } else {
+                lidar::compute_hand_from_threshold(&dem, acc_threshold_cells.unwrap())?
+            };
+            if let Some(out_path) = out_file.as_deref().map(Path::new) {
+                save_raster_to_path(&res, out_path, "compute_hand", compress)?;
+                Ok(None)
+            } else {
+                Ok(Some(res))
+            }
+        })
+        .map_err(to_py_err)?;
+    out.map(|a| to_py_array2(py, a)).transpose()
+}
+
+#[pyfunction]
+#[pyo3(signature = (dem_arr, depression_id=None, depressions=None, max_barrier_width_m=60.0, min_exit_drop=0.05, score_threshold=0.55, leaves_only=true, min_size=1000, min_depth=0.3, interval=0.3, no_data=None, cell_size=1.0, geotransform=None, crs=None))]
+#[allow(clippy::too_many_arguments)]
+fn classify_embankment_artifacts_array<'py>(
+    py: Python<'py>,
+    dem_arr: PyReadonlyArray2<'_, f64>,
+    depression_id: Option<PyReadonlyArray2<'_, i32>>,
+    depressions: Option<Bound<'py, PyList>>,
+    max_barrier_width_m: f64,
+    min_exit_drop: f64,
+    score_threshold: f64,
+    leaves_only: bool,
+    min_size: usize,
+    min_depth: f64,
+    interval: f64,
+    no_data: Option<f64>,
+    cell_size: f64,
+    geotransform: Option<[f64; 6]>,
+    crs: Option<&str>,
+) -> PyResult<Bound<'py, PyList>> {
+    let dem = from_py_array2_spatial(dem_arr, no_data, cell_size, geotransform, crs)?;
+    let gt = dem.geotransform;
+    let proj = dem.projection.clone();
+    let opts = ArtifactClassifierOptions {
+        max_barrier_width_m,
+        min_exit_drop,
+        score_threshold,
+        leaves_only,
+    };
+
+    let precomputed = match (depression_id, depressions) {
+        (Some(dep_id_arr), Some(dep_list)) => {
+            let id_grid = from_py_array2_i32_spatial(dep_id_arr, cell_size, Some(gt), Some(&proj))?;
+            let mut lvl_grid = Array2D::new(id_grid.width(), id_grid.height(), 0i32);
+            lvl_grid.copy_metadata_from(&id_grid);
+            let mut dep_records = Vec::with_capacity(dep_list.len());
+            let mut max_level = 0u32;
+            let mut max_region = 0u32;
+            for item in dep_list.iter() {
+                let d = item.cast::<PyDict>().map_err(|_| {
+                    PyValueError::new_err("each element of depressions must be a dict")
+                })?;
+                let rec = dict_to_nested_dep(d)?;
+                max_level = max_level.max(rec.level);
+                max_region = max_region.max(rec.region_id);
+                dep_records.push(rec);
+            }
+            Some(InMemoryDepressions {
+                depression_id: id_grid,
+                depression_level: lvl_grid,
+                depressions: dep_records,
+                max_level,
+                num_regions: max_region,
+            })
+        }
+        (None, None) => None,
+        _ => {
+            return Err(PyValueError::new_err(
+                "provide both depression_id and depressions, or omit both to delineate automatically",
+            ));
+        }
+    };
+
+    let candidates = py
+        .detach(move || -> lidar::Result<Vec<EmbankmentArtifactCandidate>> {
+            let deps = match precomputed {
+                Some(d) => d,
+                None => {
+                    let sinks = lidar::extract_sinks_in_memory(&dem, min_size, Topology::D8)?;
+                    lidar::delineate_depressions_in_memory(
+                        &sinks.sink,
+                        min_size,
+                        min_depth,
+                        interval,
+                    )?
+                }
+            };
+            lidar::classify_embankment_artifacts(&dem, &deps, &opts)
+        })
+        .map_err(to_py_err)?;
+
+    let out = PyList::empty(py);
+    for c in &candidates {
+        out.append(embankment_artifact_to_dict(py, c)?)?;
+    }
+    Ok(out)
+}
+
+#[pyfunction]
+#[pyo3(signature = (in_dem, max_barrier_width_m=60.0, min_exit_drop=0.05, score_threshold=0.55, leaves_only=true, min_size=1000, min_depth=0.3, interval=0.3, no_data=None))]
+#[allow(clippy::too_many_arguments)]
+fn classify_embankment_artifacts_file<'py>(
+    py: Python<'py>,
+    in_dem: &str,
+    max_barrier_width_m: f64,
+    min_exit_drop: f64,
+    score_threshold: f64,
+    leaves_only: bool,
+    min_size: usize,
+    min_depth: f64,
+    interval: f64,
+    no_data: Option<f64>,
+) -> PyResult<Bound<'py, PyList>> {
+    let in_dem = in_dem.to_string();
+    let opts = ArtifactClassifierOptions {
+        max_barrier_width_m,
+        min_exit_drop,
+        score_threshold,
+        leaves_only,
+    };
+    let candidates = py
+        .detach(move || -> lidar::Result<Vec<EmbankmentArtifactCandidate>> {
+            let mut dem = lidar::load_raster::<f64>(&in_dem, None)?;
+            if let Some(nd) = no_data {
+                dem.set_no_data(nd);
+            }
+            let sinks = lidar::extract_sinks_in_memory(&dem, min_size, Topology::D8)?;
+            let deps =
+                lidar::delineate_depressions_in_memory(&sinks.sink, min_size, min_depth, interval)?;
+            lidar::classify_embankment_artifacts(&dem, &deps, &opts)
+        })
+        .map_err(to_py_err)?;
+
+    let out = PyList::empty(py);
+    for c in &candidates {
+        out.append(embankment_artifact_to_dict(py, c)?)?;
+    }
+    Ok(out)
+}
+
 #[pyfunction]
 #[pyo3(signature = (sink_arr, depression_id=None, depression_level=None, depressions=None, interval=0.3, min_size=1000, min_depth=0.3, no_data=None, cell_size=1.0, geotransform=None, crs=None))]
 #[allow(clippy::too_many_arguments)]
@@ -3335,6 +3718,12 @@ fn _lidar_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(delineate_mounts_array, m)?)?;
     m.add_function(wrap_pyfunction!(compute_hillshade_array, m)?)?;
     m.add_function(wrap_pyfunction!(compute_hillshade_file, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_twi_array, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_twi_file, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_hand_array, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_hand_file, m)?)?;
+    m.add_function(wrap_pyfunction!(classify_embankment_artifacts_array, m)?)?;
+    m.add_function(wrap_pyfunction!(classify_embankment_artifacts_file, m)?)?;
     m.add_function(wrap_pyfunction!(compute_rating_curves, m)?)?;
     m.add_function(wrap_pyfunction!(build_connectivity_graph_from_dem, m)?)?;
     m.add_function(wrap_pyfunction!(build_connectivity_graph_from_parts, m)?)?;

@@ -17,6 +17,7 @@ from ._types import (
     DelineationResult,
     DepressionRecord,
     Download3depResult,
+    EmbankmentArtifactCandidate,
     ExtractSinksArrayResult,
     ExtractSinksResult,
     FederalDataResult,
@@ -188,6 +189,71 @@ def compute_hillshade_file(
     z_factor: float = 1.0,
     no_data: float | None = None,
 ) -> NDArray[np.uint8]: ...
+
+def compute_twi_array(
+    dem_arr: NDArray[np.float64],
+    flow_acc: NDArray[np.float64] | None = None,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+) -> NDArray[np.float64]: ...
+
+def compute_twi_file(
+    in_dem: str,
+    out_file: str | None = None,
+    flow_acc: str | None = None,
+    no_data: float | None = None,
+    compress: bool = False,
+) -> NDArray[np.float64] | None: ...
+
+def compute_hand_array(
+    dem_arr: NDArray[np.float64],
+    stream_mask: NDArray[np.uint8] | None = None,
+    acc_threshold_cells: float | None = None,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+) -> NDArray[np.float64]: ...
+
+def compute_hand_file(
+    in_dem: str,
+    out_file: str | None = None,
+    stream_mask: str | None = None,
+    acc_threshold_cells: float | None = None,
+    no_data: float | None = None,
+    compress: bool = False,
+) -> NDArray[np.float64] | None: ...
+
+def classify_embankment_artifacts_array(
+    dem_arr: NDArray[np.float64],
+    depression_id: NDArray[np.int32] | None = None,
+    depressions: list[DepressionRecord] | None = None,
+    max_barrier_width_m: float = 60.0,
+    min_exit_drop: float = 0.05,
+    score_threshold: float = 0.55,
+    leaves_only: bool = True,
+    min_size: int = 1000,
+    min_depth: float = 0.3,
+    interval: float = 0.3,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+) -> list[EmbankmentArtifactCandidate]: ...
+
+def classify_embankment_artifacts_file(
+    in_dem: str,
+    max_barrier_width_m: float = 60.0,
+    min_exit_drop: float = 0.05,
+    score_threshold: float = 0.55,
+    leaves_only: bool = True,
+    min_size: int = 1000,
+    min_depth: float = 0.3,
+    interval: float = 0.3,
+    no_data: float | None = None,
+) -> list[EmbankmentArtifactCandidate]: ...
 
 def compute_rating_curves(
     sink_arr: NDArray[np.float64],

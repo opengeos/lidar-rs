@@ -1001,3 +1001,194 @@ def test_audit_v06_python_forcing_nodata_types_and_sequence(
         datasets=UserList(["dem", "nhd"]),
     )
     assert seen_ds["spec"] == "dem,nhd"
+
+
+def test_compute_twi_and_hand_array_and_file(tmp_path: Path):
+    # Tilted V-shaped valley draining east along row 10: higher TWI and HAND == 0 in valley floor
+    rr, cc = np.indices((21, 21), dtype=np.float64)
+    dem = 100.0 + np.abs(rr - 10.0) * 1.5 + (20.0 - cc) * 0.4
+    gt = (500_000.0, 2.0, 0.0, 4_000_042.0, 0.0, -2.0)
+
+    twi = lidar_rs.compute_twi(dem, geotransform=gt, crs="EPSG:32615")
+    assert twi.shape == dem.shape
+    assert twi.dtype == np.float64
+    assert np.all(np.isfinite(twi))
+    # Valley bottom accumulates more flow and is wetter than ridge crest
+    assert twi[10, 18] > twi[0, 2]
+
+    # Custom flow_acc array is actually used and alters TWI values
+    custom_acc = np.full_like(dem, 10.0)
+    custom_acc[10, :] = 500.0
+    twi_custom = lidar_rs.compute_twi(dem, flow_acc=custom_acc, geotransform=gt)
+    assert twi_custom[10, 10] > twi_custom[2, 10]
+    assert not np.allclose(twi_custom, twi)
+
+    # Duck-typed xarray adapter works seamlessly
+    aff = _FakeAffine(2.0, 0.0, 500_000.0, 0.0, -2.0, 4_000_042.0)
+    da_rio = _FakeDataArray(dem, rio=_FakeRioAccessor(aff, _FakeCRS("EPSG:32615"), -9999.0))
+    twi_da = lidar_rs.compute_twi(da_rio)
+    np.testing.assert_allclose(twi_da, twi, rtol=1e-12)
+
+    # HAND with explicit boolean stream mask along the valley center
+    stream_mask = np.zeros(dem.shape, dtype=bool)
+    stream_mask[10, :] = True
+    hand_mask = lidar_rs.compute_hand(dem, stream_mask=stream_mask, geotransform=gt)
+    assert hand_mask.shape == dem.shape
+    assert np.allclose(hand_mask[10, :], 0.0)
+    # Interior cells drain into row 10 (grid border row 0 drains off-grid -> NoData)
+    assert hand_mask[2, 10] > hand_mask[5, 10] > 0.0
+
+    # HAND with accumulation threshold
+    hand_thresh = lidar_rs.compute_hand(dem, acc_threshold_cells=25.0, geotransform=gt)
+    assert hand_thresh.shape == dem.shape
+    assert hand_thresh[10, 18] == pytest.approx(0.0)
+    assert hand_thresh[2, 10] > 0.0
+
+    # File-based TWI and HAND (both returning array and writing GeoTIFF)
+    twi_file_arr = lidar_rs.compute_twi(TEST_DATA / "dem.tif")
+    assert twi_file_arr.shape == (400, 400)
+    twi_out = tmp_path / "twi.tif"
+    assert lidar_rs.compute_twi(TEST_DATA / "dem.tif", out_file=twi_out, compress=True) == str(
+        twi_out
+    )
+    assert twi_out.exists()
+
+    hand_file_arr = lidar_rs.compute_hand(TEST_DATA / "dem.tif", acc_threshold_cells=500.0)
+    assert hand_file_arr.shape == (400, 400)
+    hand_out = tmp_path / "hand.tif"
+    assert lidar_rs.compute_hand(
+        TEST_DATA / "dem.tif",
+        out_file=hand_out,
+        acc_threshold_cells=500.0,
+        compress=True,
+    ) == str(hand_out)
+    assert hand_out.exists()
+
+    # Validation errors
+    with pytest.raises(ValueError, match="out_file"):
+        lidar_rs.compute_twi(dem, out_file=tmp_path / "unused.tif")  # type: ignore[call-overload]
+    with pytest.raises(ValueError, match="file path"):
+        lidar_rs.compute_twi(TEST_DATA / "dem.tif", geotransform=gt)
+    with pytest.raises(ValueError, match="stream_mask or acc_threshold_cells"):
+        lidar_rs.compute_hand(dem)
+    with pytest.raises(ValueError, match="not both"):
+        lidar_rs.compute_hand(dem, stream_mask=stream_mask, acc_threshold_cells=10.0)
+    with pytest.raises(ValueError, match="file path"):
+        lidar_rs.compute_hand(TEST_DATA / "dem.tif", acc_threshold_cells=100.0, crs="EPSG:32615")
+    with pytest.raises(ValueError, match="file path"):
+        lidar_rs.compute_twi(TEST_DATA / "dem.tif", cell_size=2.0)
+    with pytest.raises(ValueError, match="file path"):
+        lidar_rs.compute_hand(TEST_DATA / "dem.tif", acc_threshold_cells=100.0, cell_size=2.0)
+    with pytest.raises(ValueError, match="overwrite"):
+        lidar_rs.compute_twi(TEST_DATA / "dem.tif", out_file=TEST_DATA / "dem.tif")
+    with pytest.raises(ValueError, match="overwrite"):
+        lidar_rs.compute_hand(
+            TEST_DATA / "dem.tif", out_file=TEST_DATA / "dem.tif", acc_threshold_cells=500.0
+        )
+
+    # Misaligned spatial-adapter auxiliary grids are rejected (both georeferenced and plain NumPy DEMs)
+    shifted_aff = _FakeAffine(2.0, 0.0, 500_100.0, 0.0, -2.0, 4_000_042.0)
+    shifted_acc = _FakeDataArray(
+        custom_acc, rio=_FakeRioAccessor(shifted_aff, _FakeCRS("EPSG:32615"), -9999.0)
+    )
+    with pytest.raises(ValueError, match="geotransform"):
+        lidar_rs.compute_twi(da_rio, flow_acc=shifted_acc)
+    with pytest.raises(ValueError, match="geotransform"):
+        lidar_rs.compute_twi(dem, flow_acc=shifted_acc)
+    shifted_mask = _FakeDataArray(
+        stream_mask.astype(np.float64),
+        rio=_FakeRioAccessor(shifted_aff, _FakeCRS("EPSG:32615"), 0.0),
+    )
+    with pytest.raises(ValueError, match="geotransform"):
+        lidar_rs.compute_hand(da_rio, stream_mask=shifted_mask)
+    with pytest.raises(ValueError, match="geotransform"):
+        lidar_rs.compute_hand(dem, stream_mask=shifted_mask)
+
+
+def test_classify_embankment_artifacts_array_and_file():
+    # Synthetic sloping valley blocked by a narrow raised road embankment at col 24..25
+    h, w = 50, 50
+    rr, cc = np.indices((h, w), dtype=np.float64)
+    dem = 100.0 + np.abs(rr - 25.0) * 0.15 + (w - cc) * 0.3
+    # Raised straight embankment perpendicular to valley flow (crest above rim, lower downstream)
+    dem[:, 24:26] = np.maximum(dem[:, 24:26], 112.0)
+    gt = (500_000.0, 2.0, 0.0, 4_000_100.0, 0.0, -2.0)
+
+    sinks = lidar_rs.extract_sinks_array(dem, min_size=10, geotransform=gt, crs="EPSG:32615")
+    deps = lidar_rs.delineate_depressions_array(
+        sinks["sink"],
+        min_size=10,
+        min_depth=0.2,
+        interval=0.3,
+        no_data=0.0,
+        geotransform=gt,
+        crs="EPSG:32615",
+    )
+    candidates = lidar_rs.classify_embankment_artifacts(dem, deps, max_barrier_width_m=40.0)
+    assert len(candidates) >= 1
+    first = candidates[0]
+    for key in (
+        "dep_id",
+        "level",
+        "area_m2",
+        "max_depth",
+        "elongatedness",
+        "circularity",
+        "compactness",
+        "barrier_width_m",
+        "barrier_height_ratio",
+        "rim_linearity",
+        "artifact_score",
+        "is_likely_artifact",
+        "suggested_breach",
+    ):
+        assert key in first
+    assert any(c["is_likely_artifact"] for c in candidates)
+    flagged = next(c for c in candidates if c["is_likely_artifact"])
+    assert flagged["barrier_width_m"] is not None and flagged["barrier_width_m"] > 0.0
+    assert flagged["suggested_breach"] is not None
+    (x1, y1), (x2, y2) = flagged["suggested_breach"]
+    assert all(np.isfinite([x1, y1, x2, y2]))
+
+    # Auto-delineate mode (no precomputed depressions) matches candidate IDs, flags, scores, and breaches
+    candidates_auto = lidar_rs.classify_embankment_artifacts(
+        dem,
+        min_size=10,
+        min_depth=0.2,
+        interval=0.3,
+        max_barrier_width_m=40.0,
+        geotransform=gt,
+        crs="EPSG:32615",
+    )
+    by_id_pre = {c["dep_id"]: c for c in candidates}
+    by_id_auto = {c["dep_id"]: c for c in candidates_auto}
+    assert set(by_id_auto) == set(by_id_pre)
+    for dep_id, pre in by_id_pre.items():
+        auto = by_id_auto[dep_id]
+        assert auto["is_likely_artifact"] == pre["is_likely_artifact"]
+        assert auto["artifact_score"] == pytest.approx(pre["artifact_score"], rel=1e-9)
+        assert auto["barrier_width_m"] == pytest.approx(pre["barrier_width_m"], rel=1e-9)
+        if pre["suggested_breach"] is None:
+            assert auto["suggested_breach"] is None
+        else:
+            assert auto["suggested_breach"] is not None
+            np.testing.assert_allclose(auto["suggested_breach"], pre["suggested_breach"])
+
+    # Misaligned precomputed depressions rejected when DEM carries a different geotransform
+    shifted_deps = dict(deps, geotransform=(500_200.0, 2.0, 0.0, 4_000_100.0, 0.0, -2.0))
+    with pytest.raises(ValueError, match="geotransform"):
+        lidar_rs.classify_embankment_artifacts(dem, shifted_deps, geotransform=gt, crs="EPSG:32615")
+
+    # File-based call on real DEM fixture
+    file_cands = lidar_rs.classify_embankment_artifacts(
+        TEST_DATA / "dem.tif", min_size=1000, min_depth=0.3, interval=0.3
+    )
+    assert isinstance(file_cands, list) and len(file_cands) >= 1
+
+    # Validation errors on file path with incompatible overrides
+    with pytest.raises(ValueError, match="file path"):
+        lidar_rs.classify_embankment_artifacts(TEST_DATA / "dem.tif", depressions=deps)
+    with pytest.raises(ValueError, match="file path"):
+        lidar_rs.classify_embankment_artifacts(TEST_DATA / "dem.tif", geotransform=gt)
+    with pytest.raises(ValueError, match="file path"):
+        lidar_rs.classify_embankment_artifacts(TEST_DATA / "dem.tif", cell_size=2.0)
