@@ -1,6 +1,6 @@
 {
   "name": "@opengeos/lidar-js",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "WebAssembly bindings for lidar-rs: nested surface depression and mount delineation, hydro-conditioning, and inundation simulation in browsers and Node.js (zero GDAL)",
   "type": "module",
   "main": "./pkg-node/lidar_js.js",
