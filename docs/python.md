@@ -187,10 +187,12 @@ lidar.PlayAnimation(
 | Group | Functions |
 | --- | --- |
 | **Pipelines & Tiling** | `run_pipeline`, `delineate_depressions_tiled` |
-| **In-Memory NumPy** | `extract_sinks_array`, `delineate_depressions_array`, `simulate_inundation_array`, `scs_curve_number_runoff`, `scs_type2_hyetograph` |
-| **Hydro-Conditioning** | `breach_depressions` (file or array), `burn_culverts` |
+| **In-Memory NumPy** | `extract_sinks_array`, `delineate_depressions_array`, `delineate_mounts_array`, `simulate_inundation_array`, `compute_hillshade`, `compute_rating_curves`, `build_connectivity_graph`, `scs_curve_number_runoff`, `scs_type2_hyetograph` |
+| **Spatial Adapters** | `depressions_to_geodataframe`, `connectivity_to_networkx`, `array_to_xarray` |
+| **Hydro-Conditioning** | `breach_depressions` (file or array), `burn_culverts`, `synthesize_culverts` |
 | **Smoothing & Hierarchies** | `MeanFilter`, `MedianFilter`, `GaussianFilter`, `ExtractSinks`, `extract_sinks`, `DelineateDepressions`, `delineate_depressions`, `DelineateMounts`, `delineate_mounts` |
 | **Catchments & Inundation** | `delineate_catchments`, `delineate_flow_paths`, `delineate_catchment_hierarchy`, `simulate_inundation` |
 | **Visualization** | `animate_inundation`, `PlayAnimation`, `export_inundation_frames_png` |
-| **Point Clouds** | `convert_lidar`, `lidar_to_dsm`, `lidar_to_dtm`, `lidar_to_chm` |
-| **Raster / Vector Utils** | `polygonize`, `mosaic`, `reproject_image`, `resample`, `clip_image`, `image_to_cog`, `add_crs`, `join_csv_to_vector`, `csv_points_to_vector` |
+| **Point Clouds** | `read_lidar`, `write_lidar`, `convert_lidar`, `classify_ground`, `lidar_to_dsm`, `lidar_to_dtm`, `lidar_to_chm` |
+| **Federal Data Download** | `download_federal_data`, `query_3dep_products`, `download_3dep_dem`, `download_wbd`, `download_nhd`, `download_nwi`, `download_roads`, `fetch_noaa_atlas14` |
+| **Raster / Vector Utils** | `polygonize`, `mosaic`, `reproject_image`, `resample`, `clip_image`, `image_to_cog`, `add_crs`, `join_tables`, `csv_to_shp`, `csv_points_to_shp` |

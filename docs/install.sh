@@ -37,7 +37,10 @@ download() {
             curl --proto-redir '=https' --tlsv1.2 -fsSL "$1" -o "$2"
         fi
     elif has wget; then
-        wget -q "$1" -O "$2"
+        case "$1" in
+            https://*) wget --https-only --secure-protocol=TLSv1_2 -q "$1" -O "$2" ;;
+            *) wget -q "$1" -O "$2" ;;
+        esac
     else
         err "neither curl nor wget is installed"
     fi
@@ -117,7 +120,8 @@ main() {
     name="lidar-cli-$version-$target"
 
     tmp=$(mktemp -d)
-    trap 'rm -rf "$tmp"' EXIT
+    stage=""
+    trap 'rm -rf "$tmp" ${stage:+"$stage"}' EXIT
 
     say "downloading lidar $version for $target"
     download "$base/$name.tar.gz" "$tmp/$name.tar.gz" ||
@@ -135,14 +139,16 @@ main() {
 
     tar -xzf "$tmp/$name.tar.gz" -C "$tmp"
     mkdir -p "$install_dir"
-    stage="$install_dir/lidar.tmp"
+    stage=$(mktemp "$install_dir/lidar.tmp.XXXXXX")
     cp "$tmp/$name/lidar" "$stage"
     chmod 755 "$stage"
     if ! installed_version=$("$stage" --version 2> /dev/null); then
         rm -f "$stage"
+        stage=""
         err "the downloaded lidar binary does not run"
     fi
     mv -f "$stage" "$install_dir/lidar"
+    stage=""
     say "installed $installed_version in $install_dir"
 
     case ":$PATH:" in

@@ -8,11 +8,15 @@
   "types": "./lidar_js.d.ts",
   "exports": {
     ".": {
-      "types": "./lidar_js.d.ts",
-      "browser": "./pkg/lidar_js.js",
-      "import": "./pkg/lidar_js.js",
-      "require": "./pkg-node/lidar_js.js",
-      "default": "./pkg/lidar_js.js"
+      "import": {
+        "types": "./lidar_js.d.ts",
+        "browser": "./pkg/lidar_js.js",
+        "default": "./pkg/lidar_js.js"
+      },
+      "require": {
+        "types": "./lidar_js_direct.d.ts",
+        "default": "./pkg-node/lidar_js.js"
+      }
     },
     "./web": {
       "types": "./lidar_js.d.ts",
@@ -20,12 +24,12 @@
       "default": "./pkg/lidar_js.js"
     },
     "./node": {
-      "types": "./lidar_js.d.ts",
+      "types": "./lidar_js_direct.d.ts",
       "require": "./pkg-node/lidar_js.js",
       "default": "./pkg-node/lidar_js.js"
     },
     "./bundler": {
-      "types": "./lidar_js.d.ts",
+      "types": "./lidar_js_direct.d.ts",
       "import": "./pkg-bundler/lidar_js.js",
       "default": "./pkg-bundler/lidar_js.js"
     },
@@ -36,6 +40,7 @@
     "pkg-node/",
     "pkg-bundler/",
     "lidar_js.d.ts",
+    "lidar_js_direct.d.ts",
     "README.md",
     "LICENSE",
     "NOTICE"

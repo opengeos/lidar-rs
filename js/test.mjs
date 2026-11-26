@@ -10,6 +10,7 @@ const rootCargoToml = fs.readFileSync(path.resolve(__dirname, "..", "Cargo.toml"
 const jsCargoToml = fs.readFileSync(path.resolve(__dirname, "Cargo.toml"), "utf8");
 const jsPackageJson = JSON.parse(fs.readFileSync(path.resolve(__dirname, "package.json"), "utf8"));
 const jsDts = fs.readFileSync(path.resolve(__dirname, "lidar_js.d.ts"), "utf8");
+const jsDirectDts = fs.readFileSync(path.resolve(__dirname, "lidar_js_direct.d.ts"), "utf8");
 const wsVersion = rootCargoToml.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
 const jsVersion = jsCargoToml.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
 assert.ok(wsVersion, "expected workspace version in root Cargo.toml");
@@ -22,15 +23,26 @@ assert.equal(
   undefined,
   'root "." export must not shadow ESM import with CJS node target (use "./node" instead)',
 );
+assert.equal(jsPackageJson.exports["./node"].types, "./lidar_js_direct.d.ts");
+assert.equal(jsPackageJson.exports["./bundler"].types, "./lidar_js_direct.d.ts");
+assert.equal(jsPackageJson.exports["."].require.types, "./lidar_js_direct.d.ts");
+assert.ok(
+  !/export\s+(default\s+)?function\s+init(Sync)?\b/.test(jsDirectDts),
+  "lidar_js_direct.d.ts must not advertise init/initSync on node/bundler/cjs subpaths",
+);
+assert.ok(
+  /export\s+\*\s+from\s+"\.\/lidar_js_direct\.d\.ts"/.test(jsDts),
+  "lidar_js.d.ts must re-export lidar_js_direct.d.ts",
+);
 assert.ok(jsPackageJson.exports["./node"], 'expected "./node" export entry in package.json');
 assert.ok(jsPackageJson.scripts?.["build:web"], "expected build:web script");
 assert.ok(jsPackageJson.scripts?.["build:node"], "expected build:node script");
 assert.ok(jsPackageJson.scripts?.["build:bundler"], "expected build:bundler script");
 
-console.log(`lidar-js version: ${lidar.version()}`);
+console.log(`lidar-wasm version: ${lidar.version()}`);
 assert.equal(lidar.version(), wsVersion);
 
-// Verify every exported symbol and output class method/getter is documented in js/lidar_js.d.ts
+// Verify every exported symbol and output class method/getter is documented in js/lidar_js_direct.d.ts
 const internalExports = new Set(["__wasm", "default"]);
 for (const exportName of Object.keys(lidar)) {
   if (internalExports.has(exportName) || exportName.startsWith("__wbg")) continue;
@@ -41,8 +53,8 @@ for (const exportName of Object.keys(lidar)) {
       ? new RegExp(`export\\s+class\\s+${exportName}\\b`)
       : new RegExp(`export\\s+function\\s+${exportName}\\s*\\(`);
     assert.ok(
-      declRe.test(jsDts),
-      `js/lidar_js.d.ts is missing declaration for exported ${isClass ? "class" : "function"} '${exportName}'`,
+      declRe.test(jsDirectDts),
+      `js/lidar_js_direct.d.ts is missing declaration for exported ${isClass ? "class" : "function"} '${exportName}'`,
     );
     if (isClass && val.prototype) {
       const classMatch = jsDts.match(
@@ -426,4 +438,4 @@ for (const [label, args] of [
   );
 }
 
-console.log("ALL lidar-js WASM TESTS PASSED!");
+console.log("ALL lidar-wasm WASM TESTS PASSED!");
