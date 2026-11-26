@@ -1527,12 +1527,14 @@ def build_connectivity_graph(
     )
 
 
-def _extract_array_masking_nodata(obj: SpatialArrayLike) -> np.ndarray:
-    """Extract a 2D array from a spatial adapter and convert any finite NoData sentinel to NaN."""
+def _extract_array_masking_nodata(
+    obj: SpatialArrayLike, *, fill: float = np.nan
+) -> np.ndarray:
+    """Extract a 2D array from a spatial adapter and replace any finite NoData sentinel with `fill`."""
     arr, _gt, _crs, nd = extract_spatial_array(obj)
     if nd is not None and np.isfinite(nd):
         masked = np.array(arr, dtype=np.float64, copy=True)
-        masked[masked == float(nd)] = np.nan
+        masked[masked == float(nd)] = fill
         return masked
     return arr
 
@@ -1565,7 +1567,7 @@ def simulate_inundation_array(
         dem_arr, geotransform=geotransform, crs=crs, no_data=no_data
     )
     rc = (
-        _extract_array_masking_nodata(runoff_coeff_arr)
+        _extract_array_masking_nodata(runoff_coeff_arr, fill=0.0)
         if runoff_coeff_arr is not None
         else None
     )

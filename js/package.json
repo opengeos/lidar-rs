@@ -8,9 +8,12 @@
   "types": "./lidar_js.d.ts",
   "exports": {
     ".": {
+      "browser": {
+        "types": "./lidar_js.d.ts",
+        "default": "./pkg/lidar_js.js"
+      },
       "import": {
         "types": "./lidar_js.d.ts",
-        "browser": "./pkg/lidar_js.js",
         "default": "./pkg/lidar_js.js"
       },
       "require": {

@@ -40,7 +40,7 @@ download() {
         case "$1" in
             https://*)
                 if wget --version 2>&1 | grep -qi 'GNU Wget'; then
-                    wget --https-only --secure-protocol=TLSv1_2 -q "$1" -O "$2"
+                    wget --https-only -q "$1" -O "$2"
                 else
                     wget -q "$1" -O "$2"
                 fi

@@ -982,7 +982,9 @@ def test_audit_v06_python_forcing_nodata_types_and_sequence(
         time_step_h=1.0,
         runoff_coeff_arr=fake_rc,
     )
-    assert np.isnan(captured["rc"][0, 0]), "finite forcing NoData must be converted to NaN"
+    assert captured["rc"][0, 0] == pytest.approx(0.0), (
+        "finite runoff_coeff NoData must be masked to 0.0 (no runoff)"
+    )
     assert captured["rc"][4, 4] == pytest.approx(0.5)
 
     # 3. download_federal_data accepts arbitrary Sequence[str] (not just list/tuple).
