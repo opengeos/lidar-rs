@@ -1,11 +1,11 @@
 # JavaScript / WebAssembly
 
-[![npm](https://img.shields.io/npm/v/%40opengeos%2Flidar-js.svg)](https://www.npmjs.com/package/@opengeos/lidar-js)
+[![npm](https://img.shields.io/npm/v/lidar-wasm.svg)](https://www.npmjs.com/package/lidar-wasm)
 
-`@opengeos/lidar-js` compiles [`lidar-rs`](https://github.com/opengeos/lidar-rs) to WebAssembly via `wasm-bindgen` for browsers and Node.js. All operations execute completely in memory on `Uint8Array` GeoTIFF, GeoJSON, GraphML, PNG, and GIF buffers with zero filesystem, GDAL, or C/C++ dependencies.
+`lidar-wasm` compiles [`lidar-rs`](https://github.com/opengeos/lidar-rs) to WebAssembly via `wasm-bindgen` for browsers and Node.js. All operations execute completely in memory on `Uint8Array` GeoTIFF, GeoJSON, GraphML, PNG, and GIF buffers with zero filesystem, GDAL, or C/C++ dependencies.
 
 ```sh
-npm install @opengeos/lidar-js
+npm install lidar-wasm
 ```
 
 Try it right now with zero installation on the interactive [WebAssembly Playground](playground.md).
@@ -148,7 +148,7 @@ try {
 
 ## TypeScript & Web Workers
 
-The `js/` package ships an npm manifest (`js/package.json` for `@opengeos/lidar-js`) and complete TypeScript definitions (`js/lidar_js.d.ts`) covering every exported function, output class, and parsed JSON/GeoJSON structure (`RasterInfo`, `NestedDepression`, `SpillFlowPath`, `RatingCurvePoint`, `ConnectivityGraph`, `FsmMassBalance`, `FsmBasinSummary`, and RFC 7946 GeoJSON FeatureCollections).
+The `js/` package ships an npm manifest (`js/package.json` for `lidar-wasm`) and complete TypeScript definitions (`js/lidar_js.d.ts`) covering every exported function, output class, and parsed JSON/GeoJSON structure (`RasterInfo`, `NestedDepression`, `SpillFlowPath`, `RatingCurvePoint`, `ConnectivityGraph`, `FsmMassBalance`, `FsmBasinSummary`, and RFC 7946 GeoJSON FeatureCollections).
 
 For large DEMs and GIF encoding in browsers, run `lidar-js` inside a dedicated ES module Web Worker (`new Worker(url, { type: "module" })`) with transferable `ArrayBuffer` responses and instant cancellation via `worker.terminate()`. See `js/README.md` and `docs/javascripts/playground-worker.js` for a complete working example.
 

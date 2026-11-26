@@ -62,12 +62,12 @@ Default features enable `parallel` (Rayon), `pointcloud` (LAS/LAZ/COPC/PLY/E57 +
 lidar = { version = "0.6", default-features = false, features = ["parallel"] }
 ```
 
-## WebAssembly (`@opengeos/lidar-js`)
+## WebAssembly (`lidar-wasm`)
 
 No installation is needed to try the [WebAssembly Playground](playground.md). Install the pre-built WebAssembly package from npm for browsers, bundlers, or Node.js:
 
 ```sh
-npm install @opengeos/lidar-js
+npm install lidar-wasm
 ```
 
 Or compile the browser, Node.js, and bundler WASM packages locally:
