@@ -500,6 +500,24 @@ class GroundClassifyResult(TypedDict):
     classification: NDArray[np.uint8]
 
 
+class EmbankmentArtifactCandidate(TypedDict):
+    """Morphometric and barrier-profile assessment of a potential embankment artifact depression."""
+
+    dep_id: int
+    level: int
+    area_m2: float
+    max_depth: float
+    elongatedness: float
+    circularity: float
+    compactness: float
+    barrier_width_m: float | None
+    barrier_height_ratio: float
+    rim_linearity: float
+    artifact_score: float
+    is_likely_artifact: bool
+    suggested_breach: tuple[tuple[float, float], tuple[float, float]] | None
+
+
 __all__ = [
     "AnimateInundationResult",
     "CatchmentHierarchyRecord",
@@ -513,6 +531,7 @@ __all__ = [
     "DelineationResult",
     "DepressionRecord",
     "Download3depResult",
+    "EmbankmentArtifactCandidate",
     "ExtractSinksArrayResult",
     "ExtractSinksResult",
     "FederalDataResult",

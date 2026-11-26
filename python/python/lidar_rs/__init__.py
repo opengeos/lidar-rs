@@ -31,6 +31,7 @@ from ._types import (
     DelineationResult,
     DepressionRecord,
     Download3depResult,
+    EmbankmentArtifactCandidate,
     ExtractSinksArrayResult,
     ExtractSinksResult,
     FederalDataResult,
@@ -1346,6 +1347,275 @@ def compute_hillshade(
     )
 
 
+@overload
+def compute_twi(
+    dem: PathLikeStr,
+    out_file: PathLikeStr,
+    flow_acc: PathLikeStr | None = None,
+    *,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+    compress: bool = False,
+) -> str: ...
+
+
+@overload
+def compute_twi(
+    dem: PathLikeStr | SpatialArrayLike,
+    out_file: None = None,
+    flow_acc: PathLikeStr | SpatialArrayLike | None = None,
+    *,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+    compress: bool = False,
+) -> NDArray[np.float64]: ...
+
+
+def compute_twi(
+    dem: PathLikeStr | SpatialArrayLike,
+    out_file: PathLikeStr | None = None,
+    flow_acc: PathLikeStr | SpatialArrayLike | None = None,
+    *,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+    compress: bool = False,
+) -> str | NDArray[np.float64]:
+    """Compute the Topographic Wetness Index (`TWI = ln(a / tan(beta))`) from a DEM file or 2D spatial array.
+
+    When `dem` is a file path and `out_file` is provided, writes the TWI GeoTIFF and returns
+    `str(out_file)`. Otherwise returns a 2D `float64` NumPy array.
+    """
+    if isinstance(dem, (str, os.PathLike)):
+        if geotransform is not None or crs is not None:
+            raise ValueError(
+                "geotransform and crs overrides are not supported when dem is a file path; "
+                "geotransform and CRS are read from the input raster file"
+            )
+        fa_str: str | None = None
+        if flow_acc is not None:
+            if not isinstance(flow_acc, (str, os.PathLike)):
+                raise ValueError(
+                    "flow_acc must be a raster file path when dem is a file path"
+                )
+            fa_str = _as_path_str(flow_acc)
+        out_str = _as_path_str(out_file) if out_file is not None else None
+        res = _lidar_rs.compute_twi_file(
+            _as_path_str(dem), out_str, fa_str, no_data, bool(compress)
+        )
+        if out_str is not None:
+            return out_str
+        assert res is not None
+        return res
+
+    if out_file is not None:
+        raise ValueError(
+            "out_file is not supported for array input; pass a raster file path or omit out_file"
+        )
+    arr, gt, resolved_crs, nd = extract_spatial_array(
+        dem, geotransform=geotransform, crs=crs, no_data=no_data
+    )
+    fa_arr: NDArray[np.float64] | None = None
+    if flow_acc is not None:
+        if isinstance(flow_acc, (str, os.PathLike)):
+            raise ValueError("flow_acc must be an array when dem is an array")
+        fa_arr = _extract_array_masking_nodata(flow_acc)
+    return _lidar_rs.compute_twi_array(
+        arr, fa_arr, nd, float(cell_size), gt, resolved_crs
+    )
+
+
+@overload
+def compute_hand(
+    dem: PathLikeStr,
+    out_file: PathLikeStr,
+    *,
+    stream_mask: PathLikeStr | None = None,
+    acc_threshold_cells: float | None = None,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+    compress: bool = False,
+) -> str: ...
+
+
+@overload
+def compute_hand(
+    dem: PathLikeStr | SpatialArrayLike,
+    out_file: None = None,
+    *,
+    stream_mask: PathLikeStr | SpatialArrayLike | None = None,
+    acc_threshold_cells: float | None = None,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+    compress: bool = False,
+) -> NDArray[np.float64]: ...
+
+
+def compute_hand(
+    dem: PathLikeStr | SpatialArrayLike,
+    out_file: PathLikeStr | None = None,
+    *,
+    stream_mask: PathLikeStr | SpatialArrayLike | None = None,
+    acc_threshold_cells: float | None = None,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+    compress: bool = False,
+) -> str | NDArray[np.float64]:
+    """Compute Height Above Nearest Drainage (HAND) from a DEM file or 2D spatial array.
+
+    Specify exactly one of `stream_mask` (binary raster/array where values > 0 mark drainage
+    cells) or `acc_threshold_cells` (D8 flow-accumulation cell threshold to extract streams).
+    """
+    if isinstance(dem, (str, os.PathLike)):
+        if geotransform is not None or crs is not None:
+            raise ValueError(
+                "geotransform and crs overrides are not supported when dem is a file path; "
+                "geotransform and CRS are read from the input raster file"
+            )
+        mask_str: str | None = None
+        if stream_mask is not None:
+            if not isinstance(stream_mask, (str, os.PathLike)):
+                raise ValueError(
+                    "stream_mask must be a raster file path when dem is a file path"
+                )
+            mask_str = _as_path_str(stream_mask)
+        out_str = _as_path_str(out_file) if out_file is not None else None
+        thresh = (
+            float(acc_threshold_cells) if acc_threshold_cells is not None else None
+        )
+        res = _lidar_rs.compute_hand_file(
+            _as_path_str(dem), out_str, mask_str, thresh, no_data, bool(compress)
+        )
+        if out_str is not None:
+            return out_str
+        assert res is not None
+        return res
+
+    if out_file is not None:
+        raise ValueError(
+            "out_file is not supported for array input; pass a raster file path or omit out_file"
+        )
+    arr, gt, resolved_crs, nd = extract_spatial_array(
+        dem, geotransform=geotransform, crs=crs, no_data=no_data
+    )
+    mask_u8: NDArray[np.uint8] | None = None
+    if stream_mask is not None:
+        if isinstance(stream_mask, (str, os.PathLike)):
+            raise ValueError("stream_mask must be an array when dem is an array")
+        mask_f64 = _extract_array_masking_nodata(stream_mask, fill=0.0)
+        mask_u8 = np.ascontiguousarray(
+            (np.isfinite(mask_f64) & (mask_f64 > 0.0)).astype(np.uint8)
+        )
+    thresh = float(acc_threshold_cells) if acc_threshold_cells is not None else None
+    return _lidar_rs.compute_hand_array(
+        arr, mask_u8, thresh, nd, float(cell_size), gt, resolved_crs
+    )
+
+
+def classify_embankment_artifacts(
+    dem: PathLikeStr | SpatialArrayLike,
+    depressions: DelineationArrayResult | Mapping[str, Any] | None = None,
+    *,
+    max_barrier_width_m: float = 60.0,
+    min_exit_drop: float = 0.05,
+    score_threshold: float = 0.55,
+    leaves_only: bool = True,
+    min_size: int = 1000,
+    min_depth: float = 0.3,
+    interval: float = 0.3,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+) -> list[EmbankmentArtifactCandidate]:
+    """Score delineated depressions to flag likely road/rail embankment impoundment artifacts.
+
+    Accepts a DEM GeoTIFF path or a 2D spatial array (NumPy ndarray, xarray DataArray, or
+    rasterio dataset). For array inputs, pass the dict returned by `delineate_depressions_array`
+    as `depressions` to reuse an existing delineation, or omit `depressions` to extract sinks
+    and delineate automatically.
+    """
+    if isinstance(dem, (str, os.PathLike)):
+        if geotransform is not None or crs is not None:
+            raise ValueError(
+                "geotransform and crs overrides are not supported when dem is a file path; "
+                "geotransform and CRS are read from the input raster file"
+            )
+        if depressions is not None:
+            raise ValueError(
+                "precomputed depressions apply only when dem is an array, not a file path"
+            )
+        return list(
+            _lidar_rs.classify_embankment_artifacts_file(
+                _as_path_str(dem),
+                float(max_barrier_width_m),
+                float(min_exit_drop),
+                float(score_threshold),
+                bool(leaves_only),
+                int(min_size),
+                float(min_depth),
+                float(interval),
+                no_data,
+            )
+        )
+
+    arr, gt, resolved_crs, nd = extract_spatial_array(
+        dem, geotransform=geotransform, crs=crs, no_data=no_data
+    )
+    dep_id_arr: NDArray[np.int32] | None = None
+    dep_lvl_arr: NDArray[np.int32] | None = None
+    dep_list: list[DepressionRecord] | None = None
+    if depressions is not None:
+        dep_id_arr = np.ascontiguousarray(depressions["depression_id"], dtype=np.int32)
+        raw_lvl = depressions.get("depression_level")
+        if raw_lvl is not None:
+            dep_lvl_arr = np.ascontiguousarray(raw_lvl, dtype=np.int32)
+        dep_list = list(depressions["depressions"])
+        if gt is None and depressions.get("geotransform") is not None:
+            raw_gt = depressions["geotransform"]
+            gt = (
+                float(raw_gt[0]),
+                float(raw_gt[1]),
+                float(raw_gt[2]),
+                float(raw_gt[3]),
+                float(raw_gt[4]),
+                float(raw_gt[5]),
+            )
+        if resolved_crs is None and depressions.get("crs") is not None:
+            resolved_crs = str(depressions["crs"])
+
+    return list(
+        _lidar_rs.classify_embankment_artifacts_array(
+            arr,
+            dep_id_arr,
+            dep_lvl_arr,
+            dep_list,
+            float(max_barrier_width_m),
+            float(min_exit_drop),
+            float(score_threshold),
+            bool(leaves_only),
+            int(min_size),
+            float(min_depth),
+            float(interval),
+            nd,
+            float(cell_size),
+            gt,
+            resolved_crs,
+        )
+    )
+
+
 def compute_rating_curves(
     sink_arr: SpatialArrayLike,
     depressions: DelineationArrayResult | Mapping[str, Any] | None = None,
@@ -1961,6 +2231,7 @@ __all__ = [
     "DelineationResult",
     "DepressionRecord",
     "Download3depResult",
+    "EmbankmentArtifactCandidate",
     "ExtractSinks",
     "ExtractSinksArrayResult",
     "ExtractSinksResult",
@@ -2000,10 +2271,13 @@ __all__ = [
     "breach_depressions",
     "build_connectivity_graph",
     "burn_culverts",
+    "classify_embankment_artifacts",
     "classify_ground",
     "clip_image",
+    "compute_hand",
     "compute_hillshade",
     "compute_rating_curves",
+    "compute_twi",
     "connectivity_to_networkx",
     "convert_lidar",
     "csv_points_to_shp",
