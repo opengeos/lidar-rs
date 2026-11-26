@@ -1,6 +1,14 @@
 # `@opengeos/lidar-js` (WebAssembly bindings for `lidar-rs`)
 
+[![npm](https://img.shields.io/npm/v/%40opengeos%2Flidar-js.svg)](https://www.npmjs.com/package/@opengeos/lidar-js)
+
 Run DEM filtering, selective depression breaching, nested surface depression and mount delineation, catchment hierarchy analysis, fill-and-spill inundation simulation (static and dynamic Fill-Spill-Merge routing), stage-storage rating curves, connectivity graphs, and PNG/GIF rendering directly in **browsers, Web Workers, and Node.js** via WebAssembly with zero GDAL, zero Python, and zero server dependencies.
+
+## Installation
+
+```sh
+npm install @opengeos/lidar-js
+```
 
 ## Building
 

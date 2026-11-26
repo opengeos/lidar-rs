@@ -1,6 +1,12 @@
 # JavaScript / WebAssembly
 
-`lidar-js` compiles [`lidar-rs`](https://github.com/opengeos/lidar-rs) to WebAssembly via `wasm-bindgen` for browsers and Node.js. All operations execute completely in memory on `Uint8Array` GeoTIFF, GeoJSON, GraphML, PNG, and GIF buffers with zero filesystem, GDAL, or C/C++ dependencies.
+[![npm](https://img.shields.io/npm/v/%40opengeos%2Flidar-js.svg)](https://www.npmjs.com/package/@opengeos/lidar-js)
+
+`@opengeos/lidar-js` compiles [`lidar-rs`](https://github.com/opengeos/lidar-rs) to WebAssembly via `wasm-bindgen` for browsers and Node.js. All operations execute completely in memory on `Uint8Array` GeoTIFF, GeoJSON, GraphML, PNG, and GIF buffers with zero filesystem, GDAL, or C/C++ dependencies.
+
+```sh
+npm install @opengeos/lidar-js
+```
 
 Try it right now with zero installation on the interactive [WebAssembly Playground](playground.md).
 
