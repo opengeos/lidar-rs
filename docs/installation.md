@@ -64,13 +64,13 @@ lidar = { version = "0.6", default-features = false, features = ["parallel"] }
 
 ## WebAssembly (`lidar-wasm`)
 
-No installation is needed to try the [WebAssembly Playground](playground.md). Install the pre-built WebAssembly package from npm for browsers, bundlers, or Node.js:
+No installation is needed to try the [WebAssembly Playground](playground.md). Install the pre-built WebAssembly package from npm for browsers, bundlers (`import init from "lidar-wasm"`), or Node.js (`import * as lidar from "lidar-wasm/node"`):
 
 ```sh
 npm install lidar-wasm
 ```
 
-Or compile the browser, Node.js, and bundler WASM packages locally:
+Or compile the browser, Node.js, and bundler WASM packages locally (requires Rust, `wasm-pack`, and Node.js 18+ with `npm`):
 
 ```sh
 rustup target add wasm32-unknown-unknown
