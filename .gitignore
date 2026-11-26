@@ -18,4 +18,5 @@ private/
 *.pyd
 js/pkg/
 js/pkg-node/
+js/pkg-bundler/
 site/

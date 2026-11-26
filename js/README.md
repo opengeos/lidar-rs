@@ -1,6 +1,14 @@
-# `@opengeos/lidar-js` (WebAssembly bindings for `lidar-rs`)
+# `lidar-wasm` (WebAssembly bindings for `lidar-rs`)
+
+[![npm](https://img.shields.io/npm/v/lidar-wasm.svg)](https://www.npmjs.com/package/lidar-wasm)
 
 Run DEM filtering, selective depression breaching, nested surface depression and mount delineation, catchment hierarchy analysis, fill-and-spill inundation simulation (static and dynamic Fill-Spill-Merge routing), stage-storage rating curves, connectivity graphs, and PNG/GIF rendering directly in **browsers, Web Workers, and Node.js** via WebAssembly with zero GDAL, zero Python, and zero server dependencies.
+
+## Installation
+
+```sh
+npm install lidar-wasm
+```
 
 ## Building
 
@@ -26,7 +34,7 @@ import init, {
   simulateInundationAdvanced,
   type NestedDepression,
   type DepressionsFeatureCollection,
-} from "@opengeos/lidar-js";
+} from "lidar-wasm";
 
 await init();
 
@@ -62,11 +70,11 @@ try {
 
 ## Dedicated Web Worker Usage
 
-For large DEMs and GIF encoding, run `@opengeos/lidar-js` inside a module Web Worker so the browser UI stays responsive and long runs can be cancelled cleanly with `worker.terminate()`.
+For large DEMs and GIF encoding, run `lidar-wasm` inside a module Web Worker so the browser UI stays responsive and long runs can be cancelled cleanly with `worker.terminate()`.
 
 ```ts
 // worker.ts
-import init, { simulateInundationAdvanced } from "@opengeos/lidar-js";
+import init, { simulateInundationAdvanced } from "lidar-wasm";
 
 const ready = init();
 
@@ -111,7 +119,7 @@ worker.postMessage({ id: 1, demBytes, filename: "dem.tif" });
 
 ```ts
 import fs from "node:fs";
-import * as lidar from "@opengeos/lidar-js/node";
+import * as lidar from "lidar-wasm/node";
 
 const demBytes = new Uint8Array(fs.readFileSync("../test_data/dem.tif"));
 const sim = lidar.simulateInundation(demBytes, "dem.tif", 3, 1000, 0.2, 0.3, 5.0, 10.0, 2.0);

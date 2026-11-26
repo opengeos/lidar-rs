@@ -1,6 +1,12 @@
 # JavaScript / WebAssembly
 
-`lidar-js` compiles [`lidar-rs`](https://github.com/opengeos/lidar-rs) to WebAssembly via `wasm-bindgen` for browsers and Node.js. All operations execute completely in memory on `Uint8Array` GeoTIFF, GeoJSON, GraphML, PNG, and GIF buffers with zero filesystem, GDAL, or C/C++ dependencies.
+[![npm](https://img.shields.io/npm/v/lidar-wasm.svg)](https://www.npmjs.com/package/lidar-wasm)
+
+`lidar-wasm` compiles [`lidar-rs`](https://github.com/opengeos/lidar-rs) to WebAssembly via `wasm-bindgen` for browsers and Node.js. All operations execute completely in memory on `Uint8Array` GeoTIFF, GeoJSON, GraphML, PNG, and GIF buffers with zero filesystem, GDAL, or C/C++ dependencies.
+
+```sh
+npm install lidar-wasm
+```
 
 Try it right now with zero installation on the interactive [WebAssembly Playground](playground.md).
 
@@ -13,7 +19,7 @@ import init, {
   version,
   rasterInfo,
   simulateInundationAdvanced,
-} from "./wasm/lidar_js.js";
+} from "lidar-wasm";
 
 await init();
 console.log("lidar-rs", version());
@@ -78,16 +84,11 @@ try {
 
 ## Quick Start (Node.js)
 
-Build the Node.js target with `wasm-pack` and call it directly from ES modules:
-
-```sh
-cd js
-wasm-pack build --target nodejs --release --out-dir pkg-node
-```
+Import the Node.js subpath (`lidar-wasm/node`) directly from ES modules or CommonJS (no `init()` call required):
 
 ```js
 import fs from "node:fs";
-import * as lidar from "./pkg-node/lidar_js.js";
+import * as lidar from "lidar-wasm/node";
 
 const demBytes = fs.readFileSync("../test_data/dem.tif");
 const breached = lidar.breachDem(demBytes, "dem.tif", "selective", 1.5, 40, false);
@@ -142,28 +143,27 @@ try {
 
 ## TypeScript & Web Workers
 
-The `js/` package ships an npm manifest (`js/package.json` for `@opengeos/lidar-js`) and complete TypeScript definitions (`js/lidar_js.d.ts`) covering every exported function, output class, and parsed JSON/GeoJSON structure (`RasterInfo`, `NestedDepression`, `SpillFlowPath`, `RatingCurvePoint`, `ConnectivityGraph`, `FsmMassBalance`, `FsmBasinSummary`, and RFC 7946 GeoJSON FeatureCollections).
+The `js/` package ships an npm manifest (`js/package.json` for `lidar-wasm`) and complete TypeScript definitions (`js/lidar_js.d.ts`) covering every exported function, output class, and parsed JSON/GeoJSON structure (`RasterInfo`, `NestedDepression`, `SpillFlowPath`, `RatingCurvePoint`, `ConnectivityGraph`, `FsmMassBalance`, `FsmBasinSummary`, and RFC 7946 GeoJSON FeatureCollections).
 
-For large DEMs and GIF encoding in browsers, run `lidar-js` inside a dedicated ES module Web Worker (`new Worker(url, { type: "module" })`) with transferable `ArrayBuffer` responses and instant cancellation via `worker.terminate()`. See `js/README.md` and `docs/javascripts/playground-worker.js` for a complete working example.
+For large DEMs and GIF encoding in browsers, run `lidar-wasm` inside a dedicated ES module Web Worker (`new Worker(url, { type: "module" })`) with transferable `ArrayBuffer` responses and instant cancellation via `worker.terminate()`. See `js/README.md` and `docs/javascripts/playground-worker.js` for a complete working example.
 
 !!! tip "Memory Management"
     `SinksOutput`, `DepressionsOutput`, `CatchmentsOutput`, and `InundationOutput` hold WebAssembly heap allocations. Call `.free()` (ideally in a `finally` block) once you have copied the buffers or strings you need.
 
 ## Building from Source
 
+Requires Rust (`wasm32-unknown-unknown` target), `wasm-pack`, and Node.js 18+ with `npm`:
+
 ```sh
 rustup target add wasm32-unknown-unknown
 cargo install wasm-pack
 
 cd js
-# Browser ES module
-wasm-pack build --target web --release --out-dir pkg -- --locked
-
-# Node.js module + end-to-end test suite
-wasm-pack build --target nodejs --release --out-dir pkg-node -- --locked
-node test.mjs
+# Build web, Node.js, and bundler targets and run the end-to-end test suite
+npm run build
+npm test
 ```
 
 ## License Note
 
-The `lidar-rs` source code is licensed under MIT, while the compiled `.wasm` binary statically links [`richdem`](https://github.com/opengeos/richdem-rs) (`GPL-3.0-only`). Accordingly, `lidar-js` declares `GPL-3.0-only` for distributed WebAssembly artifacts; see [NOTICE](https://github.com/opengeos/lidar-rs/blob/main/NOTICE).
+The `lidar-rs` source code is licensed under MIT, while the compiled `.wasm` binary statically links [`richdem`](https://github.com/opengeos/richdem-rs) (`GPL-3.0-only`). Accordingly, `lidar-wasm` declares `GPL-3.0-only` for distributed WebAssembly artifacts; see [NOTICE](https://github.com/opengeos/lidar-rs/blob/main/NOTICE).

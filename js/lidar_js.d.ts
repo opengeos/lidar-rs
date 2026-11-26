@@ -1,5 +1,5 @@
 /**
- * TypeScript definitions for `@opengeos/lidar-js` (WebAssembly bindings for `lidar-rs`).
+ * TypeScript definitions for `lidar-wasm` (WebAssembly bindings for `lidar-rs`).
  *
  * Covers every `#[wasm_bindgen]` export in `js/src/lib.rs` together with typed
  * interfaces for all parsed JSON and GeoJSON payloads.
