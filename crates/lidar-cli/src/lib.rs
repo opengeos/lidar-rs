@@ -3019,34 +3019,11 @@ fn dispatch(
                         .into(),
                 )
             })?;
-            let resolve = |p: &Path| -> PathBuf {
-                std::fs::canonicalize(p).unwrap_or_else(|_| {
-                    if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
-                        let parent_dir = if parent.as_os_str().is_empty() {
-                            Path::new(".")
-                        } else {
-                            parent
-                        };
-                        std::fs::canonicalize(parent_dir)
-                            .map(|cp| cp.join(name))
-                            .unwrap_or_else(|_| p.to_path_buf())
-                    } else {
-                        p.to_path_buf()
-                    }
-                })
-            };
-            let out_resolved = resolve(&out_path);
             for input_path in [Some(dem.as_path()), fill_time.as_deref(), depth.as_deref()]
                 .into_iter()
                 .flatten()
             {
-                if resolve(input_path) == out_resolved {
-                    return Err(lidar::Error::InvalidArgument(format!(
-                        "preview output '{}' would overwrite input raster '{}'",
-                        out_path.display(),
-                        input_path.display()
-                    )));
-                }
+                ensure_no_cli_path_collision(input_path, &out_path)?;
             }
             if let Some(h) = hour
                 && (!h.is_finite() || h < 0.0)
@@ -3323,6 +3300,12 @@ fn dispatch(
                     );
                 }
             } else {
+                if json && matches!(format, Some(CliGraphFormat::Graphml | CliGraphFormat::Csv)) {
+                    return Err(lidar::Error::InvalidArgument(
+                        "--json conflicts with --format graphml/csv when writing to stdout; pass -o FILE to write that format and emit a JSON summary"
+                            .into(),
+                    ));
+                }
                 let fmt = if json {
                     CliGraphFormat::Json
                 } else {
