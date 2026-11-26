@@ -1057,7 +1057,6 @@ fn delineate_merge_tree_impl(
         Topology::D4 => &D4_OFFSETS,
         Topology::D8 => &D8_OFFSETS,
     };
-    let dem_info = source_dem.map(|d| (d.data(), d.no_data()));
 
     for r in 0..h {
         let off = r * w;
@@ -1090,9 +1089,19 @@ fn delineate_merge_tree_impl(
 
     // When the source DEM is provided, identify the exact lowest exterior rim/outlet neighbor
     // at or above the region's maximum interior elevation so root spill elevation and storage
-    // volume reflect the true topographic pour point without being hijacked by lower pruned
-    // exterior pits.
-    if let Some((ddata, d_nd)) = dem_info {
+    // volume reflect the true topographic pour point without being hijacked by pruned exterior
+    // pits. Running Priority-Flood on `source_dem` separates true unfilled rim cells
+    // (`filled == dz`) from pruned depression cells (`filled > dz`) regardless of elevation.
+    if let Some(dem) = source_dem
+        && k > 0
+    {
+        let mut filled = dem.clone();
+        richdem::fill_depressions(&mut filled, options.topology);
+        let ddata = dem.data();
+        let d_nd = dem.no_data();
+        let fdata = filled.data();
+        let mut fallback_outlets: Vec<Option<RootOutlet>> = vec![None; k];
+
         for (idx, cells) in region_cells.iter().enumerate() {
             let lbl = (idx + 1) as u32;
             let max_z = reg_max_elev[idx];
@@ -1113,18 +1122,27 @@ fn delineate_merge_tree_impl(
                     if !dz.is_finite() || dz.rd_eq(d_nd) || dz < max_z {
                         continue;
                     }
-                    let replace = match region_outlets[idx] {
+                    let is_unfilled_rim = fdata[nidx].is_finite() && fdata[nidx] <= dz + 1e-12;
+                    let slot = if is_unfilled_rim {
+                        &mut region_outlets[idx]
+                    } else {
+                        &mut fallback_outlets[idx]
+                    };
+                    let replace = match *slot {
                         None => true,
                         Some(cur) => dz < cur.z || (dz == cur.z && (nru, ncu) < (cur.r, cur.c)),
                     };
                     if replace {
-                        region_outlets[idx] = Some(RootOutlet {
+                        *slot = Some(RootOutlet {
                             z: dz,
                             r: nru,
                             c: ncu,
                         });
                     }
                 }
+            }
+            if region_outlets[idx].is_none() {
+                region_outlets[idx] = fallback_outlets[idx];
             }
         }
     }

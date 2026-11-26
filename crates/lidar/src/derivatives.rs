@@ -155,15 +155,34 @@ struct DinfCell {
     w2: f64,
 }
 
-fn solve_dinf_grid(dem: &Array2D<f64>, out_nd: f64) -> Vec<DinfCell> {
+fn checked_metric_scale(dem: &Array2D<f64>) -> Result<(f64, f64, f64)> {
+    let scale = crs_metric_scale(
+        &dem.projection,
+        &dem.geotransform,
+        dem.width(),
+        dem.height(),
+    );
+    if !scale.cell_width_m.is_finite()
+        || !scale.cell_height_m.is_finite()
+        || !scale.cell_area_m2.is_finite()
+        || scale.cell_width_m <= 0.0
+        || scale.cell_height_m <= 0.0
+    {
+        return Err(Error::InvalidArgument(
+            "DEM geotransform or CRS produced non-finite or non-positive metric cell spacing"
+                .into(),
+        ));
+    }
+    Ok((scale.cell_width_m, scale.cell_height_m, scale.cell_area_m2))
+}
+
+fn solve_dinf_grid(dem: &Array2D<f64>, out_nd: f64) -> Result<Vec<DinfCell>> {
     let w = dem.width();
     let h = dem.height();
     let n = w * h;
     let zdata = dem.data();
     let z_nd = dem.no_data();
-    let scale = crs_metric_scale(&dem.projection, &dem.geotransform, w, h);
-    let dx = scale.cell_width_m;
-    let dy = scale.cell_height_m;
+    let (dx, dy, _) = checked_metric_scale(dem)?;
     let d_diag = dx.hypot(dy);
 
     let mut out = vec![
@@ -287,7 +306,7 @@ fn solve_dinf_grid(dem: &Array2D<f64>, out_nd: f64) -> Vec<DinfCell> {
         }
     }
 
-    out
+    Ok(out)
 }
 
 /// Computes D-Infinity flow directions (Tarboton, 1997) in radians `[0, 2*pi)` measured
@@ -299,7 +318,7 @@ pub fn dinf_flow_direction(dem: &Array2D<f64>) -> Result<Array2D<f64>> {
     let w = dem.width();
     let h = dem.height();
     let out_nd = safe_nodata(dem.no_data(), -1.0);
-    let cells = solve_dinf_grid(dem, out_nd);
+    let cells = solve_dinf_grid(dem, out_nd)?;
     let data: Vec<f64> = cells.into_iter().map(|c| c.angle).collect();
     let mut out = Array2D::from_vec(w, h, data)?;
     out.copy_metadata_from(dem);
@@ -348,7 +367,7 @@ fn dinf_flow_accumulation_and_slope(dem: &Array2D<f64>) -> Result<(Array2D<f64>,
     let z_nd = dem.no_data();
     let out_nd = safe_nodata(z_nd, 0.0);
 
-    let mut cells = solve_dinf_grid(dem, out_nd);
+    let mut cells = solve_dinf_grid(dem, out_nd)?;
     let has_flats = cells
         .iter()
         .enumerate()
@@ -462,9 +481,7 @@ pub fn mfd_flow_accumulation(dem: &Array2D<f64>, exponent: f64) -> Result<Array2
     let zdata = dem.data();
     let z_nd = dem.no_data();
     let out_nd = safe_nodata(z_nd, 0.0);
-    let scale = crs_metric_scale(&dem.projection, &dem.geotransform, w, h);
-    let dx = scale.cell_width_m;
-    let dy = scale.cell_height_m;
+    let (dx, dy, _) = checked_metric_scale(dem)?;
     let cell_size = 0.5 * (dx + dy);
     let d_diag = dx.hypot(dy);
     let diag_contour = 0.25 * std::f64::consts::SQRT_2 * cell_size;
@@ -530,10 +547,12 @@ pub fn mfd_flow_accumulation(dem: &Array2D<f64>, exponent: f64) -> Result<Array2
             let mut cnt = 0usize;
             let mut sum_w = 0.0f64;
             if raw_cnt > 0 && max_slope > 0.0 {
-                // Normalize slopes by max_slope in (0, 1] so slope^exponent never overflows
-                // sum_w to +inf or underflows all downward neighbors to 0.
+                // Compute normalized slope^exponent in log space relative to max_slope so
+                // extreme slope spreads neither overflow sum_w to +inf nor underflow valid
+                // branches to 0 when exponent is small.
+                let ln_max = max_slope.ln();
                 for &(ni, slope, d) in &local_slopes[..raw_cnt] {
-                    let weight = (slope / max_slope).powf(exponent) * d8_contour[d];
+                    let weight = (exponent * (slope.ln() - ln_max)).exp() * d8_contour[d];
                     if weight > 0.0 && weight.is_finite() {
                         local_nbrs[cnt] = (ni, weight);
                         cnt += 1;
@@ -663,17 +682,14 @@ pub fn compute_twi(dem: &Array2D<f64>, flow_acc: Option<&Array2D<f64>>) -> Resul
     let zdata = dem.data();
     let z_nd = dem.no_data();
     let out_nd = safe_nodata(z_nd, -1000.0);
-    let scale = crs_metric_scale(&dem.projection, &dem.geotransform, w, h);
-    let dx = scale.cell_width_m;
-    let dy = scale.cell_height_m;
-    let cell_area = scale.cell_area_m2;
+    let (dx, dy, cell_area) = checked_metric_scale(dem)?;
     let cell_size = 0.5 * (dx + dy);
     let sca_scale = cell_area / cell_size.max(1e-12);
 
     let computed_acc;
     let (acc_ref, slopes) = match flow_acc {
         Some(fa) => {
-            let cells = solve_dinf_grid(dem, out_nd);
+            let cells = solve_dinf_grid(dem, out_nd)?;
             let slopes: Vec<f64> = cells.into_iter().map(|c| c.slope).collect();
             (fa, slopes)
         }

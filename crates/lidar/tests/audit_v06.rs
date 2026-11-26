@@ -8,11 +8,11 @@ use lidar::{
     Array2D, BurnStreamsOptions, FsmHydrographPoint, InMemoryDepressions, MergeTreeOptions,
     NestedDepression, SimulateInundationOptions, SpillAttenuationOptions, Topology,
     attenuate_fsm_hydrograph_with_options, build_connectivity_graph, burn_streams,
-    compute_rating_curves, compute_twi, delineate_depressions_in_memory,
-    delineate_depressions_merge_tree_with_dem_in_memory, dinf_flow_direction,
-    extract_sinks_in_memory, extract_sinks_with_filled_in_memory, mfd_flow_accumulation,
-    parse_hyetograph_csv, region_props_xy, simulate_fill_spill_merge_in_memory,
-    simulate_inundation_in_memory,
+    chicago_hyetograph, compute_rating_curves, compute_twi, crs_metric_scale,
+    delineate_depressions_in_memory, delineate_depressions_merge_tree_with_dem_in_memory,
+    dinf_flow_direction, extract_sinks_in_memory, extract_sinks_with_filled_in_memory,
+    mfd_flow_accumulation, parse_hyetograph_csv, region_props_xy,
+    simulate_fill_spill_merge_in_memory, simulate_inundation_in_memory,
 };
 use richdem::DemNum;
 use terrio::vector::Coord;
@@ -61,7 +61,7 @@ fn make_dep(
 }
 
 #[test]
-fn c1_flat_high_elevation_sink_with_zero_min_depth_terminates_promptly() {
+fn flat_high_elevation_sink_with_zero_min_depth_terminates_promptly() {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut flat = Array2D::from_vec(3, 3, vec![1e30; 9]).unwrap();
@@ -78,50 +78,49 @@ fn c1_flat_high_elevation_sink_with_zero_min_depth_terminates_promptly() {
 }
 
 #[test]
-fn c2_merge_tree_root_outlet_not_hijacked_by_lower_pruned_exterior_pit() {
-    // 7x7 DEM:
-    // - Rim surrounds a 3x3 depression at rows 2..=4, cols 2..=4 with elevations 5.0..8.0
-    //   and true rim pour point at (1, 3) with elevation 10.0 (rest of rim 15.0).
-    // - A 1-cell pit at (1, 1) has elevation 2.0 (diagonally adjacent to (2, 2)), which
-    //   extract_sinks (min_size=2, D4 grouping) prunes from the sink raster while it stays
-    //   at 2.0 in the source DEM.
-    let (w, h) = (7usize, 7usize);
-    let mut z = vec![15.0f64; w * h];
-    for r in 2..=4 {
-        for c in 2..=4 {
-            z[r * w + c] = if r == 3 && c == 3 { 5.0 } else { 8.0 };
+fn merge_tree_root_outlet_not_hijacked_by_pruned_exterior_pit() {
+    // 7x7 DEM with a 3x3 depression (z in [5.0, 8.0]), true rim pour point at (1, 3) = 10.0,
+    // and a pruned 1-cell pit at (1, 1) diagonally adjacent to (2, 2). Test both a pit
+    // below max_z (2.0) and a pit between max_z and the true rim (9.0).
+    for pit_elev in [2.0f64, 9.0f64] {
+        let (w, h) = (7usize, 7usize);
+        let mut z = vec![15.0f64; w * h];
+        for r in 2..=4 {
+            for c in 2..=4 {
+                z[r * w + c] = if r == 3 && c == 3 { 5.0 } else { 8.0 };
+            }
         }
-    }
-    z[w + 3] = 10.0;
-    z[3] = 9.5;
-    z[w + 1] = 2.0;
+        z[w + 3] = 10.0;
+        z[3] = 9.5;
+        z[w + 1] = pit_elev;
 
-    let dem = make_dem(w, h, z, -9999.0, [0.0, 1.0, 0.0, 7.0, 0.0, -1.0]);
-    let sinks = extract_sinks_in_memory(&dem, 2, Topology::D8).unwrap();
-    let mt = delineate_depressions_merge_tree_with_dem_in_memory(
-        &sinks.sink,
-        &dem,
-        &MergeTreeOptions {
-            min_size: 2,
-            min_depth: 0.5,
-            topology: Topology::D8,
-        },
-    )
-    .unwrap();
-    assert_eq!(mt.nodes.len(), 1);
-    let root = &mt.nodes[0];
-    assert!(
-        (root.saddle_elev - 10.0).abs() < 1e-9,
-        "root saddle_elev should be true rim 10.0, got {} at ({}, {})",
-        root.saddle_elev,
-        root.pour_point_row,
-        root.pour_point_col
-    );
-    assert_eq!((root.pour_point_row, root.pour_point_col), (1, 3));
+        let dem = make_dem(w, h, z, -9999.0, [0.0, 1.0, 0.0, 7.0, 0.0, -1.0]);
+        let sinks = extract_sinks_in_memory(&dem, 2, Topology::D8).unwrap();
+        let mt = delineate_depressions_merge_tree_with_dem_in_memory(
+            &sinks.sink,
+            &dem,
+            &MergeTreeOptions {
+                min_size: 2,
+                min_depth: 0.5,
+                topology: Topology::D8,
+            },
+        )
+        .unwrap();
+        assert_eq!(mt.nodes.len(), 1);
+        let root = &mt.nodes[0];
+        assert!(
+            (root.saddle_elev - 10.0).abs() < 1e-9,
+            "pit_elev={pit_elev}: root saddle_elev should be true rim 10.0, got {} at ({}, {})",
+            root.saddle_elev,
+            root.pour_point_row,
+            root.pour_point_col
+        );
+        assert_eq!((root.pour_point_row, root.pour_point_col), (1, 3));
+    }
 }
 
 #[test]
-fn c3_derivatives_use_crs_metric_scale_on_geographic_dem() {
+fn derivatives_use_crs_metric_scale_on_geographic_dem() {
     let (w, h) = (11usize, 11usize);
     let ddeg = 0.0001;
     let mut z = vec![0.0f64; w * h];
@@ -146,24 +145,27 @@ fn c3_derivatives_use_crs_metric_scale_on_geographic_dem() {
             z_diag[r * w + c] = 100.0 - (c as f64) + (r as f64);
         }
     }
-    let mut dem60 = make_dem(
-        w,
-        h,
-        z_diag,
-        -9999.0,
-        [-90.0, ddeg, 0.0, 60.0005, 0.0, -ddeg],
-    );
+    let gt60 = [-90.0, ddeg, 0.0, 60.0005, 0.0, -ddeg];
+    let mut dem60 = make_dem(w, h, z_diag, -9999.0, gt60);
     dem60.projection = "EPSG:4326".to_string();
+    let scale60 = crs_metric_scale("EPSG:4326", &gt60, w, h);
+    let expected_ang = (1.0 / scale60.cell_height_m).atan2(1.0 / scale60.cell_width_m);
     let dir = dinf_flow_direction(&dem60).unwrap();
     let ang = dir.get(5, 5);
     assert!(
-        (ang - std::f64::consts::FRAC_PI_4).abs() > 0.2,
-        "EPSG:4326 D-inf at 60N should reflect geodesic aspect ratio, got angle {ang}"
+        (ang - expected_ang).abs() < 0.02,
+        "EPSG:4326 D-inf at 60N expected geodesic angle {expected_ang:.4}, got {ang:.4}"
     );
+
+    // Non-finite geographic geotransform must return Err rather than silently using degrees.
+    let mut dem_nan = dem60.clone();
+    dem_nan.geotransform[3] = f64::NAN;
+    assert!(dinf_flow_direction(&dem_nan).is_err());
+    assert!(compute_twi(&dem_nan, None).is_err());
 }
 
 #[test]
-fn c4_attenuate_hydrograph_auto_tail_converges_on_coarse_dt_and_multi_reservoir() {
+fn attenuate_hydrograph_auto_tail_converges_on_coarse_dt_and_multi_reservoir() {
     let hydro = vec![
         FsmHydrographPoint {
             time_h: 0.0,
@@ -202,22 +204,35 @@ fn c4_attenuate_hydrograph_auto_tail_converges_on_coarse_dt_and_multi_reservoir(
 }
 
 #[test]
-fn c5_mfd_flow_accumulation_conserves_flow_at_high_exponent_and_steep_slope() {
+fn mfd_flow_accumulation_conserves_flow_at_extreme_exponents_and_slope_spreads() {
+    // 1. High exponent where raw slope^p is finite (~1e308) but naive sum_w overflows to +inf.
     let mut z = vec![0.0f64; 9];
     z[4] = 1e6;
     let dem = make_dem(3, 3, z, -9999.0, [0.0, 1.0, 0.0, 3.0, 0.0, -1.0]);
-    // With exponent = 51.35, each cardinal weight is ~1e308 (finite), so naive sum_w overflows
-    // to +inf and weight/sum_w becomes 0.0, destroying all flow from the center cell.
     let acc = mfd_flow_accumulation(&dem, 51.35).unwrap();
     let rim_sum: f64 = (0..9).filter(|&i| i != 4).map(|i| acc.get_i(i)).sum();
     assert!(
         (rim_sum - 9.0).abs() < 1e-6,
         "MFD must conserve flow without overflow; expected rim_sum=9.0, got {rim_sum}"
     );
+
+    // 2. Extreme slope spread with small positive exponent must not underflow valid outflow edge.
+    let z_spread = vec![
+        1e200, 1e200, 1e200, 1e200, 1e-200, 0.0, 1e200, -1e200, 1e200,
+    ];
+    let dem_spread = make_dem(3, 3, z_spread, -9999.0, [0.0, 1.0, 0.0, 3.0, 0.0, -1.0]);
+    let acc_spread = mfd_flow_accumulation(&dem_spread, 0.001).unwrap();
+    // Center (1,1) at 1e-200 has East neighbor at 0.0 (slope 1e-200) and South at -1e200 (slope ~1e200).
+    // With exponent = 0.001, (1e-400)^0.001 = 10^-0.4 ~ 0.3981, so East must receive > 1.2 cells.
+    assert!(
+        acc_spread.get(2, 1) > 1.2,
+        "East branch must retain representable log-space weight, got {}",
+        acc_spread.get(2, 1)
+    );
 }
 
 #[test]
-fn c6_region_props_xy_clamps_minor_axis_to_min_res() {
+fn region_props_xy_clamps_minor_axis_to_min_res() {
     let (w, h) = (101usize, 3usize);
     let mut labels = vec![0u32; w * h];
     labels[..100].fill(1);
@@ -233,7 +248,7 @@ fn c6_region_props_xy_clamps_minor_axis_to_min_res() {
 }
 
 #[test]
-fn c7_alignment_checks_reject_nan_geotransforms() {
+fn alignment_checks_reject_nan_geotransforms() {
     let mut dem = make_dem(
         3,
         3,
@@ -264,7 +279,7 @@ fn c7_alignment_checks_reject_nan_geotransforms() {
 }
 
 #[test]
-fn c8_graph_and_fsm_handle_sparse_large_depression_ids_without_oom() {
+fn graph_and_fsm_handle_sparse_large_depression_ids_without_oom() {
     let gt = [0.0, 1.0, 0.0, 3.0, 0.0, -1.0];
     let big_id: u32 = 1_000_000_000;
     let mut dep_id = Array2D::from_vec(3, 3, vec![0i32; 9]).unwrap();
@@ -322,7 +337,7 @@ fn c8_graph_and_fsm_handle_sparse_large_depression_ids_without_oom() {
 }
 
 #[test]
-fn c9_burn_streams_avoids_nodata_collision() {
+fn burn_streams_avoids_nodata_collision() {
     let dir = tempfile::tempdir().unwrap();
     let stream_path = dir.path().join("stream.geojson");
     let mut layer = Layer::new("streams".to_string()).with_geom_type(GeometryType::LineString);
@@ -366,11 +381,14 @@ fn c9_burn_streams_avoids_nodata_collision() {
 }
 
 #[test]
-fn c11_hyetograph_csv_rejects_overflowing_intensity() {
+fn hyetograph_constructors_reject_overflowing_intensities_and_depths() {
     let csv = "time_h,precip_mm\n0.0,0.0\n1e-310,100.0\n";
-    let res = parse_hyetograph_csv(csv);
     assert!(
-        res.is_err(),
+        parse_hyetograph_csv(csv).is_err(),
         "subnormal dt_h overflowing intensity_cm_h to Inf must be rejected"
+    );
+    assert!(
+        chicago_hyetograph(1e308, 0.0, 0.5, 0.5, 24.0, 1.0).is_err(),
+        "overflowing Chicago IDF total depth must be rejected rather than producing zeros"
     );
 }

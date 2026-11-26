@@ -258,8 +258,13 @@ fn region_fill_times(
 
     let mut slice_idx = 0usize;
     loop {
-        if slice_idx > 0 && (elev_span == 0.0 || slice_idx > MAX_SLICES_PER_REGION) {
+        if slice_idx > 0 && elev_span == 0.0 {
             break;
+        }
+        if slice_idx > MAX_SLICES_PER_REGION {
+            return Err(Error::InvalidArgument(format!(
+                "inundation slicing exceeded MAX_SLICES_PER_REGION ({MAX_SLICES_PER_REGION})"
+            )));
         }
         let elev = max_elev - (slice_idx as f64) * step;
         if slice_idx > 0 && elev <= min_elev {
@@ -1849,6 +1854,11 @@ pub fn chicago_hyetograph(
         }
     };
     let p_tot_cm = p_idf_cm(total_min);
+    if !p_tot_cm.is_finite() {
+        return Err(Error::InvalidArgument(format!(
+            "Chicago hyetograph total depth overflowed to non-finite value ({p_tot_cm})"
+        )));
+    }
     let cum_cm = |t_min: f64| -> f64 {
         let t_clamped = t_min.clamp(0.0, total_min);
         if t_clamped <= t_peak_min {
@@ -1876,6 +1886,11 @@ pub fn chicago_hyetograph(
             break;
         }
         let p_cm = cum_cm(t_h * 60.0);
+        if !p_cm.is_finite() {
+            return Err(Error::InvalidArgument(format!(
+                "Chicago hyetograph step {k} produced non-finite cumulative depth ({p_cm})"
+            )));
+        }
         let dp_cm = (p_cm - prev_p_cm).max(0.0);
         let intensity_cm_h = dp_cm / dt_h;
         if !intensity_cm_h.is_finite() {
@@ -2544,8 +2559,13 @@ fn region_fill_times_forced(
 
     let mut slice_idx = 0usize;
     loop {
-        if slice_idx > 0 && (elev_span == 0.0 || slice_idx > MAX_SLICES_PER_REGION) {
+        if slice_idx > 0 && elev_span == 0.0 {
             break;
+        }
+        if slice_idx > MAX_SLICES_PER_REGION {
+            return Err(Error::InvalidArgument(format!(
+                "inundation slicing exceeded MAX_SLICES_PER_REGION ({MAX_SLICES_PER_REGION})"
+            )));
         }
         let elev = max_elev - (slice_idx as f64) * step;
         if slice_idx > 0 && elev <= min_elev {

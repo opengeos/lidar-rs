@@ -78,37 +78,48 @@ pub(crate) fn crs_metric_basis(
             let mid_lat_raw = geotransform[3]
                 + 0.5 * (width as f64) * geotransform[4]
                 + 0.5 * (height as f64) * geotransform[5];
-            if mid_lat_raw.is_finite() {
-                let mid_lat_deg = mid_lat_raw.clamp(-89.999_999, 89.999_999);
-                let phi = mid_lat_deg.to_radians();
-                let sin_phi = phi.sin();
-                let cos_phi = phi.cos().abs();
-                let w_sq = (1.0 - WGS84_E2 * sin_phi * sin_phi).max(1e-12);
-                let w_sqrt = w_sq.sqrt();
-                // Prime vertical (east-west) and meridional (north-south) radii of curvature.
-                let n_rad = WGS84_A / w_sqrt;
-                let m_rad = WGS84_A * (1.0 - WGS84_E2) / (w_sq * w_sqrt);
-                let m_per_deg_lon = (PI / 180.0) * n_rad * cos_phi;
-                let m_per_deg_lat = (PI / 180.0) * m_rad;
-
-                let vx_m = (vx.0 * m_per_deg_lon, vx.1 * m_per_deg_lat);
-                let vy_m = (vy.0 * m_per_deg_lon, vy.1 * m_per_deg_lat);
-                let cell_width_m = vx_m.0.hypot(vx_m.1);
-                let cell_height_m = vy_m.0.hypot(vy_m.1);
-                let cell_area_m2 = (vx_m.0 * vy_m.1 - vy_m.0 * vx_m.1).abs();
-                let to_meter = (m_per_deg_lon * m_per_deg_lat).sqrt();
+            if !mid_lat_raw.is_finite() {
                 return (
-                    vx_m,
-                    vy_m,
+                    (f64::NAN, f64::NAN),
+                    (f64::NAN, f64::NAN),
                     CrsMetricScale {
                         is_geographic: true,
-                        to_meter,
-                        cell_width_m,
-                        cell_height_m,
-                        cell_area_m2,
+                        to_meter: f64::NAN,
+                        cell_width_m: f64::NAN,
+                        cell_height_m: f64::NAN,
+                        cell_area_m2: f64::NAN,
                     },
                 );
             }
+            let mid_lat_deg = mid_lat_raw.clamp(-89.999_999, 89.999_999);
+            let phi = mid_lat_deg.to_radians();
+            let sin_phi = phi.sin();
+            let cos_phi = phi.cos().abs();
+            let w_sq = (1.0 - WGS84_E2 * sin_phi * sin_phi).max(1e-12);
+            let w_sqrt = w_sq.sqrt();
+            // Prime vertical (east-west) and meridional (north-south) radii of curvature.
+            let n_rad = WGS84_A / w_sqrt;
+            let m_rad = WGS84_A * (1.0 - WGS84_E2) / (w_sq * w_sqrt);
+            let m_per_deg_lon = (PI / 180.0) * n_rad * cos_phi;
+            let m_per_deg_lat = (PI / 180.0) * m_rad;
+
+            let vx_m = (vx.0 * m_per_deg_lon, vx.1 * m_per_deg_lat);
+            let vy_m = (vy.0 * m_per_deg_lon, vy.1 * m_per_deg_lat);
+            let cell_width_m = vx_m.0.hypot(vx_m.1);
+            let cell_height_m = vy_m.0.hypot(vy_m.1);
+            let cell_area_m2 = (vx_m.0 * vy_m.1 - vy_m.0 * vx_m.1).abs();
+            let to_meter = (m_per_deg_lon * m_per_deg_lat).sqrt();
+            return (
+                vx_m,
+                vy_m,
+                CrsMetricScale {
+                    is_geographic: true,
+                    to_meter,
+                    cell_width_m,
+                    cell_height_m,
+                    cell_area_m2,
+                },
+            );
         }
 
         let to_meter = srs

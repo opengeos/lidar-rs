@@ -341,8 +341,13 @@ fn level_set_region(
     // so flat depressions (max_elev == min_elev) are retained when min_depth == 0.0.
     let mut slice_idx = 0usize;
     loop {
-        if slice_idx > 0 && (span == 0.0 || slice_idx > MAX_SLICES_PER_REGION) {
+        if slice_idx > 0 && span == 0.0 {
             break;
+        }
+        if slice_idx > MAX_SLICES_PER_REGION {
+            return Err(Error::InvalidArgument(format!(
+                "slicing exceeded MAX_SLICES_PER_REGION ({MAX_SLICES_PER_REGION}) in region {region_id}"
+            )));
         }
         let elev = max_elev - (slice_idx as f64) * step;
         if slice_idx > 0

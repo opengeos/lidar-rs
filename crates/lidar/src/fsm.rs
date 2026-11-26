@@ -651,13 +651,13 @@ fn lowest_leaf_descendant(
     best_leaf
 }
 
-enum BasinIdMap {
+pub(crate) enum BasinIdMap {
     Dense(Vec<usize>),
     Sparse(HashMap<u32, usize>),
 }
 
 impl BasinIdMap {
-    fn from_depressions(deps: &[NestedDepression]) -> Self {
+    pub(crate) fn from_depressions(deps: &[NestedDepression]) -> Self {
         let max_id = deps.iter().map(|d| d.id).max().unwrap_or(0) as usize;
         let dense_cap = deps.len().saturating_mul(16).clamp(65_536, 1_000_000);
         if max_id <= dense_cap {
@@ -676,7 +676,7 @@ impl BasinIdMap {
     }
 
     #[inline]
-    fn get(&self, id: u32) -> usize {
+    pub(crate) fn get(&self, id: u32) -> usize {
         match self {
             Self::Dense(v) => v.get(id as usize).copied().unwrap_or(usize::MAX),
             Self::Sparse(m) => m.get(&id).copied().unwrap_or(usize::MAX),
