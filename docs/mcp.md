@@ -2,7 +2,7 @@
 
 `lidar mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server: an AI agent such as Claude Code, Claude Desktop, Cursor, or VS Code Copilot can inspect rasters and LiDAR point clouds, delineate nested surface depressions, run dynamic Fill-Spill-Merge inundation simulations, download open U.S. federal watershed datasets, and visually preview terrain and flooding on your machine.
 
-Every [CLI subcommand](cli.md) except `mcp` and `help` is exposed automatically as an MCP tool whose `args` parameter is the command line after the command name and whose description is the command's full `--help`. The server speaks JSON-RPC 2.0 over standard input and output and runs each tool call in an isolated `lidar` child process.
+Every [CLI subcommand](cli.md) except `mcp`, `completions`, and `help` is exposed automatically as an MCP tool whose `args` parameter is the command line after the command name and whose description is the command's full `--help`. The server speaks JSON-RPC 2.0 over standard input and output and runs each tool call in an isolated `lidar` child process.
 
 ## Setup
 
@@ -75,10 +75,10 @@ Add to `.vscode/mcp.json`:
 
 ## Permissions and Safety
 
-`lidar mcp` does not sandbox filesystem access: an agent can read and write wherever the server process has OS permissions. Configure your MCP client's tool approval rules and review output paths before approving writes.
+By default, `lidar mcp` does not restrict filesystem paths beyond OS permissions. Pass `--allow-dir <DIR>` (repeatable) to cooperatively restrict tool path arguments to canonicalized paths inside the allowed directories (which also rejects remote URLs/VFS schemes and `pipeline --config`, which is always disabled inside MCP subprocesses). Pair `--allow-dir` with OS sandboxing (such as Landlock or containers) when kernel-enforced isolation is required.
 
 - `info` is annotated `readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true`, `openWorldHint: false`.
-- `download` (when enabled) is annotated `openWorldHint: true` because it contacts USGS, USFWS, and NOAA web services.
+- `download` and `noaa-atlas14` (when built with `--features download`) are annotated `openWorldHint: true` because they contact USGS, USFWS, and NOAA web services.
 - All other local processing tools are annotated `openWorldHint: false` and `destructiveHint: true` because they write files and can overwrite existing outputs.
 - Annotations are client hints, not enforcement.
 

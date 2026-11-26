@@ -109,7 +109,7 @@ Run it right now in your browser with zero installation via the live [WebAssembl
 === "JavaScript / WASM"
 
     ```js
-    import init, { simulateInundationAdvanced } from "./wasm/lidar_js.js";
+    import init, { simulateInundationAdvanced } from "lidar-wasm";
 
     await init();
     const demBytes = new Uint8Array(await (await fetch("https://files.opengeos.org/lidar/data/dem.tif")).arrayBuffer());
@@ -127,10 +127,10 @@ Run it right now in your browser with zero installation via the live [WebAssembl
 
 ## Four Interfaces, One Pure-Rust Core
 
-- **[Standalone CLI (`lidar-cli`)](cli.md):** Single static binary for Linux, macOS, and Windows with 33 subcommands and JSON output mode.
-- **[Rust Library (`lidar`)](rust.md):** Ergonomic in-memory (`Array2D`) and file-based APIs with optional `parallel`, `pointcloud`, `serde`, and `download` Cargo features.
+- **[Standalone CLI (`lidar-cli`)](cli.md):** Single static binary for Linux, macOS, and Windows with 41 subcommands (39 without the `download` feature) and JSON output mode.
+- **[Rust Library (`lidar`)](rust.md):** Ergonomic in-memory (`Array2D`) and file-based APIs with optional `parallel`, `pointcloud`, `serde`, `download`, `parquet`, `flatgeobuf`, `lerc`, and `tiles` Cargo features.
 - **[Python Package (`lidar-rs`)](python.md):** Drop-in compatibility with `opengeos/lidar` plus NumPy zero-copy array workflows (`pip install lidar-rs`, Python 3.11+).
-- **[WebAssembly (`lidar-js`)](javascript.md):** Full browser and Node.js bindings powering the client-side [Playground](playground.md).
+- **[WebAssembly (`lidar-wasm`)](javascript.md):** Full browser and Node.js bindings powering the client-side [Playground](playground.md).
 
 ## Citations
 

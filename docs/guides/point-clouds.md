@@ -10,8 +10,8 @@
 | --- | --- | --- | --- | --- |
 | **Format conversion** | `lidar convert-lidar` | `convert_lidar` | `convert_lidar` | Convert between LAS, LAZ, COPC, PLY, and E57 with configurable point format (`0..10`). |
 | **Filtered DSM gridding** | `lidar lidar-to-dsm` | `lidar_to_dsm` | `lidar_to_dsm` | Grid raw or filtered points (by ASPRS classification codes, pulse return kinds, and elevation bounds: `--min-z`/`--max-z` in CLI, `minz`/`maxz` in Python, `min_z`/`max_z` in Rust) into a GeoTIFF DSM. |
-| **Ground classification & DTM** | `lidar lidar-to-dtm` | `lidar_to_dtm` | `classify_ground`, `lidar_to_dtm` | Classify bare-earth ground points using pure-Rust **CSF** (Zhang et al., 2016), **PMF** (Zhang et al., 2003), or pre-classified ASPRS ground returns (`class == 2`), then interpolate a continuous bare-earth DTM (`classify_ground` is exposed in Rust; Python runs CSF/PMF via `lidar_to_dtm(..., ground_method="csf"|"pmf")`). |
-| **Canopy Height Model** | `lidar lidar-to-chm` | `lidar_to_chm` | `lidar_to_chm` | Grid a first-surface DSM and bare-earth DTM onto one exact shared XY lattice and compute `CHM = max(0, DSM - DTM)` in a single call. |
+| **Ground classification & DTM** | `lidar classify-ground`, `lidar lidar-to-dtm` | `classify_ground`, `lidar_to_dtm` | `classify_ground`, `classify_ground_with_options`, `lidar_to_dtm` | Classify bare-earth ground points using pure-Rust **CSF** (Zhang et al., 2016), **PMF** (Zhang et al., 2003), **SMRF** (Pingel et al., 2013), or pre-classified ASPRS ground returns (`class == 2`), then interpolate a continuous bare-earth DTM. |
+| **Canopy Height Model** | `lidar lidar-to-chm` | `lidar_to_chm` | `lidar_to_chm`, `lidar_to_chm_pit_free` | Grid a first-surface DSM and bare-earth DTM onto one exact shared XY lattice and compute `CHM = max(0, DSM - DTM)` in a single call (or pit-free CHM in Rust). |
 
 ## Ground Classification Methods
 
@@ -19,6 +19,7 @@
 | --- | --- | --- |
 | `csf` (default) | Cloth Simulation Filter (Zhang et al., 2016) | General forested, urban, and mixed terrain; removes both tree canopies and flat-roofed buildings cleanly. |
 | `pmf` | Progressive Morphological Filter (Zhang et al., 2003) | Steep terrain or gradual slope transitions where morphological opening windows are preferred. |
+| `smrf` | Simple Morphological Filter (Pingel et al., 2013) | High-density airborne LiDAR with steep slopes and large buildings using progressive morphological opening with elevation-threshold slope scaling. |
 | `preclassified` | Filter existing ASPRS class (default `2`) | Pre-classified USGS 3DEP LPC / COPC tiles where vendor bare-earth classification is already verified. |
 
 !!! note "Stale Class-2 Safety"

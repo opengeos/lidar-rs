@@ -13,9 +13,9 @@ All sample files used below can be downloaded from [Sample Datasets](datasets.md
 | **Hydro-Conditioning** | `breach-depressions`, `burn-culverts` |
 | **DEM Smoothing & Sinks** | `mean-filter`, `median-filter`, `gaussian-filter`, `extract-sinks` |
 | **Nested Hierarchies** | `delineate-depressions`, `delineate-mounts`, `flip-dem` |
-| **Catchments & Inundation** | `delineate-catchments`, `delineate-flow-paths`, `catchment-hierarchy`, `simulate-inundation` |
+| **Catchments & Inundation** | `delineate-catchments`, `delineate-flow-paths`, `catchment-hierarchy`, `simulate-inundation`, `cn-to-runoff`, `rating-curves`, `connectivity-graph` |
 | **Animation & Visualization** | `animate-inundation`, `export-frames`, `preview` |
-| **AI Agents (MCP)** | `mcp` (plus `--json-usage` global catalog flag) |
+| **AI Agents (MCP) & Shell** | `mcp`, `completions` (plus `--json-usage`, `-v`/`--verbose`, `-q`/`--quiet` global flags) |
 | **LiDAR Point Clouds** | `convert-lidar`, `classify-ground`, `lidar-to-dsm`, `lidar-to-dtm`, `lidar-to-chm` |
 | **Raster & Vector Utilities** | `polygonize`, `mosaic`, `reproject`, `resample`, `clip`, `to-cog`, `add-crs`, `join-tables`, `csv-to-vector`, `info` |
 
@@ -46,16 +46,18 @@ lidar pipeline dem.tif out_storm \
 
 | Flag | Default | Description |
 | --- | --- | --- |
+| `--config <PATH>` | off | Load pipeline options from a TOML or JSON config file (explicit CLI flags override config values) |
 | `--kernel <N>` | `3` | Median filter kernel size (`<= 1` skips smoothing) |
 | `--breach-mode <MODE>` | off | Enables Lindsay (2016) pre-conditioning (`complete`, `selective`, or `constrained`) |
 | `--breach-max-depth <M>` | off | Enables selective Lindsay (2016) breaching with max depth `M` (pass `0` for unlimited) |
-| `--breach-max-length <N>` | `50` | Max breach path length in cells (requires `--breach-max-depth`; pass `0` for unlimited) |
+| `--breach-max-length <N>` | `50` | Max breach path length in cells (requires `--breach-max-depth` or `--breach-mode`; pass `0` for unlimited) |
 | `--breach-fill-remaining` | `false` | Fill remaining unbreached depressions after selective/constrained breaching |
 | `--culverts <PATH>` | off | Vector file (`.gpkg`, `.geojson`, `.shp`) burned before sink extraction |
 | `--scs-type2-mm <MM>` | off | Enables an NRCS SCS Type II design storm (`--duration` defaults to `24.0` h when omitted) |
 | `--routing <MODE>` | `static` | Inundation routing mode: `static` (independent level-set) or `fsm` (dynamic Fill-Spill-Merge cascade mass-balance) |
 | `--runoff-coeff <TIF>` | off | Spatially variable runoff coefficient raster (`0..=1`) |
-| `--curve-number <TIF>` | off | Spatially variable NRCS Curve Number (`0..=100`) raster converted to runoff coefficient via TR-55 (conflicts with `--runoff-coeff`) |
+| `--cn <VALUE>` | off | Uniform NRCS Curve Number (`0..=100`) converted to runoff coefficient via TR-55 |
+| `--curve-number <TIF>` | off | Spatially variable NRCS Curve Number (`0..=100`) raster converted to runoff coefficient via TR-55 (conflicts with `--runoff-coeff` / `--cn`) |
 | `--infiltration <TIF>` | off | Spatially variable vertical infiltration loss raster (`cm/h`) |
 | `--antecedent-depth <TIF>` | off | Antecedent ponded water depth raster (`m`) |
 | `--streams <PATH>` | off | Stream flowline vector for computing `dist_to_stream` on spill edges |

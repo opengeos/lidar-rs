@@ -96,7 +96,7 @@ High-resolution 1-m LiDAR DEMs routinely contain artificial impoundments where r
 === "JavaScript / WASM"
 
     ```js
-    import init, { breachDem } from "./wasm/lidar_js.js";
+    import init, { breachDem } from "lidar-wasm";
 
     await init();
     const demBytes = new Uint8Array(await (await fetch("https://files.opengeos.org/lidar/data/dem.tif")).arrayBuffer());

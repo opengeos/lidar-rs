@@ -12,9 +12,13 @@ lidar = "0.6"
 | Feature | Default | Description |
 | --- | --- | --- |
 | `parallel` | Yes | Multi-threaded parallelism via `rayon` (filters, level-set slicing, inundation, tiling) |
-| `pointcloud` | Yes | Pure-Rust LiDAR I/O (LAS/LAZ/COPC/PLY/E57), CSF/PMF classification, and DSM/DTM/CHM gridding via `terrio/pointcloud` |
+| `pointcloud` | Yes | Pure-Rust LiDAR I/O (LAS/LAZ/COPC/PLY/E57), CSF/PMF/SMRF classification, ROR/SOR/ELM filters, and DSM/DTM/CHM/pit-free CHM gridding via `terrio/pointcloud` |
 | `serde` | Yes | `Serialize` / `Deserialize` derives on all option/result structs plus `write_connectivity_graph_json` |
-| `download` | No | Opt-in U.S. federal geospatial data downloaders (`federal`: USGS 3DEP, WBD, NHD, Transportation, USFWS NWI, NOAA Atlas 14; non-WASM, enables `ureq` with `rustls`) |
+| `download` | No | Opt-in U.S. federal geospatial data downloaders (`federal`: USGS 3DEP, WBD, NHD, Transportation, USFWS NWI, NOAA Atlas 14; non-WASM, enables `ureq` with `rustls` and `terrio/remote`) |
+| `parquet` | No | Pure-Rust GeoParquet vector reading and writing via `terrio/parquet` |
+| `flatgeobuf` | No | Pure-Rust FlatGeobuf vector reading and writing via `terrio/flatgeobuf` |
+| `lerc` | No | Pure-Rust LERC-compressed GeoTIFF/COG reading via `terrio/lerc` |
+| `tiles` | No | Pure-Rust PMTiles and MBTiles export via `terrio/tiles` |
 
 For minimal WASM or embedded builds without threads or point-cloud support:
 
@@ -27,19 +31,23 @@ lidar = { version = "0.6", default-features = false, features = ["serde"] }
 
 | Module | Key Public Types & Functions |
 | --- | --- |
-| `filtering` | `mean_filter`, `median_filter`, `gaussian_filter` (+ `*_file` wrappers) |
-| `conditioning` | `BreachMode`, `BreachOptions` (`for_mode`), `breach_depressions`, `burn_culverts`, `BurnCulvertsOptions`, `synthesize_culverts`, `SynthesizeCulvertsOptions` |
+| `filtering` | `mean_filter`, `median_filter`, `gaussian_filter`, `bilateral_filter`, `feature_preserving_smoothing` (+ `*_file` wrappers) |
+| `conditioning` | `BreachMode`, `BreachOptions` (`for_mode`), `breach_depressions`, `burn_culverts`, `BurnCulvertsOptions`, `synthesize_culverts`, `SynthesizeCulvertsOptions`, `classify_embankment_artifacts` |
+| `derivatives` | `dinf_flow_direction`, `dinf_flow_accumulation`, `mfd_flow_accumulation`, `compute_twi`, `compute_hand`, `compute_hand_from_threshold`, `burn_streams`, `burn_streams_file` |
 | `federal` | `Region`, `Bbox`, `WbdLevel`, `DemProduct`, `FederalDataset`, `DownloadOptions`, `FederalBundleOptions`, `download_federal_data`, `query_3dep_products`, `download_3dep_dem`, `download_wbd`, `download_nhd`, `download_nwi`, `download_roads`, `fetch_noaa_atlas14` |
 | `filling` | `extract_sinks`, `extract_sinks_in_memory`, `ExtractSinksOptions`, `InMemorySinks` |
 | `slicing` | `delineate_depressions`, `delineate_depressions_in_memory`, `NestedDepression` (24 fields), `write_depressions_csv`, `write_depressions_vector` |
+| `merge_tree` | `delineate_depressions_merge_tree_in_memory`, `delineate_depressions_merge_tree_with_dem_in_memory`, `MergeTreeOptions`, `MergeTreeResult`, `MergeTreeNode` |
+| `region` | `region_group`, `region_props_xy`, `crs_metric_scale`, `CrsMetricScale`, `RegionProps` |
 | `mounts` | `flip_dem`, `delineate_mounts`, `delineate_mounts_in_memory` |
-| `catchment` | `delineate_catchments`, `delineate_flow_paths`, `delineate_catchment_hierarchy`, `delineate_catchment_hierarchy_in_memory` (compressed D8 + DSU) |
-| `inundation` | `run_pipeline`, `run_full_pipeline_in_memory`, `simulate_inundation`, `simulate_inundation_with_forcing_in_memory`, `InundationForcing`, `scs_curve_number_runoff`, `scs_type2_hyetograph`, `cumulative_runoff_mm` |
-| `fsm` | `RoutingMode`, `simulate_fill_spill_merge_in_memory`, `FsmSimulationResult`, `FsmBasinSummary`, `FsmMassBalance`, `fsm_basins_to_csv_string`, `write_fsm_basins_csv` |
+| `catchment` | `delineate_catchments`, `delineate_flow_paths`, `delineate_catchment_hierarchy`, `delineate_catchment_hierarchy_in_memory`, `delineate_catchment_hierarchy_weighted_in_memory` (compressed D8 + DSU) |
+| `inundation` | `run_pipeline`, `run_pipeline_with_control`, `run_full_pipeline_in_memory`, `simulate_inundation`, `simulate_inundation_with_forcing_in_memory`, `InundationForcing`, `scs_curve_number_runoff`, `scs_hyetograph`, `scs_type2_hyetograph`, `alternating_block_hyetograph`, `chicago_hyetograph`, `parse_hyetograph_csv`, `cumulative_runoff_mm` |
+| `fsm` | `RoutingMode`, `simulate_fill_spill_merge_in_memory`, `simulate_post_storm_recession`, `compute_fsm_hazard_rasters`, `attenuate_fsm_hydrograph_with_options`, `FsmSimulationResult`, `FsmBasinSummary`, `FsmMassBalance`, `fsm_basins_to_csv_string`, `write_fsm_basins_csv` |
 | `graph` | `compute_rating_curves`, `write_rating_curves_csv`, `build_connectivity_graph`, `write_connectivity_graph_json`, `write_connectivity_graphml`, `write_spill_paths_vector` |
-| `tiling` | `delineate_depressions_tiled`, `TiledDelineationOptions`, `load_dem_f32` |
+| `tiling` | `delineate_depressions_tiled`, `delineate_depressions_tiled_with_outputs`, `delineate_depressions_tiled_with_control`, `TiledDelineationOptions`, `TiledOutputOptions`, `load_dem_f32` |
+| `progress` | `CancellationToken`, `ExecutionControl`, `ProgressEvent`, `ProgressStage` |
 | `animation` | `animate_inundation`, `animate_inundation_to_bytes_with_spill_paths`, `export_inundation_frames_png`, `render_inundation_frame_png_bytes`, `AnimateInundationOptions` |
-| `pointcloud` | `read_lidar`, `write_lidar`, `convert_lidar`, `classify_ground`, `GroundFilterMethod`, `parse_return_kind`, `lidar_to_dsm`, `lidar_to_dtm`, `lidar_to_chm` |
+| `pointcloud` | `read_lidar`, `read_lidar_windowed`, `read_lidar_in_polygon`, `write_lidar`, `convert_lidar`, `classify_ground`, `classify_ground_with_options`, `filter_outliers_ror`, `filter_outliers_elm`, `filter_outliers_statistical`, `normalize_hag`, `GroundFilterMethod`, `parse_return_kind`, `lidar_to_dsm`, `lidar_to_dtm`, `lidar_to_chm`, `lidar_to_chm_pit_free`, `points_to_dsm`, `points_to_dtm`, `points_to_chm`, `points_to_chm_pit_free` |
 | `raster_ops` | `polygonize`, `mosaic`, `reproject_image`, `resample`, `clip_image`, `image_to_cog`, `add_crs`, `join_csv_to_vector`, `csv_points_to_vector` |
 
 ## Example 1: All-in-One File Pipeline & Hydro-Conditioning

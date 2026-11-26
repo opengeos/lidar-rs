@@ -107,6 +107,7 @@ Both `export_inundation_frames_png` and `animate_inundation` share the same pure
                     time_step_h: 2.0,
                     compress: false,
                 },
+                routing: Default::default(),
                 forcing: Default::default(),
                 scalar_runoff_coeff: 1.0,
                 stream_vector: None,

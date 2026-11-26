@@ -36,6 +36,21 @@ jobs:
             echo "::error::tag $TAG does not match python/Cargo.toml version $py_have"
             exit 1
           fi
+          js_have=$(cargo metadata --no-deps --format-version 1 --manifest-path js/Cargo.toml | jq -r '.packages[] | select(.name == "lidar-js") | .version')
+          if [ "$want" != "$js_have" ]; then
+            echo "::error::tag $TAG does not match js/Cargo.toml version $js_have"
+            exit 1
+          fi
+          npm_have=$(jq -r '.version' js/package.json)
+          if [ "$want" != "$npm_have" ]; then
+            echo "::error::tag $TAG does not match js/package.json version $npm_have"
+            exit 1
+          fi
+          cff_have=$(sed -n 's/^version: *"\?\([^"]*\)"\?/\1/p' CITATION.cff | head -n 1)
+          if [ "$want" != "$cff_have" ]; then
+            echo "::error::tag $TAG does not match CITATION.cff version $cff_have"
+            exit 1
+          fi
 
   ci:
     uses: ./.github/workflows/ci.yml

@@ -55,7 +55,9 @@ jobs:
           test -f site/samples/dem.tif
           test -f site/samples/dsm.tif
       - name: Check Playground JS syntax
-        run: node --check docs/javascripts/playground.js
+        run: |
+          node --check docs/javascripts/playground.js
+          node --check docs/javascripts/playground-worker.js
       - name: Lint and smoke-test installer scripts
         run: |
           sh -n docs/install.sh

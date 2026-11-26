@@ -931,3 +931,73 @@ def test_classify_ground_and_tunable_dtm_chm_options(tmp_path: Path):
         elevation_scalar=1.25,
     )
     assert cols >= 10 and rows >= 10 and chm_smrf.exists()
+
+
+def test_audit_v06_python_forcing_nodata_types_and_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify spatial-adapter NoData preservation, FsmBasinSummary typing, and Sequence[str] datasets."""
+    from collections import UserList
+    from typing import get_type_hints
+
+    # 1. FsmBasinSummary.spill_to_dep_id must allow None (unspilled basins).
+    hints = get_type_hints(lidar_rs.FsmBasinSummary)
+    assert type(None) in getattr(hints["spill_to_dep_id"], "__args__", ())
+
+    # 2. simulate_inundation_array masks finite NoData sentinels from spatial-adapter forcing inputs.
+    class _FakeRasterio:
+        def __init__(self, data: np.ndarray, nodata: float) -> None:
+            self._data = data
+            self.nodata = nodata
+            self.transform = (0.0, 1.0, 0.0, float(data.shape[0]), 0.0, -1.0)
+            self.crs = "EPSG:32615"
+
+        def read(self, band: int) -> np.ndarray:
+            assert band == 1
+            return self._data
+
+    dem = np.full((9, 9), 15.0, dtype=np.float64)
+    dem[3:6, 3:6] = 10.0
+    dem[4, 4] = 8.0
+    rc_data = np.full((9, 9), 0.5, dtype=np.float64)
+    rc_data[0, 0] = -9999.0
+    fake_rc = _FakeRasterio(rc_data, nodata=-9999.0)
+
+    captured: dict[str, Any] = {}
+    orig_sim = lidar_rs._lidar_rs.simulate_inundation_array
+
+    def _spy_sim(*args: Any, **kwargs: Any) -> Any:
+        captured["rc"] = args[8]
+        return orig_sim(*args, **kwargs)
+
+    monkeypatch.setattr(lidar_rs._lidar_rs, "simulate_inundation_array", _spy_sim)
+    lidar_rs.simulate_inundation_array(
+        dem,
+        kernel_size=1,
+        min_size=1,
+        min_depth=0.5,
+        interval=0.5,
+        rain_intensity_cm_h=5.0,
+        rain_duration_h=5.0,
+        time_step_h=1.0,
+        runoff_coeff_arr=fake_rc,
+    )
+    assert captured["rc"][0, 0] == pytest.approx(0.0), (
+        "finite runoff_coeff NoData must be masked to 0.0 (no runoff)"
+    )
+    assert captured["rc"][4, 4] == pytest.approx(0.5)
+
+    # 3. download_federal_data accepts arbitrary Sequence[str] (not just list/tuple).
+    seen_ds: dict[str, str] = {}
+
+    def _fake_download(*args: Any) -> dict[str, Any]:
+        seen_ds["spec"] = args[4]
+        return {}
+
+    monkeypatch.setattr(lidar_rs._lidar_rs, "download_federal_data", _fake_download)
+    lidar_rs.download_federal_data(
+        "out",
+        bbox=(-99.3, 47.0, -99.1, 47.2),
+        datasets=UserList(["dem", "nhd"]),
+    )
+    assert seen_ds["spec"] == "dem,nhd"

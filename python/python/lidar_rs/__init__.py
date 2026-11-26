@@ -1463,7 +1463,7 @@ def build_connectivity_graph(
 
         ft_src = fill_time if fill_time is not None else dem_or_depressions.get("fill_time")
         ft_arr = (
-            extract_spatial_array(ft_src)[0] if ft_src is not None else None
+            _extract_array_masking_nodata(ft_src) if ft_src is not None else None
         )
         cat_raw: Any = (
             catchment_records
@@ -1527,6 +1527,18 @@ def build_connectivity_graph(
     )
 
 
+def _extract_array_masking_nodata(
+    obj: SpatialArrayLike, *, fill: float = np.nan
+) -> np.ndarray:
+    """Extract a 2D array from a spatial adapter and replace any finite NoData sentinel with `fill`."""
+    arr, _gt, _crs, nd = extract_spatial_array(obj)
+    if nd is not None and np.isfinite(nd):
+        masked = np.array(arr, dtype=np.float64, copy=True)
+        masked[masked == float(nd)] = fill
+        return masked
+    return arr
+
+
 def simulate_inundation_array(
     dem_arr: SpatialArrayLike,
     kernel_size: int = 3,
@@ -1555,17 +1567,17 @@ def simulate_inundation_array(
         dem_arr, geotransform=geotransform, crs=crs, no_data=no_data
     )
     rc = (
-        extract_spatial_array(runoff_coeff_arr)[0]
+        _extract_array_masking_nodata(runoff_coeff_arr, fill=0.0)
         if runoff_coeff_arr is not None
         else None
     )
     inf = (
-        extract_spatial_array(infiltration_arr)[0]
+        _extract_array_masking_nodata(infiltration_arr)
         if infiltration_arr is not None
         else None
     )
     ant = (
-        extract_spatial_array(antecedent_depth_arr)[0]
+        _extract_array_masking_nodata(antecedent_depth_arr)
         if antecedent_depth_arr is not None
         else None
     )
@@ -1909,9 +1921,7 @@ def download_federal_data(
     overwrite: bool = False,
 ) -> FederalDataResult:
     """Download a bundle of open U.S. federal datasets (WBD, 3DEP DEM, NHD, NWI, roads, culverts, NOAA Atlas 14) for a region."""
-    ds_spec = (
-        ",".join(datasets) if isinstance(datasets, (list, tuple)) else str(datasets)
-    )
+    ds_spec = datasets if isinstance(datasets, str) else ",".join(str(d) for d in datasets)
     return _lidar_rs.download_federal_data(
         _as_path_str(out_dir),
         _normalize_bbox(bbox),

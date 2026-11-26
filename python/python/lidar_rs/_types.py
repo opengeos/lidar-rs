@@ -349,7 +349,7 @@ class FsmBasinSummary(TypedDict):
     initial_volume_m3: float
     final_volume_m3: float
     fill_time_h: float | None
-    spill_to_dep_id: int
+    spill_to_dep_id: int | None
     merge_time_h: float | None
     spilled_volume_m3: float
     peak_spill_rate_m3_h: float
