@@ -1269,6 +1269,15 @@ fn validate_dsm_options(options: &LidarToDsmOptions) -> Result<()> {
     Ok(())
 }
 
+fn expected_ground_class(options: &LidarToDtmOptions) -> Option<u8> {
+    match options.ground_method {
+        GroundFilterMethod::Preclassified => None,
+        GroundFilterMethod::Csf => Some(options.csf.ground_class),
+        GroundFilterMethod::Pmf => Some(options.pmf.ground_class),
+        GroundFilterMethod::Smrf => Some(options.smrf.ground_class),
+    }
+}
+
 fn validate_dtm_options(options: &LidarToDtmOptions) -> Result<()> {
     if !options.resolution.is_finite() || options.resolution <= 0.0 {
         return Err(Error::InvalidArgument(format!(
@@ -1320,12 +1329,8 @@ fn validate_dtm_options(options: &LidarToDtmOptions) -> Result<()> {
             )));
         }
     }
-    if let Some(expected_class) = match options.ground_method {
-        GroundFilterMethod::Preclassified => None,
-        GroundFilterMethod::Csf => Some(options.csf.ground_class),
-        GroundFilterMethod::Pmf => Some(options.pmf.ground_class),
-        GroundFilterMethod::Smrf => Some(options.smrf.ground_class),
-    } && options.ground_class != expected_class
+    if let Some(expected_class) = expected_ground_class(options)
+        && options.ground_class != expected_class
     {
         return Err(Error::InvalidArgument(format!(
             "{:?} assigns ground class {expected_class}; set ground_class={expected_class} or use GroundFilterMethod::Preclassified (got ground_class={})",
@@ -1502,12 +1507,7 @@ fn select_ground_points(raw: &PointCloud, options: &LidarToDtmOptions) -> Result
     match options.ground_method {
         GroundFilterMethod::Preclassified => filter_by_classification(raw, &[options.ground_class]),
         GroundFilterMethod::Csf | GroundFilterMethod::Pmf | GroundFilterMethod::Smrf => {
-            let expected_class = match options.ground_method {
-                GroundFilterMethod::Csf => options.csf.ground_class,
-                GroundFilterMethod::Pmf => options.pmf.ground_class,
-                GroundFilterMethod::Smrf => options.smrf.ground_class,
-                GroundFilterMethod::Preclassified => unreachable!(),
-            };
+            let expected_class = expected_ground_class(options).unwrap_or(options.ground_class);
             if options.ground_class != expected_class {
                 return Err(Error::InvalidArgument(format!(
                     "{:?} assigns ground class {expected_class}; set ground_class={expected_class} or use GroundFilterMethod::Preclassified (got ground_class={})",

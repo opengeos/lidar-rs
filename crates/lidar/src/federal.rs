@@ -625,11 +625,29 @@ pub struct FederalBundleResult {
 /// Hard streaming download limit (8 GiB) to prevent unbounded disk exhaustion or gzip bombs.
 const MAX_DOWNLOAD_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
-fn make_agent(timeout_secs: u64) -> ureq::Agent {
+fn make_agent_with_https(timeout_secs: u64, https_only: bool) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
-        .https_only(true)
+        .https_only(https_only)
         .max_redirects(5)
         .timeout_global(Some(Duration::from_secs(timeout_secs.max(5))))
+        .user_agent(format!("lidar-rs/{}", crate::VERSION))
+        .build();
+    ureq::Agent::new_with_config(config)
+}
+
+fn make_agent(timeout_secs: u64) -> ureq::Agent {
+    make_agent_with_https(timeout_secs, true)
+}
+
+fn make_download_agent_with_https(timeout_secs: u64, https_only: bool) -> ureq::Agent {
+    let io_timeout = Duration::from_secs(timeout_secs.max(30));
+    let config = ureq::Agent::config_builder()
+        .https_only(https_only)
+        .max_redirects(5)
+        .timeout_connect(Some(Duration::from_secs(30)))
+        .timeout_recv_response(Some(io_timeout))
+        .timeout_per_read(Some(io_timeout))
+        .timeout_per_write(Some(Duration::from_secs(30)))
         .user_agent(format!("lidar-rs/{}", crate::VERSION))
         .build();
     ureq::Agent::new_with_config(config)
@@ -638,39 +656,17 @@ fn make_agent(timeout_secs: u64) -> ureq::Agent {
 /// Builds an HTTP agent configured for large streaming file downloads using per-phase timeouts
 /// (connect, response headers, per-read, per-write) instead of a fixed total transfer timeout.
 fn make_download_agent(timeout_secs: u64) -> ureq::Agent {
-    let io_timeout = Duration::from_secs(timeout_secs.max(30));
-    let config = ureq::Agent::config_builder()
-        .https_only(true)
-        .max_redirects(5)
-        .timeout_connect(Some(Duration::from_secs(30)))
-        .timeout_recv_response(Some(io_timeout))
-        .timeout_per_read(Some(io_timeout))
-        .timeout_per_write(Some(Duration::from_secs(30)))
-        .user_agent(format!("lidar-rs/{}", crate::VERSION))
-        .build();
-    ureq::Agent::new_with_config(config)
+    make_download_agent_with_https(timeout_secs, true)
 }
 
 #[cfg(test)]
 fn make_test_http_agent(timeout_secs: u64) -> ureq::Agent {
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(timeout_secs.max(5))))
-        .user_agent(format!("lidar-rs/{}", crate::VERSION))
-        .build();
-    ureq::Agent::new_with_config(config)
+    make_agent_with_https(timeout_secs, false)
 }
 
 #[cfg(test)]
 fn make_test_http_download_agent(timeout_secs: u64) -> ureq::Agent {
-    let io_timeout = Duration::from_secs(timeout_secs.max(30));
-    let config = ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(30)))
-        .timeout_recv_response(Some(io_timeout))
-        .timeout_per_read(Some(io_timeout))
-        .timeout_per_write(Some(Duration::from_secs(30)))
-        .user_agent(format!("lidar-rs/{}", crate::VERSION))
-        .build();
-    ureq::Agent::new_with_config(config)
+    make_download_agent_with_https(timeout_secs, false)
 }
 
 pub(crate) fn is_retryable_ureq_error(err: &ureq::Error) -> bool {
@@ -886,6 +882,13 @@ fn http_download_file(
     max_retries: usize,
 ) -> Result<PathBuf> {
     let expected_bytes = expected_bytes.filter(|&n| n > 0);
+    if let Some(exp) = expected_bytes
+        && exp > MAX_DOWNLOAD_BYTES
+    {
+        return Err(Error::Http(format!(
+            "GET {url} advertised size ({exp} bytes) exceeds maximum download cap ({MAX_DOWNLOAD_BYTES} bytes)"
+        )));
+    }
     if !overwrite
         && dest.exists()
         && let Ok(meta) = std::fs::metadata(dest)
@@ -1814,6 +1817,15 @@ pub(crate) fn sanitize_tile_filename(download_url: &str, grid_key: &str) -> Stri
     }
 }
 
+fn is_disallowed_ipv4(v4: std::net::Ipv4Addr) -> bool {
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.is_multicast()
+}
+
 fn is_safe_https_download_url(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("https://") else {
         return false;
@@ -1833,15 +1845,11 @@ fn is_safe_https_download_url(url: &str) -> bool {
     }
     if let Ok(ip) = host_lower.parse::<std::net::IpAddr>() {
         return match ip {
-            std::net::IpAddr::V4(v4) => {
-                !(v4.is_loopback()
-                    || v4.is_private()
-                    || v4.is_link_local()
-                    || v4.is_unspecified()
-                    || v4.is_broadcast()
-                    || v4.is_multicast())
-            }
+            std::net::IpAddr::V4(v4) => !is_disallowed_ipv4(v4),
             std::net::IpAddr::V6(v6) => {
+                if let Some(mapped) = v6.to_ipv4_mapped() {
+                    return !is_disallowed_ipv4(mapped);
+                }
                 let segs = v6.segments();
                 let is_ula = (segs[0] & 0xfe00) == 0xfc00;
                 let is_link_local = (segs[0] & 0xffc0) == 0xfe80;
@@ -1852,6 +1860,21 @@ fn is_safe_https_download_url(url: &str) -> bool {
                     || is_link_local)
             }
         };
+    }
+    // Reject single-label hosts and non-standard numeric IPv4 encodings (e.g. `127.1`,
+    // `2852039166`, `0x7f000001`, octal dotted quads) that `getaddrinfo` resolves as IPs.
+    if !host_lower.contains('.') {
+        return false;
+    }
+    let all_numeric_labels = host_lower.split('.').all(|lbl| {
+        !lbl.is_empty()
+            && (lbl.bytes().all(|b| b.is_ascii_digit())
+                || lbl.strip_prefix("0x").is_some_and(|hex| {
+                    !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit())
+                }))
+    });
+    if all_numeric_labels {
+        return false;
     }
     true
 }
@@ -3840,26 +3863,52 @@ mod tests {
         assert!((tbl.depth_mm("5-min", 1).unwrap() - 12.5).abs() < 1e-6);
         assert!((tbl.depth_mm("5-min", 2).unwrap() - 18.0).abs() < 1e-6);
 
-        // 2. Disjoint LPC tiles sharing a 1-degree token must not be dropped during dedup,
-        //    and unsafe URLs (userinfo / loopback / metadata IP) must be rejected.
+        // 2. Disjoint tiles sharing a 1-degree token must not be dropped during dedup,
+        //    while overlapping tiles (IoU >= 0.5) still collapse to the newest, and unsafe
+        //    URLs (userinfo / loopback / metadata IP / IPv4-mapped / numeric shorthand)
+        //    must be rejected.
         let tnm = serde_json::json!({
             "items": [
                 {
-                    "title": "USGS LPC ND_2020_n48w100_001",
+                    "title": "USGS 1/3 Arc Second n48w100 20200101",
                     "publicationDate": "2020-01-01",
-                    "downloadURL": "https://prd-tnm.s3.amazonaws.com/tile1.laz",
+                    "downloadURL": "https://prd-tnm.s3.amazonaws.com/tile1_old.tif",
                     "boundingBox": {"minX": -100.0, "minY": 47.0, "maxX": -99.9, "maxY": 47.1}
                 },
                 {
-                    "title": "USGS LPC ND_2020_n48w100_002",
+                    "title": "USGS 1/3 Arc Second n48w100 20230101",
+                    "publicationDate": "2023-01-01",
+                    "downloadURL": "https://prd-tnm.s3.amazonaws.com/tile1_new.tif",
+                    "boundingBox": {"minX": -100.0, "minY": 47.0, "maxX": -99.9, "maxY": 47.1}
+                },
+                {
+                    "title": "USGS 1/3 Arc Second n48w100 20200101 B",
                     "publicationDate": "2020-01-01",
-                    "downloadURL": "https://prd-tnm.s3.amazonaws.com/tile2.laz",
+                    "downloadURL": "https://prd-tnm.s3.amazonaws.com/tile2.tif",
                     "boundingBox": {"minX": -99.8, "minY": 47.0, "maxX": -99.7, "maxY": 47.1}
                 },
                 {
                     "title": "USGS Metadata SSRF",
                     "publicationDate": "2024-01-01",
                     "downloadURL": "https://169.254.169.254/latest/meta-data/",
+                    "boundingBox": {"minX": -100.0, "minY": 47.0, "maxX": -99.5, "maxY": 47.5}
+                },
+                {
+                    "title": "USGS IPv4-Mapped SSRF",
+                    "publicationDate": "2024-01-01",
+                    "downloadURL": "https://[::ffff:169.254.169.254]/latest/meta-data/",
+                    "boundingBox": {"minX": -100.0, "minY": 47.0, "maxX": -99.5, "maxY": 47.5}
+                },
+                {
+                    "title": "USGS Decimal IP SSRF",
+                    "publicationDate": "2024-01-01",
+                    "downloadURL": "https://2852039166/latest/meta-data/",
+                    "boundingBox": {"minX": -100.0, "minY": 47.0, "maxX": -99.5, "maxY": 47.5}
+                },
+                {
+                    "title": "USGS Shorthand Loopback SSRF",
+                    "publicationDate": "2024-01-01",
+                    "downloadURL": "https://127.1/bad.tif",
                     "boundingBox": {"minX": -100.0, "minY": 47.0, "maxX": -99.5, "maxY": 47.5}
                 },
                 {
@@ -3871,7 +3920,15 @@ mod tests {
             ]
         });
         let items = parse_tnm_products_json(&tnm, None, true);
-        assert_eq!(items.len(), 2, "both disjoint LPC tiles must be retained");
+        assert_eq!(
+            items.len(),
+            2,
+            "overlapping duplicate must collapse while disjoint tile is retained"
+        );
+        let urls: Vec<&str> = items.iter().map(|p| p.download_url.as_str()).collect();
+        assert!(urls.contains(&"https://prd-tnm.s3.amazonaws.com/tile1_new.tif"));
+        assert!(urls.contains(&"https://prd-tnm.s3.amazonaws.com/tile2.tif"));
+        assert!(!urls.contains(&"https://prd-tnm.s3.amazonaws.com/tile1_old.tif"));
 
         // 3. Railroad layer lowercase `name` and `mtfcc_code` must be preserved.
         let mut rr = Map::new();
@@ -3887,13 +3944,42 @@ mod tests {
             Some("R1011")
         );
 
-        // 4. Production agents enforce HTTPS-only (rejecting plaintext http://).
+        // 4. Production agents enforce HTTPS-only without ever opening a plaintext socket.
+        let https_guard_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        https_guard_listener.set_nonblocking(true).unwrap();
+        let guard_addr = https_guard_listener.local_addr().unwrap();
+        let plain_url = format!("http://{guard_addr}/test");
         let prod_agent = make_agent(5);
-        assert!(prod_agent.get("http://127.0.0.1:1/test").call().is_err());
+        assert!(prod_agent.get(&plain_url).call().is_err());
         let prod_dl = make_download_agent(5);
-        assert!(prod_dl.get("http://127.0.0.1:1/test").call().is_err());
+        assert!(prod_dl.get(&plain_url).call().is_err());
+        assert_eq!(
+            https_guard_listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "production HTTPS-only agents must reject plaintext URLs before connecting"
+        );
 
-        // 5. http_download_file aborts mid-stream when payload exceeds expected_bytes.
+        // 5. http_download_file rejects expected_bytes > MAX_DOWNLOAD_BYTES before transferring,
+        //    and aborts mid-stream when payload exceeds expected_bytes.
+        let tmp = tempfile::tempdir().unwrap();
+        let test_dl = make_test_http_download_agent(10);
+        let too_big = http_download_file(
+            &test_dl,
+            &plain_url,
+            &tmp.path().join("too_big.tif"),
+            Some(MAX_DOWNLOAD_BYTES + 1),
+            true,
+            0,
+        );
+        assert!(
+            too_big.is_err(),
+            "expected_bytes above MAX_DOWNLOAD_BYTES must fail before transfer"
+        );
+        assert_eq!(
+            https_guard_listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let srv = std::thread::spawn(move || {
@@ -3909,9 +3995,7 @@ mod tests {
             let _ = stream.flush();
             let _ = stream.shutdown(std::net::Shutdown::Write);
         });
-        let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("oversized.tif");
-        let test_dl = make_test_http_download_agent(10);
         let res = http_download_file(
             &test_dl,
             &format!("http://{addr}/big.tif"),

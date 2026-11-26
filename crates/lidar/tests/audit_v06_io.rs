@@ -1,3 +1,4 @@
+#![cfg(feature = "pointcloud")]
 //! Regression tests for v0.6.0 point cloud, animation, and raster_ops audit findings.
 
 use lidar::{

@@ -198,15 +198,16 @@ pub fn compute_hillshade_rgb(dem: &Array2D<f64>, opts: &HillshadeOptions) -> Vec
         (cx, cy)
     };
 
+    let hs_default = HillshadeOptions::default();
     let az_deg = if opts.azimuth_deg.is_finite() {
         opts.azimuth_deg
     } else {
-        315.0
+        hs_default.azimuth_deg
     };
     let el_deg = if opts.elevation_deg.is_finite() {
         opts.elevation_deg.clamp(0.0, 90.0)
     } else {
-        45.0
+        hs_default.elevation_deg
     };
     let az_rad = az_deg.to_radians();
     let el_rad = el_deg.to_radians();
@@ -217,12 +218,12 @@ pub fn compute_hillshade_rgb(dem: &Array2D<f64>, opts: &HillshadeOptions) -> Vec
     let raw_amb = if opts.ambient_weight.is_finite() && opts.ambient_weight >= 0.0 {
         opts.ambient_weight
     } else {
-        0.35
+        hs_default.ambient_weight
     };
     let raw_lamp = if opts.lamp_weight.is_finite() && opts.lamp_weight >= 0.0 {
         opts.lamp_weight
     } else {
-        0.65
+        hs_default.lamp_weight
     };
     let w_sum = (raw_amb + raw_lamp).max(1e-12);
     let amb_w = raw_amb / w_sum;
