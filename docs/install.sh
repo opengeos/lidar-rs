@@ -38,7 +38,13 @@ download() {
         fi
     elif has wget; then
         case "$1" in
-            https://*) wget --https-only --secure-protocol=TLSv1_2 -q "$1" -O "$2" ;;
+            https://*)
+                if wget --version 2>&1 | grep -qi 'GNU Wget'; then
+                    wget --https-only --secure-protocol=TLSv1_2 -q "$1" -O "$2"
+                else
+                    wget -q "$1" -O "$2"
+                fi
+                ;;
             *) wget -q "$1" -O "$2" ;;
         esac
     else

@@ -1,4 +1,4 @@
-export * from "./lidar_js_direct.d.ts";
+export * from "./lidar_js_direct.js";
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 export type SyncInitInput = BufferSource | WebAssembly.Module;

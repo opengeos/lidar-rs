@@ -31,8 +31,8 @@ assert.ok(
   "lidar_js_direct.d.ts must not advertise init/initSync on node/bundler/cjs subpaths",
 );
 assert.ok(
-  /export\s+\*\s+from\s+"\.\/lidar_js_direct\.d\.ts"/.test(jsDts),
-  "lidar_js.d.ts must re-export lidar_js_direct.d.ts",
+  /export\s+\*\s+from\s+"\.\/lidar_js_direct\.js"/.test(jsDts),
+  "lidar_js.d.ts must re-export ./lidar_js_direct.js",
 );
 assert.ok(jsPackageJson.exports["./node"], 'expected "./node" export entry in package.json');
 assert.ok(jsPackageJson.scripts?.["build:web"], "expected build:web script");
@@ -57,17 +57,20 @@ for (const exportName of Object.keys(lidar)) {
       `js/lidar_js_direct.d.ts is missing declaration for exported ${isClass ? "class" : "function"} '${exportName}'`,
     );
     if (isClass && val.prototype) {
-      const classMatch = jsDts.match(
+      const classMatch = jsDirectDts.match(
         new RegExp(`export\\s+class\\s+${exportName}\\s*\\{([\\s\\S]*?)\\n\\}`),
       );
-      assert.ok(classMatch, `could not extract class body for '${exportName}' in js/lidar_js.d.ts`);
+      assert.ok(
+        classMatch,
+        `could not extract class body for '${exportName}' in js/lidar_js_direct.d.ts`,
+      );
       const classBody = classMatch[1];
       for (const propName of Object.getOwnPropertyNames(val.prototype)) {
         if (propName === "constructor" || propName.startsWith("__")) continue;
         const memberRe = new RegExp(`(?:readonly\\s+)?\\b${propName}\\b\\s*(?:\\(|:)`);
         assert.ok(
           memberRe.test(classBody),
-          `js/lidar_js.d.ts class '${exportName}' is missing member '${propName}'`,
+          `js/lidar_js_direct.d.ts class '${exportName}' is missing member '${propName}'`,
         );
       }
     }
