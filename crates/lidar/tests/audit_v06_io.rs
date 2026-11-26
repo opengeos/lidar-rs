@@ -5,8 +5,8 @@ use lidar::{
     AnimateInundationOptions, Array2D, GroundClassifyOptions, GroundFilterMethod,
     LidarToDtmOptions, PitFreeChmOptions, classify_ground_with_options, clip_image,
     csv_points_to_vector, encode_rgb_to_png_bytes, export_inundation_frames_png,
-    join_csv_to_vector, lidar_to_dtm, normalize_hag, points_to_chm_pit_free, polygonize,
-    render_dem_preview_png_bytes, save_raster,
+    join_csv_to_vector, lidar_to_dtm, normalize_hag, points_to_chm_pit_free, points_to_dtm,
+    polygonize, render_dem_preview_png_bytes, save_raster,
 };
 use richdem::DemNum;
 use terrio::crs::SpatialRef;
@@ -260,11 +260,21 @@ fn c11_c12_raster_ops_path_collision_and_csv_edge_cases() {
     );
 
     // Preclassified DTM must accept capitalized `Classification` dimension names.
-    let mut pre_cloud = PointCloud::new();
-    pre_cloud.x = vec![0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0];
-    pre_cloud.y = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0];
-    pre_cloud.z = vec![10.0; 9];
-    pre_cloud.add_dim("Classification", Values::U8(vec![2u8; 9]));
+    let pre_cloud = PointCloud::new(
+        vec![
+            Dimension::new(
+                "x",
+                Values::F64(vec![0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0]),
+            ),
+            Dimension::new(
+                "y",
+                Values::F64(vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0]),
+            ),
+            Dimension::new("z", Values::F64(vec![10.0; 9])),
+            Dimension::new("Classification", Values::U8(vec![2u8; 9])),
+        ],
+        SpatialRef::default(),
+    );
     let pre_dtm = points_to_dtm(
         &pre_cloud,
         &LidarToDtmOptions {
