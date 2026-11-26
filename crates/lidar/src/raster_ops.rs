@@ -95,6 +95,23 @@ fn polygonize_dataset(ds: &RasterDataset, out_vector: &Path, field_name: &str) -
     Ok(count)
 }
 
+fn normalize_lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(p) => out.push(p.as_os_str()),
+            Component::RootDir => out.push(comp.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(c) => out.push(c),
+        }
+    }
+    out
+}
+
 pub(crate) fn resolve_path_for_compare(path: &Path) -> Option<PathBuf> {
     if let Ok(canon) = std::fs::canonicalize(path) {
         return Some(canon);
@@ -104,8 +121,9 @@ pub(crate) fn resolve_path_for_compare(path: &Path) -> Option<PathBuf> {
     } else {
         std::env::current_dir().ok()?.join(path)
     };
+    let normalized = normalize_lexical(&abs);
     let mut suffix: Vec<std::ffi::OsString> = Vec::new();
-    let mut cur = abs.as_path();
+    let mut cur = normalized.as_path();
     loop {
         if let Ok(canon) = std::fs::canonicalize(cur) {
             let mut out = canon;

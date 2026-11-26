@@ -1818,14 +1818,23 @@ pub(crate) fn sanitize_tile_filename(download_url: &str, grid_key: &str) -> Stri
 }
 
 fn is_disallowed_ipv4(v4: std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    let is_cgnat = o[0] == 100 && (o[1] & 0xc0) == 64;
     v4.is_loopback()
         || v4.is_private()
         || v4.is_link_local()
         || v4.is_unspecified()
         || v4.is_broadcast()
         || v4.is_multicast()
+        || is_cgnat
 }
 
+/// Lexical URL-level safety check for remote download URLs returned by federal catalogs.
+///
+/// Rejects non-HTTPS schemes, embedded userinfo, localhost/single-label hostnames, numeric
+/// shorthand IPv4 encodings, and literal loopback/private/link-local/CGNAT/ULA IP addresses
+/// (including IPv4-mapped IPv6). This is a lexical pre-flight filter only: it does not perform
+/// DNS resolution or revalidate HTTP redirect targets.
 fn is_safe_https_download_url(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("https://") else {
         return false;
@@ -2064,7 +2073,7 @@ fn query_3dep_products_for_bbox(
     }
 
     let combined = serde_json::json!({ "items": raw_items });
-    let deduplicate = opts.deduplicate_tiles && opts.dem_product != DemProduct::LidarPointCloud;
+    let deduplicate = opts.deduplicate_tiles;
     Ok(parse_tnm_products_json(&combined, Some(bbox), deduplicate))
 }
 

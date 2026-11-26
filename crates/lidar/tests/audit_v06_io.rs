@@ -249,6 +249,33 @@ fn c11_c12_raster_ops_path_collision_and_csv_edge_cases() {
         clip_image(&dem_path, &mask_path, &mask_path).is_err(),
         "clip_image must reject mask == output collision"
     );
+    let traversal_out = tmp
+        .path()
+        .join("nonexistent_dir")
+        .join("..")
+        .join("dem.tif");
+    assert!(
+        clip_image(&dem_path, &mask_path, &traversal_out).is_err(),
+        "clip_image must reject nonexistent_dir/../dem.tif collision with input"
+    );
+
+    // Preclassified DTM must accept capitalized `Classification` dimension names.
+    let mut pre_cloud = PointCloud::new();
+    pre_cloud.x = vec![0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0];
+    pre_cloud.y = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0];
+    pre_cloud.z = vec![10.0; 9];
+    pre_cloud.add_dim("Classification", Values::U8(vec![2u8; 9]));
+    let pre_dtm = points_to_dtm(
+        &pre_cloud,
+        &LidarToDtmOptions {
+            resolution: 1.0,
+            ground_method: GroundFilterMethod::Preclassified,
+            ground_class: 2,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!((pre_dtm.get(1, 1) - 10.0).abs() < 1e-6);
 
     let csv_ok = tmp.path().join("pts.csv");
     std::fs::write(

@@ -358,11 +358,16 @@ fn polygon_from_rings(
         max_x = max_x.max(x);
         max_y = max_y.max(y);
     }
-    let holes: Vec<Vec<(f64, f64)>> = interiors
-        .iter()
-        .map(ring_to_xy)
-        .filter(|r| r.len() >= 3 && r.iter().all(|&(x, y)| x.is_finite() && y.is_finite()))
-        .collect();
+    let mut holes: Vec<Vec<(f64, f64)>> = Vec::with_capacity(interiors.len());
+    for ring in interiors {
+        let hole = ring_to_xy(ring);
+        if hole.iter().any(|&(x, y)| !x.is_finite() || !y.is_finite()) {
+            return None;
+        }
+        if hole.len() >= 3 {
+            holes.push(hole);
+        }
+    }
     Some(Polygon2D {
         bbox: [min_x, min_y, max_x, max_y],
         exterior: ext,
@@ -1057,10 +1062,12 @@ fn normalize_classification_dim(cloud: &PointCloud) -> std::borrow::Cow<'_, Poin
 
 /// Removes points classified as ASPRS low noise (`7`) or high noise (`18`).
 fn strip_noise_classes(cloud: &PointCloud) -> PointCloud {
-    let Some(dim) = cloud
-        .dim("classification")
-        .or_else(|| cloud.dim("Classification"))
-    else {
+    let Some(dim) = cloud.dim("classification").or_else(|| {
+        cloud
+            .dimensions
+            .iter()
+            .find(|d| d.name.eq_ignore_ascii_case("classification"))
+    }) else {
         return cloud.clone();
     };
     let n = cloud.len();
@@ -1163,10 +1170,12 @@ pub fn filter_by_classification(cloud: &PointCloud, classes: &[u8]) -> Result<Po
     if classes.is_empty() {
         return Ok(cloud.clone());
     }
-    let Some(dim) = cloud
-        .dim("classification")
-        .or_else(|| cloud.dim("Classification"))
-    else {
+    let Some(dim) = cloud.dim("classification").or_else(|| {
+        cloud
+            .dimensions
+            .iter()
+            .find(|d| d.name.eq_ignore_ascii_case("classification"))
+    }) else {
         return Err(Error::InvalidArgument(
             "point cloud has no classification dimension for classification filtering".into(),
         ));
