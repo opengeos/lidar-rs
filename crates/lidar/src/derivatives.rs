@@ -155,25 +155,25 @@ struct DinfCell {
     w2: f64,
 }
 
-fn checked_metric_scale(dem: &Array2D<f64>) -> Result<(f64, f64, f64)> {
+fn checked_derivative_cell_scale(dem: &Array2D<f64>) -> Result<(f64, f64, f64)> {
     let scale = crs_metric_scale(
         &dem.projection,
         &dem.geotransform,
         dem.width(),
         dem.height(),
     );
-    if !scale.cell_width_m.is_finite()
-        || !scale.cell_height_m.is_finite()
-        || !scale.cell_area_m2.is_finite()
-        || scale.cell_width_m <= 0.0
-        || scale.cell_height_m <= 0.0
-    {
+    let (dx, dy, area) = if scale.is_geographic {
+        (scale.cell_width_m, scale.cell_height_m, scale.cell_area_m2)
+    } else {
+        let (vx, vy, cell_area) = crate::region::affine_basis(&dem.geotransform);
+        (vx.0.hypot(vx.1), vy.0.hypot(vy.1), cell_area)
+    };
+    if !dx.is_finite() || !dy.is_finite() || !area.is_finite() || dx <= 0.0 || dy <= 0.0 {
         return Err(Error::InvalidArgument(
-            "DEM geotransform or CRS produced non-finite or non-positive metric cell spacing"
-                .into(),
+            "DEM geotransform or CRS produced non-finite or non-positive cell spacing".into(),
         ));
     }
-    Ok((scale.cell_width_m, scale.cell_height_m, scale.cell_area_m2))
+    Ok((dx, dy, area))
 }
 
 fn solve_dinf_grid(dem: &Array2D<f64>, out_nd: f64) -> Result<Vec<DinfCell>> {
@@ -182,7 +182,7 @@ fn solve_dinf_grid(dem: &Array2D<f64>, out_nd: f64) -> Result<Vec<DinfCell>> {
     let n = w * h;
     let zdata = dem.data();
     let z_nd = dem.no_data();
-    let (dx, dy, _) = checked_metric_scale(dem)?;
+    let (dx, dy, _) = checked_derivative_cell_scale(dem)?;
     let d_diag = dx.hypot(dy);
 
     let mut out = vec![
@@ -481,7 +481,7 @@ pub fn mfd_flow_accumulation(dem: &Array2D<f64>, exponent: f64) -> Result<Array2
     let zdata = dem.data();
     let z_nd = dem.no_data();
     let out_nd = safe_nodata(z_nd, 0.0);
-    let (dx, dy, _) = checked_metric_scale(dem)?;
+    let (dx, dy, _) = checked_derivative_cell_scale(dem)?;
     let cell_size = 0.5 * (dx + dy);
     let d_diag = dx.hypot(dy);
     let diag_contour = 0.25 * std::f64::consts::SQRT_2 * cell_size;
@@ -682,7 +682,7 @@ pub fn compute_twi(dem: &Array2D<f64>, flow_acc: Option<&Array2D<f64>>) -> Resul
     let zdata = dem.data();
     let z_nd = dem.no_data();
     let out_nd = safe_nodata(z_nd, -1000.0);
-    let (dx, dy, cell_area) = checked_metric_scale(dem)?;
+    let (dx, dy, cell_area) = checked_derivative_cell_scale(dem)?;
     let cell_size = 0.5 * (dx + dy);
     let sca_scale = cell_area / cell_size.max(1e-12);
 

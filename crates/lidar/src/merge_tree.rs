@@ -1291,6 +1291,13 @@ pub fn delineate_depressions_merge_tree_in_memory(
 /// Delineates the exact nested depression hierarchy using both the masked `sink` raster
 /// and the source `dem` (e.g., `dem_refined` or original DEM) so root depressions are
 /// finalized against their true lowest exterior outlet cell on the surrounding rim.
+///
+/// # Performance and Memory
+///
+/// When at least one sink region is present, this function clones `dem` and runs a
+/// full-grid Priority-Flood depression fill (`O(W * H)` extra memory and `O(N log N)`
+/// time) to distinguish true unfilled rim cells from pruned exterior pits regardless of
+/// whether the caller supplied the original DEM or `dem_refined`.
 pub fn delineate_depressions_merge_tree_with_dem_in_memory(
     sink: &Array2D<f64>,
     dem: &Array2D<f64>,

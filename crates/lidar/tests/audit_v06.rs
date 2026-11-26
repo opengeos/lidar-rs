@@ -392,3 +392,74 @@ fn hyetograph_constructors_reject_overflowing_intensities_and_depths() {
         "overflowing Chicago IDF total depth must be rejected rather than producing zeros"
     );
 }
+
+#[test]
+fn projected_feet_and_meters_dems_match_dinf_angles_and_slopes() {
+    // Tilted plane with both horizontal coordinates and elevations in feet (EPSG:2263) vs meters
+    // (EPSG:32618, scaled by 0.3048): D-inf flow angles and dimensionless slopes must match.
+    let (w, h) = (7, 7);
+    let mut z_ft = vec![0.0f64; w * h];
+    let mut z_m = vec![0.0f64; w * h];
+    let ft_to_m = 0.3048;
+    for r in 0..h {
+        for c in 0..w {
+            let v_ft = 100.0 - 2.0 * (c as f64) - 1.0 * (r as f64);
+            z_ft[r * w + c] = v_ft;
+            z_m[r * w + c] = v_ft * ft_to_m;
+        }
+    }
+    let mut dem_ft = make_dem(
+        w,
+        h,
+        z_ft,
+        -9999.0,
+        [1_000_000.0, 10.0, 0.0, 200_000.0, 0.0, -10.0],
+    );
+    dem_ft.projection = "EPSG:2263".to_string();
+
+    let mut dem_m = make_dem(
+        w,
+        h,
+        z_m,
+        -9999.0,
+        [
+            500_000.0,
+            10.0 * ft_to_m,
+            0.0,
+            4_500_000.0,
+            0.0,
+            -10.0 * ft_to_m,
+        ],
+    );
+    dem_m.projection = "EPSG:32618".to_string();
+
+    let ang_ft = dinf_flow_direction(&dem_ft).unwrap();
+    let ang_m = dinf_flow_direction(&dem_m).unwrap();
+    assert!(
+        (ang_ft.get(3, 3) - ang_m.get(3, 3)).abs() < 1e-9,
+        "D-inf angle must match between feet and meters DEMs: ft={}, m={}",
+        ang_ft.get(3, 3),
+        ang_m.get(3, 3)
+    );
+
+    let acc_ft = mfd_flow_accumulation(&dem_ft, 1.1).unwrap();
+    let acc_m = mfd_flow_accumulation(&dem_m, 1.1).unwrap();
+    assert!(
+        (acc_ft.get(3, 3) - acc_m.get(3, 3)).abs() < 1e-9,
+        "MFD accumulation must match between feet and meters DEMs: ft={}, m={}",
+        acc_ft.get(3, 3),
+        acc_m.get(3, 3)
+    );
+
+    let twi_ft = compute_twi(&dem_ft, None).unwrap();
+    let twi_m = compute_twi(&dem_m, None).unwrap();
+    // With identical dimensionless tan(beta) and native-unit SCA (ft vs m),
+    // twi_ft - twi_m = ln(1 / 0.3048) rather than -ln(1 / 0.3048).
+    let expected_twi_diff = (1.0 / ft_to_m).ln();
+    assert!(
+        ((twi_ft.get(3, 3) - twi_m.get(3, 3)) - expected_twi_diff).abs() < 1e-6,
+        "TWI difference must reflect native SCA units only (identical slope): got {}, expected {}",
+        twi_ft.get(3, 3) - twi_m.get(3, 3),
+        expected_twi_diff
+    );
+}
