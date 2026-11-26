@@ -60,7 +60,13 @@ const INSTRUCTIONS: &str = "lidar-rs performs terrain depression delineation (Wu
 const READ_ONLY: &[&str] = &["info"];
 
 /// Commands that contact external network services.
-const OPEN_WORLD: &[&str] = &["download"];
+const OPEN_WORLD: &[&str] = &["download", "noaa-atlas14"];
+
+/// Maximum number of JSON-RPC requests accepted in a single batch array.
+const MAX_BATCH_SIZE: usize = 128;
+
+/// Maximum number of in-flight / queued tool calls accepted at once to bound OS thread creation.
+const MAX_PENDING_TOOLS: usize = 64;
 
 type RpcError = (i64, String);
 
@@ -201,6 +207,11 @@ impl Server {
             Value::Array(batch) if batch.is_empty() => {
                 error(&Value::Null, INVALID_REQUEST, "empty batch")
             }
+            Value::Array(batch) if batch.len() > MAX_BATCH_SIZE => error(
+                &Value::Null,
+                INVALID_REQUEST,
+                &format!("batch exceeds maximum size limit ({MAX_BATCH_SIZE})"),
+            ),
             Value::Array(batch) => {
                 let (mut calls, mut ids) = (Vec::new(), HashSet::new());
                 let replies: Vec<Value> = batch
@@ -301,16 +312,25 @@ impl Server {
                     {
                         return Some(error(&id, code, &message));
                     }
-                    if self
-                        .running
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .contains_key(&id.to_string())
-                    {
+                    let running_len = {
+                        let guard = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+                        if guard.contains_key(&id.to_string()) {
+                            return Some(error(
+                                &id,
+                                INVALID_REQUEST,
+                                "a request id already in use by a running call",
+                            ));
+                        }
+                        guard.len()
+                    };
+                    let queued_in_batch = calls.as_ref().map_or(0, |(c, _)| c.len());
+                    if running_len.saturating_add(queued_in_batch) >= MAX_PENDING_TOOLS {
                         return Some(error(
                             &id,
-                            INVALID_REQUEST,
-                            "a request id already in use by a running call",
+                            INTERNAL_ERROR,
+                            &format!(
+                                "server busy: too many pending tool calls (max {MAX_PENDING_TOOLS})"
+                            ),
                         ));
                     }
                     match calls {
@@ -509,8 +529,77 @@ fn resolve_path_for_allowlist(path: &Path, depth: usize) -> std::io::Result<Path
     Ok(resolved)
 }
 
-/// Ensures every `PathBuf` argument parsed by Clap for subcommand `name` resolves inside at least
-/// one directory in `allowed_dirs`.
+fn has_disallowed_remote_or_vfs_scheme(raw: &str) -> bool {
+    let lower = raw.trim().to_ascii_lowercase();
+    if lower.contains("://") || lower.starts_with("/vsi") {
+        return true;
+    }
+    // Reject GDAL/driver-prefixed dataset specifiers (`NETCDF:...`, `WFS:...`, `PG:...`, etc.)
+    // while allowing Windows drive prefixes (`C:\...`) and verbatim paths (`\\?\C:\...`).
+    let stripped = lower.strip_prefix(r"\\?\").unwrap_or(&lower);
+    if let Some((prefix, _)) = stripped.split_once(':') {
+        let is_windows_drive = prefix.len() == 1 && prefix.as_bytes()[0].is_ascii_alphabetic();
+        let is_driver_prefix = prefix.len() >= 2
+            && prefix.as_bytes()[0].is_ascii_alphabetic()
+            && prefix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'+'));
+        if !is_windows_drive && is_driver_prefix {
+            return true;
+        }
+    }
+    false
+}
+
+fn validate_single_allowlist_path(p: &Path, allowed_dirs: &[PathBuf]) -> Result<(), RpcError> {
+    let raw = p.to_string_lossy();
+    if has_disallowed_remote_or_vfs_scheme(&raw) {
+        return Err((
+            INVALID_PARAMS,
+            format!(
+                "remote URL or virtual filesystem path '{}' is not permitted when --allow-dir is active",
+                p.display()
+            ),
+        ));
+    }
+    // `terrio` supports `<archive>.zip!<member>` VFS paths. Validate the underlying archive path
+    // so symlinks cannot bypass `--allow-dir` and reject member traversal segments.
+    let lower = raw.to_ascii_lowercase();
+    let target_path: PathBuf = if let Some(zip_pos) = lower.find(".zip!") {
+        let member = &raw[zip_pos + 5..];
+        if member.split(['/', '\\']).any(|seg| seg == "..") {
+            return Err((
+                INVALID_PARAMS,
+                format!(
+                    "archive member traversal in '{}' is not permitted under --allow-dir",
+                    p.display()
+                ),
+            ));
+        }
+        PathBuf::from(&raw[..zip_pos + 4])
+    } else {
+        p.to_path_buf()
+    };
+    let resolved = resolve_path_for_allowlist(&target_path, 0).map_err(|e| {
+        (
+            INVALID_PARAMS,
+            format!("could not resolve path '{}': {e}", p.display()),
+        )
+    })?;
+    if !allowed_dirs.iter().any(|dir| resolved.starts_with(dir)) {
+        return Err((
+            INVALID_PARAMS,
+            format!(
+                "path '{}' is outside the allowed directories configured via --allow-dir",
+                p.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Ensures every `PathBuf` argument (and string-typed raster forcing path) parsed by Clap for
+/// subcommand `name` resolves inside at least one directory in `allowed_dirs`.
 ///
 /// Cooperative argument-validation guardrail for local MCP agents: validates and canonicalizes
 /// path arguments before spawning the tool subprocess. Because child commands open paths by name,
@@ -531,6 +620,7 @@ pub(crate) fn validate_allowed_dirs(
     argv.push(OsString::from(name));
     argv.extend(args.iter().cloned());
 
+    let name_owned = name.to_string();
     let matches = with_clap_stack(move || {
         let path_ids: Vec<String> = cmd
             .get_arguments()
@@ -539,7 +629,7 @@ pub(crate) fn validate_allowed_dirs(
             .collect();
         match cmd.try_get_matches_from(argv) {
             Ok(m) => {
-                if name == "pipeline" && m.get_one::<PathBuf>("config").is_some() {
+                if name_owned == "pipeline" && m.get_one::<PathBuf>("config").is_some() {
                     return Err((
                         INVALID_PARAMS,
                         "--config is disabled under MCP --allow-dir guardrails; pass explicit validated CLI arguments instead".into(),
@@ -549,6 +639,18 @@ pub(crate) fn validate_allowed_dirs(
                 for id in path_ids {
                     if let Some(vals) = m.get_many::<PathBuf>(&id) {
                         paths.extend(vals.cloned());
+                    }
+                }
+                // `simulate-inundation` accepts forcing specs (`--runoff-coeff`, `--infiltration`,
+                // `--antecedent-depth`) as either a finite float or a raster file path.
+                if name_owned == "simulate-inundation" {
+                    for id in ["runoff_coeff", "infiltration", "antecedent_depth"] {
+                        if let Some(val) = m.get_one::<String>(id) {
+                            let trimmed = val.trim();
+                            if !trimmed.parse::<f64>().is_ok_and(f64::is_finite) {
+                                paths.push(PathBuf::from(trimmed));
+                            }
+                        }
                     }
                 }
                 Ok(paths)
@@ -566,21 +668,7 @@ pub(crate) fn validate_allowed_dirs(
     })?;
 
     for p in matches {
-        let resolved = resolve_path_for_allowlist(&p, 0).map_err(|e| {
-            (
-                INVALID_PARAMS,
-                format!("could not resolve path '{}': {e}", p.display()),
-            )
-        })?;
-        if !allowed_dirs.iter().any(|dir| resolved.starts_with(dir)) {
-            return Err((
-                INVALID_PARAMS,
-                format!(
-                    "path '{}' is outside the allowed directories configured via --allow-dir",
-                    p.display()
-                ),
-            ));
-        }
+        validate_single_allowlist_path(&p, allowed_dirs)?;
     }
     Ok(())
 }
@@ -635,10 +723,31 @@ fn call_preview(lidar: &[OsString], mut args: Vec<OsString>, cancel: &AtomicBool
         }
         if let Some(val) = s.strip_prefix("--output=") {
             explicit_output = Some(PathBuf::from(val));
-        } else if let Some(val) = s.strip_prefix("-o")
-            && !val.is_empty()
-        {
-            explicit_output = Some(PathBuf::from(val));
+        } else if s.starts_with('-') && !s.starts_with("--") && s.len() > 1 {
+            // Handle both `-oFILE` and clustered short flags such as `-vo FILE` or `-qoFILE`.
+            let shorts = &s[1..];
+            for (pos, ch) in shorts.char_indices() {
+                match ch {
+                    'h' | 'V' => {
+                        skip_temp_output = true;
+                        break;
+                    }
+                    'o' => {
+                        let rest = &shorts[pos + ch.len_utf8()..];
+                        if !rest.is_empty() {
+                            explicit_output = Some(PathBuf::from(rest));
+                        } else if let Some(val) = args.get(i + 1) {
+                            explicit_output = Some(PathBuf::from(val));
+                            i += 1;
+                        } else {
+                            skip_temp_output = true;
+                        }
+                        break;
+                    }
+                    'v' | 'q' => continue,
+                    _ => break,
+                }
+            }
         }
         i += 1;
     }
@@ -682,6 +791,7 @@ fn call_preview(lidar: &[OsString], mut args: Vec<OsString>, cancel: &AtomicBool
             .expect("tool results always have content array");
         // The child reports the server-injected temporary path, which is deleted when `_dir`
         // drops at the end of this call; rewrite it so the reply never names a vanished file.
+        let temp_path_str = path.to_string_lossy();
         let temp_phrase = format!(" to {}", path.display());
         let replacement = if png.is_some() {
             " as inline image content (no file kept; pass -o FILE to save it)"
@@ -689,10 +799,17 @@ fn call_preview(lidar: &[OsString], mut args: Vec<OsString>, cancel: &AtomicBool
             " to a temporary file that has been removed"
         };
         for item in content.iter_mut() {
-            if let Some(text) = item["text"].as_str()
-                && text.contains(&temp_phrase)
-            {
-                item["text"] = Value::String(text.replace(&temp_phrase, replacement));
+            if let Some(text) = item["text"].as_str() {
+                if text.contains(&temp_phrase) {
+                    item["text"] = Value::String(text.replace(&temp_phrase, replacement));
+                } else if let Ok(mut parsed) = serde_json::from_str::<Value>(text)
+                    && let Some(obj) = parsed.as_object_mut()
+                    && obj.get("output").and_then(Value::as_str) == Some(temp_path_str.as_ref())
+                {
+                    obj.insert("output".into(), Value::Null);
+                    obj.insert("inline_image".into(), Value::Bool(png.is_some()));
+                    item["text"] = Value::String(parsed.to_string());
+                }
             }
         }
         match png {
@@ -860,6 +977,7 @@ enum BoundedLine {
     Eof,
     Line(String),
     TooLarge,
+    InvalidUtf8,
 }
 
 fn read_bounded_line(reader: &mut impl BufRead, max_bytes: usize) -> std::io::Result<BoundedLine> {
@@ -906,15 +1024,10 @@ fn read_bounded_line(reader: &mut impl BufRead, max_bytes: usize) -> std::io::Re
     if buf.last() == Some(&b'\r') {
         buf.pop();
     }
-    let line = String::from_utf8(buf)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    Ok(BoundedLine::Line(line))
-}
-
-/// Serves MCP over stdin and stdout (one JSON-RPC message per line) until EOF.
-#[allow(dead_code)]
-pub fn serve(lidar: Vec<OsString>) -> std::io::Result<()> {
-    serve_with_allowed_dirs(lidar, Vec::new())
+    match String::from_utf8(buf) {
+        Ok(line) => Ok(BoundedLine::Line(line)),
+        Err(_) => Ok(BoundedLine::InvalidUtf8),
+    }
 }
 
 /// Serves MCP over stdin and stdout until EOF, optionally restricting tool path arguments to
@@ -963,6 +1076,11 @@ pub fn serve_with_allowed_dirs(
                             "JSON-RPC message exceeds maximum size limit",
                         )
                         .to_string(),
+                    );
+                }
+                BoundedLine::InvalidUtf8 => {
+                    let _ = send.send(
+                        error(&Value::Null, PARSE_ERROR, "message is not valid UTF-8").to_string(),
                     );
                 }
                 BoundedLine::Line(line) => {
@@ -1369,6 +1487,8 @@ mod tests {
         {
             let dl = tools.iter().find(|t| t["name"] == "download").unwrap();
             assert_eq!(dl["annotations"]["openWorldHint"], true);
+            let noaa = tools.iter().find(|t| t["name"] == "noaa-atlas14").unwrap();
+            assert_eq!(noaa["annotations"]["openWorldHint"], true);
         }
     }
 
