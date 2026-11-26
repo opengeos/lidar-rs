@@ -347,27 +347,27 @@ fn polygon_from_rings(
     interiors: &[terrio::vector::Ring],
 ) -> Option<Polygon2D> {
     let ext = ring_to_xy(exterior);
-    if ext.len() < 3 {
+    if ext.len() < 3 || ext.iter().any(|&(x, y)| !x.is_finite() || !y.is_finite()) {
         return None;
     }
     let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
     let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
     for &(x, y) in &ext {
-        if x.is_finite() && y.is_finite() {
-            min_x = min_x.min(x);
-            min_y = min_y.min(y);
-            max_x = max_x.max(x);
-            max_y = max_y.max(y);
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+    let mut holes: Vec<Vec<(f64, f64)>> = Vec::with_capacity(interiors.len());
+    for ring in interiors {
+        let hole = ring_to_xy(ring);
+        if hole.iter().any(|&(x, y)| !x.is_finite() || !y.is_finite()) {
+            return None;
+        }
+        if hole.len() >= 3 {
+            holes.push(hole);
         }
     }
-    if !min_x.is_finite() || !min_y.is_finite() {
-        return None;
-    }
-    let holes: Vec<Vec<(f64, f64)>> = interiors
-        .iter()
-        .map(ring_to_xy)
-        .filter(|r| r.len() >= 3)
-        .collect();
     Some(Polygon2D {
         bbox: [min_x, min_y, max_x, max_y],
         exterior: ext,
@@ -862,9 +862,18 @@ pub fn classify_ground_with_options(
 ) -> Result<PointCloud> {
     match options.method {
         GroundFilterMethod::Preclassified => Ok(cloud.clone()),
-        GroundFilterMethod::Csf => Ok(terrio_csf(cloud, &options.csf)?),
-        GroundFilterMethod::Pmf => Ok(terrio_pmf(cloud, &options.pmf)?),
-        GroundFilterMethod::Smrf => Ok(terrio_smrf(cloud, &options.smrf)?),
+        GroundFilterMethod::Csf => {
+            let normalized = normalize_classification_dim(cloud);
+            Ok(terrio_csf(&normalized, &options.csf)?)
+        }
+        GroundFilterMethod::Pmf => {
+            let normalized = normalize_classification_dim(cloud);
+            Ok(terrio_pmf(&normalized, &options.pmf)?)
+        }
+        GroundFilterMethod::Smrf => {
+            let normalized = normalize_classification_dim(cloud);
+            Ok(terrio_smrf(&normalized, &options.smrf)?)
+        }
     }
 }
 
@@ -1053,10 +1062,12 @@ fn normalize_classification_dim(cloud: &PointCloud) -> std::borrow::Cow<'_, Poin
 
 /// Removes points classified as ASPRS low noise (`7`) or high noise (`18`).
 fn strip_noise_classes(cloud: &PointCloud) -> PointCloud {
-    let Some(dim) = cloud
-        .dim("classification")
-        .or_else(|| cloud.dim("Classification"))
-    else {
+    let Some(dim) = cloud.dim("classification").or_else(|| {
+        cloud
+            .dimensions
+            .iter()
+            .find(|d| d.name.eq_ignore_ascii_case("classification"))
+    }) else {
         return cloud.clone();
     };
     let n = cloud.len();
@@ -1143,10 +1154,11 @@ pub fn filter_outliers_statistical(
 ///
 /// Requires a `classification` dimension with ASPRS ground points (class `2`).
 pub fn normalize_hag(cloud: &PointCloud, use_delaunay: bool) -> Result<PointCloud> {
+    let normalized = normalize_classification_dim(cloud);
     if use_delaunay {
-        Ok(hag_delaunay(cloud, &HagOptions::delaunay())?)
+        Ok(hag_delaunay(&normalized, &HagOptions::delaunay())?)
     } else {
-        Ok(hag_nn(cloud, &HagOptions::nn())?)
+        Ok(hag_nn(&normalized, &HagOptions::nn())?)
     }
 }
 
@@ -1158,10 +1170,12 @@ pub fn filter_by_classification(cloud: &PointCloud, classes: &[u8]) -> Result<Po
     if classes.is_empty() {
         return Ok(cloud.clone());
     }
-    let Some(dim) = cloud
-        .dim("classification")
-        .or_else(|| cloud.dim("Classification"))
-    else {
+    let Some(dim) = cloud.dim("classification").or_else(|| {
+        cloud
+            .dimensions
+            .iter()
+            .find(|d| d.name.eq_ignore_ascii_case("classification"))
+    }) else {
         return Err(Error::InvalidArgument(
             "point cloud has no classification dimension for classification filtering".into(),
         ));
@@ -1264,6 +1278,15 @@ fn validate_dsm_options(options: &LidarToDsmOptions) -> Result<()> {
     Ok(())
 }
 
+fn expected_ground_class(options: &LidarToDtmOptions) -> Option<u8> {
+    match options.ground_method {
+        GroundFilterMethod::Preclassified => None,
+        GroundFilterMethod::Csf => Some(options.csf.ground_class),
+        GroundFilterMethod::Pmf => Some(options.pmf.ground_class),
+        GroundFilterMethod::Smrf => Some(options.smrf.ground_class),
+    }
+}
+
 fn validate_dtm_options(options: &LidarToDtmOptions) -> Result<()> {
     if !options.resolution.is_finite() || options.resolution <= 0.0 {
         return Err(Error::InvalidArgument(format!(
@@ -1300,6 +1323,28 @@ fn validate_dtm_options(options: &LidarToDtmOptions) -> Result<()> {
                 options.sor_sigma
             )));
         }
+    }
+    if options.remove_outliers {
+        if !options.outlier_cell.is_finite() || options.outlier_cell <= 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "outlier_cell must be finite and > 0, got {}",
+                options.outlier_cell
+            )));
+        }
+        if !options.outlier_threshold.is_finite() || options.outlier_threshold < 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "outlier_threshold must be finite and >= 0, got {}",
+                options.outlier_threshold
+            )));
+        }
+    }
+    if let Some(expected_class) = expected_ground_class(options)
+        && options.ground_class != expected_class
+    {
+        return Err(Error::InvalidArgument(format!(
+            "{:?} assigns ground class {expected_class}; set ground_class={expected_class} or use GroundFilterMethod::Preclassified (got ground_class={})",
+            options.ground_method, options.ground_class
+        )));
     }
     Ok(())
 }
@@ -1471,12 +1516,7 @@ fn select_ground_points(raw: &PointCloud, options: &LidarToDtmOptions) -> Result
     match options.ground_method {
         GroundFilterMethod::Preclassified => filter_by_classification(raw, &[options.ground_class]),
         GroundFilterMethod::Csf | GroundFilterMethod::Pmf | GroundFilterMethod::Smrf => {
-            let expected_class = match options.ground_method {
-                GroundFilterMethod::Csf => options.csf.ground_class,
-                GroundFilterMethod::Pmf => options.pmf.ground_class,
-                GroundFilterMethod::Smrf => options.smrf.ground_class,
-                GroundFilterMethod::Preclassified => unreachable!(),
-            };
+            let expected_class = expected_ground_class(options).unwrap_or(options.ground_class);
             if options.ground_class != expected_class {
                 return Err(Error::InvalidArgument(format!(
                     "{:?} assigns ground class {expected_class}; set ground_class={expected_class} or use GroundFilterMethod::Preclassified (got ground_class={})",
@@ -1766,16 +1806,53 @@ struct DelaunayTri {
 }
 
 /// Deduplicates coincident 2D points, retaining the maximum height `h` at each `(x, y)` location.
-fn deduplicate_max_height(pts: &[(f64, f64, f64)]) -> Vec<(f64, f64, f64)> {
+fn deduplicate_max_height(pts: &[(f64, f64, f64)], resolution: f64) -> Vec<(f64, f64, f64)> {
+    let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
+    let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for &(x, y, h) in pts {
+        if x.is_finite() && y.is_finite() && h.is_finite() {
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+    }
+    if !min_x.is_finite() || !min_y.is_finite() {
+        return Vec::new();
+    }
+    let span = (max_x - min_x).max(max_y - min_y).max(0.0);
+    let res_tol = if resolution.is_finite() && resolution > 0.0 {
+        resolution * 1e-6
+    } else {
+        1e-6
+    };
+    let tol = res_tol.max(span * 1e-12);
+    let use_quant = tol > 0.0 && (span / tol).is_finite() && (span / tol) < 4.5e15;
+
     let mut best: HashMap<(u64, u64), (f64, f64, f64)> = HashMap::with_capacity(pts.len());
     for &(x, y, h) in pts {
         if !x.is_finite() || !y.is_finite() || !h.is_finite() {
             continue;
         }
-        // Quantize to 1e-6 CRS units to merge multi-return pulses along the same vertical beam.
-        let qx = (x * 1e6).round() as i64 as u64;
-        let qy = (y * 1e6).round() as i64 as u64;
-        best.entry((qx, qy))
+        let key = if use_quant {
+            let qx = ((x - min_x) / tol).round() as i64 as u64;
+            let qy = ((y - min_y) / tol).round() as i64 as u64;
+            (qx, qy)
+        } else {
+            (
+                if x == 0.0 {
+                    0.0f64.to_bits()
+                } else {
+                    x.to_bits()
+                },
+                if y == 0.0 {
+                    0.0f64.to_bits()
+                } else {
+                    y.to_bits()
+                },
+            )
+        };
+        best.entry(key)
             .and_modify(|e| {
                 if h > e.2 {
                     *e = (x, y, h);
@@ -2148,6 +2225,9 @@ fn rasterize_tin_max(
 ) {
     let w = grid.width;
     let h = grid.height;
+    if w == 0 || h == 0 {
+        return;
+    }
     let gt = grid.geotransform;
     let nodata = grid.nodata;
     let max_edge2 = max_edge.map(|e| e * e);
@@ -2170,7 +2250,8 @@ fn rasterize_tin_max(
         }
 
         let denom = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3);
-        if denom.abs() < 1e-10 {
+        let eps_area = 1e-12 * (cell_x * cell_y).abs().max(f64::MIN_POSITIVE);
+        if !denom.is_finite() || denom.abs() <= eps_area {
             continue;
         }
         let m1x = (y2 - y3) / denom;
@@ -2328,7 +2409,7 @@ pub fn points_to_chm_pit_free(
         ));
     }
 
-    let base_pts = deduplicate_max_height(&raw_hag_pts);
+    let base_pts = deduplicate_max_height(&raw_hag_pts, options.resolution);
 
     // 1. Base CHM surface (all returns, h >= 0.0) via full Delaunay TIN (no edge cutoff).
     let tin_grid = TinRasterGrid {

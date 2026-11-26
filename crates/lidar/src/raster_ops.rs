@@ -60,9 +60,12 @@ pub fn polygonize(
     out_vector: impl AsRef<Path>,
     field_name: &str,
 ) -> Result<usize> {
-    let in_str = path_to_str(in_raster.as_ref())?;
+    let in_path = in_raster.as_ref();
+    let out_path = out_vector.as_ref();
+    ensure_no_path_collision(in_path, &[out_path])?;
+    let in_str = path_to_str(in_path)?;
     let ds = terrio::open_raster(in_str)?;
-    polygonize_dataset(&ds, out_vector.as_ref(), field_name)
+    polygonize_dataset(&ds, out_path, field_name)
 }
 
 /// Polygonizes an in-memory [`richdem::Array2D`] directly to a vector file.
@@ -92,19 +95,47 @@ fn polygonize_dataset(ds: &RasterDataset, out_vector: &Path, field_name: &str) -
     Ok(count)
 }
 
+fn normalize_lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(p) => out.push(p.as_os_str()),
+            Component::RootDir => out.push(comp.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(c) => out.push(c),
+        }
+    }
+    out
+}
+
 pub(crate) fn resolve_path_for_compare(path: &Path) -> Option<PathBuf> {
     if let Ok(canon) = std::fs::canonicalize(path) {
         return Some(canon);
     }
-    let parent = path.parent()?;
-    let file_name = path.file_name()?;
-    let parent_dir = if parent.as_os_str().is_empty() {
-        Path::new(".")
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
     } else {
-        parent
+        std::env::current_dir().ok()?.join(path)
     };
-    let canon_parent = std::fs::canonicalize(parent_dir).ok()?;
-    Some(canon_parent.join(file_name))
+    let normalized = normalize_lexical(&abs);
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = normalized.as_path();
+    loop {
+        if let Ok(canon) = std::fs::canonicalize(cur) {
+            let mut out = canon;
+            for part in suffix.into_iter().rev() {
+                out.push(part);
+            }
+            return Some(out);
+        }
+        let name = cur.file_name()?;
+        suffix.push(name.to_os_string());
+        cur = cur.parent()?;
+    }
 }
 
 /// Returns an error if `input` resolves to the same path as any entry in `outputs`.
@@ -191,7 +222,6 @@ pub fn reproject_image(
     let out_path = output.as_ref();
     ensure_no_path_collision(in_path, &[out_path])?;
     let in_str = path_to_str(in_path)?;
-    ensure_parent_dir(out_path)?;
     let out_str = path_to_str(out_path)?;
 
     let src = terrio::open_raster(in_str)?;
@@ -203,6 +233,7 @@ pub fn reproject_image(
         ..Default::default()
     };
     let warped = warp(&[&src], &opts)?;
+    ensure_parent_dir(out_path)?;
     terrio::write_raster_dataset(&warped, out_str, &RasterWriteOptions::default())?;
     Ok(())
 }
@@ -225,7 +256,6 @@ pub fn resample(
     let out_path = output.as_ref();
     ensure_no_path_collision(in_path, &[out_path])?;
     let in_str = path_to_str(in_path)?;
-    ensure_parent_dir(out_path)?;
     let out_str = path_to_str(out_path)?;
 
     let src = terrio::open_raster(in_str)?;
@@ -235,6 +265,7 @@ pub fn resample(
         ..Default::default()
     };
     let warped = warp(&[&src], &opts)?;
+    ensure_parent_dir(out_path)?;
     terrio::write_raster_dataset(&warped, out_str, &RasterWriteOptions::default())?;
     Ok(())
 }
@@ -249,11 +280,12 @@ pub fn clip_image(
     output: impl AsRef<Path>,
 ) -> Result<()> {
     let in_path = input.as_ref();
+    let mask_path = mask.as_ref();
     let out_path = output.as_ref();
     ensure_no_path_collision(in_path, &[out_path])?;
+    ensure_no_path_collision(mask_path, &[out_path])?;
     let in_str = path_to_str(in_path)?;
-    let mask_str = path_to_str(mask.as_ref())?;
-    ensure_parent_dir(out_path)?;
+    let mask_str = path_to_str(mask_path)?;
     let out_str = path_to_str(out_path)?;
 
     let src = terrio::open_raster(in_str)?;
@@ -264,6 +296,7 @@ pub fn clip_image(
         ..Default::default()
     };
     let clipped = warp(&[&src], &opts)?;
+    ensure_parent_dir(out_path)?;
     terrio::write_raster_dataset(&clipped, out_str, &RasterWriteOptions::default())?;
     Ok(())
 }
@@ -280,7 +313,6 @@ pub fn image_to_cog(
     let out_path = output.as_ref();
     ensure_no_path_collision(in_path, &[out_path])?;
     let in_str = path_to_str(in_path)?;
-    ensure_parent_dir(out_path)?;
     let out_str = path_to_str(out_path)?;
 
     let src = terrio::open_raster(in_str)?;
@@ -289,6 +321,7 @@ pub fn image_to_cog(
         compression: Some(compression.unwrap_or("DEFLATE").to_string()),
         ..Default::default()
     };
+    ensure_parent_dir(out_path)?;
     terrio::write_raster_dataset(&src, out_str, &opts)?;
     Ok(())
 }
@@ -420,14 +453,25 @@ pub fn add_crs(input: impl AsRef<Path>, crs: &str, output: Option<&Path>) -> Res
 }
 
 /// Parses RFC-4180 CSV content into complete records, properly preserving
-/// embedded newlines and escaped quotes inside quoted fields.
-fn parse_csv_records(content: &str) -> Vec<Vec<String>> {
+/// embedded newlines, escaped quotes, and inner whitespace inside quoted fields.
+fn parse_csv_records(content: &str) -> Result<Vec<Vec<String>>> {
     let mut records: Vec<Vec<String>> = Vec::new();
     let mut row: Vec<String> = Vec::new();
     let mut field = String::new();
     let mut chars = content.chars().peekable();
     let mut in_quotes = false;
+    let mut was_quoted = false;
     let mut had_field_content = false;
+
+    let finalize_field = |f: &mut String, quoted: bool| -> String {
+        if quoted {
+            std::mem::take(f)
+        } else {
+            let trimmed = f.trim().to_string();
+            f.clear();
+            trimmed
+        }
+    };
 
     while let Some(c) = chars.next() {
         if in_quotes {
@@ -443,13 +487,15 @@ fn parse_csv_records(content: &str) -> Vec<Vec<String>> {
             }
         } else {
             match c {
-                '"' => {
+                '"' if !was_quoted && field.trim().is_empty() => {
+                    field.clear();
                     in_quotes = true;
+                    was_quoted = true;
                     had_field_content = true;
                 }
                 ',' => {
-                    row.push(field.trim().to_string());
-                    field.clear();
+                    row.push(finalize_field(&mut field, was_quoted));
+                    was_quoted = false;
                     had_field_content = true;
                 }
                 '\r' => {
@@ -457,38 +503,50 @@ fn parse_csv_records(content: &str) -> Vec<Vec<String>> {
                         chars.next();
                     }
                     if had_field_content || !field.trim().is_empty() {
-                        row.push(field.trim().to_string());
+                        row.push(finalize_field(&mut field, was_quoted));
                         records.push(std::mem::take(&mut row));
+                    } else {
+                        field.clear();
                     }
-                    field.clear();
+                    was_quoted = false;
                     had_field_content = false;
                 }
                 '\n' => {
                     if had_field_content || !field.trim().is_empty() {
-                        row.push(field.trim().to_string());
+                        row.push(finalize_field(&mut field, was_quoted));
                         records.push(std::mem::take(&mut row));
+                    } else {
+                        field.clear();
                     }
-                    field.clear();
+                    was_quoted = false;
                     had_field_content = false;
                 }
                 _ => {
-                    field.push(c);
+                    if was_quoted && c.is_whitespace() {
+                        // Ignore trailing whitespace after a closing quote before comma/EOL.
+                    } else {
+                        field.push(c);
+                    }
                 }
             }
         }
     }
 
+    if in_quotes {
+        return Err(Error::Parse("unclosed quoted field in CSV".into()));
+    }
+
     if had_field_content || !field.trim().is_empty() {
-        row.push(field.trim().to_string());
+        row.push(finalize_field(&mut field, was_quoted));
         records.push(row);
     }
-    records
+    Ok(records)
 }
 
 fn read_csv_table(csv_path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>)> {
     let raw = std::fs::read_to_string(csv_path)?;
     let content = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
-    let mut records = parse_csv_records(content);
+    let mut records = parse_csv_records(content)?;
     if records.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
@@ -640,7 +698,6 @@ pub fn join_csv_to_vector(
     ensure_no_path_collision(in_vec_path, &[out_path])?;
     ensure_no_path_collision(in_csv_path, &[out_path])?;
     let in_vec_str = path_to_str(in_vec_path)?;
-    ensure_parent_dir(out_path)?;
     let out_str = path_to_str(out_path)?;
 
     let vds = terrio::open_vector(in_vec_str, &VectorOpenOptions::default())?;
@@ -649,6 +706,9 @@ pub fn join_csv_to_vector(
     })?;
 
     let (headers, rows) = read_csv_table(in_csv_path)?;
+    if headers.is_empty() {
+        return Err(Error::Parse("CSV file has no header row".into()));
+    }
     let is_shp = out_path
         .extension()
         .and_then(|e| e.to_str())
@@ -659,23 +719,6 @@ pub fn join_csv_to_vector(
         out_layer = out_layer.with_geom_type(gt);
     }
     SpatialRef::from_layer(src_layer).apply_to_layer(&mut out_layer);
-
-    if headers.is_empty() {
-        let mut used_names = HashSet::new();
-        for field in src_layer.schema.fields() {
-            let mut out_field = field.clone();
-            if is_shp {
-                out_field.name = allocate_unique_field_name(&field.name, true, &mut used_names);
-            } else {
-                used_names.insert(out_field.name.to_ascii_lowercase());
-            }
-            out_layer.schema.add_field(out_field);
-        }
-        out_layer.features = src_layer.features.clone();
-        let n = out_layer.features.len();
-        terrio::write_vector(&[out_layer], out_str, &VectorWriteOptions::default())?;
-        return Ok(n);
-    }
 
     let vec_key_idx = src_layer
         .schema
@@ -779,6 +822,7 @@ pub fn join_csv_to_vector(
     }
 
     let count = out_layer.features.len();
+    ensure_parent_dir(out_path)?;
     terrio::write_vector(&[out_layer], out_str, &VectorWriteOptions::default())?;
     Ok(count)
 }
@@ -793,11 +837,12 @@ pub fn csv_points_to_vector(
     latitude_col: &str,
     longitude_col: &str,
 ) -> Result<usize> {
+    let in_csv_path = in_csv.as_ref();
     let out_path = out_vector.as_ref();
-    ensure_parent_dir(out_path)?;
+    ensure_no_path_collision(in_csv_path, &[out_path])?;
     let out_str = path_to_str(out_path)?;
 
-    let (headers, rows) = read_csv_table(in_csv.as_ref())?;
+    let (headers, rows) = read_csv_table(in_csv_path)?;
     if headers.is_empty() {
         return Err(Error::Parse("CSV file has no header row".into()));
     }
@@ -869,6 +914,7 @@ pub fn csv_points_to_vector(
     }
 
     let count = layer.features.len();
+    ensure_parent_dir(out_path)?;
     terrio::write_vector(&[layer], out_str, &VectorWriteOptions::default())?;
     Ok(count)
 }

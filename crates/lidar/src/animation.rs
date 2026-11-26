@@ -198,15 +198,36 @@ pub fn compute_hillshade_rgb(dem: &Array2D<f64>, opts: &HillshadeOptions) -> Vec
         (cx, cy)
     };
 
-    let az_rad = opts.azimuth_deg.to_radians();
-    let el_rad = opts.elevation_deg.to_radians();
+    let hs_default = HillshadeOptions::default();
+    let az_deg = if opts.azimuth_deg.is_finite() {
+        opts.azimuth_deg
+    } else {
+        hs_default.azimuth_deg
+    };
+    let el_deg = if opts.elevation_deg.is_finite() {
+        opts.elevation_deg.clamp(0.0, 90.0)
+    } else {
+        hs_default.elevation_deg
+    };
+    let az_rad = az_deg.to_radians();
+    let el_rad = el_deg.to_radians();
     let light_h = el_rad.sin();
     let light_r = el_rad.cos() * az_rad.sin();
     let light_c = el_rad.cos() * az_rad.cos();
 
-    let w_sum = (opts.ambient_weight + opts.lamp_weight).max(1e-12);
-    let amb_w = opts.ambient_weight / w_sum;
-    let lamp_w = opts.lamp_weight / w_sum;
+    let raw_amb = if opts.ambient_weight.is_finite() && opts.ambient_weight >= 0.0 {
+        opts.ambient_weight
+    } else {
+        hs_default.ambient_weight
+    };
+    let raw_lamp = if opts.lamp_weight.is_finite() && opts.lamp_weight >= 0.0 {
+        opts.lamp_weight
+    } else {
+        hs_default.lamp_weight
+    };
+    let w_sum = (raw_amb + raw_lamp).max(1e-12);
+    let amb_w = raw_amb / w_sum;
+    let lamp_w = raw_lamp / w_sum;
     let zf = if opts.z_factor.is_finite() && opts.z_factor > 0.0 {
         opts.z_factor
     } else {
@@ -386,9 +407,9 @@ fn downscale_rgb(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<
     }
     let mut dst = vec![0u8; dw * dh * 3];
     for y in 0..dh {
-        let sy = (y * sh / dh).min(sh - 1);
+        let sy = ((y as u64 * sh as u64) / dh as u64).min((sh - 1) as u64) as usize;
         for x in 0..dw {
-            let sx = (x * sw / dw).min(sw - 1);
+            let sx = ((x as u64 * sw as u64) / dw as u64).min((sw - 1) as u64) as usize;
             let s = (sy * sw + sx) * 3;
             let d = (y * dw + x) * 3;
             dst[d..d + 3].copy_from_slice(&src[s..s + 3]);
@@ -748,7 +769,7 @@ where
         let legend_label = options.legend_label.as_deref().unwrap_or("WATER");
         let has_spills = !spill_paths.is_empty();
         if options.show_scale_bar && !is_geographic_crs(&dem.projection, dem.geotransform) {
-            let cell_m = dem.geotransform[1].hypot(dem.geotransform[4]).max(1e-6);
+            let cell_m = dem.geotransform[1].hypot(dem.geotransform[4]);
             let reserve_right = if options.show_legend {
                 legend_box_width(legend_label, has_spills) + 12
             } else {
@@ -989,15 +1010,7 @@ pub fn animate_inundation_to_bytes_with_spill_paths(
             "time_step_h must be finite and > 0, got {time_step_h}"
         )));
     }
-    if fill_time.width() != dem.width() || fill_time.height() != dem.height() {
-        return Err(Error::DimensionMismatch(format!(
-            "fill_time ({}x{}) does not match DEM ({}x{})",
-            fill_time.width(),
-            fill_time.height(),
-            dem.width(),
-            dem.height()
-        )));
-    }
+    crate::inundation::validate_grid_alignment(dem, fill_time, "fill_time")?;
 
     let mut effective_opts = options.clone();
     effective_opts.time_step_h = Some(time_step_h);
@@ -1084,8 +1097,8 @@ fn draw_overlay_polylines(
             let y1 = map_y(seg[1].1);
             let steps = (x1 - x0).abs().max((y1 - y0).abs()).max(1);
             for s in 0..=steps {
-                let px = x0 + (x1 - x0) * s / steps;
-                let py = y0 + (y1 - y0) * s / steps;
+                let px = x0 as i64 + ((x1 - x0) as i64 * s as i64) / steps as i64;
+                let py = y0 as i64 + ((y1 - y0) as i64 * s as i64) / steps as i64;
                 if px >= 0 && py >= 0 && (px as usize) < dw && (py as usize) < dh {
                     let p = (py as usize * dw + px as usize) * 3;
                     body[p] = rgb[0];
@@ -1240,7 +1253,22 @@ fn draw_legend_box(
 
 /// Encodes an RGB24 buffer (`3 * width * height` bytes) into a pure-Rust PNG byte vector.
 pub fn encode_rgb_to_png_bytes(rgb: &[u8], width: usize, height: usize) -> Result<Vec<u8>> {
-    if rgb.len() != width * height * 3 {
+    if width == 0 || height == 0 {
+        return Err(Error::DimensionMismatch(format!(
+            "PNG dimensions must be > 0, got {width}x{height}"
+        )));
+    }
+    let w_u32 = u32::try_from(width)
+        .map_err(|_| Error::DimensionMismatch(format!("PNG width exceeds u32::MAX: {width}")))?;
+    let h_u32 = u32::try_from(height)
+        .map_err(|_| Error::DimensionMismatch(format!("PNG height exceeds u32::MAX: {height}")))?;
+    let expected_len = width
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(3))
+        .ok_or_else(|| {
+            Error::DimensionMismatch(format!("RGB buffer size overflow for {width}x{height}x3"))
+        })?;
+    if rgb.len() != expected_len {
         return Err(Error::DimensionMismatch(format!(
             "RGB buffer length {} does not match {width}x{height}x3",
             rgb.len()
@@ -1248,7 +1276,7 @@ pub fn encode_rgb_to_png_bytes(rgb: &[u8], width: usize, height: usize) -> Resul
     }
     let mut out = Vec::new();
     {
-        let mut encoder = png::Encoder::new(&mut out, width as u32, height as u32);
+        let mut encoder = png::Encoder::new(&mut out, w_u32, h_u32);
         encoder.set_color(png::ColorType::Rgb);
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder
@@ -1324,7 +1352,7 @@ pub fn render_inundation_frame_png_bytes(
     let [wr, wg, wb] = options.water_rgb;
     let ft_data = fill_time.data();
     let ft_nd = fill_time.no_data();
-    let cell_m = dem.geotransform[1].hypot(dem.geotransform[4]).max(1e-6);
+    let cell_m = dem.geotransform[1].hypot(dem.geotransform[4]);
 
     let wet: Vec<bool> = ft_data
         .iter()
@@ -1357,9 +1385,9 @@ pub fn render_inundation_frame_png_bytes(
     let body = &mut frame_rgb[ANIMATION_BANNER_HEIGHT * dw * 3..];
     body.copy_from_slice(&bg);
     for dr in 0..dh {
-        let sr = dr * sh / dh;
+        let sr = ((dr as u64 * sh as u64) / dh as u64) as usize;
         for dc in 0..dw {
-            let sc = dc * sw / dw;
+            let sc = ((dc as u64 * sw as u64) / dw as u64) as usize;
             if wet[sr * sw + sc] {
                 let p = (dr * dw + dc) * 3;
                 body[p] = (body[p] as f32 * inv_alpha + wr as f32 * alpha).round() as u8;
@@ -1413,7 +1441,7 @@ pub fn render_dem_preview_png_bytes(
     let (dw, dh, _) = compute_gif_dimensions(sw, sh, options)?;
     let full_bg = compute_hillshade_rgb(dem, &options.hillshade);
     let mut rgb = downscale_rgb(&full_bg, sw, sh, dw, dh);
-    let cell_m = dem.geotransform[1].hypot(dem.geotransform[4]).max(1e-6);
+    let cell_m = dem.geotransform[1].hypot(dem.geotransform[4]);
 
     if let Some(ov) = depth_overlay {
         let alpha = options.water_alpha.clamp(0.0, 1.0);
@@ -1473,17 +1501,11 @@ pub fn export_inundation_frames_png(
     }
     let sw = dem.width();
     let sh = dem.height();
-    if fill_time.width() != sw || fill_time.height() != sh {
-        return Err(Error::DimensionMismatch(format!(
-            "fill_time ({}x{}) does not match DEM ({sw}x{sh})",
-            fill_time.width(),
-            fill_time.height()
-        )));
-    }
+    crate::inundation::validate_grid_alignment(dem, fill_time, "fill_time")?;
+    let (dw, dh, total_h) = compute_gif_dimensions(sw, sh, options)?;
     let out_dir = out_dir.as_ref();
     std::fs::create_dir_all(out_dir)?;
 
-    let (dw, dh, total_h) = compute_gif_dimensions(sw, sh, options)?;
     let full_bg = compute_hillshade_rgb(dem, &options.hillshade);
     let bg = downscale_rgb(&full_bg, sw, sh, dw, dh);
     let alpha = options.water_alpha.clamp(0.0, 1.0);
@@ -1491,8 +1513,8 @@ pub fn export_inundation_frames_png(
     let [wr, wg, wb] = options.water_rgb;
     let ft_data = fill_time.data();
     let ft_nd = fill_time.no_data();
-    let digits = (num_steps as f64).log10().floor() as usize + 1;
-    let cell_m = dem.geotransform[1].hypot(dem.geotransform[4]).max(1e-6);
+    let digits = num_steps.to_string().len().max(3);
+    let cell_m = dem.geotransform[1].hypot(dem.geotransform[4]);
     let draw_scale =
         options.show_scale_bar && !is_geographic_crs(&dem.projection, dem.geotransform);
 

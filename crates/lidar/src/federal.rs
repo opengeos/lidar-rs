@@ -622,9 +622,32 @@ pub struct FederalBundleResult {
     pub manifest_path: PathBuf,
 }
 
-fn make_agent(timeout_secs: u64) -> ureq::Agent {
+/// Hard streaming download limit (8 GiB) to prevent unbounded disk exhaustion or gzip bombs.
+const MAX_DOWNLOAD_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+fn make_agent_with_https(timeout_secs: u64, https_only: bool) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
+        .https_only(https_only)
+        .max_redirects(5)
         .timeout_global(Some(Duration::from_secs(timeout_secs.max(5))))
+        .user_agent(format!("lidar-rs/{}", crate::VERSION))
+        .build();
+    ureq::Agent::new_with_config(config)
+}
+
+fn make_agent(timeout_secs: u64) -> ureq::Agent {
+    make_agent_with_https(timeout_secs, true)
+}
+
+fn make_download_agent_with_https(timeout_secs: u64, https_only: bool) -> ureq::Agent {
+    let io_timeout = Duration::from_secs(timeout_secs.max(30));
+    let config = ureq::Agent::config_builder()
+        .https_only(https_only)
+        .max_redirects(5)
+        .timeout_connect(Some(Duration::from_secs(30)))
+        .timeout_recv_response(Some(io_timeout))
+        .timeout_per_read(Some(io_timeout))
+        .timeout_per_write(Some(Duration::from_secs(30)))
         .user_agent(format!("lidar-rs/{}", crate::VERSION))
         .build();
     ureq::Agent::new_with_config(config)
@@ -633,15 +656,17 @@ fn make_agent(timeout_secs: u64) -> ureq::Agent {
 /// Builds an HTTP agent configured for large streaming file downloads using per-phase timeouts
 /// (connect, response headers, per-read, per-write) instead of a fixed total transfer timeout.
 fn make_download_agent(timeout_secs: u64) -> ureq::Agent {
-    let io_timeout = Duration::from_secs(timeout_secs.max(30));
-    let config = ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(30)))
-        .timeout_recv_response(Some(io_timeout))
-        .timeout_per_read(Some(io_timeout))
-        .timeout_per_write(Some(Duration::from_secs(30)))
-        .user_agent(format!("lidar-rs/{}", crate::VERSION))
-        .build();
-    ureq::Agent::new_with_config(config)
+    make_download_agent_with_https(timeout_secs, true)
+}
+
+#[cfg(test)]
+fn make_test_http_agent(timeout_secs: u64) -> ureq::Agent {
+    make_agent_with_https(timeout_secs, false)
+}
+
+#[cfg(test)]
+fn make_test_http_download_agent(timeout_secs: u64) -> ureq::Agent {
+    make_download_agent_with_https(timeout_secs, false)
 }
 
 pub(crate) fn is_retryable_ureq_error(err: &ureq::Error) -> bool {
@@ -857,6 +882,13 @@ fn http_download_file(
     max_retries: usize,
 ) -> Result<PathBuf> {
     let expected_bytes = expected_bytes.filter(|&n| n > 0);
+    if let Some(exp) = expected_bytes
+        && exp > MAX_DOWNLOAD_BYTES
+    {
+        return Err(Error::Http(format!(
+            "GET {url} advertised size ({exp} bytes) exceeds maximum download cap ({MAX_DOWNLOAD_BYTES} bytes)"
+        )));
+    }
     if !overwrite
         && dest.exists()
         && let Ok(meta) = std::fs::metadata(dest)
@@ -911,6 +943,10 @@ fn http_download_file(
             } else {
                 None
             };
+            let stream_limit = expected_bytes
+                .or(header_content_length)
+                .unwrap_or(MAX_DOWNLOAD_BYTES)
+                .min(MAX_DOWNLOAD_BYTES);
             let mut reader = resp.body_mut().as_reader();
             let mut buf = vec![0u8; 256 * 1024];
             let mut written: u64 = 0;
@@ -921,11 +957,17 @@ fn http_download_file(
                 if n == 0 {
                     break;
                 }
+                let next_written = written.saturating_add(n as u64);
+                if next_written > stream_limit {
+                    return Err(DownloadAttemptErr::Fatal(Error::Http(format!(
+                        "GET {url} exceeded download size limit ({stream_limit} bytes)"
+                    ))));
+                }
                 tmp_file
                     .as_file_mut()
                     .write_all(&buf[..n])
                     .map_err(|e| DownloadAttemptErr::Fatal(Error::Io(e)))?;
-                written += n as u64;
+                written = next_written;
             }
             tmp_file
                 .as_file_mut()
@@ -1775,6 +1817,92 @@ pub(crate) fn sanitize_tile_filename(download_url: &str, grid_key: &str) -> Stri
     }
 }
 
+fn is_disallowed_ipv4(v4: std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    let is_cgnat = o[0] == 100 && (o[1] & 0xc0) == 64;
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.is_multicast()
+        || is_cgnat
+}
+
+/// Lexical URL-level safety check for remote download URLs returned by federal catalogs.
+///
+/// Rejects non-HTTPS schemes, embedded userinfo, localhost/single-label hostnames, numeric
+/// shorthand IPv4 encodings, and literal loopback/private/link-local/CGNAT/ULA IP addresses
+/// (including IPv4-mapped IPv6). This is a lexical pre-flight filter only: it does not perform
+/// DNS resolution or revalidate HTTP redirect targets.
+fn is_safe_https_download_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    let host = if let Some(inner) = authority.strip_prefix('[') {
+        inner.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    let host_lower = host.trim_end_matches('.').to_ascii_lowercase();
+    if host_lower.is_empty() || host_lower == "localhost" || host_lower.ends_with(".localhost") {
+        return false;
+    }
+    if let Ok(ip) = host_lower.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => !is_disallowed_ipv4(v4),
+            std::net::IpAddr::V6(v6) => {
+                if let Some(mapped) = v6.to_ipv4_mapped() {
+                    return !is_disallowed_ipv4(mapped);
+                }
+                let segs = v6.segments();
+                let is_ula = (segs[0] & 0xfe00) == 0xfc00;
+                let is_link_local = (segs[0] & 0xffc0) == 0xfe80;
+                !(v6.is_loopback()
+                    || v6.is_unspecified()
+                    || v6.is_multicast()
+                    || is_ula
+                    || is_link_local)
+            }
+        };
+    }
+    // Reject single-label hosts and non-standard numeric IPv4 encodings (e.g. `127.1`,
+    // `2852039166`, `0x7f000001`, octal dotted quads) that `getaddrinfo` resolves as IPs.
+    if !host_lower.contains('.') {
+        return false;
+    }
+    let all_numeric_labels = host_lower.split('.').all(|lbl| {
+        !lbl.is_empty()
+            && (lbl.bytes().all(|b| b.is_ascii_digit())
+                || lbl.strip_prefix("0x").is_some_and(|hex| {
+                    !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit())
+                }))
+    });
+    if all_numeric_labels {
+        return false;
+    }
+    true
+}
+
+fn bbox_iou(a: &Bbox, b: &Bbox) -> f64 {
+    let ix0 = a.min_lon.max(b.min_lon);
+    let iy0 = a.min_lat.max(b.min_lat);
+    let ix1 = a.max_lon.min(b.max_lon);
+    let iy1 = a.max_lat.min(b.max_lat);
+    if ix1 <= ix0 || iy1 <= iy0 {
+        return 0.0;
+    }
+    let inter = (ix1 - ix0) * (iy1 - iy0);
+    let area_a = (a.max_lon - a.min_lon).max(0.0) * (a.max_lat - a.min_lat).max(0.0);
+    let area_b = (b.max_lon - b.min_lon).max(0.0) * (b.max_lat - b.min_lat).max(0.0);
+    let union = area_a + area_b - inter;
+    if union > 0.0 { inter / union } else { 0.0 }
+}
+
 /// Parses USGS TNM products JSON and optionally deduplicates overlapping grid tiles to the
 /// newest `publicationDate`.
 pub(crate) fn parse_tnm_products_json(
@@ -1790,7 +1918,7 @@ pub(crate) fn parse_tnm_products_json(
         let Some(url) = it
             .get("downloadURL")
             .and_then(Value::as_str)
-            .filter(|s| s.starts_with("https://"))
+            .filter(|s| is_safe_https_download_url(s))
         else {
             continue;
         };
@@ -1849,17 +1977,27 @@ pub(crate) fn parse_tnm_products_json(
         return parsed;
     }
 
-    let mut by_grid: HashMap<String, TnmProductItem> = HashMap::new();
+    let mut by_grid: HashMap<String, Vec<TnmProductItem>> = HashMap::new();
     for item in parsed {
-        match by_grid.get(&item.grid_key) {
-            Some(prev) if prev.publication_date >= item.publication_date => {}
-            _ => {
-                by_grid.insert(item.grid_key.clone(), item);
+        let bucket = by_grid.entry(item.grid_key.clone()).or_default();
+        if let Some(prev) = bucket
+            .iter_mut()
+            .find(|existing| bbox_iou(&existing.bbox, &item.bbox) >= 0.5)
+        {
+            if item.publication_date > prev.publication_date {
+                *prev = item;
             }
+        } else {
+            bucket.push(item);
         }
     }
-    let mut deduped: Vec<TnmProductItem> = by_grid.into_values().collect();
-    deduped.sort_by(|a, b| a.grid_key.cmp(&b.grid_key));
+    let mut deduped: Vec<TnmProductItem> = by_grid.into_values().flatten().collect();
+    deduped.sort_by(|a, b| {
+        a.grid_key
+            .cmp(&b.grid_key)
+            .then_with(|| a.title.cmp(&b.title))
+            .then_with(|| a.download_url.cmp(&b.download_url))
+    });
     deduped
 }
 
@@ -1935,11 +2073,8 @@ fn query_3dep_products_for_bbox(
     }
 
     let combined = serde_json::json!({ "items": raw_items });
-    Ok(parse_tnm_products_json(
-        &combined,
-        Some(bbox),
-        opts.deduplicate_tiles,
-    ))
+    let deduplicate = opts.deduplicate_tiles;
+    Ok(parse_tnm_products_json(&combined, Some(bbox), deduplicate))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2302,18 +2437,7 @@ fn download_roads_resolved(
                     .and_then(Value::as_object)
                     .cloned()
                     .unwrap_or_default();
-                let mut props = Map::new();
-                props.insert("trans_layer".to_string(), Value::from(lyr));
-                if let Some(name) = old_props.get("FULL_STREET_NAME") {
-                    props.insert("FULL_STREET_NAME".to_string(), name.clone());
-                } else {
-                    props.insert("FULL_STREET_NAME".to_string(), Value::Null);
-                }
-                if let Some(mtfcc) = old_props.get("MTFCC_CODE") {
-                    props.insert("MTFCC_CODE".to_string(), mtfcc.clone());
-                } else {
-                    props.insert("MTFCC_CODE".to_string(), Value::Null);
-                }
+                let props = normalize_transportation_properties(lyr, &old_props);
                 if let Some(obj) = f.as_object_mut() {
                     obj.insert("properties".to_string(), Value::Object(props));
                 }
@@ -2332,6 +2456,71 @@ fn download_roads_resolved(
         None
     };
     write_geojson_feature_collection(&merged, out_path, "usgs_roads", mask)
+}
+
+fn lookup_prop_ci<'a>(props: &'a Map<String, Value>, candidates: &[&str]) -> Option<&'a Value> {
+    for &cand in candidates {
+        if let Some(v) = props.get(cand) {
+            return Some(v);
+        }
+    }
+    for &cand in candidates {
+        if let Some((_, v)) = props.iter().find(|(k, _)| k.eq_ignore_ascii_case(cand)) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+pub(crate) fn normalize_transportation_properties(
+    lyr: u32,
+    old_props: &Map<String, Value>,
+) -> Map<String, Value> {
+    let mut props = Map::new();
+    props.insert("trans_layer".to_string(), Value::from(lyr));
+    let name = lookup_prop_ci(old_props, &["FULL_STREET_NAME", "NAME"])
+        .cloned()
+        .unwrap_or(Value::Null);
+    props.insert("FULL_STREET_NAME".to_string(), name);
+    let mtfcc = lookup_prop_ci(old_props, &["MTFCC_CODE"])
+        .cloned()
+        .unwrap_or(Value::Null);
+    props.insert("MTFCC_CODE".to_string(), mtfcc);
+    props
+}
+
+fn find_balanced_json_array_end(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'[') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_quote: Option<u8> = None;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if let Some(q) = in_quote {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == q {
+                in_quote = None;
+            }
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => in_quote = Some(b),
+            b'[' => depth += 1,
+            b']' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn find_js_assignment_rhs<'a>(body: &'a str, ident: &str) -> Option<&'a str> {
@@ -2365,14 +2554,13 @@ pub(crate) fn parse_noaa_atlas14_response(
     let after_eq = find_js_assignment_rhs(body, "quantiles").ok_or_else(|| {
         Error::Parse("NOAA Atlas 14 response missing 'quantiles' array (point may be outside Atlas 14 coverage)".into())
     })?;
-    let start = after_eq
-        .find("[[")
-        .ok_or_else(|| Error::Parse("NOAA Atlas 14 quantiles opening '[[' not found".into()))?;
-    let rest = &after_eq[start..];
-    let end = rest
-        .find("]];")
-        .map(|i| i + 2)
-        .or_else(|| rest.find("]]").map(|i| i + 2))
+    let rest = after_eq.trim_start();
+    if !rest.starts_with("[[") {
+        return Err(Error::Parse(
+            "NOAA Atlas 14 quantiles array is empty or malformed".into(),
+        ));
+    }
+    let end = find_balanced_json_array_end(rest)
         .ok_or_else(|| Error::Parse("NOAA Atlas 14 quantiles closing ']]' not found".into()))?;
     let raw_matrix = rest[..end].replace('\'', "\"");
     let matrix: Vec<Vec<Value>> = serde_json::from_str(&raw_matrix).map_err(|e| {
@@ -2689,12 +2877,10 @@ pub fn download_federal_data(
         .as_deref()
         .or_else(|| dem_tiles.first().map(PathBuf::as_path))
         .and_then(|p| p.to_str())
-        .and_then(|s| terrio::open_raster(s).ok())
-        .and_then(|ds| {
-            ds.raster
-                .crs
-                .wkt
-                .or(ds.raster.crs.epsg.map(|e| format!("EPSG:{e}")))
+        .and_then(|s| terrio::open_raster_lazy(s).ok())
+        .and_then(|lazy| {
+            let crs = lazy.crs();
+            crs.to_wkt().or_else(|| crs.to_proj4())
         })
         .filter(|crs_str| {
             SpatialRef::parse(crs_str)
@@ -3475,7 +3661,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("tile.tif");
-        let agent = make_download_agent(10);
+        let agent = make_test_http_download_agent(10);
         let url = format!("http://{addr}/tile.tif");
         let saved = http_download_file(&agent, &url, &dest, None, true, 1).unwrap();
         server.join().unwrap();
@@ -3514,7 +3700,7 @@ mod tests {
             let _ = stream.flush();
             let _ = stream.shutdown(std::net::Shutdown::Write);
         });
-        let agent = make_agent(10);
+        let agent = make_test_http_agent(10);
         let empty_oids: Vec<i64> = (1..=20).collect();
         let empty_res = fetch_arcgis_oid_chunk(
             &agent,
@@ -3672,5 +3858,163 @@ mod tests {
         let tbl = parse_noaa_atlas14_response(47.0, -99.0, body).unwrap();
         assert!((tbl.depth_mm("5-min", 1).unwrap() - 12.5).abs() < 1e-6);
         assert!((tbl.depth_mm("5-min", 2).unwrap() - 18.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn audit_v06_noaa_lpc_roads_and_http_security() {
+        // 1. NOAA Atlas 14 must reject empty quantiles rather than hijacking `upper`, and handle
+        //    newline-terminated quantiles without a trailing semicolon.
+        let hijacked = "quantiles = [];\nupper = [['12.5', '18.0']];\n";
+        assert!(parse_noaa_atlas14_response(47.0, -99.0, hijacked).is_err());
+
+        let no_semi = "quantiles = [['12.5', '18.0']]\nupper = [['99.0', '99.0']];\n";
+        let tbl = parse_noaa_atlas14_response(47.0, -99.0, no_semi).unwrap();
+        assert!((tbl.depth_mm("5-min", 1).unwrap() - 12.5).abs() < 1e-6);
+        assert!((tbl.depth_mm("5-min", 2).unwrap() - 18.0).abs() < 1e-6);
+
+        // 2. Disjoint tiles sharing a 1-degree token must not be dropped during dedup,
+        //    while overlapping tiles (IoU >= 0.5) still collapse to the newest, and unsafe
+        //    URLs (userinfo / loopback / metadata IP / IPv4-mapped / numeric shorthand)
+        //    must be rejected.
+        let tnm = serde_json::json!({
+            "items": [
+                {
+                    "title": "USGS 1/3 Arc Second n48w100 20200101",
+                    "publicationDate": "2020-01-01",
+                    "downloadURL": "https://prd-tnm.s3.amazonaws.com/tile1_old.tif",
+                    "boundingBox": {"minX": -100.0, "minY": 47.0, "maxX": -99.9, "maxY": 47.1}
+                },
+                {
+                    "title": "USGS 1/3 Arc Second n48w100 20230101",
+                    "publicationDate": "2023-01-01",
+                    "downloadURL": "https://prd-tnm.s3.amazonaws.com/tile1_new.tif",
+                    "boundingBox": {"minX": -100.0, "minY": 47.0, "maxX": -99.9, "maxY": 47.1}
+                },
+                {
+                    "title": "USGS 1/3 Arc Second n48w100 20200101 B",
+                    "publicationDate": "2020-01-01",
+                    "downloadURL": "https://prd-tnm.s3.amazonaws.com/tile2.tif",
+                    "boundingBox": {"minX": -99.8, "minY": 47.0, "maxX": -99.7, "maxY": 47.1}
+                },
+                {
+                    "title": "USGS Metadata SSRF",
+                    "publicationDate": "2024-01-01",
+                    "downloadURL": "https://169.254.169.254/latest/meta-data/",
+                    "boundingBox": {"minX": -100.0, "minY": 47.0, "maxX": -99.5, "maxY": 47.5}
+                },
+                {
+                    "title": "USGS IPv4-Mapped SSRF",
+                    "publicationDate": "2024-01-01",
+                    "downloadURL": "https://[::ffff:169.254.169.254]/latest/meta-data/",
+                    "boundingBox": {"minX": -100.0, "minY": 47.0, "maxX": -99.5, "maxY": 47.5}
+                },
+                {
+                    "title": "USGS Decimal IP SSRF",
+                    "publicationDate": "2024-01-01",
+                    "downloadURL": "https://2852039166/latest/meta-data/",
+                    "boundingBox": {"minX": -100.0, "minY": 47.0, "maxX": -99.5, "maxY": 47.5}
+                },
+                {
+                    "title": "USGS Shorthand Loopback SSRF",
+                    "publicationDate": "2024-01-01",
+                    "downloadURL": "https://127.1/bad.tif",
+                    "boundingBox": {"minX": -100.0, "minY": 47.0, "maxX": -99.5, "maxY": 47.5}
+                },
+                {
+                    "title": "USGS Userinfo URL",
+                    "publicationDate": "2024-01-01",
+                    "downloadURL": "https://user:pass@prd-tnm.s3.amazonaws.com/bad.tif",
+                    "boundingBox": {"minX": -100.0, "minY": 47.0, "maxX": -99.5, "maxY": 47.5}
+                }
+            ]
+        });
+        let items = parse_tnm_products_json(&tnm, None, true);
+        assert_eq!(
+            items.len(),
+            2,
+            "overlapping duplicate must collapse while disjoint tile is retained"
+        );
+        let urls: Vec<&str> = items.iter().map(|p| p.download_url.as_str()).collect();
+        assert!(urls.contains(&"https://prd-tnm.s3.amazonaws.com/tile1_new.tif"));
+        assert!(urls.contains(&"https://prd-tnm.s3.amazonaws.com/tile2.tif"));
+        assert!(!urls.contains(&"https://prd-tnm.s3.amazonaws.com/tile1_old.tif"));
+
+        // 3. Railroad layer lowercase `name` and `mtfcc_code` must be preserved.
+        let mut rr = Map::new();
+        rr.insert("name".into(), Value::String("BNSF Railway".into()));
+        rr.insert("mtfcc_code".into(), Value::String("R1011".into()));
+        let norm = normalize_transportation_properties(29, &rr);
+        assert_eq!(
+            norm.get("FULL_STREET_NAME").and_then(Value::as_str),
+            Some("BNSF Railway")
+        );
+        assert_eq!(
+            norm.get("MTFCC_CODE").and_then(Value::as_str),
+            Some("R1011")
+        );
+
+        // 4. Production agents enforce HTTPS-only without ever opening a plaintext socket.
+        let https_guard_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        https_guard_listener.set_nonblocking(true).unwrap();
+        let guard_addr = https_guard_listener.local_addr().unwrap();
+        let plain_url = format!("http://{guard_addr}/test");
+        let prod_agent = make_agent(5);
+        assert!(prod_agent.get(&plain_url).call().is_err());
+        let prod_dl = make_download_agent(5);
+        assert!(prod_dl.get(&plain_url).call().is_err());
+        assert_eq!(
+            https_guard_listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "production HTTPS-only agents must reject plaintext URLs before connecting"
+        );
+
+        // 5. http_download_file rejects expected_bytes > MAX_DOWNLOAD_BYTES before transferring,
+        //    and aborts mid-stream when payload exceeds expected_bytes.
+        let tmp = tempfile::tempdir().unwrap();
+        let test_dl = make_test_http_download_agent(10);
+        let too_big = http_download_file(
+            &test_dl,
+            &plain_url,
+            &tmp.path().join("too_big.tif"),
+            Some(MAX_DOWNLOAD_BYTES + 1),
+            true,
+            0,
+        );
+        assert!(
+            too_big.is_err(),
+            "expected_bytes above MAX_DOWNLOAD_BYTES must fail before transfer"
+        );
+        assert_eq!(
+            https_guard_listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = drain_http_request_body(&mut stream);
+            let payload = vec![b'A'; 64];
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(&payload);
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        });
+        let dest = tmp.path().join("oversized.tif");
+        let res = http_download_file(
+            &test_dl,
+            &format!("http://{addr}/big.tif"),
+            &dest,
+            Some(16),
+            true,
+            0,
+        );
+        srv.join().unwrap();
+        assert!(res.is_err(), "oversized stream must fail immediately");
+        assert!(!dest.exists());
     }
 }
