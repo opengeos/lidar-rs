@@ -28,8 +28,9 @@ use terrio::{Geometry, VectorOpenOptions};
 
 use crate::catchment::d8_flow_directions_resolved;
 use crate::error::{Error, Result};
-use crate::inundation::{affine_metrics, validate_grid_alignment};
+use crate::inundation::validate_grid_alignment;
 use crate::raster_ops::ensure_no_path_collision;
+use crate::region::crs_metric_scale;
 
 /// Minimum tangent slope floor used in [`compute_twi`] to avoid `ln(inf)` on flat cells.
 const TWI_MIN_TAN_SLOPE: f64 = 1e-4;
@@ -160,7 +161,9 @@ fn solve_dinf_grid(dem: &Array2D<f64>, out_nd: f64) -> Vec<DinfCell> {
     let n = w * h;
     let zdata = dem.data();
     let z_nd = dem.no_data();
-    let (dx, dy, _) = affine_metrics(&dem.geotransform);
+    let scale = crs_metric_scale(&dem.projection, &dem.geotransform, w, h);
+    let dx = scale.cell_width_m;
+    let dy = scale.cell_height_m;
     let d_diag = dx.hypot(dy);
 
     let mut out = vec![
@@ -459,7 +462,9 @@ pub fn mfd_flow_accumulation(dem: &Array2D<f64>, exponent: f64) -> Result<Array2
     let zdata = dem.data();
     let z_nd = dem.no_data();
     let out_nd = safe_nodata(z_nd, 0.0);
-    let (dx, dy, _) = affine_metrics(&dem.geotransform);
+    let scale = crs_metric_scale(&dem.projection, &dem.geotransform, w, h);
+    let dx = scale.cell_width_m;
+    let dy = scale.cell_height_m;
     let cell_size = 0.5 * (dx + dy);
     let d_diag = dx.hypot(dy);
     let diag_contour = 0.25 * std::f64::consts::SQRT_2 * cell_size;
@@ -489,6 +494,7 @@ pub fn mfd_flow_accumulation(dem: &Array2D<f64>, exponent: f64) -> Result<Array2
     let mut flat_cells: Vec<usize> = Vec::new();
     let mut indegree = vec![0u32; n];
 
+    let mut local_slopes = [(0usize, 0.0f64, 0usize); 8];
     let mut local_nbrs = [(0usize, 0.0f64); 8];
 
     for r in 0..h {
@@ -500,8 +506,8 @@ pub fn mfd_flow_accumulation(dem: &Array2D<f64>, exponent: f64) -> Result<Array2
             if !is_valid_dem(z0, z_nd) {
                 continue;
             }
-            let mut cnt = 0usize;
-            let mut sum_w = 0.0f64;
+            let mut raw_cnt = 0usize;
+            let mut max_slope = 0.0f64;
             for d in 1..=8 {
                 let nr = r as isize + D8Y[d] as isize;
                 let nc = c as isize + D8X[d] as isize;
@@ -512,7 +518,22 @@ pub fn mfd_flow_accumulation(dem: &Array2D<f64>, exponent: f64) -> Result<Array2
                 let zi = zdata[ni];
                 if is_valid_dem(zi, z_nd) && zi < z0 {
                     let slope = (z0 - zi) / d8_dist[d];
-                    let weight = slope.powf(exponent) * d8_contour[d];
+                    if slope > 0.0 && slope.is_finite() {
+                        local_slopes[raw_cnt] = (ni, slope, d);
+                        raw_cnt += 1;
+                        if slope > max_slope {
+                            max_slope = slope;
+                        }
+                    }
+                }
+            }
+            let mut cnt = 0usize;
+            let mut sum_w = 0.0f64;
+            if raw_cnt > 0 && max_slope > 0.0 {
+                // Normalize slopes by max_slope in (0, 1] so slope^exponent never overflows
+                // sum_w to +inf or underflows all downward neighbors to 0.
+                for &(ni, slope, d) in &local_slopes[..raw_cnt] {
+                    let weight = (slope / max_slope).powf(exponent) * d8_contour[d];
                     if weight > 0.0 && weight.is_finite() {
                         local_nbrs[cnt] = (ni, weight);
                         cnt += 1;
@@ -520,7 +541,7 @@ pub fn mfd_flow_accumulation(dem: &Array2D<f64>, exponent: f64) -> Result<Array2
                     }
                 }
             }
-            if cnt > 0 && sum_w > 0.0 {
+            if cnt > 0 && sum_w > 0.0 && sum_w.is_finite() {
                 for &(ni, weight) in &local_nbrs[..cnt] {
                     edge_targets.push(ni);
                     edge_weights.push(weight / sum_w);
@@ -642,7 +663,10 @@ pub fn compute_twi(dem: &Array2D<f64>, flow_acc: Option<&Array2D<f64>>) -> Resul
     let zdata = dem.data();
     let z_nd = dem.no_data();
     let out_nd = safe_nodata(z_nd, -1000.0);
-    let (dx, dy, cell_area) = affine_metrics(&dem.geotransform);
+    let scale = crs_metric_scale(&dem.projection, &dem.geotransform, w, h);
+    let dx = scale.cell_width_m;
+    let dy = scale.cell_height_m;
+    let cell_area = scale.cell_area_m2;
     let cell_size = 0.5 * (dx + dy);
     let sca_scale = cell_area / cell_size.max(1e-12);
 
@@ -1022,8 +1046,10 @@ fn edt_1d(f: &[f64], out: &mut [f64], v: &mut [usize], z: &mut [f64]) {
                 v[k] = q;
                 break f64::NEG_INFINITY;
             }
-            let num = (f[q] + (q * q) as f64) - (f[p] + (p * p) as f64);
-            let den = 2.0 * (q as f64 - p as f64);
+            let qf = q as f64;
+            let pf = p as f64;
+            let num = (f[q] + qf * qf) - (f[p] + pf * pf);
+            let den = 2.0 * (qf - pf);
             let s_cand = num / den;
             if s_cand <= z[k] && k > 0 {
                 k -= 1;
@@ -1214,7 +1240,14 @@ pub fn burn_streams(
             0.0
         };
         if drop > 0.0 {
-            *val -= drop;
+            let mut new_val = *val - drop;
+            if nd.is_finite() && new_val.rd_eq(nd) {
+                new_val = new_val.next_down();
+                if !new_val.is_finite() {
+                    new_val = nd.next_up();
+                }
+            }
+            *val = new_val;
             modified += 1;
         }
     }

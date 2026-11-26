@@ -260,6 +260,11 @@ fn level_set_region(
             "interval={step} produces too many slices ({est_slices}) for elevation range {span:.4} in region {region_id} (max {MAX_SLICES_PER_REGION})"
         )));
     }
+    if span > 0.0 && max_elev - step >= max_elev {
+        return Err(Error::InvalidArgument(format!(
+            "interval={step} is smaller than floating-point precision at elevation {max_elev} in region {region_id}"
+        )));
+    }
 
     // Degenerate 1-row or 1-column depression (matches slicing.py lines 289-334).
     if bh == 1 || bw == 1 {
@@ -336,6 +341,9 @@ fn level_set_region(
     // so flat depressions (max_elev == min_elev) are retained when min_depth == 0.0.
     let mut slice_idx = 0usize;
     loop {
+        if slice_idx > 0 && (span == 0.0 || slice_idx > MAX_SLICES_PER_REGION) {
+            break;
+        }
         let elev = max_elev - (slice_idx as f64) * step;
         if slice_idx > 0
             && (if min_depth > 0.0 {
