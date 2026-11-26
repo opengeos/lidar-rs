@@ -51,7 +51,7 @@ Add `lidar` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-lidar = "0.5"
+lidar = "0.6"
 ```
 
 ```rust,no_run
