@@ -88,6 +88,9 @@ fn mcp_allow_dir_blocks_forcing_path_urls_and_zip_symlink_bypasses() {
         (2, "http://169.254.169.254/latest/meta-data/"),
         (3, "WFS:http://127.0.0.1:8080/geoserver"),
         (4, "/vsicurl/https://example.org/dem.tif"),
+        (40, "/vsimem/secret.tif"),
+        (41, "DODS:http://127.0.0.1:8080/dem.tif"),
+        (42, "PG:dbname=prod"),
     ] {
         let r = rpc(json!({
             "jsonrpc": "2.0",

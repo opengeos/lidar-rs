@@ -531,26 +531,10 @@ fn resolve_path_for_allowlist(path: &Path, depth: usize) -> std::io::Result<Path
 
 fn has_disallowed_remote_or_vfs_scheme(raw: &str) -> bool {
     let lower = raw.trim().to_ascii_lowercase();
-    const PREFIXES: &[&str] = &[
-        "http://",
-        "https://",
-        "ftp://",
-        "s3://",
-        "gs://",
-        "az://",
-        "file://",
-        "/vsicurl/",
-        "/vsizip/",
-        "/vsis3/",
-        "/vsigs/",
-        "/vsiaz/",
-        "/vsigzip/",
-        "/vsitar/",
-        "oapif:",
-        "wfs:",
-        "wcs:",
-        "wms:",
-    ];
+    if lower.contains("://") || lower.starts_with("/vsi") {
+        return true;
+    }
+    const PREFIXES: &[&str] = &["oapif:", "wfs:", "wcs:", "wms:", "wmts:", "dods:", "pg:"];
     PREFIXES.iter().any(|p| lower.starts_with(p))
 }
 
