@@ -223,7 +223,7 @@ pub fn extract_sinks_with_filled_in_memory(
                 .enumerate()
             {
                 let tol = 1e-9 * a.abs().max(b.abs()).max(1.0);
-                if (a - b).abs() > tol {
+                if !a.is_finite() || !b.is_finite() || (a - b).abs() > tol {
                     return Err(Error::DimensionMismatch(format!(
                         "filled DEM geotransform[{k}] ({b}) does not match input DEM ({a})"
                     )));

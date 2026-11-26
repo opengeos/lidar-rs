@@ -71,17 +71,21 @@ pub fn compute_rating_curves(
     };
     let nd = sink.no_data();
 
-    // Build parent lookup and gather owned elevation values per depression ID.
-    let max_id = deps.depressions.iter().map(|d| d.id).max().unwrap_or(0) as usize;
-    if max_id == 0 {
+    // Build parent lookup and gather owned elevation values per depression ID using adaptive
+    // dense/sparse lookup so sparse/large depression IDs cannot trigger huge allocations.
+    if deps.depressions.iter().all(|d| d.id == 0) {
         return Ok(Vec::new());
     }
-    let mut owned_elevs: Vec<Vec<f64>> = vec![Vec::new(); max_id + 1];
+    let id_to_idx = crate::fsm::BasinIdMap::from_depressions(&deps.depressions);
+    let mut owned_elevs: Vec<Vec<f64>> = vec![Vec::new(); deps.depressions.len()];
     let sdata = sink.data();
     let id_data = deps.depression_id.data();
     for (&did, &z) in id_data.iter().zip(sdata.iter()) {
-        if did > 0 && (did as usize) <= max_id && z.is_finite() && !z.rd_eq(nd) {
-            owned_elevs[did as usize].push(z);
+        if did > 0 && z.is_finite() && !z.rd_eq(nd) {
+            let idx = id_to_idx.get(did as u32);
+            if idx != usize::MAX {
+                owned_elevs[idx].push(z);
+            }
         }
     }
 
@@ -91,6 +95,7 @@ pub fn compute_rating_curves(
 
     fn collect_descendant_elevs(
         root_id: u32,
+        id_to_idx: &crate::fsm::BasinIdMap,
         dep_by_id: &HashMap<u32, &NestedDepression>,
         owned_elevs: &[Vec<f64>],
         out: &mut Vec<f64>,
@@ -101,8 +106,9 @@ pub fn compute_rating_curves(
             if !visited.insert(id) {
                 continue;
             }
-            if let Some(v) = owned_elevs.get(id as usize) {
-                out.extend_from_slice(v);
+            let idx = id_to_idx.get(id);
+            if idx != usize::MAX {
+                out.extend_from_slice(&owned_elevs[idx]);
             }
             if let Some(d) = dep_by_id.get(&id) {
                 for &cid in &d.children_ids {
@@ -116,7 +122,7 @@ pub fn compute_rating_curves(
     let mut buf = Vec::new();
     for d in &deps.depressions {
         buf.clear();
-        collect_descendant_elevs(d.id, &dep_by_id, &owned_elevs, &mut buf);
+        collect_descendant_elevs(d.id, &id_to_idx, &dep_by_id, &owned_elevs, &mut buf);
         if buf.is_empty() {
             continue;
         }
@@ -610,11 +616,12 @@ pub fn build_connectivity_graph(
 
     // Approximate per-depression fill time (max finite fill time across its owned cells)
     // and collect each depression's earliest row-major pixel index & owned pixel count for
-    // exact spatial catchment matching.
-    let max_id = deps.depressions.iter().map(|d| d.id).max().unwrap_or(0) as usize;
-    let mut dep_max_ft = vec![f64::NEG_INFINITY; max_id + 1];
-    let mut first_idx = vec![usize::MAX; max_id + 1];
-    let mut subtree_count = vec![0usize; max_id + 1];
+    // exact spatial catchment matching, indexed densely over 0..deps.len().
+    let n_deps = deps.depressions.len();
+    let id_to_idx = crate::fsm::BasinIdMap::from_depressions(&deps.depressions);
+    let mut dep_max_ft = vec![f64::NEG_INFINITY; n_deps];
+    let mut first_idx = vec![usize::MAX; n_deps];
+    let mut subtree_count = vec![0usize; n_deps];
     let nd = fill_time.no_data();
     for (gidx, (&did, &ft)) in deps
         .depression_id
@@ -623,14 +630,16 @@ pub fn build_connectivity_graph(
         .zip(fill_time.data().iter())
         .enumerate()
     {
-        if did > 0 && (did as usize) <= max_id {
-            let uid = did as usize;
-            if first_idx[uid] == usize::MAX {
-                first_idx[uid] = gidx;
-            }
-            subtree_count[uid] += 1;
-            if ft.is_finite() && !ft.rd_eq(nd) && ft >= 0.0 && ft > dep_max_ft[uid] {
-                dep_max_ft[uid] = ft;
+        if did > 0 {
+            let uid = id_to_idx.get(did as u32);
+            if uid != usize::MAX {
+                if first_idx[uid] == usize::MAX {
+                    first_idx[uid] = gidx;
+                }
+                subtree_count[uid] += 1;
+                if ft.is_finite() && !ft.rd_eq(nd) && ft >= 0.0 && ft > dep_max_ft[uid] {
+                    dep_max_ft[uid] = ft;
+                }
             }
         }
     }
@@ -650,10 +659,13 @@ pub fn build_connectivity_graph(
     let mut asc_deps: Vec<&NestedDepression> = deps.depressions.iter().collect();
     asc_deps.sort_by_key(|d| (d.level, d.id));
     for d in &asc_deps {
-        let uid = d.id as usize;
+        let uid = id_to_idx.get(d.id);
+        if uid == usize::MAX {
+            continue;
+        }
         if let Some(&pid) = parent_of.get(&d.id) {
-            let pid_u = pid as usize;
-            if pid_u > 0 && pid_u <= max_id && pid_u != uid {
+            let pid_u = id_to_idx.get(pid);
+            if pid_u != usize::MAX && pid_u != uid {
                 if first_idx[uid] < first_idx[pid_u] {
                     first_idx[pid_u] = first_idx[uid];
                 }
@@ -673,27 +685,37 @@ pub fn build_connectivity_graph(
         recs_by_level.entry(r.level).or_default().push(r);
     }
     let mut exact_cat_by_id: HashMap<u32, f64> = HashMap::new();
-    for (lvl, mut ldeps) in deps_by_level {
+    for (lvl, ldeps) in deps_by_level {
         let Some(mut lrecs) = recs_by_level.remove(&lvl) else {
             continue;
         };
         if ldeps.len() != lrecs.len() {
             continue;
         }
-        if !ldeps.iter().all(|d| first_idx[d.id as usize] != usize::MAX) {
+        let mut ldeps_idx: Vec<(usize, &NestedDepression)> = Vec::with_capacity(ldeps.len());
+        let mut all_present = true;
+        for d in ldeps {
+            let idx = id_to_idx.get(d.id);
+            if idx == usize::MAX || first_idx[idx] == usize::MAX {
+                all_present = false;
+                break;
+            }
+            ldeps_idx.push((idx, d));
+        }
+        if !all_present {
             continue;
         }
-        ldeps.sort_by_key(|d| first_idx[d.id as usize]);
+        ldeps_idx.sort_by_key(|&(idx, _)| first_idx[idx]);
         lrecs.sort_by_key(|r| r.level_fid);
         // Accept either `d.count` (level-set depression footprint) or `subtree_count` (total
         // pixels owned by `d` and its descendants in `depression_id`, matching the cumulative
         // `level <= L` mask used by `delineate_catchment_hierarchy_in_memory`).
-        let counts_align = ldeps
+        let counts_align = ldeps_idx
             .iter()
             .zip(lrecs.iter())
-            .all(|(d, r)| d.count == r.count || subtree_count[d.id as usize] == r.count);
+            .all(|(&(idx, d), r)| d.count == r.count || subtree_count[idx] == r.count);
         if counts_align {
-            for (d, r) in ldeps.into_iter().zip(lrecs) {
+            for ((_, d), r) in ldeps_idx.into_iter().zip(lrecs) {
                 exact_cat_by_id.insert(d.id, r.cat_area);
             }
         }
@@ -713,9 +735,9 @@ pub fn build_connectivity_graph(
         .depressions
         .iter()
         .map(|d| {
-            let ft = dep_max_ft
-                .get(d.id as usize)
-                .copied()
+            let idx = id_to_idx.get(d.id);
+            let ft = (idx != usize::MAX)
+                .then(|| dep_max_ft[idx])
                 .filter(|v| v.is_finite() && *v >= 0.0);
             let cat_area = exact_cat_by_id
                 .get(&d.id)
@@ -798,9 +820,9 @@ pub fn build_connectivity_graph(
     // 2. Hierarchical child -> parent merge edges
     for d in &deps.depressions {
         if d.parent_id > 0 {
-            let parent_ft = dep_max_ft
-                .get(d.parent_id as usize)
-                .copied()
+            let pidx = id_to_idx.get(d.parent_id);
+            let parent_ft = (pidx != usize::MAX)
+                .then(|| dep_max_ft[pidx])
                 .filter(|v| v.is_finite() && *v >= 0.0);
             edges.push(GraphEdge {
                 from_id: d.id,

@@ -770,10 +770,9 @@ fn build_region_merge_tree(
     // or the highest retained sink cell as lower-bound rim estimate otherwise.
     let root_uf = uf_find(&mut uf_parent, m - 1);
     let top_cell = cells[m - 1];
-    let (root_z, root_r, root_c) = if let Some(out) = root_outlet {
-        (out.z.max(top_cell.z), out.r, out.c)
-    } else {
-        (top_cell.z, top_cell.r, top_cell.c)
+    let (root_z, root_r, root_c) = match root_outlet {
+        Some(out) if out.z >= top_cell.z => (out.z, out.r, out.c),
+        _ => (top_cell.z, top_cell.r, top_cell.c),
     };
     let root_nidx = finalize_component(
         root_uf,
@@ -1050,6 +1049,7 @@ fn delineate_merge_tree_impl(
     let k = nb_labels as usize;
     let mut bboxes = vec![(usize::MAX, usize::MAX, 0usize, 0usize); k];
     let mut region_cells: Vec<Vec<SinkCell>> = vec![Vec::new(); k];
+    let mut reg_max_elev = vec![f64::NEG_INFINITY; k];
     let mut region_outlets: Vec<Option<RootOutlet>> = vec![None; k];
 
     let sdata = sink.data();
@@ -1057,7 +1057,6 @@ fn delineate_merge_tree_impl(
         Topology::D4 => &D4_OFFSETS,
         Topology::D8 => &D8_OFFSETS,
     };
-    let dem_info = source_dem.map(|d| (d.data(), d.no_data()));
 
     for r in 0..h {
         let off = r * w;
@@ -1080,19 +1079,36 @@ fn delineate_merge_tree_impl(
             if c + 1 > b.3 {
                 b.3 = c + 1;
             }
-            region_cells[idx].push(SinkCell {
-                z: sdata[off + c],
-                r,
-                c,
-            });
+            let z = sdata[off + c];
+            if z > reg_max_elev[idx] {
+                reg_max_elev[idx] = z;
+            }
+            region_cells[idx].push(SinkCell { z, r, c });
+        }
+    }
 
-            // When the source DEM is provided, identify the exact lowest exterior rim/outlet
-            // neighbor bordering this sink region so root spill elevation and storage volume
-            // reflect the true topographic pour point rather than the highest interior cell.
-            if let Some((ddata, d_nd)) = dem_info {
+    // When the source DEM is provided, identify the exact lowest exterior rim/outlet neighbor
+    // at or above the region's maximum interior elevation so root spill elevation and storage
+    // volume reflect the true topographic pour point without being hijacked by pruned exterior
+    // pits. Running Priority-Flood on `source_dem` separates true unfilled rim cells
+    // (`filled == dz`) from pruned depression cells (`filled > dz`) regardless of elevation.
+    if let Some(dem) = source_dem
+        && k > 0
+    {
+        let mut filled = dem.clone();
+        richdem::fill_depressions(&mut filled, options.topology);
+        let ddata = dem.data();
+        let d_nd = dem.no_data();
+        let fdata = filled.data();
+        let mut fallback_outlets: Vec<Option<RootOutlet>> = vec![None; k];
+
+        for (idx, cells) in region_cells.iter().enumerate() {
+            let lbl = (idx + 1) as u32;
+            let max_z = reg_max_elev[idx];
+            for cell in cells {
                 for &(dr, dc) in offsets {
-                    let nr = r as isize + dr;
-                    let nc = c as isize + dc;
+                    let nr = cell.r as isize + dr;
+                    let nc = cell.c as isize + dc;
                     if nr < 0 || nc < 0 || nr >= h as isize || nc >= w as isize {
                         continue;
                     }
@@ -1103,21 +1119,30 @@ fn delineate_merge_tree_impl(
                         continue;
                     }
                     let dz = ddata[nidx];
-                    if !dz.is_finite() || dz.rd_eq(d_nd) {
+                    if !dz.is_finite() || dz.rd_eq(d_nd) || dz < max_z {
                         continue;
                     }
-                    let replace = match region_outlets[idx] {
+                    let is_unfilled_rim = fdata[nidx].is_finite() && fdata[nidx] <= dz + 1e-12;
+                    let slot = if is_unfilled_rim {
+                        &mut region_outlets[idx]
+                    } else {
+                        &mut fallback_outlets[idx]
+                    };
+                    let replace = match *slot {
                         None => true,
                         Some(cur) => dz < cur.z || (dz == cur.z && (nru, ncu) < (cur.r, cur.c)),
                     };
                     if replace {
-                        region_outlets[idx] = Some(RootOutlet {
+                        *slot = Some(RootOutlet {
                             z: dz,
                             r: nru,
                             c: ncu,
                         });
                     }
                 }
+            }
+            if region_outlets[idx].is_none() {
+                region_outlets[idx] = fallback_outlets[idx];
             }
         }
     }
@@ -1266,6 +1291,13 @@ pub fn delineate_depressions_merge_tree_in_memory(
 /// Delineates the exact nested depression hierarchy using both the masked `sink` raster
 /// and the source `dem` (e.g., `dem_refined` or original DEM) so root depressions are
 /// finalized against their true lowest exterior outlet cell on the surrounding rim.
+///
+/// # Performance and Memory
+///
+/// When at least one sink region is present, this function clones `dem` and runs a
+/// full-grid Priority-Flood depression fill (`O(W * H)` extra memory and `O(N log N)`
+/// time) to distinguish true unfilled rim cells from pruned exterior pits regardless of
+/// whether the caller supplied the original DEM or `dem_refined`.
 pub fn delineate_depressions_merge_tree_with_dem_in_memory(
     sink: &Array2D<f64>,
     dem: &Array2D<f64>,

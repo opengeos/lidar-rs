@@ -651,6 +651,39 @@ fn lowest_leaf_descendant(
     best_leaf
 }
 
+pub(crate) enum BasinIdMap {
+    Dense(Vec<usize>),
+    Sparse(HashMap<u32, usize>),
+}
+
+impl BasinIdMap {
+    pub(crate) fn from_depressions(deps: &[NestedDepression]) -> Self {
+        let max_id = deps.iter().map(|d| d.id).max().unwrap_or(0) as usize;
+        let dense_cap = deps.len().saturating_mul(16).clamp(65_536, 1_000_000);
+        if max_id <= dense_cap {
+            let mut v = vec![usize::MAX; max_id + 1];
+            for (idx, d) in deps.iter().enumerate() {
+                v[d.id as usize] = idx;
+            }
+            Self::Dense(v)
+        } else {
+            let mut m = HashMap::with_capacity(deps.len());
+            for (idx, d) in deps.iter().enumerate() {
+                m.insert(d.id, idx);
+            }
+            Self::Sparse(m)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get(&self, id: u32) -> usize {
+        match self {
+            Self::Dense(v) => v.get(id as usize).copied().unwrap_or(usize::MAX),
+            Self::Sparse(m) => m.get(&id).copied().unwrap_or(usize::MAX),
+        }
+    }
+}
+
 /// Resolves the live receiving basin (`Active` or `FullSpilling`) for a spill targeting `id`.
 ///
 /// - `Merged` targets walk upward to their active ancestor.
@@ -659,12 +692,12 @@ fn lowest_leaf_descendant(
 /// - Returns `0` (DEM boundary) if no eligible live basin exists or if it would self-loop.
 fn resolve_spill_target(
     basins: &[BasinNode],
-    id_to_idx: &[usize],
+    id_to_idx: &BasinIdMap,
     src_id: u32,
     mut id: u32,
 ) -> u32 {
     while id != 0 {
-        let idx = id_to_idx.get(id as usize).copied().unwrap_or(usize::MAX);
+        let idx = id_to_idx.get(id);
         if idx == usize::MAX {
             return 0;
         }
@@ -685,12 +718,12 @@ fn resolve_spill_target(
 }
 
 /// Finds the lowest common ancestor of a set of depression IDs in the nesting tree, if one exists.
-fn find_lca(nodes: &[u32], basins: &[BasinNode], id_to_idx: &[usize]) -> Option<u32> {
+fn find_lca(nodes: &[u32], basins: &[BasinNode], id_to_idx: &BasinIdMap) -> Option<u32> {
     let first = *nodes.first()?;
     let mut common: Vec<u32> = Vec::new();
     let mut cur = first;
     while cur != 0 {
-        let idx = id_to_idx.get(cur as usize).copied().unwrap_or(usize::MAX);
+        let idx = id_to_idx.get(cur);
         if idx == usize::MAX {
             break;
         }
@@ -701,7 +734,7 @@ fn find_lca(nodes: &[u32], basins: &[BasinNode], id_to_idx: &[usize]) -> Option<
         let mut anc = HashSet::new();
         let mut c = nid;
         while c != 0 {
-            let idx = id_to_idx.get(c as usize).copied().unwrap_or(usize::MAX);
+            let idx = id_to_idx.get(c);
             if idx == usize::MAX {
                 break;
             }
@@ -722,12 +755,12 @@ fn lowest_active_descendant(
     root_id: u32,
     is_excluded: impl Fn(u32) -> bool,
     basins: &[BasinNode],
-    id_to_idx: &[usize],
+    id_to_idx: &BasinIdMap,
 ) -> Option<u32> {
     let mut stack = vec![root_id];
     let mut best: Option<(f64, u32)> = None;
     while let Some(cur) = stack.pop() {
-        let idx = id_to_idx.get(cur as usize).copied().unwrap_or(usize::MAX);
+        let idx = id_to_idx.get(cur);
         if idx == usize::MAX {
             continue;
         }
@@ -755,7 +788,7 @@ fn lowest_active_descendant(
 #[allow(clippy::too_many_arguments)]
 fn evaluate_topological_routing(
     basins: &mut [BasinNode],
-    id_to_idx: &[usize],
+    id_to_idx: &BasinIdMap,
     live_indices: &[usize],
     rain_m_h: f64,
     allow_drain_revert: bool,
@@ -798,7 +831,7 @@ fn evaluate_topological_routing(
                 .unwrap_or(0);
             let rep = resolve_spill_target(basins, id_to_idx, basins[i].id, raw_dst);
             if rep != 0 {
-                let dst_idx = id_to_idx.get(rep as usize).copied().unwrap_or(usize::MAX);
+                let dst_idx = id_to_idx.get(rep);
                 if dst_idx != usize::MAX && dst_idx != i {
                     target_idx_buf[i] = dst_idx;
                     indegree[dst_idx] += 1;
@@ -1138,20 +1171,13 @@ fn simulate_fill_spill_merge_impl(
     }
 
     // 1. Build hierarchy lookup maps and group pixels by innermost depression ID.
-    let max_id = depressions
-        .depressions
-        .iter()
-        .map(|d| d.id)
-        .max()
-        .unwrap_or(0) as usize;
-    let mut id_to_idx = vec![usize::MAX; max_id + 1];
+    let id_to_idx = BasinIdMap::from_depressions(&depressions.depressions);
     let mut dep_by_id: HashMap<u32, &NestedDepression> =
         HashMap::with_capacity(depressions.depressions.len());
     let mut children_map: HashMap<u32, Vec<u32>> =
         HashMap::with_capacity(depressions.depressions.len());
     let mut parent_map: HashMap<u32, u32> = HashMap::new();
-    for (idx, d) in depressions.depressions.iter().enumerate() {
-        id_to_idx[d.id as usize] = idx;
+    for d in &depressions.depressions {
         dep_by_id.insert(d.id, d);
         children_map.insert(d.id, d.children_ids.clone());
         if d.parent_id > 0 {
@@ -1165,7 +1191,7 @@ fn simulate_fill_spill_merge_impl(
     let dep_ids = depressions.depression_id.data();
     let mut pixels_by_id: HashMap<u32, Vec<usize>> = HashMap::new();
     for (idx, &did) in dep_ids.iter().enumerate() {
-        if did > 0 && id_to_idx.get(did as usize).copied().unwrap_or(usize::MAX) != usize::MAX {
+        if did > 0 && id_to_idx.get(did as u32) != usize::MAX {
             pixels_by_id.entry(did as u32).or_default().push(idx);
         }
     }
@@ -1191,8 +1217,8 @@ fn simulate_fill_spill_merge_impl(
     // `cell_area * runoff_coeff` to `lowest_leaf_descendant(d)` so water always fills
     // from the bottom up with exact 100% watershed mass conservation (zero double counting).
     let mut leaf_memo: HashMap<u32, u32> = HashMap::new();
-    let mut local_cat_area = vec![0.0f64; max_id + 1];
-    let mut local_eff_cat_area = vec![0.0f64; max_id + 1];
+    let mut local_cat_area = vec![0.0f64; depressions.depressions.len()];
+    let mut local_eff_cat_area = vec![0.0f64; depressions.depressions.len()];
     let mut boundary_cat_area = 0.0f64;
     let mut boundary_eff_cat_area = 0.0f64;
     let mut total_valid_area = 0.0f64;
@@ -1237,9 +1263,7 @@ fn simulate_fill_spill_merge_impl(
 
                 let dir = fdata[cur] as usize;
                 if dir == NO_FLOW as usize || dir > 8 {
-                    if did > 0
-                        && id_to_idx.get(did as usize).copied().unwrap_or(usize::MAX) != usize::MAX
-                    {
+                    if did > 0 && id_to_idx.get(did as u32) != usize::MAX {
                         break lowest_leaf_descendant(did as u32, &dep_by_id, &mut leaf_memo);
                     }
                     break 0;
@@ -1247,9 +1271,7 @@ fn simulate_fill_spill_merge_impl(
                 let nr = (cur / w) as isize + D8Y[dir] as isize;
                 let nc = (cur % w) as isize + D8X[dir] as isize;
                 if nr < 0 || nc < 0 || nr >= h as isize || nc >= w as isize {
-                    if did > 0
-                        && id_to_idx.get(did as usize).copied().unwrap_or(usize::MAX) != usize::MAX
-                    {
+                    if did > 0 && id_to_idx.get(did as u32) != usize::MAX {
                         break lowest_leaf_descendant(did as u32, &dep_by_id, &mut leaf_memo);
                     }
                     break 0;
@@ -1257,9 +1279,7 @@ fn simulate_fill_spill_merge_impl(
                 let next = (nr as usize) * w + (nc as usize);
                 let nz = zdata[next];
                 if !nz.is_finite() || nz.rd_eq(z_nd) {
-                    if did > 0
-                        && id_to_idx.get(did as usize).copied().unwrap_or(usize::MAX) != usize::MAX
-                    {
+                    if did > 0 && id_to_idx.get(did as u32) != usize::MAX {
                         break lowest_leaf_descendant(did as u32, &dep_by_id, &mut leaf_memo);
                     }
                     break 0;
@@ -1285,9 +1305,14 @@ fn simulate_fill_spill_merge_impl(
             .unwrap_or(1.0);
 
         total_valid_area += cell_area;
-        if target > 0 {
-            local_cat_area[target as usize] += cell_area;
-            local_eff_cat_area[target as usize] += cell_area * c_val;
+        let target_idx = if target > 0 {
+            id_to_idx.get(target)
+        } else {
+            usize::MAX
+        };
+        if target_idx != usize::MAX {
+            local_cat_area[target_idx] += cell_area;
+            local_eff_cat_area[target_idx] += cell_area * c_val;
         } else {
             boundary_cat_area += cell_area;
             boundary_eff_cat_area += cell_area * c_val;
@@ -1458,7 +1483,7 @@ fn simulate_fill_spill_merge_impl(
         }
 
         for &cid in &d.children_ids {
-            let cidx = id_to_idx.get(cid as usize).copied().unwrap_or(usize::MAX);
+            let cidx = id_to_idx.get(cid);
             if cidx == usize::MAX {
                 continue;
             }
@@ -1534,7 +1559,7 @@ fn simulate_fill_spill_merge_impl(
             .children_ids
             .iter()
             .filter_map(|&cid| {
-                let ci = id_to_idx.get(cid as usize).copied().unwrap_or(usize::MAX);
+                let ci = id_to_idx.get(cid);
                 (ci != usize::MAX).then_some(ci)
             })
             .collect();
@@ -1559,7 +1584,7 @@ fn simulate_fill_spill_merge_impl(
                     }
                 }
                 for &cid in &depressions.depressions[u].children_ids {
-                    let ci = id_to_idx.get(cid as usize).copied().unwrap_or(usize::MAX);
+                    let ci = id_to_idx.get(cid);
                     if ci != usize::MAX {
                         stack.push(ci);
                     }
@@ -1673,8 +1698,8 @@ fn simulate_fill_spill_merge_impl(
             hypso_cells,
             hypso_cursor: 0,
             max_vol_reached: -1.0,
-            local_cat_area_m2: local_cat_area[d.id as usize],
-            local_eff_cat_area_m2: local_eff_cat_area[d.id as usize],
+            local_cat_area_m2: local_cat_area[dep_idx],
+            local_eff_cat_area_m2: local_eff_cat_area[dep_idx],
             footprint_area_m2: subtree_count[dep_idx] as f64 * cell_area,
             static_loss_rate_m3_h: loss_rate_m3_h,
             ga_loss_rate_m3_h: 0.0,
@@ -1701,7 +1726,7 @@ fn simulate_fill_spill_merge_impl(
             infiltrated_vol_storm_m3: 0.0,
             storm_end_vol_m3: owned_ant_vol,
             storm_end_merged: false,
-            storm_end_routed_cat_m2: local_cat_area[d.id as usize],
+            storm_end_routed_cat_m2: local_cat_area[dep_idx],
             has_unmarked_merged_children: false,
         };
 
@@ -1811,7 +1836,7 @@ fn simulate_fill_spill_merge_impl(
     fn flush_unmarked_descendants(
         root_idx: usize,
         basins: &mut [BasinNode],
-        id_to_idx: &[usize],
+        id_to_idx: &BasinIdMap,
         t_mark: f64,
         fill_time_data: &mut [f64],
     ) {
@@ -1819,7 +1844,7 @@ fn simulate_fill_spill_merge_impl(
             .children_ids
             .iter()
             .filter_map(|&cid| {
-                let ci = id_to_idx.get(cid as usize).copied().unwrap_or(usize::MAX);
+                let ci = id_to_idx.get(cid);
                 (ci != usize::MAX).then_some(ci)
             })
             .collect();
@@ -1837,7 +1862,7 @@ fn simulate_fill_spill_merge_impl(
             if basins[cidx].has_unmarked_merged_children {
                 basins[cidx].has_unmarked_merged_children = false;
                 for &gcid in &basins[cidx].children_ids {
-                    let gidx = id_to_idx.get(gcid as usize).copied().unwrap_or(usize::MAX);
+                    let gidx = id_to_idx.get(gcid);
                     if gidx != usize::MAX {
                         stack.push(gidx);
                     }
@@ -1849,7 +1874,7 @@ fn simulate_fill_spill_merge_impl(
     #[allow(clippy::too_many_arguments)]
     fn resolve_merges_and_cycles(
         basins: &mut [BasinNode],
-        id_to_idx: &[usize],
+        id_to_idx: &BasinIdMap,
         live_indices: &mut Vec<usize>,
         waiting_indices: &mut Vec<usize>,
         t_now: f64,
@@ -1875,7 +1900,7 @@ fn simulate_fill_spill_merge_impl(
                     continue;
                 }
                 let all_children_full = basins[idx].children_ids.iter().all(|&cid| {
-                    let cidx = id_to_idx.get(cid as usize).copied().unwrap_or(usize::MAX);
+                    let cidx = id_to_idx.get(cid);
                     cidx != usize::MAX
                         && matches!(
                             basins[cidx].state,
@@ -1892,7 +1917,7 @@ fn simulate_fill_spill_merge_impl(
                 let mut merged_eff_cat = basins[idx].local_eff_cat_area_m2;
                 let mut child_ga_weighted = 0.0f64;
                 for &cid in &child_ids {
-                    let cidx = id_to_idx.get(cid as usize).copied().unwrap_or(usize::MAX);
+                    let cidx = id_to_idx.get(cid);
                     if cidx != usize::MAX && basins[cidx].state == BasinState::FullSpilling {
                         merged_vol += basins[cidx].stored_vol_m3;
                         merged_cat += basins[cidx].local_cat_area_m2;
@@ -1910,7 +1935,7 @@ fn simulate_fill_spill_merge_impl(
                 // Track or immediately flush any un-marked cells of degenerate 0-capacity flat
                 // children so they receive exact inundation timestamps once the parent holds water.
                 let any_unmarked_child = child_ids.iter().any(|&cid| {
-                    let cidx = id_to_idx.get(cid as usize).copied().unwrap_or(usize::MAX);
+                    let cidx = id_to_idx.get(cid);
                     cidx != usize::MAX
                         && (basins[cidx].hypso_cursor < basins[cidx].hypso_cells.len()
                             || basins[cidx].has_unmarked_merged_children)
@@ -2028,7 +2053,7 @@ fn simulate_fill_spill_merge_impl(
                     if rep == 0 {
                         break;
                     }
-                    let next_idx = id_to_idx.get(rep as usize).copied().unwrap_or(usize::MAX);
+                    let next_idx = id_to_idx.get(rep);
                     if next_idx == usize::MAX || basins[next_idx].state != BasinState::FullSpilling
                     {
                         break;
@@ -2049,15 +2074,11 @@ fn simulate_fill_spill_merge_impl(
                 let break_id = *cyc
                     .iter()
                     .min_by(|&&a, &&b| {
-                        let za = id_to_idx
-                            .get(a as usize)
-                            .copied()
+                        let za = Some(id_to_idx.get(a))
                             .filter(|&i| i != usize::MAX)
                             .and_then(|i| basins[i].outlet.as_ref())
                             .map_or(f64::INFINITY, |o| o.spill_elev);
-                        let zb = id_to_idx
-                            .get(b as usize)
-                            .copied()
+                        let zb = Some(id_to_idx.get(b))
                             .filter(|&i| i != usize::MAX)
                             .and_then(|i| basins[i].outlet.as_ref())
                             .map_or(f64::INFINITY, |o| o.spill_elev);
@@ -2070,10 +2091,7 @@ fn simulate_fill_spill_merge_impl(
                         lowest_active_descendant(lca, |x| cyc_set.contains(&x), basins, id_to_idx)
                     })
                     .unwrap_or(0);
-                let bidx = id_to_idx
-                    .get(break_id as usize)
-                    .copied()
-                    .unwrap_or(usize::MAX);
+                let bidx = id_to_idx.get(break_id);
                 if bidx != usize::MAX {
                     basins[bidx].spill_override = Some(new_target);
                     changed = true;
@@ -2950,15 +2968,27 @@ pub fn attenuate_fsm_hydrograph_with_options(
     let k_res = options.mean_travel_time_h / n_res as f64;
     let total_in_vol = integrate_fsm_hydrograph_m3(hydrograph);
 
-    let auto_tail_h = (30.0 * options.mean_travel_time_h).max(dt);
-    let max_t_end = t_storm_end + options.tail_duration_h.unwrap_or(auto_tail_h);
-    let raw_steps = ((max_t_end - t0) / dt).ceil();
-    if !raw_steps.is_finite() || raw_steps > MAX_ATTENUATION_STEPS as f64 {
-        return Err(Error::InvalidArgument(format!(
-            "attenuation requires {raw_steps} steps (exceeds limit {MAX_ATTENUATION_STEPS}); increase dt_h or reduce tail_duration_h"
-        )));
-    }
-    let max_steps = (raw_steps as usize).max(1);
+    let (max_t_end, max_steps) = if let Some(tail_h) = options.tail_duration_h {
+        let end_t = t_storm_end + tail_h;
+        let raw_steps = ((end_t - t0) / dt).ceil();
+        if !raw_steps.is_finite() || raw_steps > MAX_ATTENUATION_STEPS as f64 {
+            return Err(Error::InvalidArgument(format!(
+                "attenuation requires {raw_steps} steps (exceeds limit {MAX_ATTENUATION_STEPS}); increase dt_h or reduce tail_duration_h"
+            )));
+        }
+        (end_t, (raw_steps as usize).max(1))
+    } else {
+        // Automatic recession tail: iterate until channel storage drains below `vol_tol`
+        // (bounded only by `MAX_ATTENUATION_STEPS`) so coarse `dt_h` or multi-reservoir
+        // cascades never fail convergence prematurely.
+        let min_storm_steps = ((t_storm_end - t0) / dt).ceil();
+        if !min_storm_steps.is_finite() || min_storm_steps > MAX_ATTENUATION_STEPS as f64 {
+            return Err(Error::InvalidArgument(format!(
+                "attenuation requires at least {min_storm_steps} storm steps (exceeds limit {MAX_ATTENUATION_STEPS}); increase dt_h"
+            )));
+        }
+        (f64::INFINITY, MAX_ATTENUATION_STEPS)
+    };
     let vol_tol = 1e-12 * total_in_vol.max(1.0);
 
     // Advancing cursors keep bin integration and state sampling O(N + M) overall.

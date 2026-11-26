@@ -75,10 +75,23 @@ pub(crate) fn crs_metric_basis(
             const WGS84_F: f64 = 1.0 / 298.257_223_563;
             const WGS84_E2: f64 = WGS84_F * (2.0 - WGS84_F);
 
-            let mid_lat_deg = (geotransform[3]
+            let mid_lat_raw = geotransform[3]
                 + 0.5 * (width as f64) * geotransform[4]
-                + 0.5 * (height as f64) * geotransform[5])
-                .clamp(-89.999_999, 89.999_999);
+                + 0.5 * (height as f64) * geotransform[5];
+            if !mid_lat_raw.is_finite() {
+                return (
+                    (f64::NAN, f64::NAN),
+                    (f64::NAN, f64::NAN),
+                    CrsMetricScale {
+                        is_geographic: true,
+                        to_meter: f64::NAN,
+                        cell_width_m: f64::NAN,
+                        cell_height_m: f64::NAN,
+                        cell_area_m2: f64::NAN,
+                    },
+                );
+            }
+            let mid_lat_deg = mid_lat_raw.clamp(-89.999_999, 89.999_999);
             let phi = mid_lat_deg.to_radians();
             let sin_phi = phi.sin();
             let cos_phi = phi.cos().abs();
@@ -1189,10 +1202,7 @@ fn region_props_affine_inner(
         let l2 = (0.5 * (mu20 + mu02 - common)).max(0.0);
 
         let major_axis = 4.0 * l1.sqrt();
-        let mut minor_axis = 4.0 * l2.sqrt();
-        if minor_axis == 0.0 {
-            minor_axis = min_res;
-        }
+        let minor_axis = (4.0 * l2.sqrt()).max(min_res);
         let elongatedness = if minor_axis > 0.0 {
             major_axis / minor_axis
         } else {

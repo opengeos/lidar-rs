@@ -250,9 +250,22 @@ fn region_fill_times(
             "interval={step} requires {est_slices} slices (exceeds MAX_SLICES_PER_REGION={MAX_SLICES_PER_REGION})"
         )));
     }
+    if elev_span > 0.0 && max_elev - step >= max_elev {
+        return Err(Error::InvalidArgument(format!(
+            "interval={step} is smaller than floating-point precision at elevation {max_elev}"
+        )));
+    }
 
     let mut slice_idx = 0usize;
     loop {
+        if slice_idx > 0 && elev_span == 0.0 {
+            break;
+        }
+        if slice_idx > MAX_SLICES_PER_REGION {
+            return Err(Error::InvalidArgument(format!(
+                "inundation slicing exceeded MAX_SLICES_PER_REGION ({MAX_SLICES_PER_REGION})"
+            )));
+        }
         let elev = max_elev - (slice_idx as f64) * step;
         if slice_idx > 0 && elev <= min_elev {
             break;
@@ -1668,6 +1681,11 @@ pub fn scs_hyetograph(
         let frac = interp(t / duration_h);
         let d_mm = ((frac - prev_frac) * total_precip_mm).max(0.0);
         let intensity_cm_h = (d_mm / 10.0) / dt;
+        if !intensity_cm_h.is_finite() {
+            return Err(Error::InvalidArgument(format!(
+                "SCS hyetograph step {k} produced non-finite intensity ({intensity_cm_h})"
+            )));
+        }
         out.push((dt, intensity_cm_h));
         prev_t = t;
         prev_frac = frac;
@@ -1836,6 +1854,11 @@ pub fn chicago_hyetograph(
         }
     };
     let p_tot_cm = p_idf_cm(total_min);
+    if !p_tot_cm.is_finite() {
+        return Err(Error::InvalidArgument(format!(
+            "Chicago hyetograph total depth overflowed to non-finite value ({p_tot_cm})"
+        )));
+    }
     let cum_cm = |t_min: f64| -> f64 {
         let t_clamped = t_min.clamp(0.0, total_min);
         if t_clamped <= t_peak_min {
@@ -1863,8 +1886,19 @@ pub fn chicago_hyetograph(
             break;
         }
         let p_cm = cum_cm(t_h * 60.0);
+        if !p_cm.is_finite() {
+            return Err(Error::InvalidArgument(format!(
+                "Chicago hyetograph step {k} produced non-finite cumulative depth ({p_cm})"
+            )));
+        }
         let dp_cm = (p_cm - prev_p_cm).max(0.0);
-        out.push((dt_h, dp_cm / dt_h));
+        let intensity_cm_h = dp_cm / dt_h;
+        if !intensity_cm_h.is_finite() {
+            return Err(Error::InvalidArgument(format!(
+                "Chicago hyetograph step {k} produced non-finite intensity ({intensity_cm_h})"
+            )));
+        }
+        out.push((dt_h, intensity_cm_h));
         prev_t_h = t_h;
         prev_p_cm = p_cm;
     }
@@ -1977,6 +2011,11 @@ pub fn parse_hyetograph_csv(csv_text: &str) -> Result<Vec<(f64, f64)>> {
                 }
                 let dt_h = v0 - prev_time_h;
                 let intensity_cm_h = (v1 / 10.0) / dt_h;
+                if !intensity_cm_h.is_finite() {
+                    return Err(Error::InvalidArgument(format!(
+                        "hyetograph CSV line {line_no}: interval dt_h={dt_h} produces non-finite intensity"
+                    )));
+                }
                 out.push((dt_h, intensity_cm_h));
                 prev_time_h = v0;
                 saw_first_time_row = true;
@@ -2512,9 +2551,22 @@ fn region_fill_times_forced(
             "interval={step} requires {est_slices} slices (exceeds MAX_SLICES_PER_REGION={MAX_SLICES_PER_REGION})"
         )));
     }
+    if elev_span > 0.0 && max_elev - step >= max_elev {
+        return Err(Error::InvalidArgument(format!(
+            "interval={step} is smaller than floating-point precision at elevation {max_elev}"
+        )));
+    }
 
     let mut slice_idx = 0usize;
     loop {
+        if slice_idx > 0 && elev_span == 0.0 {
+            break;
+        }
+        if slice_idx > MAX_SLICES_PER_REGION {
+            return Err(Error::InvalidArgument(format!(
+                "inundation slicing exceeded MAX_SLICES_PER_REGION ({MAX_SLICES_PER_REGION})"
+            )));
+        }
         let elev = max_elev - (slice_idx as f64) * step;
         if slice_idx > 0 && elev <= min_elev {
             break;
@@ -2660,7 +2712,7 @@ pub(crate) fn validate_grid_alignment<T: DemNum, U: DemNum>(
             3 => 1e-3 * cell_y,
             _ => 1e-6 * a.abs().max(b.abs()).max(1e-12),
         };
-        if (a - b).abs() > tol {
+        if !a.is_finite() || !b.is_finite() || (a - b).abs() > tol {
             return Err(Error::DimensionMismatch(format!(
                 "{name} geotransform[{k}] ({a}) does not match reference ({b})"
             )));
