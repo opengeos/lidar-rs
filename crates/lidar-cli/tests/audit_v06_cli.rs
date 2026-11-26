@@ -91,6 +91,7 @@ fn mcp_allow_dir_blocks_forcing_path_urls_and_zip_symlink_bypasses() {
         (40, "/vsimem/secret.tif"),
         (41, "DODS:http://127.0.0.1:8080/dem.tif"),
         (42, "PG:dbname=prod"),
+        (43, "NETCDF:/outside/secret.nc:var"),
     ] {
         let r = rpc(json!({
             "jsonrpc": "2.0",
@@ -259,5 +260,10 @@ fn connectivity_graph_rejects_conflicting_format_with_json_on_stdout() {
     assert!(
         !out.status.success(),
         "connectivity-graph --format graphml --json without -o must fail"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--json conflicts with --format"),
+        "expected format conflict error, got: {stderr}"
     );
 }

@@ -534,8 +534,21 @@ fn has_disallowed_remote_or_vfs_scheme(raw: &str) -> bool {
     if lower.contains("://") || lower.starts_with("/vsi") {
         return true;
     }
-    const PREFIXES: &[&str] = &["oapif:", "wfs:", "wcs:", "wms:", "wmts:", "dods:", "pg:"];
-    PREFIXES.iter().any(|p| lower.starts_with(p))
+    // Reject GDAL/driver-prefixed dataset specifiers (`NETCDF:...`, `WFS:...`, `PG:...`, etc.)
+    // while allowing Windows drive prefixes (`C:\...`) and verbatim paths (`\\?\C:\...`).
+    let stripped = lower.strip_prefix(r"\\?\").unwrap_or(&lower);
+    if let Some((prefix, _)) = stripped.split_once(':') {
+        let is_windows_drive = prefix.len() == 1 && prefix.as_bytes()[0].is_ascii_alphabetic();
+        let is_driver_prefix = prefix.len() >= 2
+            && prefix.as_bytes()[0].is_ascii_alphabetic()
+            && prefix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'+'));
+        if !is_windows_drive && is_driver_prefix {
+            return true;
+        }
+    }
+    false
 }
 
 fn validate_single_allowlist_path(p: &Path, allowed_dirs: &[PathBuf]) -> Result<(), RpcError> {
