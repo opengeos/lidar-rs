@@ -1075,6 +1075,20 @@ def test_compute_twi_and_hand_array_and_file(tmp_path: Path):
     with pytest.raises(ValueError, match="file path"):
         lidar_rs.compute_hand(TEST_DATA / "dem.tif", acc_threshold_cells=100.0, crs="EPSG:32615")
 
+    # Misaligned spatial-adapter auxiliary grids are rejected instead of silently re-tagged
+    shifted_aff = _FakeAffine(2.0, 0.0, 500_100.0, 0.0, -2.0, 4_000_042.0)
+    shifted_acc = _FakeDataArray(
+        custom_acc, rio=_FakeRioAccessor(shifted_aff, _FakeCRS("EPSG:32615"), -9999.0)
+    )
+    with pytest.raises(ValueError, match="geotransform"):
+        lidar_rs.compute_twi(da_rio, flow_acc=shifted_acc)
+    shifted_mask = _FakeDataArray(
+        stream_mask.astype(np.float64),
+        rio=_FakeRioAccessor(shifted_aff, _FakeCRS("EPSG:32615"), 0.0),
+    )
+    with pytest.raises(ValueError, match="geotransform"):
+        lidar_rs.compute_hand(da_rio, stream_mask=shifted_mask)
+
 
 def test_classify_embankment_artifacts_array_and_file():
     # Synthetic sloping valley blocked by a narrow raised road embankment at col 24..25

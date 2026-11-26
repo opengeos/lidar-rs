@@ -123,6 +123,36 @@ fn crs_to_py(projection: &str) -> Option<String> {
     }
 }
 
+fn resolve_spatial_meta(
+    height: usize,
+    cell_size: f64,
+    geotransform: Option<[f64; 6]>,
+    crs: Option<&str>,
+) -> PyResult<([f64; 6], Option<String>)> {
+    let gt = if let Some(gt) = geotransform {
+        validate_geotransform(gt)?
+    } else {
+        if !cell_size.is_finite() || cell_size <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "cell_size must be finite and > 0, got {cell_size}"
+            )));
+        }
+        [
+            0.0,
+            cell_size,
+            0.0,
+            (height as f64) * cell_size,
+            0.0,
+            -cell_size,
+        ]
+    };
+    let proj = crs
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Ok((gt, proj))
+}
+
 fn from_py_array2_spatial(
     arr: PyReadonlyArray2<'_, f64>,
     no_data: Option<f64>,
@@ -131,28 +161,10 @@ fn from_py_array2_spatial(
     crs: Option<&str>,
 ) -> PyResult<Array2D<f64>> {
     let mut a = from_py_array2(arr, no_data)?;
-    if let Some(gt) = geotransform {
-        a.geotransform = validate_geotransform(gt)?;
-    } else {
-        if !cell_size.is_finite() || cell_size <= 0.0 {
-            return Err(PyValueError::new_err(format!(
-                "cell_size must be finite and > 0, got {cell_size}"
-            )));
-        }
-        a.geotransform = [
-            0.0,
-            cell_size,
-            0.0,
-            (a.height() as f64) * cell_size,
-            0.0,
-            -cell_size,
-        ];
-    }
-    if let Some(c) = crs {
-        let trimmed = c.trim();
-        if !trimmed.is_empty() {
-            a.projection = trimmed.to_string();
-        }
+    let (gt, proj) = resolve_spatial_meta(a.height(), cell_size, geotransform, crs)?;
+    a.geotransform = gt;
+    if let Some(p) = proj {
+        a.projection = p;
     }
     Ok(a)
 }
@@ -171,28 +183,10 @@ fn from_py_array2_i32_spatial(
         .unwrap_or_else(|| view.iter().copied().collect());
     let mut a = Array2D::from_vec(w, h, data).map_err(|e| to_py_err(e.into()))?;
     a.set_no_data(0);
-    if let Some(gt) = geotransform {
-        a.geotransform = validate_geotransform(gt)?;
-    } else {
-        if !cell_size.is_finite() || cell_size <= 0.0 {
-            return Err(PyValueError::new_err(format!(
-                "cell_size must be finite and > 0, got {cell_size}"
-            )));
-        }
-        a.geotransform = [
-            0.0,
-            cell_size,
-            0.0,
-            (a.height() as f64) * cell_size,
-            0.0,
-            -cell_size,
-        ];
-    }
-    if let Some(c) = crs {
-        let trimmed = c.trim();
-        if !trimmed.is_empty() {
-            a.projection = trimmed.to_string();
-        }
+    let (gt, proj) = resolve_spatial_meta(a.height(), cell_size, geotransform, crs)?;
+    a.geotransform = gt;
+    if let Some(p) = proj {
+        a.projection = p;
     }
     Ok(a)
 }
@@ -2333,30 +2327,27 @@ fn from_py_array2_u8_spatial(
         .unwrap_or_else(|| view.iter().copied().collect());
     let mut a = Array2D::from_vec(w, h, data).map_err(|e| to_py_err(e.into()))?;
     a.set_no_data(0);
-    if let Some(gt) = geotransform {
-        a.geotransform = validate_geotransform(gt)?;
-    } else {
-        if !cell_size.is_finite() || cell_size <= 0.0 {
-            return Err(PyValueError::new_err(format!(
-                "cell_size must be finite and > 0, got {cell_size}"
-            )));
-        }
-        a.geotransform = [
-            0.0,
-            cell_size,
-            0.0,
-            (a.height() as f64) * cell_size,
-            0.0,
-            -cell_size,
-        ];
-    }
-    if let Some(c) = crs {
-        let trimmed = c.trim();
-        if !trimmed.is_empty() {
-            a.projection = trimmed.to_string();
-        }
+    let (gt, proj) = resolve_spatial_meta(a.height(), cell_size, geotransform, crs)?;
+    a.geotransform = gt;
+    if let Some(p) = proj {
+        a.projection = p;
     }
     Ok(a)
+}
+
+fn save_raster_to_path(
+    grid: &Array2D<f64>,
+    out_path: &Path,
+    history: &str,
+    compress: bool,
+) -> lidar::Result<()> {
+    if let Some(parent) = out_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    lidar::save_raster(grid, out_path, Some(history), compress)?;
+    Ok(())
 }
 
 fn embankment_artifact_to_dict<'py>(
@@ -2435,12 +2426,7 @@ fn compute_twi_file<'py>(
             };
             let res = lidar::compute_twi(&dem, fa.as_ref())?;
             if let Some(out_path) = out_file.as_deref().map(Path::new) {
-                if let Some(parent) = out_path.parent()
-                    && !parent.as_os_str().is_empty()
-                {
-                    std::fs::create_dir_all(parent)?;
-                }
-                lidar::save_raster(&res, out_path, Some("compute_twi"), compress)?;
+                save_raster_to_path(&res, out_path, "compute_twi", compress)?;
                 Ok(None)
             } else {
                 Ok(Some(res))
@@ -2536,12 +2522,7 @@ fn compute_hand_file<'py>(
                 lidar::compute_hand_from_threshold(&dem, acc_threshold_cells.unwrap())?
             };
             if let Some(out_path) = out_file.as_deref().map(Path::new) {
-                if let Some(parent) = out_path.parent()
-                    && !parent.as_os_str().is_empty()
-                {
-                    std::fs::create_dir_all(parent)?;
-                }
-                lidar::save_raster(&res, out_path, Some("compute_hand"), compress)?;
+                save_raster_to_path(&res, out_path, "compute_hand", compress)?;
                 Ok(None)
             } else {
                 Ok(Some(res))

@@ -1375,6 +1375,28 @@ def compute_twi(
 ) -> NDArray[np.float64]: ...
 
 
+def _check_aux_grid_alignment(
+    name: str,
+    aux_gt: Geotransform | None,
+    aux_crs: str | None,
+    dem_gt: Geotransform | None,
+    dem_crs: str | None,
+) -> None:
+    """Validate that an auxiliary spatial input's geotransform and CRS match the DEM when present."""
+    if (
+        aux_gt is not None
+        and dem_gt is not None
+        and not np.allclose(aux_gt, dem_gt, rtol=0.0, atol=1e-6)
+    ):
+        raise ValueError(
+            f"{name} geotransform {aux_gt} does not match DEM geotransform {dem_gt}"
+        )
+    if aux_crs is not None and dem_crs is not None and aux_crs.strip() != dem_crs.strip():
+        raise ValueError(
+            f"{name} CRS {aux_crs!r} does not match DEM CRS {dem_crs!r}"
+        )
+
+
 def compute_twi(
     dem: PathLikeStr | SpatialArrayLike,
     out_file: PathLikeStr | None = None,
@@ -1388,8 +1410,10 @@ def compute_twi(
 ) -> str | NDArray[np.float64]:
     """Compute the Topographic Wetness Index (`TWI = ln(a / tan(beta))`) from a DEM file or 2D spatial array.
 
-    When `dem` is a file path and `out_file` is provided, writes the TWI GeoTIFF and returns
-    `str(out_file)`. Otherwise returns a 2D `float64` NumPy array.
+    `flow_acc`, if provided, must be a cell-count flow-accumulation grid (not specific
+    catchment area) aligned to `dem`. When `dem` is a file path and `out_file` is provided,
+    writes the TWI GeoTIFF and returns `str(out_file)`. Otherwise returns a 2D `float64`
+    NumPy array.
     """
     if isinstance(dem, (str, os.PathLike)):
         if geotransform is not None or crs is not None:
@@ -1424,7 +1448,13 @@ def compute_twi(
     if flow_acc is not None:
         if isinstance(flow_acc, (str, os.PathLike)):
             raise ValueError("flow_acc must be an array when dem is an array")
-        fa_arr = _extract_array_masking_nodata(flow_acc)
+        fa_raw, fa_gt, fa_crs, fa_nd = extract_spatial_array(flow_acc)
+        _check_aux_grid_alignment("flow_acc", fa_gt, fa_crs, gt, resolved_crs)
+        if fa_nd is not None and np.isfinite(fa_nd):
+            fa_arr = np.array(fa_raw, dtype=np.float64, copy=True)
+            fa_arr[fa_arr == float(fa_nd)] = np.nan
+        else:
+            fa_arr = fa_raw
     return _lidar_rs.compute_twi_array(
         arr, fa_arr, nd, float(cell_size), gt, resolved_crs
     )
@@ -1513,7 +1543,13 @@ def compute_hand(
     if stream_mask is not None:
         if isinstance(stream_mask, (str, os.PathLike)):
             raise ValueError("stream_mask must be an array when dem is an array")
-        mask_f64 = _extract_array_masking_nodata(stream_mask, fill=0.0)
+        m_raw, m_gt, m_crs, m_nd = extract_spatial_array(stream_mask)
+        _check_aux_grid_alignment("stream_mask", m_gt, m_crs, gt, resolved_crs)
+        if m_nd is not None and np.isfinite(m_nd):
+            mask_f64 = np.array(m_raw, dtype=np.float64, copy=True)
+            mask_f64[mask_f64 == float(m_nd)] = 0.0
+        else:
+            mask_f64 = m_raw
         mask_u8 = np.ascontiguousarray(
             (np.isfinite(mask_f64) & (mask_f64 > 0.0)).astype(np.uint8)
         )
