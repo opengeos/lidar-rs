@@ -233,6 +233,7 @@ pub fn compute_rating_curves_from_dem(
     };
     match options.delineation_method {
         crate::slicing::DelineationMethod::LevelSet => {
+            drop(dem_refined);
             let deps = delineate_depressions_in_memory(
                 &sink,
                 options.min_size,

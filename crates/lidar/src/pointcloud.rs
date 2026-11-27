@@ -2705,10 +2705,17 @@ fn lidar_to_tiled_grid_impl(
     let tile_cells = (options.tile_size / res).round().max(1.0) as usize;
     let pad_cells = (options.overlap / res).ceil() as usize;
 
+    // Cap each row band's pixel buffer at ~128 MiB so very wide rasters never allocate multi-GB
+    // row-band buffers regardless of tile_size.
+    const MAX_ROW_BAND_BYTES: usize = 128 * 1024 * 1024;
+    let max_band_rows =
+        (MAX_ROW_BAND_BYTES / (width.saturating_mul(std::mem::size_of::<f64>()).max(1))).max(1);
+    let band_step_rows = tile_cells.min(max_band_rows);
+
     let mut row_bands: Vec<(usize, usize)> = Vec::new();
     let mut r0 = 0usize;
     while r0 < height {
-        let r1 = (r0 + tile_cells).min(height);
+        let r1 = (r0 + band_step_rows).min(height);
         row_bands.push((r0, r1));
         r0 = r1;
     }
@@ -2721,8 +2728,8 @@ fn lidar_to_tiled_grid_impl(
     }
     let total_tiles = (row_bands.len() * col_strips.len()).max(1);
 
-    // Always stage into a sibling temp GeoTIFF and atomically move (or convert to COG) upon
-    // completion so mid-run cancellation or I/O errors never leave a partial/corrupt output file.
+    // Always stage into a sibling temp GeoTIFF/COG and atomically rename upon completion so
+    // mid-run cancellation or I/O errors never leave a partial/corrupt output file.
     let stem = out_raster
         .file_name()
         .and_then(|s| s.to_str())
@@ -2751,7 +2758,10 @@ fn lidar_to_tiled_grid_impl(
 
     let header_ds = build_streaming_f64_header(width, height, gt, &crs, nodata);
     let mut write_opts = RasterWriteOptions::default();
-    if options.dtm.compress && !options.dtm.cog {
+    if options.dtm.cog {
+        write_opts.driver = Some(terrio::formats::RasterDriver::Cog);
+    }
+    if options.dtm.compress {
         write_opts.compression = Some("DEFLATE".into());
     }
     let mut writer = GeoTiffWriter::create(stream_str, &header_ds, &write_opts)?;
@@ -2849,55 +2859,54 @@ fn lidar_to_tiled_grid_impl(
             Ok((core_c0, core_c1, core_vals))
         };
 
-        #[cfg(feature = "parallel")]
-        let strip_results: Vec<(usize, usize, Vec<f64>)> = col_strips
-            .par_iter()
-            .map(run_tile)
-            .collect::<Result<Vec<_>>>()?;
-        #[cfg(not(feature = "parallel"))]
-        let strip_results: Vec<(usize, usize, Vec<f64>)> = col_strips
-            .iter()
-            .map(run_tile)
-            .collect::<Result<Vec<_>>>()?;
-
+        // Process column strips in bounded chunks and scatter straight into `band_buf` so we
+        // never retain all column-strip buffers simultaneously alongside `band_buf`.
         let mut band_buf = vec![nodata; band_rows * width];
-        for (core_c0, core_c1, core_vals) in strip_results {
-            let core_w = core_c1 - core_c0;
-            for lr in 0..band_rows {
-                let dst = &mut band_buf[lr * width + core_c0..lr * width + core_c1];
-                let src = &core_vals[lr * core_w..(lr + 1) * core_w];
-                dst.copy_from_slice(src);
+        #[cfg(feature = "parallel")]
+        let strip_batch = rayon::current_num_threads().clamp(1, 8);
+        #[cfg(not(feature = "parallel"))]
+        let strip_batch = 1usize;
+
+        for strip_chunk in col_strips.chunks(strip_batch) {
+            #[cfg(feature = "parallel")]
+            let chunk_results: Vec<(usize, usize, Vec<f64>)> = strip_chunk
+                .par_iter()
+                .map(run_tile)
+                .collect::<Result<Vec<_>>>()?;
+            #[cfg(not(feature = "parallel"))]
+            let chunk_results: Vec<(usize, usize, Vec<f64>)> = strip_chunk
+                .iter()
+                .map(run_tile)
+                .collect::<Result<Vec<_>>>()?;
+
+            for (core_c0, core_c1, core_vals) in chunk_results {
+                let core_w = core_c1 - core_c0;
+                for lr in 0..band_rows {
+                    let dst = &mut band_buf[lr * width + core_c0..lr * width + core_c1];
+                    let src = &core_vals[lr * core_w..(lr + 1) * core_w];
+                    dst.copy_from_slice(src);
+                }
             }
+            tiles_done += strip_chunk.len();
+            control.report(
+                "tile",
+                (tiles_done as f64 / total_tiles as f64) * 0.95,
+                Some(format!("Gridded tile {tiles_done}/{total_tiles}")),
+            );
         }
+
         let rd = RasterData::F64(band_buf);
         writer.write_rows(&rd, band_rows, None)?;
-
-        tiles_done += col_strips.len();
-        control.report(
-            "tile",
-            (tiles_done as f64 / total_tiles as f64) * 0.95,
-            Some(format!("Gridded tile {tiles_done}/{total_tiles}")),
-        );
     }
 
     writer.finish()?;
 
-    if options.dtm.cog {
-        control.check_cancelled()?;
-        control.report("cog", 0.97, Some("Converting tiled raster to COG".into()));
-        crate::raster_ops::image_to_cog(
-            &temp_stage,
-            out_raster,
-            options.dtm.compress.then_some("DEFLATE"),
-        )?;
-    } else {
-        control.check_cancelled()?;
-        if out_raster.exists() {
-            let _ = std::fs::remove_file(out_raster);
-        }
-        std::fs::rename(&temp_stage, out_raster)?;
-        temp_guard.disarm();
+    control.check_cancelled()?;
+    if out_raster.exists() {
+        let _ = std::fs::remove_file(out_raster);
     }
+    std::fs::rename(&temp_stage, out_raster)?;
+    temp_guard.disarm();
 
     control.check_cancelled()?;
     control.report(

@@ -1831,16 +1831,25 @@ fn is_disallowed_ipv4(v4: std::net::Ipv4Addr) -> bool {
 
 /// Lexical URL-level safety check for remote download URLs returned by federal catalogs.
 ///
-/// Rejects non-HTTPS schemes, embedded userinfo, localhost/single-label hostnames, numeric
-/// shorthand IPv4 encodings, and literal loopback/private/link-local/CGNAT/ULA IP addresses
-/// (including IPv4-mapped IPv6). This is a lexical pre-flight filter only: it does not perform
-/// DNS resolution or revalidate HTTP redirect targets.
+/// Rejects non-HTTPS schemes, ASCII control/whitespace characters, backslashes or percent-encoding
+/// in the authority, embedded userinfo, localhost/single-label hostnames, numeric shorthand IPv4
+/// encodings, and literal loopback/private/link-local/CGNAT/ULA IP addresses (including
+/// IPv4-mapped IPv6). This is a lexical pre-flight filter only: it does not perform DNS
+/// resolution, pin resolved IPs, revalidate HTTP redirect targets, or inspect child URLs fetched
+/// from remote catalog/EPT manifests.
 fn is_safe_https_download_url(url: &str) -> bool {
+    if url.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+        return false;
+    }
     let Some(rest) = url.strip_prefix("https://") else {
         return false;
     };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if authority.is_empty() || authority.contains('@') {
+    let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or("");
+    if authority.is_empty()
+        || authority.contains('@')
+        || authority.contains('%')
+        || rest.as_bytes().get(authority.len()) == Some(&b'\\')
+    {
         return false;
     }
     let host = if let Some(inner) = authority.strip_prefix('[') {
@@ -3052,23 +3061,46 @@ fn stream_pointcloud_aoi_impl(
                 a[3].min(b[3]),
             ];
             if inter[0] > inter[2] || inter[1] > inter[3] {
-                return Ok(terrio::pointcloud::PointCloud::new(
-                    vec![
-                        terrio::pointcloud::Dimension::new(
-                            "x",
-                            terrio::pointcloud::Values::F64(Vec::new()),
-                        ),
-                        terrio::pointcloud::Dimension::new(
-                            "y",
-                            terrio::pointcloud::Values::F64(Vec::new()),
-                        ),
-                        terrio::pointcloud::Dimension::new(
-                            "z",
-                            terrio::pointcloud::Values::F64(Vec::new()),
-                        ),
-                    ],
-                    cloud_crs,
-                ));
+                let dims = reader
+                    .dimensions()
+                    .into_iter()
+                    .map(|(name, vt)| {
+                        let vals = match vt {
+                            terrio::pointcloud::ValueType::U8 => {
+                                terrio::pointcloud::Values::U8(Vec::new())
+                            }
+                            terrio::pointcloud::ValueType::I8 => {
+                                terrio::pointcloud::Values::I8(Vec::new())
+                            }
+                            terrio::pointcloud::ValueType::U16 => {
+                                terrio::pointcloud::Values::U16(Vec::new())
+                            }
+                            terrio::pointcloud::ValueType::I16 => {
+                                terrio::pointcloud::Values::I16(Vec::new())
+                            }
+                            terrio::pointcloud::ValueType::U32 => {
+                                terrio::pointcloud::Values::U32(Vec::new())
+                            }
+                            terrio::pointcloud::ValueType::I32 => {
+                                terrio::pointcloud::Values::I32(Vec::new())
+                            }
+                            terrio::pointcloud::ValueType::U64 => {
+                                terrio::pointcloud::Values::U64(Vec::new())
+                            }
+                            terrio::pointcloud::ValueType::I64 => {
+                                terrio::pointcloud::Values::I64(Vec::new())
+                            }
+                            terrio::pointcloud::ValueType::F32 => {
+                                terrio::pointcloud::Values::F32(Vec::new())
+                            }
+                            terrio::pointcloud::ValueType::F64 => {
+                                terrio::pointcloud::Values::F64(Vec::new())
+                            }
+                        };
+                        terrio::pointcloud::Dimension::new(&name, vals)
+                    })
+                    .collect();
+                return Ok(terrio::pointcloud::PointCloud::new(dims, cloud_crs));
             }
             Some(inter)
         }
@@ -3091,9 +3123,12 @@ fn stream_pointcloud_aoi_impl(
 /// Streams only the octree chunks overlapping an Area of Interest from a remote public HTTPS
 /// COPC (`.copc.laz`) or Entwine Point Tile (`ept.json`) dataset using HTTP range requests.
 ///
-/// Performs a lexical pre-flight check rejecting non-HTTPS schemes, loopback/private/link-local
-/// hosts, and embedded credentials (note: DNS resolution and downstream redirects are handled
-/// by `terrio`'s remote reader).
+/// Performs a **lexical-only** pre-flight URL check rejecting non-HTTPS schemes, control
+/// characters, embedded credentials, and literal loopback/private/link-local hosts. It does
+/// **not** perform DNS resolution / IP pinning, inspect HTTP redirect targets, or validate child
+/// `ept-data`/`ept-hierarchy` URLs referenced inside an EPT manifest (those requests are issued
+/// directly by `terrio`'s remote reader). Callers exposing this to untrusted URLs should enforce
+/// egress controls at the network/sandbox layer.
 #[cfg(feature = "pointcloud")]
 pub fn stream_remote_pointcloud_aoi(
     opts: &EptStreamOptions,

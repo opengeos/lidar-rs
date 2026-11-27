@@ -182,7 +182,18 @@ fn execution_control_progress_and_cancellation_in_core_algorithms() {
         Err(Error::Cancelled)
     ));
 
-    // 5. Full in-memory pipeline progress (strictly monotonic via sub_range) + cancellation.
+    // 5. Full in-memory pipeline progress (monotonic) + cancellation + direct sub_range remapping.
+    let sub_evs = Arc::new(Mutex::new(Vec::new()));
+    let sub_cap = Arc::clone(&sub_evs);
+    let root_ctrl =
+        ExecutionControl::new().with_progress_fn(move |e| sub_cap.lock().unwrap().push(e.clone()));
+    let sub = root_ctrl.sub_range(0.25, 0.75);
+    sub.report("phase", 0.0, None);
+    sub.report("phase", 0.5, None);
+    sub.report("phase", 1.0, None);
+    let fracs: Vec<f64> = sub_evs.lock().unwrap().iter().map(|e| e.fraction).collect();
+    assert_eq!(fracs, vec![0.25, 0.5, 0.75]);
+
     let evs = Arc::new(Mutex::new(Vec::new()));
     let cap = Arc::clone(&evs);
     let ctrl =
@@ -465,12 +476,15 @@ fn remote_copc_ept_url_validation_and_wgs84_bbox_projection() {
     };
     use terrio::crs::SpatialRef;
 
-    // 1. SSRF / non-HTTPS URLs must be rejected before any network call.
+    // 1. Unsafe / non-HTTPS / WHATWG-obfuscated URLs must be rejected before any network call.
     for bad in [
         "http://example.org/test.copc.laz",
         "https://localhost/test.copc.laz",
         "https://127.0.0.1/test.copc.laz",
         "https://169.254.169.254/latest/meta-data",
+        "https://127.0.0.1\\.example.com/test.copc.laz",
+        "https://%31%32%37.0.0.1/test.copc.laz",
+        "https://127.0.0.\t1/test.copc.laz",
         "file:///etc/passwd",
     ] {
         let err = stream_remote_pointcloud_aoi(&EptStreamOptions {
