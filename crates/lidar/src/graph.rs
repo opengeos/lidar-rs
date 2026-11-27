@@ -529,7 +529,11 @@ impl StreamSegmentIndex {
     }
 }
 
-fn load_stream_segments(path: &Path, dem_projection: &str) -> Result<StreamSegmentIndex> {
+fn load_stream_segments(
+    path: &Path,
+    dem_projection: &str,
+    axis_scale_m: (f64, f64),
+) -> Result<StreamSegmentIndex> {
     let p_str = path.to_str().ok_or_else(|| {
         Error::InvalidArgument(format!("non-UTF-8 stream vector path: {}", path.display()))
     })?;
@@ -541,11 +545,12 @@ fn load_stream_segments(path: &Path, dem_projection: &str) -> Result<StreamSegme
             .ok()
             .filter(|s| !s.is_unknown())
     };
+    let (sx, sy) = axis_scale_m;
     let mut segs = Vec::new();
-    fn push_geom(g: &Geometry, segs: &mut Vec<([f64; 2], [f64; 2])>) {
+    fn push_geom(g: &Geometry, sx: f64, sy: f64, segs: &mut Vec<([f64; 2], [f64; 2])>) {
         let mut push_pair = |a: &Coord, b: &Coord| {
             if a.x.is_finite() && a.y.is_finite() && b.x.is_finite() && b.y.is_finite() {
-                segs.push(([a.x, a.y], [b.x, b.y]));
+                segs.push(([a.x * sx, a.y * sy], [b.x * sx, b.y * sy]));
             }
         };
         match g {
@@ -563,7 +568,7 @@ fn load_stream_segments(path: &Path, dem_projection: &str) -> Result<StreamSegme
             }
             Geometry::GeometryCollection(gs) => {
                 for sub in gs {
-                    push_geom(sub, segs);
+                    push_geom(sub, sx, sy, segs);
                 }
             }
             _ => {}
@@ -583,7 +588,7 @@ fn load_stream_segments(path: &Path, dem_projection: &str) -> Result<StreamSegme
         }
         for feat in &layer.features {
             if let Some(ref g) = feat.geometry {
-                push_geom(g, &mut segs);
+                push_geom(g, sx, sy, &mut segs);
             }
         }
     }
@@ -765,8 +770,18 @@ pub fn build_connectivity_graph(
         })
         .collect();
 
+    let axis_scale_m = crate::region::crs_axis_meters_per_unit(
+        &deps.depression_id.projection,
+        &gt,
+        deps.depression_id.width(),
+        deps.depression_id.height(),
+    );
     let stream_index = match stream_vector {
-        Some(p) => Some(load_stream_segments(p, &deps.depression_id.projection)?),
+        Some(p) => Some(load_stream_segments(
+            p,
+            &deps.depression_id.projection,
+            axis_scale_m,
+        )?),
         None => None,
     };
     let mut stream_seen: Vec<u32> = stream_index
@@ -801,7 +816,12 @@ pub fn build_connectivity_graph(
                     stream_seen.fill(0);
                     query_stamp = 1;
                 }
-                Some(idx.nearest_dist(ex, ey, &mut stream_seen, query_stamp))
+                Some(idx.nearest_dist(
+                    ex * axis_scale_m.0,
+                    ey * axis_scale_m.1,
+                    &mut stream_seen,
+                    query_stamp,
+                ))
             }
             _ => None,
         };
@@ -1315,7 +1335,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = load_stream_segments(&tmp, "EPSG:26916");
+        let err = load_stream_segments(&tmp, "EPSG:26916", (1.0, 1.0));
         let _ = std::fs::remove_file(&tmp);
         assert!(
             matches!(err, Err(Error::InvalidArgument(ref msg)) if msg.contains("CRS")),

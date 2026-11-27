@@ -204,6 +204,8 @@ pub(crate) fn safe_crs_metric_basis(
             scale.cell_height_m,
             scale.cell_area_m2,
         )
+    } else if scale.is_geographic {
+        ((1.0, 0.0), (0.0, -1.0), 1.0, 1.0, 1.0)
     } else {
         (
             (geotransform[1], geotransform[4]),
@@ -212,6 +214,42 @@ pub(crate) fn safe_crs_metric_basis(
             raw_ry,
             raw_det,
         )
+    }
+}
+
+/// Returns `(meters_per_x_unit, meters_per_y_unit)` for converting raw CRS coordinate
+/// differences `(dx, dy)` into SI meters at the raster center.
+pub(crate) fn crs_axis_meters_per_unit(
+    projection: &str,
+    geotransform: &[f64; 6],
+    width: usize,
+    height: usize,
+) -> (f64, f64) {
+    let unit_gt = [geotransform[0], 1.0, 0.0, geotransform[3], 0.0, -1.0];
+    let (vx_m, vy_m, scale) = crs_metric_basis(projection, &unit_gt, 0, 0);
+    if scale.is_geographic {
+        // Evaluate latitude at the true raster center rather than the top-left corner.
+        let mid_lat_raw = geotransform[3]
+            + 0.5 * (width as f64) * geotransform[4]
+            + 0.5 * (height as f64) * geotransform[5];
+        if !mid_lat_raw.is_finite() {
+            return (1.0, 1.0);
+        }
+        let mid_gt = [geotransform[0], 1.0, 0.0, mid_lat_raw, 0.0, -1.0];
+        let (mvx, mvy, _) = crs_metric_basis(projection, &mid_gt, 0, 0);
+        let sx = mvx.0.abs();
+        let sy = mvy.1.abs();
+        if sx.is_finite() && sx > 0.0 && sy.is_finite() && sy > 0.0 {
+            return (sx, sy);
+        }
+        return (1.0, 1.0);
+    }
+    let sx = vx_m.0.abs();
+    let sy = vy_m.1.abs();
+    if sx.is_finite() && sx > 0.0 && sy.is_finite() && sy > 0.0 {
+        (sx, sy)
+    } else {
+        (1.0, 1.0)
     }
 }
 
