@@ -2494,20 +2494,29 @@ pub fn points_to_chm_pit_free(
         Some((partial_pts, partial_tris))
     };
 
+    // Build and rasterize partial TIN levels in bounded thread-sized chunks so peak memory
+    // stays proportional to worker concurrency rather than total threshold count.
     #[cfg(feature = "parallel")]
-    let partial_levels: Vec<PartialTinLevel> =
-        thresholds.par_iter().filter_map(build_level).collect();
+    let chunk_size = rayon::current_num_threads().max(1);
     #[cfg(not(feature = "parallel"))]
-    let partial_levels: Vec<PartialTinLevel> = thresholds.iter().filter_map(build_level).collect();
+    let chunk_size = 1usize;
 
-    for (partial_pts, partial_tris) in partial_levels {
-        rasterize_tin_max(
-            &partial_pts,
-            &partial_tris,
-            &tin_grid,
-            Some(max_edge),
-            &mut chm_data,
-        );
+    for chunk in thresholds.chunks(chunk_size) {
+        #[cfg(feature = "parallel")]
+        let partial_levels: Vec<PartialTinLevel> =
+            chunk.par_iter().filter_map(build_level).collect();
+        #[cfg(not(feature = "parallel"))]
+        let partial_levels: Vec<PartialTinLevel> = chunk.iter().filter_map(build_level).collect();
+
+        for (partial_pts, partial_tris) in partial_levels {
+            rasterize_tin_max(
+                &partial_pts,
+                &partial_tris,
+                &tin_grid,
+                Some(max_edge),
+                &mut chm_data,
+            );
+        }
     }
 
     let mut chm = Array2D::from_vec(w, h, chm_data)?;

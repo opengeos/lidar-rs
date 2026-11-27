@@ -734,18 +734,64 @@ where
         }
     }
 
-    // Cache decoded wet masks on the rising pass when `ping_pong` is enabled so
-    // `load_wet_mask` (e.g., GeoTIFF decoding) never decodes the same frame twice.
-    let mut cached_wet: Vec<Option<Vec<bool>>> = if options.ping_pong && num_steps > 1 {
-        vec![None; num_steps]
+    // Compact bit-packed wet-mask cache for `ping_pong: true` so `load_wet_mask` never decodes
+    // the same frame twice while keeping memory 8x smaller than `Vec<bool>` (or downscaled to
+    // `(dw, dh)` bits when no spill paths need full-resolution wet lookups).
+    struct BitMask {
+        words: Vec<u64>,
+        len: usize,
+    }
+    impl BitMask {
+        fn pack_full(wet: &[bool]) -> Self {
+            let mut words = vec![0u64; wet.len().div_ceil(64)];
+            for (i, &w) in wet.iter().enumerate() {
+                if w {
+                    words[i >> 6] |= 1u64 << (i & 63);
+                }
+            }
+            Self {
+                words,
+                len: wet.len(),
+            }
+        }
+        fn pack_downscaled(wet: &[bool], sw: usize, sh: usize, dw: usize, dh: usize) -> Self {
+            let len = dw * dh;
+            let mut words = vec![0u64; len.div_ceil(64)];
+            for y in 0..dh {
+                let sy = (y * sh / dh).min(sh - 1);
+                let dst_row = y * dw;
+                let src_row = sy * sw;
+                for x in 0..dw {
+                    let sx = (x * sw / dw).min(sw - 1);
+                    if wet[src_row + sx] {
+                        let i = dst_row + x;
+                        words[i >> 6] |= 1u64 << (i & 63);
+                    }
+                }
+            }
+            Self { words, len }
+        }
+        #[inline]
+        fn get(&self, i: usize) -> bool {
+            i < self.len && ((self.words[i >> 6] >> (i & 63)) & 1) != 0
+        }
+        fn unpack(&self) -> Vec<bool> {
+            (0..self.len).map(|i| self.get(i)).collect()
+        }
+    }
+
+    let need_full_wet_for_spills = !spill_paths.is_empty() && options.time_step_h.is_some();
+    let cache_enabled = options.ping_pong && num_steps > 1;
+    let mut cached_wet: Vec<Option<BitMask>> = if cache_enabled {
+        (0..num_steps).map(|_| None).collect()
     } else {
         Vec::new()
     };
 
     let mut frame_rgb = vec![0u8; dw * total_h * 3];
     for &(src_idx, rising) in &sequence {
-        let owned_wet;
-        let wet: &[bool] = if !cached_wet.is_empty() {
+        let mut owned_wet: Option<Vec<bool>> = None;
+        if cache_enabled {
             if cached_wet[src_idx].is_none() {
                 let loaded = load_wet_mask(src_idx)?;
                 if loaded.len() != sw * sh {
@@ -754,19 +800,24 @@ where
                         loaded.len()
                     )));
                 }
-                cached_wet[src_idx] = Some(loaded);
+                let packed = if need_full_wet_for_spills {
+                    BitMask::pack_full(&loaded)
+                } else {
+                    BitMask::pack_downscaled(&loaded, sw, sh, dw, dh)
+                };
+                cached_wet[src_idx] = Some(packed);
+                owned_wet = Some(loaded);
             }
-            cached_wet[src_idx].as_deref().expect("cached wet mask")
         } else {
-            owned_wet = load_wet_mask(src_idx)?;
-            if owned_wet.len() != sw * sh {
+            let loaded = load_wet_mask(src_idx)?;
+            if loaded.len() != sw * sh {
                 return Err(Error::DimensionMismatch(format!(
                     "wet mask length ({}) does not match DEM ({sw}x{sh})",
-                    owned_wet.len()
+                    loaded.len()
                 )));
             }
-            &owned_wet
-        };
+            owned_wet = Some(loaded);
+        }
 
         let progress = (src_idx + 1) as f64 / num_steps as f64;
         let time_label = match options.time_step_h {
@@ -801,17 +852,39 @@ where
 
         let body = &mut frame_rgb[dw * banner_h * 3..];
         body.copy_from_slice(&base_rgb);
-        for y in 0..dh {
-            let sy = (y * sh / dh).min(sh - 1);
-            for x in 0..dw {
-                let sx = (x * sw / dw).min(sw - 1);
-                if wet[sy * sw + sx] {
-                    let p = (y * dw + x) * 3;
-                    body[p] = (body[p] as f32 * inv_alpha + wr as f32 * alpha).round() as u8;
-                    body[p + 1] =
-                        (body[p + 1] as f32 * inv_alpha + wg as f32 * alpha).round() as u8;
-                    body[p + 2] =
-                        (body[p + 2] as f32 * inv_alpha + wb as f32 * alpha).round() as u8;
+        if let Some(ref wet_full) = owned_wet {
+            for y in 0..dh {
+                let sy = (y * sh / dh).min(sh - 1);
+                for x in 0..dw {
+                    let sx = (x * sw / dw).min(sw - 1);
+                    if wet_full[sy * sw + sx] {
+                        let p = (y * dw + x) * 3;
+                        body[p] = (body[p] as f32 * inv_alpha + wr as f32 * alpha).round() as u8;
+                        body[p + 1] =
+                            (body[p + 1] as f32 * inv_alpha + wg as f32 * alpha).round() as u8;
+                        body[p + 2] =
+                            (body[p + 2] as f32 * inv_alpha + wb as f32 * alpha).round() as u8;
+                    }
+                }
+            }
+        } else if let Some(ref packed) = cached_wet[src_idx] {
+            for y in 0..dh {
+                let sy = (y * sh / dh).min(sh - 1);
+                for x in 0..dw {
+                    let is_wet = if need_full_wet_for_spills {
+                        let sx = (x * sw / dw).min(sw - 1);
+                        packed.get(sy * sw + sx)
+                    } else {
+                        packed.get(y * dw + x)
+                    };
+                    if is_wet {
+                        let p = (y * dw + x) * 3;
+                        body[p] = (body[p] as f32 * inv_alpha + wr as f32 * alpha).round() as u8;
+                        body[p + 1] =
+                            (body[p + 1] as f32 * inv_alpha + wg as f32 * alpha).round() as u8;
+                        body[p + 2] =
+                            (body[p + 2] as f32 * inv_alpha + wb as f32 * alpha).round() as u8;
+                    }
                 }
             }
         }
@@ -832,7 +905,18 @@ where
             && let Some(dt) = options.time_step_h
         {
             let t_hours = (src_idx + 1) as f64 * dt;
-            draw_active_spill_paths(body, dw, dh, sw, sh, wet, t_hours, spill_paths);
+            let unpacked;
+            let wet_slice: &[bool] = match owned_wet.as_deref() {
+                Some(s) => s,
+                None => {
+                    unpacked = cached_wet[src_idx]
+                        .as_ref()
+                        .expect("cached full wet mask")
+                        .unpack();
+                    &unpacked
+                }
+            };
+            draw_active_spill_paths(body, dw, dh, sw, sh, wet_slice, t_hours, spill_paths);
         }
 
         let legend_label = options.legend_label.as_deref().unwrap_or("WATER");

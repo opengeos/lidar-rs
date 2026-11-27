@@ -305,9 +305,10 @@ fn build_streaming_header(
         metadata: Default::default(),
         data: RasterData::new_filled(data_type, 0, 0.0),
     };
-    if !meta.projection.is_empty()
-        && let Ok(sref) = SpatialRef::parse(&meta.projection)
-    {
+    if !meta.projection.is_empty() {
+        let sref = SpatialRef::parse(&meta.projection).map_err(|e| {
+            Error::InvalidArgument(format!("invalid projection '{}': {e}", meta.projection))
+        })?;
         raster.crs = sref.to_crs_info();
     }
     let mut ds = RasterDataset::new(raster, true);
@@ -1118,7 +1119,7 @@ fn run_tiled_in_memory<T: DemNum>(
         geotransform: dem.geotransform,
         projection: dem.projection.clone(),
     };
-    let _n_pix = meta.width.checked_mul(meta.height).ok_or_else(|| {
+    meta.width.checked_mul(meta.height).ok_or_else(|| {
         Error::DimensionMismatch(format!(
             "raster dimensions overflow ({}x{})",
             meta.width, meta.height
@@ -1343,7 +1344,7 @@ pub fn delineate_depressions_tiled_with_control(
                 #[cfg(feature = "parallel")]
                 drop(lazy);
 
-                let _n_pix = meta.width.checked_mul(meta.height).ok_or_else(|| {
+                meta.width.checked_mul(meta.height).ok_or_else(|| {
                     Error::DimensionMismatch(format!(
                         "raster dimensions overflow ({}x{})",
                         meta.width, meta.height
@@ -1374,19 +1375,15 @@ pub fn delineate_depressions_tiled_with_control(
                 let per_tile: Vec<Vec<TileRegionOutput>> = windows
                     .into_par_iter()
                     .map_init(
-                        || terrio::open_raster_lazy(p_str),
+                        || terrio::open_raster_lazy(p_str).map_err(|e| e.to_string()),
                         |lazy_res, win| -> Result<Vec<TileRegionOutput>> {
                             control.check_cancelled()?;
                             let lazy = match lazy_res {
                                 Ok(l) => l,
-                                Err(_) => {
-                                    // Propagate fresh open error cleanly (terrio::Error isn't Clone).
-                                    return Err(terrio::open_raster_lazy(p_str)
-                                        .err()
-                                        .map(Error::from)
-                                        .unwrap_or_else(|| {
-                                            Error::Algorithm("failed to open lazy raster".into())
-                                        }));
+                                Err(msg) => {
+                                    return Err(Error::Algorithm(format!(
+                                        "failed to open lazy raster '{p_str}': {msg}"
+                                    )));
                                 }
                             };
                             let tile = read_tile_window_with_lazy(lazy, p_str, &meta, win)?;
