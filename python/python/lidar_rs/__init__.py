@@ -37,6 +37,7 @@ from ._types import (
     FederalDataResult,
     FlowPathRecord,
     FsmBasinSummary,
+    FsmHydrographPoint,
     FsmMassBalance,
     Geotransform,
     GraphEdge,
@@ -46,12 +47,15 @@ from ._types import (
     InundationResult,
     InundationStepRecord,
     InundationStepSummaryRecord,
+    MergeTreeNode,
+    MergeTreeResult,
     NoaaAtlas14Table,
     PathLikeStr,
     PipelineResult,
     PointCloudDict,
     RatingCurve,
     RatingCurvePoint,
+    RecessionCurvePoint,
     SinkDepressionRecord,
     SpatialArrayLike,
     SpillFlowPathRecord,
@@ -215,6 +219,139 @@ def GaussianFilter(
     out_str = _as_path_str(out_file) if out_file is not None else None
     res = _lidar_rs.gaussian_filter_file(
         _as_path_str(in_dem), float(sigma), out_str, no_data
+    )
+    if out_str is not None:
+        return out_str
+    assert res is not None
+    return res
+
+
+@overload
+def bilateral_filter(
+    in_dem: PathLikeStr,
+    spatial_sigma: float = 1.5,
+    range_sigma: float = 0.5,
+    *,
+    out_file: PathLikeStr,
+    no_data: float | None = None,
+) -> str: ...
+
+
+@overload
+def bilateral_filter(
+    in_dem: PathLikeStr | SpatialArrayLike,
+    spatial_sigma: float = 1.5,
+    range_sigma: float = 0.5,
+    out_file: None = None,
+    no_data: float | None = None,
+) -> NDArray[np.float64]: ...
+
+
+def bilateral_filter(
+    in_dem: PathLikeStr | SpatialArrayLike,
+    spatial_sigma: float = 1.5,
+    range_sigma: float = 0.5,
+    out_file: PathLikeStr | None = None,
+    no_data: float | None = None,
+) -> str | NDArray[np.float64]:
+    """Apply an edge-preserving 2D bilateral filter to a DEM file or 2D spatial array."""
+    if is_spatial_array(in_dem) or not isinstance(in_dem, (str, os.PathLike)):
+        if out_file is not None:
+            raise ValueError(
+                "out_file is not supported for array input; pass a raster file path or omit out_file"
+            )
+        arr, _gt, _crs, nd = extract_spatial_array(in_dem, no_data=no_data)
+        return _lidar_rs.bilateral_filter_array(
+            arr, float(spatial_sigma), float(range_sigma), nd
+        )
+    out_str = _as_path_str(out_file) if out_file is not None else None
+    res = _lidar_rs.bilateral_filter_file(
+        _as_path_str(in_dem), float(spatial_sigma), float(range_sigma), out_str, no_data
+    )
+    if out_str is not None:
+        return out_str
+    assert res is not None
+    return res
+
+
+@overload
+def feature_preserving_smoothing(
+    in_dem: PathLikeStr,
+    filter_size: int = 11,
+    norm_diff: float = 15.0,
+    num_iter: int = 3,
+    max_z_change: float | None = None,
+    *,
+    out_file: PathLikeStr,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+    compress: bool = False,
+) -> str: ...
+
+
+@overload
+def feature_preserving_smoothing(
+    in_dem: PathLikeStr | SpatialArrayLike,
+    filter_size: int = 11,
+    norm_diff: float = 15.0,
+    num_iter: int = 3,
+    max_z_change: float | None = None,
+    out_file: None = None,
+    *,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+    compress: bool = False,
+) -> NDArray[np.float64]: ...
+
+
+def feature_preserving_smoothing(
+    in_dem: PathLikeStr | SpatialArrayLike,
+    filter_size: int = 11,
+    norm_diff: float = 15.0,
+    num_iter: int = 3,
+    max_z_change: float | None = None,
+    out_file: PathLikeStr | None = None,
+    *,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+    compress: bool = False,
+) -> str | NDArray[np.float64]:
+    """Apply Lindsay et al. (2019) feature-preserving DEM smoothing to a file or 2D spatial array."""
+    if is_spatial_array(in_dem) or not isinstance(in_dem, (str, os.PathLike)):
+        if out_file is not None:
+            raise ValueError(
+                "out_file is not supported for array input; pass a raster file path or omit out_file"
+            )
+        arr, gt, resolved_crs, nd = extract_spatial_array(
+            in_dem, geotransform=geotransform, crs=crs, no_data=no_data
+        )
+        return _lidar_rs.feature_preserving_smoothing_array(
+            arr,
+            int(filter_size),
+            float(norm_diff),
+            int(num_iter),
+            float(max_z_change) if max_z_change is not None else None,
+            nd,
+            float(cell_size),
+            gt,
+            resolved_crs,
+        )
+    out_str = _as_path_str(out_file) if out_file is not None else None
+    res = _lidar_rs.feature_preserving_smoothing_file(
+        _as_path_str(in_dem),
+        int(filter_size),
+        float(norm_diff),
+        int(num_iter),
+        float(max_z_change) if max_z_change is not None else None,
+        out_str,
+        no_data,
+        bool(compress),
     )
     if out_str is not None:
         return out_str
@@ -409,8 +546,12 @@ def mosaic(
     images: PathLikeStr | Sequence[PathLikeStr],
     output: PathLikeStr,
     ext: str = ".tif",
+    *,
+    resampling: str = "nearest",
+    compress: bool = False,
+    cog: bool = False,
 ) -> None:
-    """Mosaic a list of rasters (or all raster files in a directory) into a single GeoTIFF."""
+    """Mosaic a list of rasters (or all raster files in a directory) into a single GeoTIFF or COG."""
     out_resolved = Path(output).resolve()
     if isinstance(images, (str, os.PathLike)):
         path = Path(images)
@@ -432,7 +573,7 @@ def mosaic(
             )
     else:
         inputs = [_as_path_str(p) for p in images]
-    _lidar_rs.mosaic(inputs, _as_path_str(output))
+    _lidar_rs.mosaic(inputs, _as_path_str(output), resampling, bool(compress), bool(cog))
 
 
 def reproject_image(
@@ -441,10 +582,19 @@ def reproject_image(
     dst_crs: str = "EPSG:4326",
     resampling: str = "nearest",
     resolution: tuple[float, float] | None = None,
+    *,
+    compress: bool = False,
+    cog: bool = False,
 ) -> None:
     """Reproject a raster to `dst_crs`."""
     _lidar_rs.reproject_image(
-        _as_path_str(image), _as_path_str(output), dst_crs, resampling, resolution
+        _as_path_str(image),
+        _as_path_str(output),
+        dst_crs,
+        resampling,
+        resolution,
+        bool(compress),
+        bool(cog),
     )
 
 
@@ -453,10 +603,18 @@ def resample(
     dst: PathLikeStr,
     resolution: float,
     resampling: str = "bilinear",
+    *,
+    compress: bool = False,
+    cog: bool = False,
 ) -> None:
     """Resample a raster to a target pixel resolution."""
     _lidar_rs.resample(
-        _as_path_str(src), _as_path_str(dst), float(resolution), resampling
+        _as_path_str(src),
+        _as_path_str(dst),
+        float(resolution),
+        resampling,
+        bool(compress),
+        bool(cog),
     )
 
 
@@ -464,9 +622,18 @@ def clip_image(
     image: PathLikeStr,
     mask: PathLikeStr,
     output: PathLikeStr,
+    *,
+    compress: bool = False,
+    cog: bool = False,
 ) -> None:
     """Clip a raster by a polygon vector mask."""
-    _lidar_rs.clip_image(_as_path_str(image), _as_path_str(mask), _as_path_str(output))
+    _lidar_rs.clip_image(
+        _as_path_str(image),
+        _as_path_str(mask),
+        _as_path_str(output),
+        bool(compress),
+        bool(cog),
+    )
 
 
 def image_to_cog(
@@ -768,8 +935,11 @@ def lidar_to_dsm(
     window_size: int = 0,
     classifications: Sequence[int] | None = None,
     return_kinds: Sequence[str] | None = None,
+    *,
+    compress: bool = False,
+    cog: bool = False,
 ) -> tuple[int, int]:
-    """Grid a LiDAR point cloud into a Digital Surface Model (DSM) GeoTIFF."""
+    """Grid a LiDAR point cloud into a Digital Surface Model (DSM) GeoTIFF or COG."""
     cols, rows = _lidar_rs.lidar_to_dsm(
         _as_path_str(filename),
         _as_path_str(output),
@@ -782,6 +952,8 @@ def lidar_to_dsm(
         int(window_size),
         [int(c) for c in classifications] if classifications is not None else None,
         list(return_kinds) if return_kinds is not None else None,
+        bool(compress),
+        bool(cog),
     )
     return int(cols), int(rows)
 
@@ -811,8 +983,15 @@ def lidar_to_dtm(
     window_radius: float | None = None,
     elevation_threshold: float | None = None,
     elevation_scalar: float | None = None,
+    remove_outliers: bool = False,
+    ror_radius: float | None = None,
+    ror_min_neighbors: int | None = None,
+    sor_k: int | None = None,
+    sor_sigma: float | None = None,
+    compress: bool = False,
+    cog: bool = False,
 ) -> tuple[int, int]:
-    """Generate a bare-earth DTM GeoTIFF from a LiDAR point cloud (preclassified, CSF, PMF, or SMRF)."""
+    """Generate a bare-earth DTM GeoTIFF (or COG) from a LiDAR point cloud."""
     cols, rows = _lidar_rs.lidar_to_dtm(
         _as_path_str(filename),
         _as_path_str(output),
@@ -837,6 +1016,13 @@ def lidar_to_dtm(
         float(window_radius) if window_radius is not None else None,
         float(elevation_threshold) if elevation_threshold is not None else None,
         float(elevation_scalar) if elevation_scalar is not None else None,
+        bool(remove_outliers),
+        float(ror_radius) if ror_radius is not None else None,
+        int(ror_min_neighbors) if ror_min_neighbors is not None else None,
+        int(sor_k) if sor_k is not None else None,
+        float(sor_sigma) if sor_sigma is not None else None,
+        bool(compress),
+        bool(cog),
     )
     return int(cols), int(rows)
 
@@ -864,8 +1050,15 @@ def lidar_to_chm(
     window_radius: float | None = None,
     elevation_threshold: float | None = None,
     elevation_scalar: float | None = None,
+    remove_outliers: bool = False,
+    ror_radius: float | None = None,
+    ror_min_neighbors: int | None = None,
+    sor_k: int | None = None,
+    sor_sigma: float | None = None,
+    compress: bool = False,
+    cog: bool = False,
 ) -> tuple[int, int]:
-    """Generate a Canopy Height Model (CHM = DSM - DTM) GeoTIFF from a LiDAR point cloud."""
+    """Generate a Canopy Height Model (CHM = DSM - DTM) GeoTIFF (or COG) from a LiDAR point cloud."""
     cols, rows = _lidar_rs.lidar_to_chm(
         _as_path_str(filename),
         _as_path_str(output),
@@ -888,8 +1081,172 @@ def lidar_to_chm(
         float(window_radius) if window_radius is not None else None,
         float(elevation_threshold) if elevation_threshold is not None else None,
         float(elevation_scalar) if elevation_scalar is not None else None,
+        bool(remove_outliers),
+        float(ror_radius) if ror_radius is not None else None,
+        int(ror_min_neighbors) if ror_min_neighbors is not None else None,
+        int(sor_k) if sor_k is not None else None,
+        float(sor_sigma) if sor_sigma is not None else None,
+        bool(compress),
+        bool(cog),
     )
     return int(cols), int(rows)
+
+
+def lidar_to_chm_pit_free(
+    filename: PathLikeStr,
+    output: PathLikeStr,
+    resolution: float = 1.0,
+    ground_method: str = "csf",
+    ground_class: int = 2,
+    *,
+    height_thresholds: Sequence[float] | None = None,
+    max_triangle_edge: float | None = None,
+    remove_outliers: bool = False,
+    ror_radius: float | None = None,
+    ror_min_neighbors: int | None = None,
+    sor_k: int | None = None,
+    sor_sigma: float | None = None,
+    compress: bool = False,
+    cog: bool = False,
+) -> tuple[int, int]:
+    """Generate a Khosravipour et al. (2014) pit-free multi-threshold TIN CHM GeoTIFF (or COG)."""
+    cols, rows = _lidar_rs.lidar_to_chm_pit_free(
+        _as_path_str(filename),
+        _as_path_str(output),
+        float(resolution),
+        ground_method,
+        int(ground_class),
+        [float(v) for v in height_thresholds]
+        if height_thresholds is not None
+        else None,
+        float(max_triangle_edge) if max_triangle_edge is not None else None,
+        bool(remove_outliers),
+        float(ror_radius) if ror_radius is not None else None,
+        int(ror_min_neighbors) if ror_min_neighbors is not None else None,
+        int(sor_k) if sor_k is not None else None,
+        float(sor_sigma) if sor_sigma is not None else None,
+        bool(compress),
+        bool(cog),
+    )
+    return int(cols), int(rows)
+
+
+def lidar_to_dtm_tiled(
+    filename: PathLikeStr,
+    output: PathLikeStr,
+    tile_size: float = 500.0,
+    overlap: float = 25.0,
+    resolution: float = 1.0,
+    ground_method: str = "csf",
+    ground_class: int = 2,
+    method: str = "linear",
+    stat: str = "idw",
+    window_size: int = 5,
+    *,
+    remove_outliers: bool = False,
+    ror_radius: float | None = None,
+    ror_min_neighbors: int | None = None,
+    sor_k: int | None = None,
+    sor_sigma: float | None = None,
+    compress: bool = False,
+    cog: bool = False,
+    read_resolution: float | None = None,
+    max_level: int | None = None,
+) -> tuple[int, int]:
+    """Generate a bare-earth DTM GeoTIFF (or streaming COG) from a large point cloud in overlapping tiles."""
+    cols, rows = _lidar_rs.lidar_to_dtm_tiled(
+        _as_path_str(filename),
+        _as_path_str(output),
+        float(tile_size),
+        float(overlap),
+        float(resolution),
+        ground_method,
+        int(ground_class),
+        method,
+        stat,
+        int(window_size),
+        bool(remove_outliers),
+        float(ror_radius) if ror_radius is not None else None,
+        int(ror_min_neighbors) if ror_min_neighbors is not None else None,
+        int(sor_k) if sor_k is not None else None,
+        float(sor_sigma) if sor_sigma is not None else None,
+        bool(compress),
+        bool(cog),
+        float(read_resolution) if read_resolution is not None else None,
+        int(max_level) if max_level is not None else None,
+    )
+    return int(cols), int(rows)
+
+
+def lidar_to_chm_tiled(
+    filename: PathLikeStr,
+    output: PathLikeStr,
+    tile_size: float = 500.0,
+    overlap: float = 25.0,
+    resolution: float = 1.0,
+    ground_method: str = "csf",
+    ground_class: int = 2,
+    window_size: int = 5,
+    *,
+    remove_outliers: bool = False,
+    ror_radius: float | None = None,
+    ror_min_neighbors: int | None = None,
+    sor_k: int | None = None,
+    sor_sigma: float | None = None,
+    compress: bool = False,
+    cog: bool = False,
+    read_resolution: float | None = None,
+    max_level: int | None = None,
+) -> tuple[int, int]:
+    """Generate a CHM GeoTIFF (or streaming COG) from a large point cloud in overlapping tiles."""
+    cols, rows = _lidar_rs.lidar_to_chm_tiled(
+        _as_path_str(filename),
+        _as_path_str(output),
+        float(tile_size),
+        float(overlap),
+        float(resolution),
+        ground_method,
+        int(ground_class),
+        int(window_size),
+        bool(remove_outliers),
+        float(ror_radius) if ror_radius is not None else None,
+        int(ror_min_neighbors) if ror_min_neighbors is not None else None,
+        int(sor_k) if sor_k is not None else None,
+        float(sor_sigma) if sor_sigma is not None else None,
+        bool(compress),
+        bool(cog),
+        float(read_resolution) if read_resolution is not None else None,
+        int(max_level) if max_level is not None else None,
+    )
+    return int(cols), int(rows)
+
+
+def stream_remote_pointcloud_aoi(
+    source_url: str,
+    *,
+    bounds_wgs84: tuple[float, float, float, float] | Sequence[float] | None = None,
+    bounds_native: tuple[float, float, float, float] | Sequence[float] | None = None,
+    classifications: Sequence[int] | None = None,
+    return_kinds: str | Sequence[str] | None = None,
+    max_level: int | None = None,
+    resolution: float | None = None,
+    max_points: int | None = None,
+) -> PointCloudDict:
+    """Stream an AOI from a remote public HTTPS COPC or EPT point cloud dataset."""
+    return _lidar_rs.stream_remote_pointcloud_aoi(
+        str(source_url),
+        _normalize_bbox(bounds_wgs84),
+        _normalize_bbox(
+            bounds_native, names=("min_x", "min_y", "max_x", "max_y")
+        ),
+        [int(c) for c in classifications] if classifications is not None else None,
+        list((return_kinds,) if isinstance(return_kinds, str) else return_kinds)
+        if return_kinds is not None
+        else None,
+        int(max_level) if max_level is not None else None,
+        float(resolution) if resolution is not None else None,
+        int(max_points) if max_points is not None else None,
+    )
 
 
 def delineate_catchments(
@@ -1388,6 +1745,271 @@ def _check_aux_grid_alignment(
 
 
 @overload
+def dinf_flow_direction(
+    dem: PathLikeStr,
+    out_file: PathLikeStr,
+    *,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+    compress: bool = False,
+) -> str: ...
+
+
+@overload
+def dinf_flow_direction(
+    dem: PathLikeStr | SpatialArrayLike,
+    out_file: None = None,
+    *,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+    compress: bool = False,
+) -> NDArray[np.float64]: ...
+
+
+def dinf_flow_direction(
+    dem: PathLikeStr | SpatialArrayLike,
+    out_file: PathLikeStr | None = None,
+    *,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+    compress: bool = False,
+) -> str | NDArray[np.float64]:
+    """Compute Tarboton (1997) D-infinity flow direction (radians in `[0, 2*pi)`)."""
+    if isinstance(dem, (str, os.PathLike)):
+        if geotransform is not None or crs is not None or cell_size != 1.0:
+            raise ValueError(
+                "cell_size, geotransform, and crs overrides are not supported when dem is a file path"
+            )
+        out_str = _as_path_str(out_file) if out_file is not None else None
+        res = _lidar_rs.dinf_flow_direction_file(
+            _as_path_str(dem), out_str, no_data, bool(compress)
+        )
+        if out_str is not None:
+            return out_str
+        assert res is not None
+        return res
+    if out_file is not None:
+        raise ValueError("out_file is not supported for array input")
+    arr, gt, resolved_crs, nd = extract_spatial_array(
+        dem, geotransform=geotransform, crs=crs, no_data=no_data
+    )
+    return _lidar_rs.dinf_flow_direction_array(
+        arr, nd, float(cell_size), gt, resolved_crs
+    )
+
+
+@overload
+def dinf_flow_accumulation(
+    dem: PathLikeStr,
+    out_file: PathLikeStr,
+    *,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+    compress: bool = False,
+) -> str: ...
+
+
+@overload
+def dinf_flow_accumulation(
+    dem: PathLikeStr | SpatialArrayLike,
+    out_file: None = None,
+    *,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+    compress: bool = False,
+) -> NDArray[np.float64]: ...
+
+
+def dinf_flow_accumulation(
+    dem: PathLikeStr | SpatialArrayLike,
+    out_file: PathLikeStr | None = None,
+    *,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+    compress: bool = False,
+) -> str | NDArray[np.float64]:
+    """Compute Tarboton (1997) D-infinity flow accumulation (contributing area in cells)."""
+    if isinstance(dem, (str, os.PathLike)):
+        if geotransform is not None or crs is not None or cell_size != 1.0:
+            raise ValueError(
+                "cell_size, geotransform, and crs overrides are not supported when dem is a file path"
+            )
+        out_str = _as_path_str(out_file) if out_file is not None else None
+        res = _lidar_rs.dinf_flow_accumulation_file(
+            _as_path_str(dem), out_str, no_data, bool(compress)
+        )
+        if out_str is not None:
+            return out_str
+        assert res is not None
+        return res
+    if out_file is not None:
+        raise ValueError("out_file is not supported for array input")
+    arr, gt, resolved_crs, nd = extract_spatial_array(
+        dem, geotransform=geotransform, crs=crs, no_data=no_data
+    )
+    return _lidar_rs.dinf_flow_accumulation_array(
+        arr, nd, float(cell_size), gt, resolved_crs
+    )
+
+
+@overload
+def mfd_flow_accumulation(
+    dem: PathLikeStr,
+    exponent: float = 1.1,
+    *,
+    out_file: PathLikeStr,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+    compress: bool = False,
+) -> str: ...
+
+
+@overload
+def mfd_flow_accumulation(
+    dem: PathLikeStr | SpatialArrayLike,
+    exponent: float = 1.1,
+    out_file: None = None,
+    *,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+    compress: bool = False,
+) -> NDArray[np.float64]: ...
+
+
+def mfd_flow_accumulation(
+    dem: PathLikeStr | SpatialArrayLike,
+    exponent: float = 1.1,
+    out_file: PathLikeStr | None = None,
+    *,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+    compress: bool = False,
+) -> str | NDArray[np.float64]:
+    """Compute Multiple Flow Direction (MFD; Quinn 1991 / Freeman 1991) flow accumulation."""
+    if isinstance(dem, (str, os.PathLike)):
+        if geotransform is not None or crs is not None or cell_size != 1.0:
+            raise ValueError(
+                "cell_size, geotransform, and crs overrides are not supported when dem is a file path"
+            )
+        out_str = _as_path_str(out_file) if out_file is not None else None
+        res = _lidar_rs.mfd_flow_accumulation_file(
+            _as_path_str(dem), float(exponent), out_str, no_data, bool(compress)
+        )
+        if out_str is not None:
+            return out_str
+        assert res is not None
+        return res
+    if out_file is not None:
+        raise ValueError("out_file is not supported for array input")
+    arr, gt, resolved_crs, nd = extract_spatial_array(
+        dem, geotransform=geotransform, crs=crs, no_data=no_data
+    )
+    return _lidar_rs.mfd_flow_accumulation_array(
+        arr, float(exponent), nd, float(cell_size), gt, resolved_crs
+    )
+
+
+def burn_streams(
+    in_dem: PathLikeStr,
+    streams_vector: PathLikeStr,
+    out_dem: PathLikeStr,
+    *,
+    depth: float = 1.0,
+    width_cells: int = 0,
+    buffer_cells: int = 0,
+    smooth_drop: float = 0.0,
+    compress: bool = False,
+) -> int:
+    """Burn stream polylines into a DEM GeoTIFF with optional AGREE-style smooth buffer."""
+    return int(
+        _lidar_rs.burn_streams(
+            _as_path_str(in_dem),
+            _as_path_str(streams_vector),
+            _as_path_str(out_dem),
+            float(depth),
+            int(width_cells),
+            int(buffer_cells),
+            float(smooth_drop),
+            bool(compress),
+        )
+    )
+
+
+def delineate_depressions_merge_tree(
+    sink_arr: SpatialArrayLike,
+    dem_arr: SpatialArrayLike | None = None,
+    *,
+    min_size: int = 1000,
+    min_depth: float = 0.3,
+    topology: str = "D8",
+    dem_is_refined: bool = False,
+    max_rating_curve_points: int | None = None,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+) -> MergeTreeResult:
+    """Delineate exact bottom-up Union-Find merge-tree depressions and continuous rating curves."""
+    arr, gt, resolved_crs, nd = extract_spatial_array(
+        sink_arr, geotransform=geotransform, crs=crs, no_data=no_data
+    )
+    dem_np: NDArray[np.float64] | None = None
+    if dem_arr is not None:
+        dem_np, _dgt, _dcrs, _dnd = extract_spatial_array(dem_arr, no_data=nd)
+    return _lidar_rs.delineate_depressions_merge_tree(
+        arr,
+        dem_np,
+        int(min_size),
+        float(min_depth),
+        topology,
+        bool(dem_is_refined),
+        int(max_rating_curve_points) if max_rating_curve_points is not None else None,
+        nd,
+        float(cell_size),
+        gt,
+        resolved_crs,
+    )
+
+
+def attenuate_fsm_hydrograph(
+    hydrograph: Sequence[FsmHydrographPoint],
+    mean_travel_time_h: float,
+    *,
+    dt_h: float = 0.25,
+    num_reservoirs: int = 2,
+    tail_duration_h: float | None = None,
+) -> list[FsmHydrographPoint]:
+    """Apply volume-conserving Nash linear-reservoir travel-time attenuation to an FSM hydrograph."""
+    return list(
+        _lidar_rs.attenuate_fsm_hydrograph(
+            list(hydrograph),
+            float(mean_travel_time_h),
+            float(dt_h),
+            int(num_reservoirs),
+            float(tail_duration_h) if tail_duration_h is not None else None,
+        )
+    )
+
+
+@overload
 def compute_twi(
     dem: PathLikeStr,
     out_file: PathLikeStr,
@@ -1709,6 +2331,8 @@ def compute_rating_curves(
     cell_size: float = 1.0,
     geotransform: Geotransform | None = None,
     crs: str | None = None,
+    *,
+    delineation_method: str = "level_set",
 ) -> list[RatingCurve]:
     """Compute exact stage-area-volume rating curves for every depression in `sink_arr`.
 
@@ -1753,6 +2377,7 @@ def compute_rating_curves(
         float(cell_size),
         gt,
         resolved_crs,
+        delineation_method,
     )
 
 
@@ -1911,27 +2536,47 @@ def simulate_inundation_array(
     routing: str = "static",
     geotransform: Geotransform | None = None,
     crs: str | None = None,
+    *,
+    runoff_coeff_no_data: float | None = None,
+    infiltration_no_data: float | None = None,
+    antecedent_depth_no_data: float | None = None,
+    delineation_method: str = "level_set",
+    green_ampt: tuple[float, float, float] | None = None,
+    compute_hazard: bool = False,
+    recession_et_cm_h: float | None = None,
+    recession_seepage_cm_h: float | None = None,
+    recession_max_h: float = 168.0,
 ) -> InundationArrayResult:
     """Run the complete hydrology and inundation pipeline in memory on a 2D array, xarray DataArray, or rasterio dataset.
 
     Set `routing="fsm"` for dynamic Fill-Spill-Merge cascade mass-balance routing.
+    Per-forcing NoData sentinels (from spatial adapters or explicit keyword overrides) are
+    forwarded directly to Rust without mutating forcing values in Python.
     """
     arr, gt, resolved_crs, nd = extract_spatial_array(
         dem_arr, geotransform=geotransform, crs=crs, no_data=no_data
     )
-    rc = (
-        _extract_array_masking_nodata(runoff_coeff_arr, fill=0.0)
-        if runoff_coeff_arr is not None
-        else None
-    )
-    inf = (
-        _extract_array_masking_nodata(infiltration_arr)
-        if infiltration_arr is not None
-        else None
-    )
-    ant = (
-        _extract_array_masking_nodata(antecedent_depth_arr)
-        if antecedent_depth_arr is not None
+    rc: NDArray[np.float64] | None = None
+    rc_nd: float | None = runoff_coeff_no_data
+    if runoff_coeff_arr is not None:
+        rc, _rc_gt, _rc_crs, rc_nd = extract_spatial_array(
+            runoff_coeff_arr, no_data=runoff_coeff_no_data
+        )
+    inf: NDArray[np.float64] | None = None
+    inf_nd: float | None = infiltration_no_data
+    if infiltration_arr is not None:
+        inf, _inf_gt, _inf_crs, inf_nd = extract_spatial_array(
+            infiltration_arr, no_data=infiltration_no_data
+        )
+    ant: NDArray[np.float64] | None = None
+    ant_nd: float | None = antecedent_depth_no_data
+    if antecedent_depth_arr is not None:
+        ant, _ant_gt, _ant_crs, ant_nd = extract_spatial_array(
+            antecedent_depth_arr, no_data=antecedent_depth_no_data
+        )
+    ga_tuple = (
+        (float(green_ampt[0]), float(green_ampt[1]), float(green_ampt[2]))
+        if green_ampt is not None
         else None
     )
     return _lidar_rs.simulate_inundation_array(
@@ -1955,6 +2600,15 @@ def simulate_inundation_array(
         routing,
         gt,
         resolved_crs,
+        rc_nd,
+        inf_nd,
+        ant_nd,
+        delineation_method,
+        ga_tuple,
+        bool(compute_hazard),
+        float(recession_et_cm_h) if recession_et_cm_h is not None else None,
+        float(recession_seepage_cm_h) if recession_seepage_cm_h is not None else None,
+        float(recession_max_h),
     )
 
 
@@ -1982,6 +2636,8 @@ def run_pipeline(
     export_graph: bool = True,
     compress: bool = False,
     routing: str = "static",
+    *,
+    delineation_method: str = "level_set",
 ) -> PipelineResult:
     """Run the all-in-one in-memory hydrology pipeline from a raw DEM file to GeoPackage, CSV, GraphML, and rasters.
 
@@ -2015,6 +2671,7 @@ def run_pipeline(
         bool(export_graph),
         bool(compress),
         routing,
+        delineation_method,
     )
 
 
@@ -2028,6 +2685,11 @@ def delineate_depressions_tiled(
     min_depth: float = 0.3,
     interval: float = 0.3,
     use_f32: bool = True,
+    *,
+    delineation_method: str = "level_set",
+    write_rasters: bool = False,
+    write_gpkg: bool = False,
+    compress: bool = False,
 ) -> TiledDelineationResult:
     """Delineate nested depressions across large DEMs using parallel overlapping tiles.
 
@@ -2045,6 +2707,10 @@ def delineate_depressions_tiled(
         float(min_depth),
         float(interval),
         bool(use_f32),
+        delineation_method,
+        bool(write_rasters),
+        bool(write_gpkg),
+        bool(compress),
     )
 
 
@@ -2322,6 +2988,7 @@ __all__ = [
     "FlipDEM",
     "FlowPathRecord",
     "FsmBasinSummary",
+    "FsmHydrographPoint",
     "FsmMassBalance",
     "GaussianFilter",
     "Geotransform",
@@ -2334,6 +3001,8 @@ __all__ = [
     "InundationStepSummaryRecord",
     "MeanFilter",
     "MedianFilter",
+    "MergeTreeNode",
+    "MergeTreeResult",
     "NoaaAtlas14Table",
     "PathLikeStr",
     "PipelineResult",
@@ -2341,6 +3010,7 @@ __all__ = [
     "PointCloudDict",
     "RatingCurve",
     "RatingCurvePoint",
+    "RecessionCurvePoint",
     "SimulateInundation",
     "SinkDepressionRecord",
     "SpatialArrayLike",
@@ -2351,9 +3021,12 @@ __all__ = [
     "add_crs",
     "animate_inundation",
     "array_to_xarray",
+    "attenuate_fsm_hydrograph",
+    "bilateral_filter",
     "breach_depressions",
     "build_connectivity_graph",
     "burn_culverts",
+    "burn_streams",
     "classify_embankment_artifacts",
     "classify_ground",
     "clip_image",
@@ -2369,11 +3042,14 @@ __all__ = [
     "delineate_catchments",
     "delineate_depressions",
     "delineate_depressions_array",
+    "delineate_depressions_merge_tree",
     "delineate_depressions_tiled",
     "delineate_flow_paths",
     "delineate_mounts",
     "delineate_mounts_array",
     "depressions_to_geodataframe",
+    "dinf_flow_accumulation",
+    "dinf_flow_direction",
     "download_3dep_dem",
     "download_federal_data",
     "download_nhd",
@@ -2383,16 +3059,21 @@ __all__ = [
     "export_inundation_frames_png",
     "extract_sinks",
     "extract_sinks_array",
+    "feature_preserving_smoothing",
     "fetch_noaa_atlas14",
     "flip_dem",
     "gaussian_filter",
     "image_to_cog",
     "join_tables",
     "lidar_to_chm",
+    "lidar_to_chm_pit_free",
+    "lidar_to_chm_tiled",
     "lidar_to_dsm",
     "lidar_to_dtm",
+    "lidar_to_dtm_tiled",
     "mean_filter",
     "median_filter",
+    "mfd_flow_accumulation",
     "mosaic",
     "polygonize",
     "query_3dep_products",
@@ -2404,6 +3085,7 @@ __all__ = [
     "scs_type2_hyetograph",
     "simulate_inundation",
     "simulate_inundation_array",
+    "stream_remote_pointcloud_aoi",
     "synthesize_culverts",
     "write_lidar",
 ]

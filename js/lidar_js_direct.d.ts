@@ -11,6 +11,9 @@ export type BreachMode = "complete" | "selective" | "constrained";
 /** Supported hydrological routing modes for {@link simulateInundationAdvanced}. */
 export type RoutingMode = "static" | "fsm";
 
+/** Supported depression delineation algorithms for {@link simulateInundationAdvanced}. */
+export type DelineationMethod = "level_set" | "merge_tree";
+
 /** Parsed result of {@link rasterInfo}. */
 export interface RasterInfo {
   width: number;
@@ -318,6 +321,56 @@ export class SinksOutput {
   depthRgba(): Uint8Array;
 }
 
+/** Single point on an FSM watershed outlet hydrograph parsed from {@link InundationOutput.fsmHydrographJson}. */
+export interface FsmHydrographPoint {
+  time_h: number;
+  q_boundary_m3_s: number;
+  total_stored_m3: number;
+  connected_area_fraction: number;
+  spilling_basin_count: number;
+}
+
+/** Exact merge-tree node metadata parsed from {@link MergeTreeOutput.nodesJson}. */
+export interface MergeTreeNode {
+  id: number;
+  parent_id: number;
+  children_ids: number[];
+  level: number;
+  region_id: number;
+  min_elev: number;
+  saddle_elev: number;
+  pour_point_row: number;
+  pour_point_col: number;
+  pour_point_x: number;
+  pour_point_y: number;
+  count: number;
+  area: number;
+  volume: number;
+  max_depth: number;
+  avg_depth: number;
+  is_leaf: boolean;
+}
+
+/** Output container returned by {@link delineateDepressionsMergeTree}. Call `.free()` when done. */
+export class MergeTreeOutput {
+  free(): void;
+  readonly width: number;
+  readonly height: number;
+  readonly projection: string;
+  readonly maxLevel: number;
+  readonly numRegions: number;
+  boundsWgs84(): Float64Array | undefined;
+  depressionsJson(): string;
+  nodesJson(): string;
+  ratingCurvesJson(): string;
+  ratingCurvesCsv(): string;
+  depressionIdValues(): Int32Array;
+  idTif(): Uint8Array;
+  levelTif(): Uint8Array;
+  geojson(): string;
+  levelRgba(): Uint8Array;
+}
+
 /** Output container returned by {@link delineateDepressions} and {@link delineateMounts}. Call `.free()` when done. */
 export class DepressionsOutput {
   free(): void;
@@ -387,6 +440,8 @@ export class InundationOutput {
   fsmMassBalanceJson(): string;
   fsmBasinsJson(): string;
   fsmBasinsCsv(): string;
+  fsmHydrographJson(): string;
+  fsmHydrographCsv(): string;
   renderFramePng(
     step_index: number,
     show_scale_bar: boolean,
@@ -418,6 +473,64 @@ export function medianFilter(bytes: Uint8Array, filename: string, kernel_size: n
 
 /** Applies a 2D Gaussian filter to a GeoTIFF buffer and returns GeoTIFF bytes. */
 export function gaussianFilter(bytes: Uint8Array, filename: string, sigma: number): Uint8Array;
+
+/** Applies an edge-preserving 2D bilateral filter to a DEM GeoTIFF buffer. */
+export function bilateralFilter(
+  bytes: Uint8Array,
+  filename: string,
+  spatial_sigma: number,
+  range_sigma: number,
+): Uint8Array;
+
+/** Applies Lindsay et al. (2019) feature-preserving DEM smoothing to a GeoTIFF buffer. */
+export function featurePreservingSmoothing(
+  bytes: Uint8Array,
+  filename: string,
+  filter_size: number,
+  norm_diff: number,
+  num_iter: number,
+  max_z_change?: number | null,
+): Uint8Array;
+
+/** Computes Tarboton (1997) D-infinity flow direction (radians in `[0, 2*pi)`). */
+export function dinfFlowDirection(bytes: Uint8Array, filename: string): Uint8Array;
+
+/** Computes Tarboton (1997) D-infinity flow accumulation (contributing area in cells). */
+export function dinfFlowAccumulation(bytes: Uint8Array, filename: string): Uint8Array;
+
+/** Computes Multiple Flow Direction (MFD) flow accumulation. */
+export function mfdFlowAccumulation(
+  bytes: Uint8Array,
+  filename: string,
+  exponent: number,
+): Uint8Array;
+
+/** Computes the Topographic Wetness Index (`TWI = ln(a / tan(beta))`) from a DEM GeoTIFF buffer. */
+export function computeTwi(bytes: Uint8Array, filename: string): Uint8Array;
+
+/** Computes Height Above Nearest Drainage (HAND) using a D-infinity flow-accumulation threshold. */
+export function computeHand(
+  bytes: Uint8Array,
+  filename: string,
+  acc_threshold_cells: number,
+): Uint8Array;
+
+/** Applies Nash linear-reservoir travel-time attenuation to a JSON-serialized FSM hydrograph. */
+export function attenuateFsmHydrograph(
+  hydrograph_json: string,
+  mean_travel_time_h: number,
+  dt_h: number,
+  num_reservoirs: number,
+): string;
+
+/** Delineates exact bottom-up Union-Find merge-tree depressions and continuous rating curves. */
+export function delineateDepressionsMergeTree(
+  sink_bytes: Uint8Array,
+  filename: string,
+  min_size: number,
+  min_depth: number,
+  max_rating_curve_points?: number | null,
+): MergeTreeOutput;
 
 /** Flips a DEM upside-down (`-dem + max + delta`) and returns GeoTIFF bytes. */
 export function flipDem(bytes: Uint8Array, filename: string, delta: number): Uint8Array;
@@ -512,4 +625,5 @@ export function simulateInundationAdvanced(
   runoff_coeff: number,
   scs_type2_mm?: number | null,
   routing?: RoutingMode | string | null,
+  delineation_method?: DelineationMethod | string | null,
 ): InundationOutput;

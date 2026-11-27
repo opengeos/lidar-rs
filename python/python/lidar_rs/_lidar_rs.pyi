@@ -21,10 +21,12 @@ from ._types import (
     ExtractSinksArrayResult,
     ExtractSinksResult,
     FederalDataResult,
+    FsmHydrographPoint,
     Geotransform,
     GroundClassifyResult,
     InundationArrayResult,
     InundationResult,
+    MergeTreeResult,
     NoaaAtlas14Table,
     PipelineResult,
     PointCloudDict,
@@ -58,6 +60,44 @@ def gaussian_filter_array(
     sigma: float = 1.0,
     no_data: float | None = None,
 ) -> NDArray[np.float64]: ...
+
+def bilateral_filter_array(
+    arr: NDArray[np.float64],
+    spatial_sigma: float = 1.5,
+    range_sigma: float = 0.5,
+    no_data: float | None = None,
+) -> NDArray[np.float64]: ...
+
+def bilateral_filter_file(
+    in_dem: str,
+    spatial_sigma: float = 1.5,
+    range_sigma: float = 0.5,
+    out_file: str | None = None,
+    no_data: float | None = None,
+) -> NDArray[np.float64] | None: ...
+
+def feature_preserving_smoothing_array(
+    arr: NDArray[np.float64],
+    filter_size: int = 11,
+    norm_diff: float = 15.0,
+    num_iter: int = 3,
+    max_z_change: float | None = None,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+) -> NDArray[np.float64]: ...
+
+def feature_preserving_smoothing_file(
+    in_dem: str,
+    filter_size: int = 11,
+    norm_diff: float = 15.0,
+    num_iter: int = 3,
+    max_z_change: float | None = None,
+    out_file: str | None = None,
+    no_data: float | None = None,
+    compress: bool = False,
+) -> NDArray[np.float64] | None: ...
 
 def flip_dem_array(
     arr: NDArray[np.float64],
@@ -146,6 +186,10 @@ def delineate_depressions_tiled(
     min_depth: float = 0.3,
     interval: float = 0.3,
     use_f32: bool = True,
+    delineation_method: str = "level_set",
+    write_rasters: bool = False,
+    write_gpkg: bool = False,
+    compress: bool = False,
 ) -> TiledDelineationResult: ...
 
 def delineate_mounts(
@@ -207,6 +251,86 @@ def compute_twi_file(
     compress: bool = False,
 ) -> NDArray[np.float64] | None: ...
 
+def dinf_flow_direction_array(
+    dem_arr: NDArray[np.float64],
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+) -> NDArray[np.float64]: ...
+
+def dinf_flow_direction_file(
+    in_dem: str,
+    out_file: str | None = None,
+    no_data: float | None = None,
+    compress: bool = False,
+) -> NDArray[np.float64] | None: ...
+
+def dinf_flow_accumulation_array(
+    dem_arr: NDArray[np.float64],
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+) -> NDArray[np.float64]: ...
+
+def dinf_flow_accumulation_file(
+    in_dem: str,
+    out_file: str | None = None,
+    no_data: float | None = None,
+    compress: bool = False,
+) -> NDArray[np.float64] | None: ...
+
+def mfd_flow_accumulation_array(
+    dem_arr: NDArray[np.float64],
+    exponent: float = 1.1,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+) -> NDArray[np.float64]: ...
+
+def mfd_flow_accumulation_file(
+    in_dem: str,
+    exponent: float = 1.1,
+    out_file: str | None = None,
+    no_data: float | None = None,
+    compress: bool = False,
+) -> NDArray[np.float64] | None: ...
+
+def burn_streams(
+    in_dem: str,
+    streams_vector: str,
+    out_dem: str,
+    depth: float = 1.0,
+    width_cells: int = 0,
+    buffer_cells: int = 0,
+    smooth_drop: float = 0.0,
+    compress: bool = False,
+) -> int: ...
+
+def delineate_depressions_merge_tree(
+    sink_arr: NDArray[np.float64],
+    dem_arr: NDArray[np.float64] | None = None,
+    min_size: int = 1000,
+    min_depth: float = 0.3,
+    topology: str = "D8",
+    dem_is_refined: bool = False,
+    max_rating_curve_points: int | None = None,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+) -> MergeTreeResult: ...
+
+def attenuate_fsm_hydrograph(
+    hydrograph: Sequence[FsmHydrographPoint],
+    mean_travel_time_h: float,
+    dt_h: float = 0.25,
+    num_reservoirs: int = 2,
+    tail_duration_h: float | None = None,
+) -> list[FsmHydrographPoint]: ...
+
 def compute_hand_array(
     dem_arr: NDArray[np.float64],
     stream_mask: NDArray[np.uint8] | None = None,
@@ -267,6 +391,7 @@ def compute_rating_curves(
     cell_size: float = 1.0,
     geotransform: Geotransform | None = None,
     crs: str | None = None,
+    delineation_method: str = "level_set",
 ) -> list[RatingCurve]: ...
 
 def build_connectivity_graph_from_dem(
@@ -355,6 +480,15 @@ def simulate_inundation_array(
     routing: str = "static",
     geotransform: Geotransform | None = None,
     crs: str | None = None,
+    runoff_coeff_no_data: float | None = None,
+    infiltration_no_data: float | None = None,
+    antecedent_depth_no_data: float | None = None,
+    delineation_method: str = "level_set",
+    green_ampt: tuple[float, float, float] | None = None,
+    compute_hazard: bool = False,
+    recession_et_cm_h: float | None = None,
+    recession_seepage_cm_h: float | None = None,
+    recession_max_h: float = 168.0,
 ) -> InundationArrayResult: ...
 
 def run_pipeline(
@@ -381,6 +515,7 @@ def run_pipeline(
     export_graph: bool = True,
     compress: bool = False,
     routing: str = "static",
+    delineation_method: str = "level_set",
 ) -> PipelineResult: ...
 
 def breach_depressions(
@@ -551,7 +686,13 @@ def polygonize(
     field_name: str = "id",
 ) -> int: ...
 
-def mosaic(inputs: Sequence[str], output: str) -> None: ...
+def mosaic(
+    inputs: Sequence[str],
+    output: str,
+    resampling: str = "nearest",
+    compress: bool = False,
+    cog: bool = False,
+) -> None: ...
 
 def reproject_image(
     input: str,
@@ -559,6 +700,8 @@ def reproject_image(
     dst_crs: str = "EPSG:4326",
     resampling: str = "nearest",
     resolution: tuple[float, float] | None = None,
+    compress: bool = False,
+    cog: bool = False,
 ) -> None: ...
 
 def resample(
@@ -566,9 +709,17 @@ def resample(
     output: str,
     resolution: float,
     resampling: str = "bilinear",
+    compress: bool = False,
+    cog: bool = False,
 ) -> None: ...
 
-def clip_image(input: str, mask: str, output: str) -> None: ...
+def clip_image(
+    input: str,
+    mask: str,
+    output: str,
+    compress: bool = False,
+    cog: bool = False,
+) -> None: ...
 
 def image_to_cog(
     input: str,
@@ -690,6 +841,8 @@ def lidar_to_dsm(
     window_size: int = 0,
     classifications: Sequence[int] | None = None,
     return_kinds: Sequence[str] | None = None,
+    compress: bool = False,
+    cog: bool = False,
 ) -> tuple[int, int]: ...
 
 def lidar_to_dtm(
@@ -716,6 +869,13 @@ def lidar_to_dtm(
     window_radius: float | None = None,
     elevation_threshold: float | None = None,
     elevation_scalar: float | None = None,
+    remove_outliers: bool = False,
+    ror_radius: float | None = None,
+    ror_min_neighbors: int | None = None,
+    sor_k: int | None = None,
+    sor_sigma: float | None = None,
+    compress: bool = False,
+    cog: bool = False,
 ) -> tuple[int, int]: ...
 
 def lidar_to_chm(
@@ -740,4 +900,81 @@ def lidar_to_chm(
     window_radius: float | None = None,
     elevation_threshold: float | None = None,
     elevation_scalar: float | None = None,
+    remove_outliers: bool = False,
+    ror_radius: float | None = None,
+    ror_min_neighbors: int | None = None,
+    sor_k: int | None = None,
+    sor_sigma: float | None = None,
+    compress: bool = False,
+    cog: bool = False,
 ) -> tuple[int, int]: ...
+
+def lidar_to_chm_pit_free(
+    in_lidar: str,
+    out_chm: str,
+    resolution: float = 1.0,
+    ground_method: str = "csf",
+    ground_class: int = 2,
+    height_thresholds: Sequence[float] | None = None,
+    max_triangle_edge: float | None = None,
+    remove_outliers: bool = False,
+    ror_radius: float | None = None,
+    ror_min_neighbors: int | None = None,
+    sor_k: int | None = None,
+    sor_sigma: float | None = None,
+    compress: bool = False,
+    cog: bool = False,
+) -> tuple[int, int]: ...
+
+def lidar_to_dtm_tiled(
+    in_lidar: str,
+    out_dtm: str,
+    tile_size: float = 500.0,
+    overlap: float = 25.0,
+    resolution: float = 1.0,
+    ground_method: str = "csf",
+    ground_class: int = 2,
+    method: str = "linear",
+    stat: str = "idw",
+    window_size: int = 5,
+    remove_outliers: bool = False,
+    ror_radius: float | None = None,
+    ror_min_neighbors: int | None = None,
+    sor_k: int | None = None,
+    sor_sigma: float | None = None,
+    compress: bool = False,
+    cog: bool = False,
+    read_resolution: float | None = None,
+    max_level: int | None = None,
+) -> tuple[int, int]: ...
+
+def lidar_to_chm_tiled(
+    in_lidar: str,
+    out_chm: str,
+    tile_size: float = 500.0,
+    overlap: float = 25.0,
+    resolution: float = 1.0,
+    ground_method: str = "csf",
+    ground_class: int = 2,
+    window_size: int = 5,
+    remove_outliers: bool = False,
+    ror_radius: float | None = None,
+    ror_min_neighbors: int | None = None,
+    sor_k: int | None = None,
+    sor_sigma: float | None = None,
+    compress: bool = False,
+    cog: bool = False,
+    read_resolution: float | None = None,
+    max_level: int | None = None,
+) -> tuple[int, int]: ...
+
+def stream_remote_pointcloud_aoi(
+    source_url: str,
+    bounds_wgs84: tuple[float, float, float, float] | None = None,
+    bounds_native: tuple[float, float, float, float] | None = None,
+    classifications: Sequence[int] | None = None,
+    return_kinds: Sequence[str] | None = None,
+    max_level: int | None = None,
+    resolution: float | None = None,
+    max_points: int | None = None,
+) -> PointCloudDict: ...

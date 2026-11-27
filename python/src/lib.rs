@@ -11,18 +11,21 @@ use terrio::crs::SpatialRef;
 
 use lidar::pointcloud::{
     CsfOptions, Dimension, GridMethod, GridStat, GroundClassifyOptions, GroundFilterMethod,
-    LidarReadOptions, LidarToDsmOptions, LidarToDtmOptions, PmfOptions, PointCloud,
-    PointWriteOptions, ReturnKind, SmrfOptions, Values,
+    LidarReadOptions, LidarToDsmOptions, LidarToDtmOptions, PitFreeChmOptions, PmfOptions,
+    PointCloud, PointWriteOptions, ReturnKind, SmrfOptions, TiledPointCloudOptions, Values,
 };
 use lidar::{
     AnimateInundationOptions, Array2D, ArtifactClassifierOptions, Bbox, BreachMode, BreachOptions,
-    BurnCulvertsOptions, CatchmentHierarchyOptions, CatchmentHierarchyRecord, ConnectivityGraph,
-    DelineateCatchmentsOptions, DelineateFlowPathsOptions, DelineateOptions, DemProduct,
-    DownloadOptions, EmbankmentArtifactCandidate, ExtractSinksOptions, FederalBundleOptions,
-    FsmBasinSummary, FsmMassBalance, GraphEdge, GraphNode, HillshadeOptions, InMemoryDepressions,
-    InundationForcing, NestedDepression, NoaaAtlas14Table, Region, RoutingMode, RunPipelineOptions,
-    SimulateInundationOptions, SinkDepression, SpillFlowPath, SynthesizeCulvertsOptions,
-    TiledDelineationOptions, TnmProductItem, Topology, WbdLevel,
+    BurnCulvertsOptions, BurnStreamsOptions, CatchmentHierarchyOptions, CatchmentHierarchyRecord,
+    ConnectivityGraph, DelineateCatchmentsOptions, DelineateFlowPathsOptions, DelineateOptions,
+    DelineationMethod, DemProduct, DownloadOptions, EmbankmentArtifactCandidate, EptStreamOptions,
+    ExtractSinksOptions, FeaturePreservingOptions, FederalBundleOptions, FsmBasinSummary,
+    FsmForcing, FsmHydrographPoint, FsmMassBalance, GraphEdge, GraphNode, GreenAmptParams,
+    HillshadeOptions, InMemoryDepressions, InundationForcing, MergeTreeNode, MergeTreeOptions,
+    NestedDepression, NoaaAtlas14Table, RasterOutputOptions, RecessionCurvePoint, RecessionOptions,
+    Region, RoutingMode, RunPipelineOptions, SimulateInundationOptions, SinkDepression,
+    SpillAttenuationOptions, SpillFlowPath, SynthesizeCulvertsOptions, TiledDelineationOptions,
+    TiledOutputOptions, TnmProductItem, Topology, WbdLevel,
 };
 
 fn to_py_err(e: lidar::Error) -> PyErr {
@@ -40,6 +43,76 @@ fn parse_topology(topo: &str) -> PyResult<Topology> {
         "d4" => Ok(Topology::D4),
         other => Err(PyValueError::new_err(format!("Unknown topology: {other}"))),
     }
+}
+
+fn parse_delineation_method(method: &str) -> PyResult<DelineationMethod> {
+    match method.trim().to_ascii_lowercase().as_str() {
+        "level_set" | "level-set" | "levelset" => Ok(DelineationMethod::LevelSet),
+        "merge_tree" | "merge-tree" | "mergetree" => Ok(DelineationMethod::MergeTree),
+        other => Err(PyValueError::new_err(format!(
+            "Unknown delineation_method '{other}'; expected 'level_set' or 'merge_tree'"
+        ))),
+    }
+}
+
+fn fsm_hydrograph_point_to_dict<'py>(
+    py: Python<'py>,
+    p: &FsmHydrographPoint,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("time_h", p.time_h)?;
+    d.set_item("q_boundary_m3_s", p.q_boundary_m3_s)?;
+    d.set_item("total_stored_m3", p.total_stored_m3)?;
+    d.set_item("connected_area_fraction", p.connected_area_fraction)?;
+    d.set_item("spilling_basin_count", p.spilling_basin_count)?;
+    Ok(d)
+}
+
+fn dict_to_fsm_hydrograph_point(d: &Bound<'_, PyDict>) -> PyResult<FsmHydrographPoint> {
+    Ok(FsmHydrographPoint {
+        time_h: dict_get_or(d, "time_h", 0.0f64)?,
+        q_boundary_m3_s: dict_get_or(d, "q_boundary_m3_s", 0.0f64)?,
+        total_stored_m3: dict_get_or(d, "total_stored_m3", 0.0f64)?,
+        connected_area_fraction: dict_get_or(d, "connected_area_fraction", 0.0f64)?,
+        spilling_basin_count: dict_get_or(d, "spilling_basin_count", 0usize)?,
+    })
+}
+
+fn recession_curve_point_to_dict<'py>(
+    py: Python<'py>,
+    p: &RecessionCurvePoint,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("time_h", p.time_h)?;
+    d.set_item("stored_vol_m3", p.stored_vol_m3)?;
+    d.set_item("inundated_area_m2", p.inundated_area_m2)?;
+    d.set_item("wet_basin_count", p.wet_basin_count)?;
+    Ok(d)
+}
+
+fn merge_tree_node_to_dict<'py>(
+    py: Python<'py>,
+    n: &MergeTreeNode,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("id", n.id)?;
+    d.set_item("parent_id", n.parent_id)?;
+    d.set_item("children_ids", n.children_ids.clone())?;
+    d.set_item("level", n.level)?;
+    d.set_item("region_id", n.region_id)?;
+    d.set_item("min_elev", n.min_elev)?;
+    d.set_item("saddle_elev", n.saddle_elev)?;
+    d.set_item("pour_point_row", n.pour_point_row)?;
+    d.set_item("pour_point_col", n.pour_point_col)?;
+    d.set_item("pour_point_x", n.pour_point_x)?;
+    d.set_item("pour_point_y", n.pour_point_y)?;
+    d.set_item("count", n.count)?;
+    d.set_item("area", n.area)?;
+    d.set_item("volume", n.volume)?;
+    d.set_item("max_depth", n.max_depth)?;
+    d.set_item("avg_depth", n.avg_depth)?;
+    d.set_item("is_leaf", n.is_leaf)?;
+    Ok(d)
 }
 
 fn from_py_array2(arr: PyReadonlyArray2<'_, f64>, no_data: Option<f64>) -> PyResult<Array2D<f64>> {
@@ -888,6 +961,127 @@ fn gaussian_filter_array<'py>(
 }
 
 #[pyfunction]
+#[pyo3(signature = (arr, spatial_sigma=1.5, range_sigma=0.5, no_data=None))]
+fn bilateral_filter_array<'py>(
+    py: Python<'py>,
+    arr: PyReadonlyArray2<'_, f64>,
+    spatial_sigma: f64,
+    range_sigma: f64,
+    no_data: Option<f64>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let dem = from_py_array2(arr, no_data)?;
+    let out = py
+        .detach(move || lidar::bilateral_filter(&dem, spatial_sigma, range_sigma))
+        .map_err(to_py_err)?;
+    to_py_array2(py, out)
+}
+
+#[pyfunction]
+#[pyo3(signature = (in_dem, spatial_sigma=1.5, range_sigma=0.5, out_file=None, no_data=None))]
+fn bilateral_filter_file<'py>(
+    py: Python<'py>,
+    in_dem: &str,
+    spatial_sigma: f64,
+    range_sigma: f64,
+    out_file: Option<&str>,
+    no_data: Option<f64>,
+) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
+    let in_dem = in_dem.to_string();
+    let out_file = out_file.map(str::to_string);
+    let out = py
+        .detach(move || -> lidar::Result<Option<Array2D<f64>>> {
+            let has_out = out_file.is_some();
+            let arr = if no_data.is_none() {
+                lidar::bilateral_filter_file(
+                    &in_dem,
+                    spatial_sigma,
+                    range_sigma,
+                    out_file.as_deref().map(Path::new),
+                )?
+            } else {
+                let hist = format!("bilateral_filter({spatial_sigma},{range_sigma})");
+                run_file_filter(&in_dem, out_file.as_deref(), no_data, &hist, |dem| {
+                    lidar::bilateral_filter(dem, spatial_sigma, range_sigma)
+                })?
+            };
+            Ok(if has_out { None } else { Some(arr) })
+        })
+        .map_err(to_py_err)?;
+    out.map(|a| to_py_array2(py, a)).transpose()
+}
+
+#[pyfunction]
+#[pyo3(signature = (arr, filter_size=11, norm_diff=15.0, num_iter=3, max_z_change=None, no_data=None, cell_size=1.0, geotransform=None, crs=None))]
+#[allow(clippy::too_many_arguments)]
+fn feature_preserving_smoothing_array<'py>(
+    py: Python<'py>,
+    arr: PyReadonlyArray2<'_, f64>,
+    filter_size: usize,
+    norm_diff: f64,
+    num_iter: usize,
+    max_z_change: Option<f64>,
+    no_data: Option<f64>,
+    cell_size: f64,
+    geotransform: Option<[f64; 6]>,
+    crs: Option<&str>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let dem = from_py_array2_spatial(arr, no_data, cell_size, geotransform, crs)?;
+    let opts = FeaturePreservingOptions {
+        filter_size,
+        norm_diff_deg: norm_diff,
+        num_iter,
+        max_z_change,
+        compress: false,
+    };
+    let out = py
+        .detach(move || lidar::feature_preserving_smoothing(&dem, &opts))
+        .map_err(to_py_err)?;
+    to_py_array2(py, out)
+}
+
+#[pyfunction]
+#[pyo3(signature = (in_dem, filter_size=11, norm_diff=15.0, num_iter=3, max_z_change=None, out_file=None, no_data=None, compress=false))]
+#[allow(clippy::too_many_arguments)]
+fn feature_preserving_smoothing_file<'py>(
+    py: Python<'py>,
+    in_dem: &str,
+    filter_size: usize,
+    norm_diff: f64,
+    num_iter: usize,
+    max_z_change: Option<f64>,
+    out_file: Option<&str>,
+    no_data: Option<f64>,
+    compress: bool,
+) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
+    let in_dem = in_dem.to_string();
+    let out_file = out_file.map(str::to_string);
+    let opts = FeaturePreservingOptions {
+        filter_size,
+        norm_diff_deg: norm_diff,
+        num_iter,
+        max_z_change,
+        compress,
+    };
+    let out = py
+        .detach(move || -> lidar::Result<Option<Array2D<f64>>> {
+            let has_out = out_file.is_some();
+            let mut dem = lidar::load_raster::<f64>(&in_dem, None)?;
+            if let Some(nd) = no_data {
+                dem.set_no_data(nd);
+            }
+            let res = lidar::feature_preserving_smoothing(&dem, &opts)?;
+            if let Some(out_path) = out_file.as_deref().map(Path::new) {
+                save_raster_to_path(&res, out_path, "feature_preserving_smoothing", compress)?;
+                Ok(None)
+            } else {
+                Ok(if has_out { None } else { Some(res) })
+            }
+        })
+        .map_err(to_py_err)?;
+    out.map(|a| to_py_array2(py, a)).transpose()
+}
+
+#[pyfunction]
 #[pyo3(signature = (arr, delta=100.0, no_data=None))]
 fn flip_dem_array<'py>(
     py: Python<'py>,
@@ -1213,14 +1407,25 @@ fn polygonize(
 }
 
 #[pyfunction]
-fn mosaic(py: Python<'_>, inputs: Vec<String>, output: &str) -> PyResult<()> {
+#[pyo3(signature = (inputs, output, resampling="nearest", compress=false, cog=false))]
+fn mosaic(
+    py: Python<'_>,
+    inputs: Vec<String>,
+    output: &str,
+    resampling: &str,
+    compress: bool,
+    cog: bool,
+) -> PyResult<()> {
+    let r = lidar::parse_resampling(resampling).map_err(to_py_err)?;
     let output = output.to_string();
-    py.detach(move || lidar::mosaic(&inputs, &output))
+    let out_opts = RasterOutputOptions { compress, cog };
+    py.detach(move || lidar::mosaic_with_options(&inputs, &output, r, &out_opts))
         .map_err(to_py_err)
 }
 
 #[pyfunction]
-#[pyo3(signature = (input, output, dst_crs="EPSG:4326", resampling="nearest", resolution=None))]
+#[pyo3(signature = (input, output, dst_crs="EPSG:4326", resampling="nearest", resolution=None, compress=false, cog=false))]
+#[allow(clippy::too_many_arguments)]
 fn reproject_image(
     py: Python<'_>,
     input: &str,
@@ -1228,37 +1433,54 @@ fn reproject_image(
     dst_crs: &str,
     resampling: &str,
     resolution: Option<(f64, f64)>,
+    compress: bool,
+    cog: bool,
 ) -> PyResult<()> {
     let r = lidar::parse_resampling(resampling).map_err(to_py_err)?;
     let input = input.to_string();
     let output = output.to_string();
     let dst_crs = dst_crs.to_string();
-    py.detach(move || lidar::reproject_image(&input, &output, &dst_crs, r, resolution))
-        .map_err(to_py_err)
+    let out_opts = RasterOutputOptions { compress, cog };
+    py.detach(move || {
+        lidar::reproject_image_with_options(&input, &output, &dst_crs, r, resolution, &out_opts)
+    })
+    .map_err(to_py_err)
 }
 
 #[pyfunction]
-#[pyo3(signature = (input, output, resolution, resampling="bilinear"))]
+#[pyo3(signature = (input, output, resolution, resampling="bilinear", compress=false, cog=false))]
 fn resample(
     py: Python<'_>,
     input: &str,
     output: &str,
     resolution: f64,
     resampling: &str,
+    compress: bool,
+    cog: bool,
 ) -> PyResult<()> {
     let r = lidar::parse_resampling(resampling).map_err(to_py_err)?;
     let input = input.to_string();
     let output = output.to_string();
-    py.detach(move || lidar::resample(&input, &output, resolution, r))
+    let out_opts = RasterOutputOptions { compress, cog };
+    py.detach(move || lidar::resample_with_options(&input, &output, resolution, r, &out_opts))
         .map_err(to_py_err)
 }
 
 #[pyfunction]
-fn clip_image(py: Python<'_>, input: &str, mask: &str, output: &str) -> PyResult<()> {
+#[pyo3(signature = (input, mask, output, compress=false, cog=false))]
+fn clip_image(
+    py: Python<'_>,
+    input: &str,
+    mask: &str,
+    output: &str,
+    compress: bool,
+    cog: bool,
+) -> PyResult<()> {
     let input = input.to_string();
     let mask = mask.to_string();
     let output = output.to_string();
-    py.detach(move || lidar::clip_image(&input, &mask, &output))
+    let out_opts = RasterOutputOptions { compress, cog };
+    py.detach(move || lidar::clip_image_with_options(&input, &mask, &output, &out_opts))
         .map_err(to_py_err)
 }
 
@@ -1336,7 +1558,7 @@ fn convert_lidar(
 }
 
 #[pyfunction]
-#[pyo3(signature = (in_lidar, out_dsm, resolution=1.0, radius=None, min_z=None, max_z=None, stat="max", method="statistics", window_size=0, classifications=None, return_kinds=None))]
+#[pyo3(signature = (in_lidar, out_dsm, resolution=1.0, radius=None, min_z=None, max_z=None, stat="max", method="statistics", window_size=0, classifications=None, return_kinds=None, compress=false, cog=false))]
 #[allow(clippy::too_many_arguments)]
 fn lidar_to_dsm(
     py: Python<'_>,
@@ -1351,6 +1573,8 @@ fn lidar_to_dsm(
     window_size: usize,
     classifications: Option<Vec<u8>>,
     return_kinds: Option<Vec<String>>,
+    compress: bool,
+    cog: bool,
 ) -> PyResult<(usize, usize)> {
     let opts = LidarToDsmOptions {
         resolution,
@@ -1362,6 +1586,8 @@ fn lidar_to_dsm(
         stat: GridStat::parse(stat).map_err(|e| to_py_err(e.into()))?,
         method: GridMethod::parse(method).map_err(|e| to_py_err(e.into()))?,
         window_size,
+        compress,
+        cog,
         ..Default::default()
     };
     let in_lidar = in_lidar.to_string();
@@ -1371,7 +1597,7 @@ fn lidar_to_dsm(
 }
 
 #[pyfunction]
-#[pyo3(signature = (in_lidar, out_dtm, resolution=1.0, ground_method="csf", ground_class=2, radius=None, method="linear", stat="idw", window_size=5, cloth_resolution=None, rigidness=None, class_threshold=None, slope_smooth=None, iterations=None, time_step=None, max_window_size=None, initial_distance=None, max_distance=None, cell_size=None, slope=None, window_radius=None, elevation_threshold=None, elevation_scalar=None))]
+#[pyo3(signature = (in_lidar, out_dtm, resolution=1.0, ground_method="csf", ground_class=2, radius=None, method="linear", stat="idw", window_size=5, cloth_resolution=None, rigidness=None, class_threshold=None, slope_smooth=None, iterations=None, time_step=None, max_window_size=None, initial_distance=None, max_distance=None, cell_size=None, slope=None, window_radius=None, elevation_threshold=None, elevation_scalar=None, remove_outliers=false, ror_radius=None, ror_min_neighbors=None, sor_k=None, sor_sigma=None, compress=false, cog=false))]
 #[allow(clippy::too_many_arguments)]
 fn lidar_to_dtm(
     py: Python<'_>,
@@ -1398,6 +1624,13 @@ fn lidar_to_dtm(
     window_radius: Option<f64>,
     elevation_threshold: Option<f64>,
     elevation_scalar: Option<f64>,
+    remove_outliers: bool,
+    ror_radius: Option<f64>,
+    ror_min_neighbors: Option<usize>,
+    sor_k: Option<usize>,
+    sor_sigma: Option<f64>,
+    compress: bool,
+    cog: bool,
 ) -> PyResult<(usize, usize)> {
     let (csf, pmf, smrf) = build_ground_options(
         ground_class,
@@ -1416,6 +1649,7 @@ fn lidar_to_dtm(
         elevation_threshold,
         elevation_scalar,
     )?;
+    let defaults = LidarToDtmOptions::default();
     let opts = LidarToDtmOptions {
         resolution,
         ground_method: parse_ground_method(ground_method)?,
@@ -1424,10 +1658,17 @@ fn lidar_to_dtm(
         method: GridMethod::parse(method).map_err(|e| to_py_err(e.into()))?,
         stat: GridStat::parse(stat).map_err(|e| to_py_err(e.into()))?,
         window_size,
+        remove_outliers,
+        ror_radius,
+        ror_min_neighbors: ror_min_neighbors.unwrap_or(defaults.ror_min_neighbors),
+        sor_k,
+        sor_sigma: sor_sigma.unwrap_or(defaults.sor_sigma),
+        compress,
+        cog,
         csf,
         pmf,
         smrf,
-        ..Default::default()
+        ..defaults
     };
     let in_lidar = in_lidar.to_string();
     let out_dtm = out_dtm.to_string();
@@ -1436,7 +1677,7 @@ fn lidar_to_dtm(
 }
 
 #[pyfunction]
-#[pyo3(signature = (in_lidar, out_chm, resolution=1.0, ground_method="csf", ground_class=2, radius=None, window_size=5, cloth_resolution=None, rigidness=None, class_threshold=None, slope_smooth=None, iterations=None, time_step=None, max_window_size=None, initial_distance=None, max_distance=None, cell_size=None, slope=None, window_radius=None, elevation_threshold=None, elevation_scalar=None))]
+#[pyo3(signature = (in_lidar, out_chm, resolution=1.0, ground_method="csf", ground_class=2, radius=None, window_size=5, cloth_resolution=None, rigidness=None, class_threshold=None, slope_smooth=None, iterations=None, time_step=None, max_window_size=None, initial_distance=None, max_distance=None, cell_size=None, slope=None, window_radius=None, elevation_threshold=None, elevation_scalar=None, remove_outliers=false, ror_radius=None, ror_min_neighbors=None, sor_k=None, sor_sigma=None, compress=false, cog=false))]
 #[allow(clippy::too_many_arguments)]
 fn lidar_to_chm(
     py: Python<'_>,
@@ -1461,6 +1702,13 @@ fn lidar_to_chm(
     window_radius: Option<f64>,
     elevation_threshold: Option<f64>,
     elevation_scalar: Option<f64>,
+    remove_outliers: bool,
+    ror_radius: Option<f64>,
+    ror_min_neighbors: Option<usize>,
+    sor_k: Option<usize>,
+    sor_sigma: Option<f64>,
+    compress: bool,
+    cog: bool,
 ) -> PyResult<(usize, usize)> {
     let (csf, pmf, smrf) = build_ground_options(
         ground_class,
@@ -1479,21 +1727,220 @@ fn lidar_to_chm(
         elevation_threshold,
         elevation_scalar,
     )?;
+    let defaults = LidarToDtmOptions::default();
     let opts = LidarToDtmOptions {
         resolution,
         ground_method: parse_ground_method(ground_method)?,
         ground_class,
         radius,
         window_size,
+        remove_outliers,
+        ror_radius,
+        ror_min_neighbors: ror_min_neighbors.unwrap_or(defaults.ror_min_neighbors),
+        sor_k,
+        sor_sigma: sor_sigma.unwrap_or(defaults.sor_sigma),
+        compress,
+        cog,
         csf,
         pmf,
         smrf,
-        ..Default::default()
+        ..defaults
     };
     let in_lidar = in_lidar.to_string();
     let out_chm = out_chm.to_string();
     py.detach(move || lidar::lidar_to_chm(&in_lidar, &out_chm, &opts))
         .map_err(to_py_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (in_lidar, out_chm, resolution=1.0, ground_method="csf", ground_class=2, height_thresholds=None, max_triangle_edge=None, remove_outliers=false, ror_radius=None, ror_min_neighbors=None, sor_k=None, sor_sigma=None, compress=false, cog=false))]
+#[allow(clippy::too_many_arguments)]
+fn lidar_to_chm_pit_free(
+    py: Python<'_>,
+    in_lidar: &str,
+    out_chm: &str,
+    resolution: f64,
+    ground_method: &str,
+    ground_class: u8,
+    height_thresholds: Option<Vec<f64>>,
+    max_triangle_edge: Option<f64>,
+    remove_outliers: bool,
+    ror_radius: Option<f64>,
+    ror_min_neighbors: Option<usize>,
+    sor_k: Option<usize>,
+    sor_sigma: Option<f64>,
+    compress: bool,
+    cog: bool,
+) -> PyResult<(usize, usize)> {
+    let defaults = LidarToDtmOptions::default();
+    let dtm = LidarToDtmOptions {
+        resolution,
+        ground_method: parse_ground_method(ground_method)?,
+        ground_class,
+        remove_outliers,
+        ror_radius,
+        ror_min_neighbors: ror_min_neighbors.unwrap_or(defaults.ror_min_neighbors),
+        sor_k,
+        sor_sigma: sor_sigma.unwrap_or(defaults.sor_sigma),
+        ..defaults
+    };
+    let mut opts = PitFreeChmOptions {
+        resolution,
+        max_triangle_edge,
+        dtm,
+        compress,
+        cog,
+        ..Default::default()
+    };
+    if let Some(th) = height_thresholds {
+        opts.height_thresholds = th;
+    }
+    let in_lidar = in_lidar.to_string();
+    let out_chm = out_chm.to_string();
+    let chm = py
+        .detach(move || lidar::lidar_to_chm_pit_free(&in_lidar, &out_chm, &opts))
+        .map_err(to_py_err)?;
+    Ok((chm.width(), chm.height()))
+}
+
+#[pyfunction]
+#[pyo3(signature = (in_lidar, out_dtm, tile_size=500.0, overlap=25.0, resolution=1.0, ground_method="csf", ground_class=2, method="linear", stat="idw", window_size=5, remove_outliers=false, ror_radius=None, ror_min_neighbors=None, sor_k=None, sor_sigma=None, compress=false, cog=false, read_resolution=None, max_level=None))]
+#[allow(clippy::too_many_arguments)]
+fn lidar_to_dtm_tiled(
+    py: Python<'_>,
+    in_lidar: &str,
+    out_dtm: &str,
+    tile_size: f64,
+    overlap: f64,
+    resolution: f64,
+    ground_method: &str,
+    ground_class: u8,
+    method: &str,
+    stat: &str,
+    window_size: usize,
+    remove_outliers: bool,
+    ror_radius: Option<f64>,
+    ror_min_neighbors: Option<usize>,
+    sor_k: Option<usize>,
+    sor_sigma: Option<f64>,
+    compress: bool,
+    cog: bool,
+    read_resolution: Option<f64>,
+    max_level: Option<u32>,
+) -> PyResult<(usize, usize)> {
+    let defaults = LidarToDtmOptions::default();
+    let dtm = LidarToDtmOptions {
+        resolution,
+        ground_method: parse_ground_method(ground_method)?,
+        ground_class,
+        method: GridMethod::parse(method).map_err(|e| to_py_err(e.into()))?,
+        stat: GridStat::parse(stat).map_err(|e| to_py_err(e.into()))?,
+        window_size,
+        remove_outliers,
+        ror_radius,
+        ror_min_neighbors: ror_min_neighbors.unwrap_or(defaults.ror_min_neighbors),
+        sor_k,
+        sor_sigma: sor_sigma.unwrap_or(defaults.sor_sigma),
+        compress,
+        cog,
+        ..defaults
+    };
+    let opts = TiledPointCloudOptions {
+        tile_size,
+        overlap,
+        dtm,
+        read_resolution,
+        max_level,
+    };
+    let in_lidar = in_lidar.to_string();
+    let out_dtm = out_dtm.to_string();
+    py.detach(move || lidar::lidar_to_dtm_tiled(&in_lidar, &out_dtm, &opts))
+        .map_err(to_py_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (in_lidar, out_chm, tile_size=500.0, overlap=25.0, resolution=1.0, ground_method="csf", ground_class=2, window_size=5, remove_outliers=false, ror_radius=None, ror_min_neighbors=None, sor_k=None, sor_sigma=None, compress=false, cog=false, read_resolution=None, max_level=None))]
+#[allow(clippy::too_many_arguments)]
+fn lidar_to_chm_tiled(
+    py: Python<'_>,
+    in_lidar: &str,
+    out_chm: &str,
+    tile_size: f64,
+    overlap: f64,
+    resolution: f64,
+    ground_method: &str,
+    ground_class: u8,
+    window_size: usize,
+    remove_outliers: bool,
+    ror_radius: Option<f64>,
+    ror_min_neighbors: Option<usize>,
+    sor_k: Option<usize>,
+    sor_sigma: Option<f64>,
+    compress: bool,
+    cog: bool,
+    read_resolution: Option<f64>,
+    max_level: Option<u32>,
+) -> PyResult<(usize, usize)> {
+    let defaults = LidarToDtmOptions::default();
+    let dtm = LidarToDtmOptions {
+        resolution,
+        ground_method: parse_ground_method(ground_method)?,
+        ground_class,
+        window_size,
+        remove_outliers,
+        ror_radius,
+        ror_min_neighbors: ror_min_neighbors.unwrap_or(defaults.ror_min_neighbors),
+        sor_k,
+        sor_sigma: sor_sigma.unwrap_or(defaults.sor_sigma),
+        compress,
+        cog,
+        ..defaults
+    };
+    let opts = TiledPointCloudOptions {
+        tile_size,
+        overlap,
+        dtm,
+        read_resolution,
+        max_level,
+    };
+    let in_lidar = in_lidar.to_string();
+    let out_chm = out_chm.to_string();
+    py.detach(move || lidar::lidar_to_chm_tiled(&in_lidar, &out_chm, &opts))
+        .map_err(to_py_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (source_url, bounds_wgs84=None, bounds_native=None, classifications=None, return_kinds=None, max_level=None, resolution=None, max_points=None))]
+#[allow(clippy::too_many_arguments)]
+fn stream_remote_pointcloud_aoi<'py>(
+    py: Python<'py>,
+    source_url: &str,
+    bounds_wgs84: Option<(f64, f64, f64, f64)>,
+    bounds_native: Option<[f64; 4]>,
+    classifications: Option<Vec<u8>>,
+    return_kinds: Option<Vec<String>>,
+    max_level: Option<u32>,
+    resolution: Option<f64>,
+    max_points: Option<usize>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let bb_wgs84 = match bounds_wgs84 {
+        Some((x0, y0, x1, y1)) => Some(Bbox::new(x0, y0, x1, y1).map_err(to_py_err)?),
+        None => None,
+    };
+    let opts = EptStreamOptions {
+        source_url: source_url.to_string(),
+        bounds_wgs84: bb_wgs84,
+        bounds_native,
+        classifications: classifications.unwrap_or_default(),
+        return_kinds: parse_return_kinds_py(return_kinds)?.unwrap_or_default(),
+        max_level,
+        resolution,
+        max_points,
+    };
+    let cloud = py
+        .detach(move || lidar::stream_remote_pointcloud_aoi(&opts))
+        .map_err(to_py_err)?;
+    point_cloud_to_dict(py, &cloud)
 }
 
 #[pyfunction]
@@ -2430,6 +2877,295 @@ fn compute_twi_array<'py>(
 }
 
 #[pyfunction]
+#[pyo3(signature = (dem_arr, no_data=None, cell_size=1.0, geotransform=None, crs=None))]
+fn dinf_flow_direction_array<'py>(
+    py: Python<'py>,
+    dem_arr: PyReadonlyArray2<'_, f64>,
+    no_data: Option<f64>,
+    cell_size: f64,
+    geotransform: Option<[f64; 6]>,
+    crs: Option<&str>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let dem = from_py_array2_spatial(dem_arr, no_data, cell_size, geotransform, crs)?;
+    let out = py
+        .detach(move || lidar::dinf_flow_direction(&dem))
+        .map_err(to_py_err)?;
+    to_py_array2(py, out)
+}
+
+#[pyfunction]
+#[pyo3(signature = (in_dem, out_file=None, no_data=None, compress=false))]
+fn dinf_flow_direction_file<'py>(
+    py: Python<'py>,
+    in_dem: &str,
+    out_file: Option<&str>,
+    no_data: Option<f64>,
+    compress: bool,
+) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
+    if let Some(out) = out_file {
+        ensure_no_output_collision(in_dem, out, "in_dem")?;
+    }
+    let in_dem = in_dem.to_string();
+    let out_file = out_file.map(str::to_string);
+    let out = py
+        .detach(move || -> lidar::Result<Option<Array2D<f64>>> {
+            let mut dem = lidar::load_raster::<f64>(&in_dem, None)?;
+            if let Some(nd) = no_data {
+                dem.set_no_data(nd);
+            }
+            let res = lidar::dinf_flow_direction(&dem)?;
+            if let Some(out_path) = out_file.as_deref().map(Path::new) {
+                save_raster_to_path(&res, out_path, "dinf_flow_direction", compress)?;
+                Ok(None)
+            } else {
+                Ok(Some(res))
+            }
+        })
+        .map_err(to_py_err)?;
+    out.map(|a| to_py_array2(py, a)).transpose()
+}
+
+#[pyfunction]
+#[pyo3(signature = (dem_arr, no_data=None, cell_size=1.0, geotransform=None, crs=None))]
+fn dinf_flow_accumulation_array<'py>(
+    py: Python<'py>,
+    dem_arr: PyReadonlyArray2<'_, f64>,
+    no_data: Option<f64>,
+    cell_size: f64,
+    geotransform: Option<[f64; 6]>,
+    crs: Option<&str>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let dem = from_py_array2_spatial(dem_arr, no_data, cell_size, geotransform, crs)?;
+    let out = py
+        .detach(move || lidar::dinf_flow_accumulation(&dem))
+        .map_err(to_py_err)?;
+    to_py_array2(py, out)
+}
+
+#[pyfunction]
+#[pyo3(signature = (in_dem, out_file=None, no_data=None, compress=false))]
+fn dinf_flow_accumulation_file<'py>(
+    py: Python<'py>,
+    in_dem: &str,
+    out_file: Option<&str>,
+    no_data: Option<f64>,
+    compress: bool,
+) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
+    if let Some(out) = out_file {
+        ensure_no_output_collision(in_dem, out, "in_dem")?;
+    }
+    let in_dem = in_dem.to_string();
+    let out_file = out_file.map(str::to_string);
+    let out = py
+        .detach(move || -> lidar::Result<Option<Array2D<f64>>> {
+            let mut dem = lidar::load_raster::<f64>(&in_dem, None)?;
+            if let Some(nd) = no_data {
+                dem.set_no_data(nd);
+            }
+            let res = lidar::dinf_flow_accumulation(&dem)?;
+            if let Some(out_path) = out_file.as_deref().map(Path::new) {
+                save_raster_to_path(&res, out_path, "dinf_flow_accumulation", compress)?;
+                Ok(None)
+            } else {
+                Ok(Some(res))
+            }
+        })
+        .map_err(to_py_err)?;
+    out.map(|a| to_py_array2(py, a)).transpose()
+}
+
+#[pyfunction]
+#[pyo3(signature = (dem_arr, exponent=1.1, no_data=None, cell_size=1.0, geotransform=None, crs=None))]
+fn mfd_flow_accumulation_array<'py>(
+    py: Python<'py>,
+    dem_arr: PyReadonlyArray2<'_, f64>,
+    exponent: f64,
+    no_data: Option<f64>,
+    cell_size: f64,
+    geotransform: Option<[f64; 6]>,
+    crs: Option<&str>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let dem = from_py_array2_spatial(dem_arr, no_data, cell_size, geotransform, crs)?;
+    let out = py
+        .detach(move || lidar::mfd_flow_accumulation(&dem, exponent))
+        .map_err(to_py_err)?;
+    to_py_array2(py, out)
+}
+
+#[pyfunction]
+#[pyo3(signature = (in_dem, exponent=1.1, out_file=None, no_data=None, compress=false))]
+fn mfd_flow_accumulation_file<'py>(
+    py: Python<'py>,
+    in_dem: &str,
+    exponent: f64,
+    out_file: Option<&str>,
+    no_data: Option<f64>,
+    compress: bool,
+) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
+    if let Some(out) = out_file {
+        ensure_no_output_collision(in_dem, out, "in_dem")?;
+    }
+    let in_dem = in_dem.to_string();
+    let out_file = out_file.map(str::to_string);
+    let out = py
+        .detach(move || -> lidar::Result<Option<Array2D<f64>>> {
+            let mut dem = lidar::load_raster::<f64>(&in_dem, None)?;
+            if let Some(nd) = no_data {
+                dem.set_no_data(nd);
+            }
+            let res = lidar::mfd_flow_accumulation(&dem, exponent)?;
+            if let Some(out_path) = out_file.as_deref().map(Path::new) {
+                save_raster_to_path(&res, out_path, "mfd_flow_accumulation", compress)?;
+                Ok(None)
+            } else {
+                Ok(Some(res))
+            }
+        })
+        .map_err(to_py_err)?;
+    out.map(|a| to_py_array2(py, a)).transpose()
+}
+
+#[pyfunction]
+#[pyo3(signature = (in_dem, streams_vector, out_dem, depth=1.0, width_cells=0, buffer_cells=0, smooth_drop=0.0, compress=false))]
+#[allow(clippy::too_many_arguments)]
+fn burn_streams(
+    py: Python<'_>,
+    in_dem: &str,
+    streams_vector: &str,
+    out_dem: &str,
+    depth: f64,
+    width_cells: usize,
+    buffer_cells: usize,
+    smooth_drop: f64,
+    compress: bool,
+) -> PyResult<usize> {
+    let in_dem = in_dem.to_string();
+    let streams_vector = streams_vector.to_string();
+    let out_dem = out_dem.to_string();
+    let opts = BurnStreamsOptions {
+        burn_depth: depth,
+        stream_width_cells: width_cells,
+        buffer_cells,
+        smooth_drop,
+        compress,
+    };
+    let (_burned, count) = py
+        .detach(move || lidar::burn_streams_file(&in_dem, &streams_vector, &out_dem, &opts))
+        .map_err(to_py_err)?;
+    Ok(count)
+}
+
+#[pyfunction]
+#[pyo3(signature = (sink_arr, dem_arr=None, min_size=1000, min_depth=0.3, topology="D8", dem_is_refined=false, max_rating_curve_points=None, no_data=None, cell_size=1.0, geotransform=None, crs=None))]
+#[allow(clippy::too_many_arguments)]
+fn delineate_depressions_merge_tree<'py>(
+    py: Python<'py>,
+    sink_arr: PyReadonlyArray2<'_, f64>,
+    dem_arr: Option<PyReadonlyArray2<'_, f64>>,
+    min_size: usize,
+    min_depth: f64,
+    topology: &str,
+    dem_is_refined: bool,
+    max_rating_curve_points: Option<usize>,
+    no_data: Option<f64>,
+    cell_size: f64,
+    geotransform: Option<[f64; 6]>,
+    crs: Option<&str>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let topo = parse_topology(topology)?;
+    let sink = from_py_array2_spatial(sink_arr, no_data, cell_size, geotransform, crs)?;
+    let out_gt = sink.geotransform;
+    let out_crs = crs_to_py(&sink.projection);
+    let dem = dem_arr
+        .map(|a| from_py_array2_spatial(a, no_data, cell_size, Some(out_gt), crs))
+        .transpose()?;
+    let opts = MergeTreeOptions {
+        min_size,
+        min_depth,
+        topology: topo,
+        dem_is_refined,
+        max_rating_curve_points,
+    };
+    let mt = py
+        .detach(move || match dem.as_ref() {
+            Some(d) => lidar::delineate_depressions_merge_tree_with_dem_in_memory(&sink, d, &opts),
+            None => lidar::delineate_depressions_merge_tree_in_memory(&sink, &opts),
+        })
+        .map_err(to_py_err)?;
+
+    let dict = PyDict::new(py);
+    dict.set_item(
+        "depression_id",
+        to_py_array2_i32(py, mt.depressions.depression_id)?,
+    )?;
+    dict.set_item(
+        "depression_level",
+        to_py_array2_i32(py, mt.depressions.depression_level)?,
+    )?;
+    dict.set_item("max_level", mt.depressions.max_level)?;
+    dict.set_item("num_regions", mt.depressions.num_regions)?;
+    let py_deps = PyList::empty(py);
+    for d in &mt.depressions.depressions {
+        py_deps.append(nested_dep_to_dict(py, d)?)?;
+    }
+    dict.set_item("depressions", py_deps)?;
+    let py_nodes = PyList::empty(py);
+    for n in &mt.nodes {
+        py_nodes.append(merge_tree_node_to_dict(py, n)?)?;
+    }
+    dict.set_item("nodes", py_nodes)?;
+    let py_rc = PyList::empty(py);
+    for pt in &mt.rating_curves {
+        let d = PyDict::new(py);
+        d.set_item("dep_id", pt.dep_id)?;
+        d.set_item("level", pt.level)?;
+        d.set_item("region_id", pt.region_id)?;
+        d.set_item("stage", pt.stage)?;
+        d.set_item("depth", pt.depth)?;
+        d.set_item("area", pt.area)?;
+        d.set_item("volume", pt.volume)?;
+        py_rc.append(d)?;
+    }
+    dict.set_item("rating_curves", py_rc)?;
+    dict.set_item("geotransform", geotransform_to_py(out_gt))?;
+    dict.set_item("crs", out_crs)?;
+    Ok(dict)
+}
+
+#[pyfunction]
+#[pyo3(signature = (hydrograph, mean_travel_time_h, dt_h=0.25, num_reservoirs=2, tail_duration_h=None))]
+fn attenuate_fsm_hydrograph<'py>(
+    py: Python<'py>,
+    hydrograph: Bound<'py, PyList>,
+    mean_travel_time_h: f64,
+    dt_h: f64,
+    num_reservoirs: usize,
+    tail_duration_h: Option<f64>,
+) -> PyResult<Bound<'py, PyList>> {
+    let mut pts = Vec::with_capacity(hydrograph.len());
+    for item in hydrograph.iter() {
+        let d = item
+            .cast::<PyDict>()
+            .map_err(|_| PyValueError::new_err("each hydrograph entry must be a dict"))?;
+        pts.push(dict_to_fsm_hydrograph_point(d)?);
+    }
+    let opts = SpillAttenuationOptions {
+        mean_travel_time_h,
+        dt_h,
+        num_reservoirs,
+        tail_duration_h,
+    };
+    let out = py
+        .detach(move || lidar::attenuate_fsm_hydrograph_with_options(&pts, &opts))
+        .map_err(to_py_err)?;
+    let py_out = PyList::empty(py);
+    for p in &out {
+        py_out.append(fsm_hydrograph_point_to_dict(py, p)?)?;
+    }
+    Ok(py_out)
+}
+
+#[pyfunction]
 #[pyo3(signature = (in_dem, out_file=None, flow_acc=None, no_data=None, compress=false))]
 fn compute_twi_file<'py>(
     py: Python<'py>,
@@ -2703,7 +3439,7 @@ fn classify_embankment_artifacts_file<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (sink_arr, depression_id=None, depression_level=None, depressions=None, interval=0.3, min_size=1000, min_depth=0.3, no_data=None, cell_size=1.0, geotransform=None, crs=None))]
+#[pyo3(signature = (sink_arr, depression_id=None, depression_level=None, depressions=None, interval=0.3, min_size=1000, min_depth=0.3, no_data=None, cell_size=1.0, geotransform=None, crs=None, delineation_method="level_set"))]
 #[allow(clippy::too_many_arguments)]
 fn compute_rating_curves<'py>(
     py: Python<'py>,
@@ -2718,7 +3454,9 @@ fn compute_rating_curves<'py>(
     cell_size: f64,
     geotransform: Option<[f64; 6]>,
     crs: Option<&str>,
+    delineation_method: &str,
 ) -> PyResult<Bound<'py, PyList>> {
+    let delin_method = parse_delineation_method(delineation_method)?;
     let sink = from_py_array2_spatial(sink_arr, no_data, cell_size, geotransform, crs)?;
     let gt = sink.geotransform;
     let proj = sink.projection.clone();
@@ -2766,13 +3504,28 @@ fn compute_rating_curves<'py>(
 
     let points = py
         .detach(move || -> lidar::Result<Vec<lidar::RatingCurvePoint>> {
-            let deps = match precomputed {
-                Some(d) => d,
-                None => {
-                    lidar::delineate_depressions_in_memory(&sink, min_size, min_depth, interval)?
+            if let Some(d) = precomputed {
+                return lidar::compute_rating_curves(&sink, &d, interval);
+            }
+            match delin_method {
+                DelineationMethod::LevelSet => {
+                    let deps = lidar::delineate_depressions_in_memory(
+                        &sink, min_size, min_depth, interval,
+                    )?;
+                    lidar::compute_rating_curves(&sink, &deps, interval)
                 }
-            };
-            lidar::compute_rating_curves(&sink, &deps, interval)
+                DelineationMethod::MergeTree => {
+                    let mt = lidar::delineate_depressions_merge_tree_in_memory(
+                        &sink,
+                        &MergeTreeOptions {
+                            min_size,
+                            min_depth,
+                            ..Default::default()
+                        },
+                    )?;
+                    Ok(mt.rating_curves)
+                }
+            }
         })
         .map_err(to_py_err)?;
 
@@ -2977,7 +3730,7 @@ fn build_connectivity_graph_from_parts<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (dem_arr, kernel_size=3, min_size=1000, min_depth=0.3, interval=0.3, rain_intensity_cm_h=5.0, rain_duration_h=50.0, time_step_h=1.0, runoff_coeff_arr=None, infiltration_arr=None, antecedent_depth_arr=None, hyetograph=None, breach_max_depth=None, no_data=None, cell_size=1.0, routing="static", geotransform=None, crs=None))]
+#[pyo3(signature = (dem_arr, kernel_size=3, min_size=1000, min_depth=0.3, interval=0.3, rain_intensity_cm_h=5.0, rain_duration_h=50.0, time_step_h=1.0, runoff_coeff_arr=None, infiltration_arr=None, antecedent_depth_arr=None, hyetograph=None, breach_max_depth=None, no_data=None, cell_size=1.0, routing="static", geotransform=None, crs=None, runoff_coeff_no_data=None, infiltration_no_data=None, antecedent_depth_no_data=None, delineation_method="level_set", green_ampt=None, compute_hazard=false, recession_et_cm_h=None, recession_seepage_cm_h=None, recession_max_h=168.0))]
 #[allow(clippy::too_many_arguments)]
 fn simulate_inundation_array<'py>(
     py: Python<'py>,
@@ -2999,19 +3752,43 @@ fn simulate_inundation_array<'py>(
     routing: &str,
     geotransform: Option<[f64; 6]>,
     crs: Option<&str>,
+    runoff_coeff_no_data: Option<f64>,
+    infiltration_no_data: Option<f64>,
+    antecedent_depth_no_data: Option<f64>,
+    delineation_method: &str,
+    green_ampt: Option<(f64, f64, f64)>,
+    compute_hazard: bool,
+    recession_et_cm_h: Option<f64>,
+    recession_seepage_cm_h: Option<f64>,
+    recession_max_h: f64,
 ) -> PyResult<Bound<'py, PyDict>> {
     let routing_mode = parse_routing_mode(routing)?;
+    let delin_method = parse_delineation_method(delineation_method)?;
+    let ga_params = green_ampt.map(|(ks_cm_h, psi_cm, delta_theta)| GreenAmptParams {
+        ks_cm_h,
+        psi_cm,
+        delta_theta,
+    });
+    if ga_params.is_some() && routing_mode != RoutingMode::FillSpillMerge {
+        return Err(PyValueError::new_err("green_ampt requires routing='fsm'"));
+    }
+    let want_recession = recession_et_cm_h.is_some() || recession_seepage_cm_h.is_some();
+    if (compute_hazard || want_recession) && routing_mode != RoutingMode::FillSpillMerge {
+        return Err(PyValueError::new_err(
+            "compute_hazard and recession_* parameters require routing='fsm'",
+        ));
+    }
     let raw_dem = from_py_array2_spatial(dem_arr, no_data, cell_size, geotransform, crs)?;
     let out_gt = raw_dem.geotransform;
     let out_crs = crs_to_py(&raw_dem.projection);
     let rc = runoff_coeff_arr
-        .map(|a| from_py_array2_spatial(a, None, cell_size, Some(out_gt), crs))
+        .map(|a| from_py_array2_spatial(a, runoff_coeff_no_data, cell_size, Some(out_gt), crs))
         .transpose()?;
     let inf = infiltration_arr
-        .map(|a| from_py_array2_spatial(a, None, cell_size, Some(out_gt), crs))
+        .map(|a| from_py_array2_spatial(a, infiltration_no_data, cell_size, Some(out_gt), crs))
         .transpose()?;
     let ant = antecedent_depth_arr
-        .map(|a| from_py_array2_spatial(a, None, cell_size, Some(out_gt), crs))
+        .map(|a| from_py_array2_spatial(a, antecedent_depth_no_data, cell_size, Some(out_gt), crs))
         .transpose()?;
 
     let sim_opts = SimulateInundationOptions {
@@ -3024,8 +3801,8 @@ fn simulate_inundation_array<'py>(
         compress: false,
     };
 
-    let pipe = py
-        .detach(move || {
+    let (pipe, hazard_opt, recession_opt) = py
+        .detach(move || -> lidar::Result<_> {
             let breach = breach_max_depth.map(|md| BreachOptions {
                 mode: BreachMode::Selective,
                 max_depth: Some(md),
@@ -3034,7 +3811,8 @@ fn simulate_inundation_array<'py>(
             let opts = lidar::InMemoryFullPipelineOptions {
                 kernel_size,
                 breach,
-                simulation: sim_opts,
+                delineation_method: delin_method,
+                simulation: sim_opts.clone(),
                 routing: routing_mode,
                 forcing: InundationForcing {
                     runoff_coeff: rc.as_ref(),
@@ -3044,9 +3822,65 @@ fn simulate_inundation_array<'py>(
                 },
                 scalar_runoff_coeff: 1.0,
                 stream_vector: None,
-                ..Default::default()
             };
-            lidar::run_full_pipeline_in_memory(&raw_dem, &opts)
+            let mut pipe = lidar::run_full_pipeline_in_memory(&raw_dem, &opts)?;
+
+            // When Green-Ampt, hazard rasters, or post-storm recession are requested in FSM mode,
+            // run the full FSM simulation (with optional Green-Ampt) to obtain the complete
+            // `FsmSimulationResult` for post-processing.
+            let mut hazard_out = None;
+            let mut recession_out = None;
+            if routing_mode == RoutingMode::FillSpillMerge
+                && (ga_params.is_some() || compute_hazard || want_recession)
+            {
+                let fsm_forcing = FsmForcing {
+                    base: InundationForcing {
+                        runoff_coeff: rc.as_ref(),
+                        infiltration_cm_h: inf.as_ref(),
+                        antecedent_depth: ant.as_ref(),
+                        hyetograph: hyetograph.as_deref(),
+                    },
+                    green_ampt: ga_params,
+                    ..Default::default()
+                };
+                let fsm_res = lidar::simulate_fill_spill_merge_with_green_ampt_in_memory(
+                    &pipe.sinks.dem_refined,
+                    &pipe.sinks.sink,
+                    &pipe.depressions,
+                    &sim_opts,
+                    &fsm_forcing,
+                )?;
+                if compute_hazard {
+                    hazard_out = Some(lidar::compute_fsm_hazard_rasters(
+                        &pipe.sinks.dem_refined,
+                        &fsm_res.fill_time,
+                        &pipe.depressions,
+                        &fsm_res,
+                        sim_opts.rain_duration_h,
+                    )?);
+                }
+                if want_recession {
+                    let rec_defaults = RecessionOptions::default();
+                    let rec_opts = RecessionOptions {
+                        et_cm_h: recession_et_cm_h.unwrap_or(rec_defaults.et_cm_h),
+                        seepage_cm_h: recession_seepage_cm_h.unwrap_or(rec_defaults.seepage_cm_h),
+                        max_recession_h: recession_max_h,
+                    };
+                    recession_out = Some(lidar::simulate_post_storm_recession(
+                        &pipe.sinks.dem_refined,
+                        &pipe.depressions,
+                        &fsm_res,
+                        &rec_opts,
+                    )?);
+                }
+                if ga_params.is_some() {
+                    pipe.fill_time = fsm_res.fill_time;
+                    pipe.fsm_mass_balance = Some(fsm_res.mass_balance);
+                    pipe.fsm_basins = Some(fsm_res.basins);
+                    pipe.fsm_hydrograph = Some(fsm_res.hydrograph);
+                }
+            }
+            Ok((pipe, hazard_out, recession_out))
         })
         .map_err(to_py_err)?;
 
@@ -3140,13 +3974,40 @@ fn simulate_inundation_array<'py>(
     } else {
         dict.set_item("fsm_basins", py.None())?;
     }
+    if let Some(ref hydro) = pipe.fsm_hydrograph {
+        let py_hydro = PyList::empty(py);
+        for pt in hydro {
+            py_hydro.append(fsm_hydrograph_point_to_dict(py, pt)?)?;
+        }
+        dict.set_item("fsm_hydrograph", py_hydro)?;
+    } else {
+        dict.set_item("fsm_hydrograph", py.None())?;
+    }
+    if let Some(hz) = hazard_opt {
+        dict.set_item("fsm_hazard_max_depth", to_py_array2(py, hz.max_depth)?)?;
+        dict.set_item("fsm_hazard_wse", to_py_array2(py, hz.wse)?)?;
+        dict.set_item("fsm_hazard_duration_h", to_py_array2(py, hz.duration_h)?)?;
+    }
+    if let Some(rec) = recession_opt {
+        dict.set_item(
+            "fsm_recession_drain_time_h",
+            to_py_array2(py, rec.drain_time_h)?,
+        )?;
+        dict.set_item("fsm_recession_remaining_m3", rec.remaining_volume_m3)?;
+        dict.set_item("fsm_recession_drained_m3", rec.total_drained_m3)?;
+        let py_curve = PyList::empty(py);
+        for pt in &rec.curve {
+            py_curve.append(recession_curve_point_to_dict(py, pt)?)?;
+        }
+        dict.set_item("fsm_recession_curve", py_curve)?;
+    }
     dict.set_item("geotransform", geotransform_to_py(out_gt))?;
     dict.set_item("crs", out_crs)?;
     Ok(dict)
 }
 
 #[pyfunction]
-#[pyo3(signature = (in_dem, out_dir, kernel_size=3, min_size=1000, min_depth=0.3, interval=0.3, rain_intensity_cm_h=5.0, rain_duration_h=50.0, time_step_h=1.0, breach_max_depth=None, breach_max_length=40, culverts_vector=None, runoff_coeff_path=None, infiltration_path=None, antecedent_depth_path=None, hyetograph=None, stream_vector=None, use_f32=false, save_rasters=true, export_vectors=true, export_graph=true, compress=false, routing="static"))]
+#[pyo3(signature = (in_dem, out_dir, kernel_size=3, min_size=1000, min_depth=0.3, interval=0.3, rain_intensity_cm_h=5.0, rain_duration_h=50.0, time_step_h=1.0, breach_max_depth=None, breach_max_length=40, culverts_vector=None, runoff_coeff_path=None, infiltration_path=None, antecedent_depth_path=None, hyetograph=None, stream_vector=None, use_f32=false, save_rasters=true, export_vectors=true, export_graph=true, compress=false, routing="static", delineation_method="level_set"))]
 #[allow(clippy::too_many_arguments)]
 fn run_pipeline<'py>(
     py: Python<'py>,
@@ -3173,8 +4034,10 @@ fn run_pipeline<'py>(
     export_graph: bool,
     compress: bool,
     routing: &str,
+    delineation_method: &str,
 ) -> PyResult<Bound<'py, PyDict>> {
     let routing_mode = parse_routing_mode(routing)?;
+    let delin_method = parse_delineation_method(delineation_method)?;
     let in_dem = in_dem.to_string();
     let out_dir = out_dir.to_string();
     let breach = breach_max_depth.map(|md| BreachOptions {
@@ -3187,6 +4050,7 @@ fn run_pipeline<'py>(
         kernel_size,
         breach,
         culverts_vector: culverts_vector.map(PathBuf::from),
+        delineation_method: delin_method,
         simulation: SimulateInundationOptions {
             min_size,
             min_depth,
@@ -3274,7 +4138,7 @@ fn run_pipeline<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (in_dem, out_dir, tile_size=2048, overlap=128, kernel_size=3, min_size=1000, min_depth=0.3, interval=0.3, use_f32=true))]
+#[pyo3(signature = (in_dem, out_dir, tile_size=2048, overlap=128, kernel_size=3, min_size=1000, min_depth=0.3, interval=0.3, use_f32=true, delineation_method="level_set", write_rasters=false, write_gpkg=false, compress=false))]
 #[allow(clippy::too_many_arguments)]
 fn delineate_depressions_tiled<'py>(
     py: Python<'py>,
@@ -3287,7 +4151,12 @@ fn delineate_depressions_tiled<'py>(
     min_depth: f64,
     interval: f64,
     use_f32: bool,
+    delineation_method: &str,
+    write_rasters: bool,
+    write_gpkg: bool,
+    compress: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
+    let delin_method = parse_delineation_method(delineation_method)?;
     let in_dem = in_dem.to_string();
     let out_dir = out_dir.to_string();
     let opts = TiledDelineationOptions {
@@ -3298,10 +4167,19 @@ fn delineate_depressions_tiled<'py>(
         min_depth,
         interval,
         use_f32,
+        delineation_method: delin_method,
         ..Default::default()
     };
+    let out_opts = TiledOutputOptions {
+        write_rasters,
+        write_gpkg,
+        breach: None,
+        compress,
+    };
     let res = py
-        .detach(move || lidar::delineate_depressions_tiled(&in_dem, &out_dir, &opts))
+        .detach(move || {
+            lidar::delineate_depressions_tiled_with_outputs(&in_dem, &out_dir, &opts, &out_opts)
+        })
         .map_err(to_py_err)?;
 
     let dict = PyDict::new(py);
@@ -3706,6 +4584,10 @@ fn _lidar_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mean_filter_array, m)?)?;
     m.add_function(wrap_pyfunction!(median_filter_array, m)?)?;
     m.add_function(wrap_pyfunction!(gaussian_filter_array, m)?)?;
+    m.add_function(wrap_pyfunction!(bilateral_filter_array, m)?)?;
+    m.add_function(wrap_pyfunction!(bilateral_filter_file, m)?)?;
+    m.add_function(wrap_pyfunction!(feature_preserving_smoothing_array, m)?)?;
+    m.add_function(wrap_pyfunction!(feature_preserving_smoothing_file, m)?)?;
     m.add_function(wrap_pyfunction!(flip_dem_array, m)?)?;
     m.add_function(wrap_pyfunction!(mean_filter_file, m)?)?;
     m.add_function(wrap_pyfunction!(median_filter_file, m)?)?;
@@ -3722,6 +4604,15 @@ fn _lidar_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_hillshade_file, m)?)?;
     m.add_function(wrap_pyfunction!(compute_twi_array, m)?)?;
     m.add_function(wrap_pyfunction!(compute_twi_file, m)?)?;
+    m.add_function(wrap_pyfunction!(dinf_flow_direction_array, m)?)?;
+    m.add_function(wrap_pyfunction!(dinf_flow_direction_file, m)?)?;
+    m.add_function(wrap_pyfunction!(dinf_flow_accumulation_array, m)?)?;
+    m.add_function(wrap_pyfunction!(dinf_flow_accumulation_file, m)?)?;
+    m.add_function(wrap_pyfunction!(mfd_flow_accumulation_array, m)?)?;
+    m.add_function(wrap_pyfunction!(mfd_flow_accumulation_file, m)?)?;
+    m.add_function(wrap_pyfunction!(burn_streams, m)?)?;
+    m.add_function(wrap_pyfunction!(delineate_depressions_merge_tree, m)?)?;
+    m.add_function(wrap_pyfunction!(attenuate_fsm_hydrograph, m)?)?;
     m.add_function(wrap_pyfunction!(compute_hand_array, m)?)?;
     m.add_function(wrap_pyfunction!(compute_hand_file, m)?)?;
     m.add_function(wrap_pyfunction!(classify_embankment_artifacts_array, m)?)?;
@@ -3768,5 +4659,9 @@ fn _lidar_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lidar_to_dsm, m)?)?;
     m.add_function(wrap_pyfunction!(lidar_to_dtm, m)?)?;
     m.add_function(wrap_pyfunction!(lidar_to_chm, m)?)?;
+    m.add_function(wrap_pyfunction!(lidar_to_chm_pit_free, m)?)?;
+    m.add_function(wrap_pyfunction!(lidar_to_dtm_tiled, m)?)?;
+    m.add_function(wrap_pyfunction!(lidar_to_chm_tiled, m)?)?;
+    m.add_function(wrap_pyfunction!(stream_remote_pointcloud_aoi, m)?)?;
     Ok(())
 }
