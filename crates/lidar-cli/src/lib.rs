@@ -14,29 +14,43 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use lidar::pointcloud::{
     CsfOptions, GridMethod, GridStat, GroundClassifyOptions, GroundFilterMethod, LidarToDsmOptions,
-    LidarToDtmOptions, PmfOptions, PointWriteOptions, ReturnKind, SmrfOptions,
-    classify_ground_with_options, convert_lidar, filter_outliers_ror, lidar_to_chm, lidar_to_dsm,
-    lidar_to_dtm, read_lidar, write_lidar,
+    LidarToDtmOptions, PitFreeChmOptions, PmfOptions, PointWriteOptions, ReturnKind, SmrfOptions,
+    TiledPointCloudOptions, classify_ground_with_options, convert_lidar, filter_outliers_ror,
+    filter_outliers_statistical, lidar_to_chm, lidar_to_chm_pit_free,
+    lidar_to_chm_tiled_with_control, lidar_to_dsm, lidar_to_dtm, lidar_to_dtm_tiled_with_control,
+    read_lidar, write_lidar,
 };
 use lidar::{
-    AnimateInundationOptions, BreachMode, BreachOptions, BurnCulvertsOptions,
+    AnimateInundationOptions, BreachMode, BreachOptions, BurnCulvertsOptions, BurnStreamsOptions,
     CatchmentHierarchyOptions, DelineateCatchmentsOptions, DelineateFlowPathsOptions,
-    DelineateOptions, ExecutionControl, ExtractSinksOptions, ForcingInput, HillshadeOptions,
-    InMemoryFullPipelineOptions, RatingCurvesFromDemOptions, RoutingMode, RunPipelineOptions,
-    SimulateInundationAdvancedOptions, SimulateInundationOptions, SynthesizeCulvertsOptions,
-    TiledDelineationOptions, TiledOutputOptions, Topology, add_crs, animate_inundation,
-    breach_depressions_file, burn_culverts_file, clip_image, compute_rating_curves_from_dem,
-    connectivity_graph_to_graphml_string, csv_points_to_vector, delineate_catchment_hierarchy,
-    delineate_catchments, delineate_depressions, delineate_depressions_tiled_with_control,
-    delineate_flow_paths, delineate_mounts, export_inundation_frames_png, extract_sinks,
-    flip_dem_file, gaussian_filter_file, image_to_cog, join_csv_to_vector, load_dem_for_preview,
-    load_raster, mean_filter_file, median_filter_file, mosaic, parse_resampling, polygonize,
-    rating_curves_to_csv_string, render_dem_preview_png_bytes, render_inundation_frame_png_bytes,
-    reproject_image, resample, run_full_pipeline_in_memory, run_pipeline_with_control, save_raster,
+    DelineateOptions, DelineationMethod, ExecutionControl, ExtractSinksOptions,
+    FeaturePreservingOptions, ForcingInput, FsmForcing, GreenAmptParams, HillshadeOptions,
+    InMemoryFullPipelineOptions, InundationForcing, MergeTreeOptions, RasterOutputOptions,
+    RatingCurvesFromDemOptions, RecessionOptions, RoutingMode, RunPipelineOptions,
+    SimulateInundationAdvancedOptions, SimulateInundationOptions, SpillAttenuationOptions,
+    SynthesizeCulvertsOptions, TiledDelineationOptions, TiledOutputOptions, Topology, add_crs,
+    animate_inundation, attenuate_fsm_hydrograph_with_options, bilateral_filter_file,
+    breach_depressions_file, burn_culverts_file, burn_streams_file, clip_image_with_options,
+    compute_fsm_hazard_rasters, compute_hand, compute_hand_from_threshold,
+    compute_rating_curves_from_dem, compute_twi, connectivity_graph_to_graphml_string,
+    csv_points_to_vector, delineate_catchment_hierarchy, delineate_catchments,
+    delineate_depressions, delineate_depressions_in_memory,
+    delineate_depressions_merge_tree_in_memory_with_control,
+    delineate_depressions_merge_tree_with_dem_in_memory_with_control,
+    delineate_depressions_tiled_with_control, delineate_flow_paths, delineate_mounts,
+    dinf_flow_accumulation, dinf_flow_direction, export_inundation_frames_png, extract_sinks,
+    extract_sinks_in_memory, feature_preserving_smoothing_file, flip_dem_file,
+    gaussian_filter_file, image_to_cog, join_csv_to_vector, load_dem_for_preview, load_raster,
+    mean_filter_file, median_filter, median_filter_file, mfd_flow_accumulation,
+    mosaic_with_options, parse_resampling, polygonize, rating_curves_to_csv_string,
+    render_dem_preview_png_bytes, render_inundation_frame_png_bytes, reproject_image_with_options,
+    resample_with_options, run_full_pipeline_in_memory, run_pipeline_with_control, save_raster,
     scs_curve_number_runoff, scs_curve_number_runoff_scalar, scs_curve_number_runoff_with_ia,
-    scs_type2_hyetograph, simulate_inundation, simulate_inundation_advanced, synthesize_culverts,
+    scs_type2_hyetograph, simulate_fill_spill_merge_with_green_ampt_in_memory, simulate_inundation,
+    simulate_inundation_advanced, simulate_post_storm_recession, synthesize_culverts,
     uniform_runoff_coeff_raster_for_cn, write_connectivity_graph_edges_csv,
-    write_connectivity_graph_json, write_connectivity_graphml, write_rating_curves_csv,
+    write_connectivity_graph_json, write_connectivity_graphml, write_depressions_csv,
+    write_fsm_hazard_rasters, write_fsm_hydrograph_csv, write_rating_curves_csv,
 };
 #[cfg(feature = "download")]
 use lidar::{
@@ -111,6 +125,21 @@ impl From<CliRoutingMode> for RoutingMode {
         match m {
             CliRoutingMode::Static => RoutingMode::Static,
             CliRoutingMode::Fsm => RoutingMode::FillSpillMerge,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum, Debug, PartialEq, Eq)]
+enum CliDelineationMethod {
+    LevelSet,
+    MergeTree,
+}
+
+impl From<CliDelineationMethod> for DelineationMethod {
+    fn from(m: CliDelineationMethod) -> Self {
+        match m {
+            CliDelineationMethod::LevelSet => DelineationMethod::LevelSet,
+            CliDelineationMethod::MergeTree => DelineationMethod::MergeTree,
         }
     }
 }
@@ -275,6 +304,12 @@ struct GroundFilterArgs {
     /// Minimum neighbor count within --ror-radius for ROR (default 2)
     #[arg(long, default_value_t = 2)]
     ror_min_neighbors: usize,
+    /// Optional Statistical Outlier Removal (SOR) neighbor count mean_k applied before ground classification
+    #[arg(long)]
+    sor_k: Option<usize>,
+    /// Standard-deviation multiplier for SOR when --sor-k is set (default 2.0)
+    #[arg(long, default_value_t = 2.0)]
+    sor_sigma: f64,
 }
 
 impl Default for GroundFilterArgs {
@@ -295,6 +330,8 @@ impl Default for GroundFilterArgs {
             smrf_scalar: None,
             ror_radius: None,
             ror_min_neighbors: 2,
+            sor_k: None,
+            sor_sigma: 2.0,
         }
     }
 }
@@ -369,6 +406,8 @@ impl GroundFilterArgs {
         opts.smrf = self.build_smrf(opts.ground_class);
         opts.ror_radius = self.ror_radius;
         opts.ror_min_neighbors = self.ror_min_neighbors;
+        opts.sor_k = self.sor_k;
+        opts.sor_sigma = self.sor_sigma;
     }
 }
 
@@ -382,6 +421,7 @@ struct PipelineConfig {
     min_size: Option<usize>,
     min_depth: Option<f64>,
     interval: Option<f64>,
+    delineation_method: Option<String>,
     rain_intensity: Option<f64>,
     duration: Option<f64>,
     time_step: Option<f64>,
@@ -397,6 +437,9 @@ struct PipelineConfig {
     antecedent_depth: Option<PathBuf>,
     scs_type2_mm: Option<f64>,
     routing: Option<String>,
+    green_ampt_ks: Option<f64>,
+    green_ampt_psi: Option<f64>,
+    green_ampt_dtheta: Option<f64>,
     streams: Option<PathBuf>,
     use_f32: Option<bool>,
     no_rasters: Option<bool>,
@@ -454,33 +497,73 @@ fn parse_routing_mode_str(s: &str) -> lidar::Result<CliRoutingMode> {
     }
 }
 
+fn parse_delineation_method_str(s: &str) -> lidar::Result<CliDelineationMethod> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "level-set" | "level_set" | "levelset" => Ok(CliDelineationMethod::LevelSet),
+        "merge-tree" | "merge_tree" | "mergetree" => Ok(CliDelineationMethod::MergeTree),
+        other => Err(lidar::Error::InvalidArgument(format!(
+            "invalid delineation_method '{other}'; expected level-set or merge-tree"
+        ))),
+    }
+}
+
+fn parse_f64_list(s: &str) -> lidar::Result<Vec<f64>> {
+    let parsed: Vec<f64> = s
+        .split(',')
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| {
+            part.trim().parse::<f64>().map_err(|_| {
+                lidar::Error::InvalidArgument(format!("invalid numeric value: '{part}'"))
+            })
+        })
+        .collect::<lidar::Result<Vec<_>>>()?;
+    if parsed.is_empty() {
+        return Err(lidar::Error::InvalidArgument(
+            "numeric list cannot be empty".into(),
+        ));
+    }
+    Ok(parsed)
+}
+
 fn make_progress_control(verbosity: Verbosity) -> ExecutionControl {
-    if !verbosity.is_verbose() {
+    let emit_mcp = std::env::var_os("LIDAR_MCP_PROGRESS").is_some();
+    let emit_verbose = verbosity.is_verbose();
+    if !emit_verbose && !emit_mcp {
         return ExecutionControl::new();
     }
     let started = Instant::now();
     let last_stage: Mutex<Option<(String, Instant)>> = Mutex::new(None);
     ExecutionControl::new().with_progress_fn(move |ev| {
-        let now = Instant::now();
-        let total_s = now.duration_since(started).as_secs_f64();
-        let mut guard = last_stage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((ref prev_name, prev_t)) = *guard
-            && prev_name != &ev.stage
-        {
-            let stage_s = now.duration_since(prev_t).as_secs_f64();
-            eprintln!("[lidar +{total_s:>6.3}s] finished {prev_name} ({stage_s:.3}s)");
+        if emit_mcp {
+            let payload = json!({
+                "stage": ev.stage,
+                "fraction": ev.fraction,
+                "message": ev.message,
+            });
+            eprintln!("{}{payload}", mcp::MCP_PROGRESS_PREFIX);
         }
-        let pct = (ev.fraction * 100.0).round() as u32;
-        match ev.message.as_deref() {
-            Some(msg) => eprintln!("[lidar +{total_s:>6.3}s] {pct:>3}% [{}] {msg}", ev.stage),
-            None => eprintln!("[lidar +{total_s:>6.3}s] {pct:>3}% [{}]", ev.stage),
-        }
-        if ev.stage == "complete" {
-            *guard = None;
-        } else if guard.as_ref().is_none_or(|(p, _)| p != &ev.stage) {
-            *guard = Some((ev.stage.clone(), now));
+        if emit_verbose {
+            let now = Instant::now();
+            let total_s = now.duration_since(started).as_secs_f64();
+            let mut guard = last_stage
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((ref prev_name, prev_t)) = *guard
+                && prev_name != &ev.stage
+            {
+                let stage_s = now.duration_since(prev_t).as_secs_f64();
+                eprintln!("[lidar +{total_s:>6.3}s] finished {prev_name} ({stage_s:.3}s)");
+            }
+            let pct = (ev.fraction * 100.0).round() as u32;
+            match ev.message.as_deref() {
+                Some(msg) => eprintln!("[lidar +{total_s:>6.3}s] {pct:>3}% [{}] {msg}", ev.stage),
+                None => eprintln!("[lidar +{total_s:>6.3}s] {pct:>3}% [{}]", ev.stage),
+            }
+            if ev.stage == "complete" {
+                *guard = None;
+            } else if guard.as_ref().is_none_or(|(p, _)| p != &ev.stage) {
+                *guard = Some((ev.stage.clone(), now));
+            }
         }
     })
 }
@@ -536,6 +619,648 @@ fn parse_return_kinds(s: &str) -> lidar::Result<Vec<ReturnKind>> {
     lidar::pointcloud::parse_return_kinds(s)
 }
 
+#[derive(Args)]
+struct LidarToDsmArgs {
+    /// Input point cloud file (LAS, LAZ, COPC, PLY, E57)
+    input: PathBuf,
+    /// Output DSM GeoTIFF
+    output: PathBuf,
+    /// Output pixel resolution
+    #[arg(long, default_value_t = 1.0)]
+    resolution: f64,
+    /// Optional search radius around each cell center
+    #[arg(long)]
+    radius: Option<f64>,
+    /// Optional minimum Z filter
+    #[arg(long, allow_hyphen_values = true)]
+    min_z: Option<f64>,
+    /// Optional maximum Z filter
+    #[arg(long, allow_hyphen_values = true)]
+    max_z: Option<f64>,
+    /// Optional ASPRS classification codes to keep (comma-separated, e.g. "2" or "2,6")
+    #[arg(long)]
+    classification: Option<String>,
+    /// Optional pulse return kinds to keep (comma-separated: first,last,intermediate,only)
+    #[arg(long)]
+    return_kind: Option<String>,
+    /// Grid statistic (max, min, mean, idw, count, stdev)
+    #[arg(long, default_value = "max")]
+    stat: String,
+    /// Gridding method (statistics, linear, nearest)
+    #[arg(long, default_value = "statistics")]
+    method: String,
+    /// Gap-filling window size in cells (0 = none)
+    #[arg(long, default_value_t = 0)]
+    window_size: usize,
+    /// Compress output GeoTIFF with DEFLATE
+    #[arg(short = 'c', long)]
+    compress: bool,
+    /// Write output as a Cloud Optimized GeoTIFF (COG) with overviews
+    #[arg(long)]
+    cog: bool,
+    /// Print summary as JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct LidarToDtmArgs {
+    /// Input point cloud file (LAS, LAZ, COPC, PLY, E57)
+    input: PathBuf,
+    /// Output DTM GeoTIFF
+    output: PathBuf,
+    /// Ground classification method (preclassified, csf, pmf, smrf)
+    #[arg(long, value_enum, default_value_t = CliGroundMethod::Csf)]
+    ground_method: CliGroundMethod,
+    /// ASPRS ground class code (default 2)
+    #[arg(long, default_value_t = 2)]
+    ground_class: u8,
+    /// Output pixel resolution
+    #[arg(long, default_value_t = 1.0)]
+    resolution: f64,
+    /// Optional search radius around each cell center
+    #[arg(long)]
+    radius: Option<f64>,
+    /// Gridding method (linear, statistics, nearest)
+    #[arg(long, default_value = "linear")]
+    method: String,
+    /// Grid statistic when --method=statistics (idw, min, mean, max, count, stdev)
+    #[arg(long, default_value = "idw")]
+    stat: String,
+    /// Gap-filling window size in cells
+    #[arg(long, default_value_t = 5)]
+    window_size: usize,
+    /// Strip ASPRS low/high noise outliers via ELM before ground selection
+    #[arg(long)]
+    remove_outliers: bool,
+    /// ELM cell size in CRS horizontal units when --remove-outliers is set
+    #[arg(long, default_value_t = 10.0)]
+    outlier_cell: f64,
+    /// ELM elevation drop threshold in CRS vertical units when --remove-outliers is set
+    #[arg(long, default_value_t = 1.0)]
+    outlier_threshold: f64,
+    /// Compress output GeoTIFF with DEFLATE
+    #[arg(short = 'c', long)]
+    compress: bool,
+    /// Write output as a Cloud Optimized GeoTIFF (COG) with overviews
+    #[arg(long)]
+    cog: bool,
+    /// Process large point clouds in overlapping spatial tiles streaming row strips to GeoTIFF
+    #[arg(long)]
+    tiled: bool,
+    /// Core tile size in CRS horizontal units when --tiled is set (default 500.0)
+    #[arg(long, default_value_t = 500.0)]
+    tile_size: f64,
+    /// Overlap halo around each tile in CRS horizontal units when --tiled is set (default 25.0)
+    #[arg(long, default_value_t = 25.0)]
+    overlap: f64,
+    #[command(flatten)]
+    ground_filter: GroundFilterArgs,
+    /// Print summary as JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct LidarToChmArgs {
+    /// Input point cloud file (LAS, LAZ, COPC, PLY, E57)
+    input: PathBuf,
+    /// Output CHM GeoTIFF
+    output: PathBuf,
+    /// Ground classification method (preclassified, csf, pmf, smrf)
+    #[arg(long, value_enum, default_value_t = CliGroundMethod::Csf)]
+    ground_method: CliGroundMethod,
+    /// ASPRS ground class code (default 2)
+    #[arg(long, default_value_t = 2)]
+    ground_class: u8,
+    /// Output pixel resolution
+    #[arg(long, default_value_t = 1.0)]
+    resolution: f64,
+    /// Optional search radius around each cell center
+    #[arg(long)]
+    radius: Option<f64>,
+    /// Gap-filling window size in cells
+    #[arg(long, default_value_t = 5)]
+    window_size: usize,
+    /// Strip ASPRS low/high noise outliers via ELM before ground selection
+    #[arg(long)]
+    remove_outliers: bool,
+    /// ELM cell size in CRS horizontal units when --remove-outliers is set
+    #[arg(long, default_value_t = 10.0)]
+    outlier_cell: f64,
+    /// ELM elevation drop threshold in CRS vertical units when --remove-outliers is set
+    #[arg(long, default_value_t = 1.0)]
+    outlier_threshold: f64,
+    /// Use Khosravipour et al. (2014) pit-free multi-threshold Delaunay TIN CHM algorithm
+    #[arg(long, conflicts_with = "tiled")]
+    pit_free: bool,
+    /// Comma-separated height-above-ground thresholds for --pit-free (default "0,2,5,10,15")
+    #[arg(long)]
+    height_thresholds: Option<String>,
+    /// Maximum 2D TIN triangle edge length for --pit-free partial canopy surfaces (default 3 * resolution)
+    #[arg(long)]
+    max_triangle_edge: Option<f64>,
+    /// Compress output GeoTIFF with DEFLATE
+    #[arg(short = 'c', long)]
+    compress: bool,
+    /// Write output as a Cloud Optimized GeoTIFF (COG) with overviews
+    #[arg(long)]
+    cog: bool,
+    /// Process large point clouds in overlapping spatial tiles streaming row strips to GeoTIFF
+    #[arg(long, conflicts_with = "pit_free")]
+    tiled: bool,
+    /// Core tile size in CRS horizontal units when --tiled is set (default 500.0)
+    #[arg(long, default_value_t = 500.0)]
+    tile_size: f64,
+    /// Overlap halo around each tile in CRS horizontal units when --tiled is set (default 25.0)
+    #[arg(long, default_value_t = 25.0)]
+    overlap: f64,
+    #[command(flatten)]
+    ground_filter: GroundFilterArgs,
+    /// Print summary as JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct PipelineArgs {
+    /// Input raw DEM raster (may be omitted when provided in --config)
+    #[arg(required_unless_present = "config")]
+    input: Option<PathBuf>,
+    /// Output directory (may be omitted when provided in --config)
+    #[arg(required_unless_present = "config")]
+    out_dir: Option<PathBuf>,
+    /// Optional TOML or JSON pipeline configuration file (CLI flags override config values; relative paths inside config files resolve against the current working directory)
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Median filter kernel size (1 = skip filtering; default 3)
+    #[arg(short = 'k', long)]
+    kernel: Option<usize>,
+    /// Minimum depression size in pixels (default 1000)
+    #[arg(short = 'm', long)]
+    min_size: Option<usize>,
+    /// Minimum depression depth (default 0.3)
+    #[arg(short = 'd', long)]
+    min_depth: Option<f64>,
+    /// Vertical level-set slicing interval (default 0.3)
+    #[arg(short = 'i', long)]
+    interval: Option<f64>,
+    /// Depression delineation algorithm (level-set or merge-tree; default level-set)
+    #[arg(long, value_enum)]
+    delineation_method: Option<CliDelineationMethod>,
+    /// Rainfall intensity in cm/h (default 5.0)
+    #[arg(long)]
+    rain_intensity: Option<f64>,
+    /// Total rainfall duration in hours (defaults to 24.0 when --scs-type2-mm is set, else 50.0)
+    #[arg(long)]
+    duration: Option<f64>,
+    /// Simulation time step in hours (default 1.0)
+    #[arg(long)]
+    time_step: Option<f64>,
+    /// Optional breaching mode (complete, selective, constrained; enables Lindsay 2016 pre-conditioning)
+    #[arg(long, value_enum)]
+    breach_mode: Option<CliBreachMode>,
+    /// Optional selective breaching maximum depth (enables Lindsay 2016 pre-conditioning; pass 0 for unlimited)
+    #[arg(long)]
+    breach_max_depth: Option<f64>,
+    /// Optional selective breaching maximum path length in cells (defaults to 50 when --breach-max-depth is set; pass 0 for unlimited)
+    #[arg(long)]
+    breach_max_length: Option<u32>,
+    /// Fill remaining unbreached depressions after selective/constrained breaching (supports =true/=false to override --config)
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    breach_fill_remaining: Option<bool>,
+    /// Optional culvert vector (.gpkg, .geojson, .shp) to burn before sink extraction
+    #[arg(long)]
+    culverts: Option<PathBuf>,
+    /// Optional spatially variable runoff-coefficient raster (GeoTIFF, values 0..=1)
+    #[arg(long, conflicts_with_all = ["curve_number", "cn"])]
+    runoff_coeff: Option<PathBuf>,
+    /// Optional NRCS Curve Number (0..=100) raster (GeoTIFF) converted to runoff coefficient via TR-55
+    #[arg(long, conflicts_with_all = ["runoff_coeff", "cn"])]
+    curve_number: Option<PathBuf>,
+    /// Optional uniform NRCS Curve Number in (0, 100] converted to runoff coefficient via TR-55
+    #[arg(long, conflicts_with_all = ["runoff_coeff", "curve_number"])]
+    cn: Option<f64>,
+    /// Optional spatially variable infiltration loss raster (GeoTIFF, cm/h)
+    #[arg(long)]
+    infiltration: Option<PathBuf>,
+    /// Optional antecedent water depth raster (GeoTIFF)
+    #[arg(long)]
+    antecedent_depth: Option<PathBuf>,
+    /// Optional SCS Type II design storm total precipitation in mm (overrides constant rainfall)
+    #[arg(long)]
+    scs_type2_mm: Option<f64>,
+    /// Hydrologic routing mode (static = independent level-set timing, fsm = dynamic Fill-Spill-Merge cascade mass-balance; default static)
+    #[arg(long, value_enum)]
+    routing: Option<CliRoutingMode>,
+    /// Optional Green-Ampt saturated hydraulic conductivity K_s (cm/h; requires --routing fsm and --green-ampt-psi/--green-ampt-dtheta)
+    #[arg(long)]
+    green_ampt_ks: Option<f64>,
+    /// Optional Green-Ampt capillary suction head psi (cm; requires --green-ampt-ks and --green-ampt-dtheta)
+    #[arg(long)]
+    green_ampt_psi: Option<f64>,
+    /// Optional Green-Ampt initial moisture deficit delta_theta in (0, 1] (requires --green-ampt-ks and --green-ampt-psi)
+    #[arg(long)]
+    green_ampt_dtheta: Option<f64>,
+    /// Optional directory to write FSM flood-hazard rasters (max_depth.tif, wse.tif, duration_h.tif; requires --routing fsm)
+    #[arg(long)]
+    hazard_dir: Option<PathBuf>,
+    /// Optional post-storm evapotranspiration rate (cm/h) to simulate FSM recession (requires --routing fsm)
+    #[arg(long)]
+    recession_et_cm_h: Option<f64>,
+    /// Optional post-storm seepage rate (cm/h) to simulate FSM recession (requires --routing fsm)
+    #[arg(long)]
+    recession_seepage_cm_h: Option<f64>,
+    /// Maximum post-storm recession duration in hours (default 168.0 when recession is enabled)
+    #[arg(long)]
+    recession_max_h: Option<f64>,
+    /// Optional mean overland/channel travel time in hours for Nash-cascade FSM hydrograph attenuation (requires --routing fsm)
+    #[arg(long)]
+    attenuate_travel_time_h: Option<f64>,
+    /// Output sampling interval in hours for attenuated FSM hydrograph (default 0.25)
+    #[arg(long, default_value_t = 0.25)]
+    attenuate_dt_h: f64,
+    /// Number of equal linear reservoirs in series for FSM hydrograph attenuation (default 2)
+    #[arg(long, default_value_t = 2)]
+    attenuate_reservoirs: usize,
+    /// Optional stream network vector (.gpkg, .geojson, .shp) for distance-to-stream graph metrics
+    #[arg(long)]
+    streams: Option<PathBuf>,
+    /// Load DEM as f32 (halves peak RAM on large rasters; supports =true/=false to override --config)
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    use_f32: Option<bool>,
+    /// Skip writing output GeoTIFF rasters (keep CSV, GeoPackage, and graph outputs; supports =true/=false to override --config)
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    no_rasters: Option<bool>,
+    /// Skip writing output GeoPackage vectors (supports =true/=false to override --config)
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    no_vectors: Option<bool>,
+    /// Skip writing rating curves and connectivity graph (supports =true/=false to override --config)
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    no_graph: Option<bool>,
+    /// Compress output GeoTIFFs with DEFLATE (supports =true/=false to override --config)
+    #[arg(short = 'c', long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    compress: Option<bool>,
+    /// Print summary as JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct TiledDepressionsArgs {
+    /// Input DEM raster
+    input: PathBuf,
+    /// Output directory
+    out_dir: PathBuf,
+    /// Core tile width/height in pixels
+    #[arg(long, default_value_t = 2048)]
+    tile_size: usize,
+    /// Overlap halo around each tile in pixels
+    #[arg(long, default_value_t = 128)]
+    overlap: usize,
+    /// Median filter kernel size (1 = skip)
+    #[arg(short = 'k', long, default_value_t = 3)]
+    kernel: usize,
+    /// Minimum depression size in pixels
+    #[arg(short = 'm', long, default_value_t = 1000)]
+    min_size: usize,
+    /// Minimum depression depth
+    #[arg(short = 'd', long, default_value_t = 0.3)]
+    min_depth: f64,
+    /// Vertical level-set slicing interval
+    #[arg(short = 'i', long, default_value_t = 0.3)]
+    interval: f64,
+    /// Connectivity topology for per-tile depression filling (d8 or d4)
+    #[arg(short = 't', long, value_enum, default_value_t = CliTopology::D8)]
+    topology: CliTopology,
+    /// Depression delineation algorithm per tile (level-set or merge-tree)
+    #[arg(long, value_enum, default_value_t = CliDelineationMethod::LevelSet)]
+    delineation_method: CliDelineationMethod,
+    /// Write stitched full-DEM GeoTIFF outputs (depression_id.tif, depression_level.tif, depth.tif)
+    #[arg(long)]
+    write_rasters: bool,
+    /// Write stitched depressions.gpkg vector layer
+    #[arg(long)]
+    write_gpkg: bool,
+    /// Optional per-tile depression breaching mode (complete, selective, constrained)
+    #[arg(long, value_enum)]
+    breach_mode: Option<CliBreachMode>,
+    /// Optional maximum per-tile breach depth (enables selective breaching when set; 0 = unlimited)
+    #[arg(long)]
+    breach_max_depth: Option<f64>,
+    /// Optional maximum per-tile breach path length in cells (0 = unlimited)
+    #[arg(long)]
+    breach_max_length: Option<u32>,
+    /// Fill remaining unbreached depressions after per-tile selective/constrained breaching
+    #[arg(long)]
+    breach_fill_remaining: bool,
+    /// Compress stitched GeoTIFF outputs with DEFLATE
+    #[arg(short = 'c', long)]
+    compress: bool,
+    /// Load DEM in f64 precision on the eager/in-memory fallback path (windowed GeoTIFF/COG inputs always read one tile at a time directly into f64)
+    #[arg(long, conflicts_with = "use_f32")]
+    use_f64: bool,
+    /// Load DEM in f32 precision on the eager/in-memory fallback path (default for non-windowed formats; windowed GeoTIFF/COG inputs read one tile at a time directly into f64)
+    #[arg(long, hide = true)]
+    use_f32: bool,
+    /// Print summary as JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct ExportFramesArgs {
+    /// Background DEM raster
+    dem: PathBuf,
+    /// Fill-time raster (fill_time.tif)
+    fill_time: PathBuf,
+    /// Output directory for numbered PNG frames
+    out_dir: PathBuf,
+    /// Number of frames to export
+    #[arg(long, default_value_t = 10)]
+    num_steps: usize,
+    /// Time step in hours
+    #[arg(long, default_value_t = 1.0)]
+    time_step: f64,
+    /// Optional rainfall intensity in cm/h for banner labels
+    #[arg(long)]
+    rain_intensity: Option<f64>,
+    /// Water overlay opacity (0.0..=1.0)
+    #[arg(long, default_value_t = 0.55)]
+    water_alpha: f32,
+    /// Optional maximum width/height in pixels
+    #[arg(long)]
+    max_dim: Option<usize>,
+    /// Draw a metric scale bar on each frame
+    #[arg(long)]
+    scale_bar: bool,
+    /// Draw a legend box on each frame
+    #[arg(long)]
+    legend: bool,
+    /// Hillshade azimuth in degrees
+    #[arg(long, default_value_t = 135.0)]
+    azimuth: f64,
+    /// Hillshade elevation angle in degrees
+    #[arg(long, default_value_t = 45.0)]
+    elevation: f64,
+    /// Print summary as JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct SimulateInundationArgs {
+    /// Input sink elevation raster (sink.tif)
+    sink: PathBuf,
+    /// Input catchment hierarchy raster (catchment_hir.tif)
+    catchment: PathBuf,
+    /// Output directory for flood_*.tif frames, fill_time.tif, and summary CSV
+    out_dir: PathBuf,
+    /// Minimum depression size in pixels
+    #[arg(short = 'm', long, default_value_t = 1000)]
+    min_size: usize,
+    /// Minimum depression depth
+    #[arg(short = 'd', long, default_value_t = 0.2)]
+    min_depth: f64,
+    /// Vertical level-set slicing interval (positive; sliced top-down)
+    #[arg(short = 'i', long, default_value_t = 0.2)]
+    interval: f64,
+    /// Rainfall intensity in cm/h
+    #[arg(long, default_value_t = 5.0)]
+    rain_intensity: f64,
+    /// Total rainfall duration in hours (defaults to 24.0 when --scs-type2-mm is set, else 50.0)
+    #[arg(long)]
+    duration: Option<f64>,
+    /// Simulation time step in hours
+    #[arg(long, default_value_t = 1.0)]
+    time_step: f64,
+    /// Hydrologic routing mode (static = independent level-set timing, fsm = dynamic Fill-Spill-Merge cascade mass-balance)
+    #[arg(long, value_enum, default_value_t = CliRoutingMode::Static)]
+    routing: CliRoutingMode,
+    /// Required when --routing fsm; refined DEM raster (e.g. dem.tif) used to compute D8 catchments and overland routing
+    #[arg(long)]
+    dem: Option<PathBuf>,
+    /// Optional SCS Type II design storm total precipitation in mm (overrides constant rainfall)
+    #[arg(long)]
+    scs_type2_mm: Option<f64>,
+    /// Optional runoff coefficient scalar (0..=1) or aligned GeoTIFF raster path
+    #[arg(long)]
+    runoff_coeff: Option<String>,
+    /// Optional vertical infiltration loss rate scalar (cm/h, >= 0) or aligned GeoTIFF raster path
+    #[arg(long)]
+    infiltration: Option<String>,
+    /// Optional antecedent ponded water depth scalar (>= 0) or aligned GeoTIFF raster path
+    #[arg(long)]
+    antecedent_depth: Option<String>,
+    /// Compress output GeoTIFFs with DEFLATE
+    #[arg(short = 'c', long)]
+    compress: bool,
+    /// Print summary as JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct AnimateInundationArgs {
+    /// Background DEM raster (e.g. dem.tif)
+    dem: PathBuf,
+    /// Directory containing flood_*.tif rasters from simulate-inundation
+    flood_dir: PathBuf,
+    /// Output animated GIF path (e.g. inundation.gif)
+    output: PathBuf,
+    /// Delay between frames in milliseconds
+    #[arg(long, default_value_t = 200)]
+    delay_ms: u16,
+    /// Play only rising water (disable rising-then-falling ping-pong playback)
+    #[arg(long)]
+    no_ping_pong: bool,
+    /// Number of GIF loops (0 = infinite)
+    #[arg(long, default_value_t = 0)]
+    loops: u16,
+    /// Water overlay opacity (0.0..=1.0)
+    #[arg(long, default_value_t = 0.55)]
+    water_alpha: f32,
+    /// Optional maximum width/height in pixels for downscaling large DEMs
+    #[arg(long)]
+    max_dim: Option<usize>,
+    /// Optional time step in hours for frame labels
+    #[arg(long, default_value_t = 1.0)]
+    time_step: f64,
+    /// Optional rainfall intensity in cm/h for the banner title
+    #[arg(long)]
+    rain_intensity: Option<f64>,
+    /// Hillshade azimuth in degrees
+    #[arg(long, default_value_t = 135.0)]
+    azimuth: f64,
+    /// Hillshade elevation angle in degrees
+    #[arg(long, default_value_t = 45.0)]
+    elevation: f64,
+    /// Draw a metric scale bar on each frame
+    #[arg(long)]
+    scale_bar: bool,
+    /// Draw a legend box on each frame
+    #[arg(long)]
+    legend: bool,
+    /// Print summary as JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[cfg(feature = "download")]
+#[derive(Args)]
+struct DownloadArgs {
+    /// Output directory for downloaded federal datasets and manifest.json
+    #[arg(short = 'o', long)]
+    out_dir: PathBuf,
+    /// WGS 84 bounding box as 'min_lon,min_lat,max_lon,max_lat'
+    #[arg(long, allow_hyphen_values = true, conflicts_with_all = ["huc", "region"])]
+    bbox: Option<String>,
+    /// USGS WBD Hydrologic Unit Code (2, 4, 6, 8, 10, or 12 digits, e.g. 10160002)
+    #[arg(long, conflicts_with_all = ["bbox", "region"])]
+    huc: Option<String>,
+    /// Local polygon vector file (.geojson, .gpkg, .shp) defining the region of interest
+    #[arg(long, conflicts_with_all = ["bbox", "huc"])]
+    region: Option<PathBuf>,
+    /// Comma-separated datasets to download ('all' or subset of wbd,dem,nhd,nwi,roads,culverts,noaa)
+    #[arg(long, default_value = "all")]
+    datasets: String,
+    /// USGS 3DEP product to download (1m, 10m, 30m, lpc)
+    #[arg(long, default_value = "1m")]
+    dem_product: String,
+    /// USGS WBD hierarchy level (2, 4, 6, 8, 10, or 12)
+    #[arg(long, default_value = "12")]
+    wbd_level: String,
+    /// Optional shared cache directory for 3DEP tiles
+    #[arg(long)]
+    tile_cache: Option<PathBuf>,
+    /// Keep all overlapping 3DEP tile vintages instead of deduplicating to newest publicationDate
+    #[arg(long)]
+    no_deduplicate: bool,
+    /// Skip mosaicking downloaded 3DEP GeoTIFF tiles into dem.tif
+    #[arg(long)]
+    no_mosaic: bool,
+    /// Skip clipping downloaded DEM/vectors to the HUC or vector region boundary
+    #[arg(long)]
+    no_clip: bool,
+    /// Culvert synthesis half-length along stream flowlines in meters
+    #[arg(long, default_value_t = 25.0)]
+    culvert_half_length: f64,
+    /// Culvert synthesis snapping distance in meters
+    #[arg(long, default_value_t = 15.0)]
+    culvert_snap_distance: f64,
+    /// Maximum TNM product records to scan across paginated pages (default 1000)
+    #[arg(long)]
+    max_products: Option<usize>,
+    /// Comma-separated USGS National Transportation MapServer layer IDs (default "29,30,31,32,33,38")
+    #[arg(long)]
+    transportation_layers: Option<String>,
+    /// Per-request HTTP timeout in seconds (default 120)
+    #[arg(long)]
+    timeout_secs: Option<u64>,
+    /// Maximum retry attempts for transient network or 5xx errors (default 4)
+    #[arg(long)]
+    max_retries: Option<usize>,
+    /// ArcGIS ObjectID chunk size for paginated vector downloads (default 250)
+    #[arg(long)]
+    oid_chunk_size: Option<usize>,
+    /// Re-download files even if they already exist locally
+    #[arg(long)]
+    overwrite: bool,
+    /// Query matching USGS 3DEP tiles without downloading data
+    #[arg(long)]
+    dry_run: bool,
+    /// Print summary as JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct PreviewArgs {
+    /// Input DEM or DSM raster
+    dem: PathBuf,
+    /// Output PNG file path (in MCP mode, omit -o to return the PNG directly as inline image content)
+    #[arg(short = 'o', long)]
+    output: Option<PathBuf>,
+    /// Optional fill-time raster (fill_time.tif) to overlay inundation at --hour
+    #[arg(long, conflicts_with = "depth")]
+    fill_time: Option<PathBuf>,
+    /// Inundation snapshot time in hours when --fill-time is set; shows cells first inundated by
+    /// this time (defaults to max finite fill time, which can exceed the storm duration because
+    /// constant-rain fill_time.tif assumes sustained rainfall; pass the storm duration to stop
+    /// at storm end)
+    #[arg(long, requires = "fill_time")]
+    hour: Option<f64>,
+    /// Optional depression depth raster (depth.tif or sink.tif) to overlay positive-depth basins
+    #[arg(long, conflicts_with = "fill_time")]
+    depth: Option<PathBuf>,
+    /// Maximum output width/height in pixels (0 = native resolution)
+    #[arg(long, default_value_t = 1024)]
+    max_dim: usize,
+    /// Overlay opacity (0.0..=1.0)
+    #[arg(long, default_value_t = 0.55)]
+    water_alpha: f32,
+    /// Draw a metric scale bar on the preview
+    #[arg(long)]
+    scale_bar: bool,
+    /// Draw a color legend box on the preview (when an overlay is shown)
+    #[arg(long)]
+    legend: bool,
+    /// Hillshade azimuth in degrees
+    #[arg(long, default_value_t = 135.0)]
+    azimuth: f64,
+    /// Hillshade elevation angle in degrees
+    #[arg(long, default_value_t = 45.0)]
+    elevation: f64,
+    /// Print summary as JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct ConnectivityGraphArgs {
+    /// Input DEM raster
+    input: PathBuf,
+    /// Optional output file path (.json, .graphml, or .csv; prints to stdout if omitted)
+    #[arg(short = 'o', long)]
+    output: Option<PathBuf>,
+    /// Output graph serialization format (json, graphml, csv; inferred from -o extension when omitted)
+    #[arg(long, value_enum)]
+    format: Option<CliGraphFormat>,
+    /// Median filter kernel size (1 = skip filtering)
+    #[arg(short = 'k', long, default_value_t = 3)]
+    kernel: usize,
+    /// Minimum depression size in pixels
+    #[arg(short = 'm', long, default_value_t = 1000)]
+    min_size: usize,
+    /// Minimum depression depth
+    #[arg(short = 'd', long, default_value_t = 0.3)]
+    min_depth: f64,
+    /// Vertical level-set slicing interval
+    #[arg(short = 'i', long, default_value_t = 0.3)]
+    interval: f64,
+    /// Depression delineation algorithm (level-set or merge-tree)
+    #[arg(long, value_enum, default_value_t = CliDelineationMethod::LevelSet)]
+    delineation_method: CliDelineationMethod,
+    /// Rainfall intensity in cm/h
+    #[arg(long, default_value_t = 5.0)]
+    rain_intensity: f64,
+    /// Total rainfall duration in hours
+    #[arg(long, default_value_t = 50.0)]
+    duration: f64,
+    /// Simulation time step in hours
+    #[arg(long, default_value_t = 1.0)]
+    time_step: f64,
+    /// Hydrologic routing mode (static or fsm)
+    #[arg(long, value_enum, default_value_t = CliRoutingMode::Static)]
+    routing: CliRoutingMode,
+    /// Optional stream network vector (.gpkg, .geojson, .shp) for distance-to-stream edge metrics
+    #[arg(long)]
+    streams: Option<PathBuf>,
+    /// Print graph (or summary when -o is provided) as JSON
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Apply a moving-window mean filter to a DEM
@@ -573,6 +1298,173 @@ enum Commands {
         /// Standard deviation (sigma) in pixels
         #[arg(short = 's', long, default_value_t = 1.0)]
         sigma: f64,
+        /// Print summary as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply an edge-preserving 2D bilateral filter to a DEM
+    BilateralFilter {
+        /// Input DEM raster
+        input: PathBuf,
+        /// Output filtered DEM raster
+        output: PathBuf,
+        /// Spatial Gaussian standard deviation in pixels
+        #[arg(long, default_value_t = 1.5)]
+        spatial_sigma: f64,
+        /// Elevation range Gaussian standard deviation in vertical DEM units
+        #[arg(long, default_value_t = 0.5)]
+        range_sigma: f64,
+        /// Print summary as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply Lindsay et al. (2019) feature-preserving DEM smoothing
+    FeaturePreservingSmoothing {
+        /// Input DEM raster
+        input: PathBuf,
+        /// Output smoothed DEM raster
+        output: PathBuf,
+        /// Odd square filter window size in pixels
+        #[arg(long, default_value_t = 11)]
+        filter_size: usize,
+        /// Maximum angle difference between neighboring surface normals (degrees)
+        #[arg(long, default_value_t = 15.0)]
+        norm_diff: f64,
+        /// Number of elevation-fitting iterations
+        #[arg(long, default_value_t = 3)]
+        num_iter: usize,
+        /// Optional maximum absolute elevation change per cell
+        #[arg(long)]
+        max_z_change: Option<f64>,
+        /// Compress output GeoTIFF with DEFLATE
+        #[arg(short = 'c', long)]
+        compress: bool,
+        /// Print summary as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compute Tarboton (1997) D-infinity flow direction and/or flow accumulation rasters
+    Dinf {
+        /// Input hydro-conditioned DEM raster
+        input: PathBuf,
+        /// Optional output D-infinity flow direction raster (radians in [0, 2*pi))
+        #[arg(long, required_unless_present = "accumulation")]
+        direction: Option<PathBuf>,
+        /// Optional output D-infinity flow accumulation raster (contributing area in cells)
+        #[arg(long, required_unless_present = "direction")]
+        accumulation: Option<PathBuf>,
+        /// Compress output GeoTIFF(s) with DEFLATE
+        #[arg(short = 'c', long)]
+        compress: bool,
+        /// Print summary as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compute Multiple Flow Direction (MFD; Quinn 1991 / Freeman 1991) flow accumulation
+    Mfd {
+        /// Input hydro-conditioned DEM raster
+        input: PathBuf,
+        /// Output MFD flow accumulation raster
+        output: PathBuf,
+        /// Flow partitioning exponent (1.1 = Freeman 1991, 1.0 = Quinn 1991)
+        #[arg(short = 'p', long, default_value_t = 1.1)]
+        exponent: f64,
+        /// Compress output GeoTIFF with DEFLATE
+        #[arg(short = 'c', long)]
+        compress: bool,
+        /// Print summary as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compute Topographic Wetness Index (TWI = ln(a / tan(beta)))
+    Twi {
+        /// Input DEM raster
+        input: PathBuf,
+        /// Output TWI GeoTIFF
+        output: PathBuf,
+        /// Optional precomputed flow accumulation raster (defaults to D-infinity accumulation)
+        #[arg(long)]
+        flow_acc: Option<PathBuf>,
+        /// Compress output GeoTIFF with DEFLATE
+        #[arg(short = 'c', long)]
+        compress: bool,
+        /// Print summary as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compute Height Above Nearest Drainage (HAND) relative to a stream mask or D-inf threshold
+    Hand {
+        /// Input hydro-conditioned DEM raster
+        input: PathBuf,
+        /// Output HAND GeoTIFF
+        output: PathBuf,
+        /// Optional binary stream mask raster (> 0 = stream cell; overrides --stream-threshold)
+        #[arg(long, conflicts_with = "stream_threshold")]
+        stream_mask: Option<PathBuf>,
+        /// D-infinity flow accumulation threshold in cells for stream extraction (default 100.0)
+        #[arg(long, conflicts_with = "stream_mask")]
+        stream_threshold: Option<f64>,
+        /// Compress output GeoTIFF with DEFLATE
+        #[arg(short = 'c', long)]
+        compress: bool,
+        /// Print summary as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Burn stream polylines into a DEM with optional AGREE-style smooth buffer
+    BurnStreams {
+        /// Input DEM raster
+        input: PathBuf,
+        /// Input stream polyline vector (.geojson, .gpkg, .shp)
+        streams: PathBuf,
+        /// Output burned DEM GeoTIFF
+        output: PathBuf,
+        /// Sharp elevation drop applied to stream cells (vertical DEM units)
+        #[arg(long, default_value_t = 1.0)]
+        depth: f64,
+        /// Additional half-width around the stream centerline in cells (0 = 1-cell wide)
+        #[arg(long, default_value_t = 0)]
+        width: usize,
+        /// Optional AGREE-style smooth buffer radius in cells outside the stream channel
+        #[arg(long, default_value_t = 0)]
+        buffer_cells: usize,
+        /// Smooth elevation drop tapering linearly across --buffer-cells
+        #[arg(long, default_value_t = 0.0)]
+        smooth_drop: f64,
+        /// Compress output GeoTIFF with DEFLATE
+        #[arg(short = 'c', long)]
+        compress: bool,
+        /// Print summary as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Exact bottom-up Union-Find merge-tree nested depression delineation and continuous rating curves
+    MergeTree {
+        /// Input sink elevation raster (e.g., sink.tif from extract-sinks)
+        input: PathBuf,
+        /// Output directory for depression_id.tif, depression_level.tif, depressions_info.csv, merge_tree_nodes.json, and rating_curves.csv
+        out_dir: PathBuf,
+        /// Optional source or refined DEM for exact exterior root outlet finalization
+        #[arg(long)]
+        dem: Option<PathBuf>,
+        /// Indicate --dem is already pit-refined (skips redundant Priority-Flood pass)
+        #[arg(long, requires = "dem")]
+        dem_is_refined: bool,
+        /// Minimum number of pixels for a depression branch
+        #[arg(short = 'm', long, default_value_t = 1000)]
+        min_size: usize,
+        /// Minimum vertical relief for a depression branch
+        #[arg(short = 'd', long, default_value_t = 0.3)]
+        min_depth: f64,
+        /// Grid connectivity topology (d8 or d4)
+        #[arg(short = 't', long, value_enum, default_value_t = CliTopology::D8)]
+        topology: CliTopology,
+        /// Optional cap on emitted rating-curve breakpoints per node (0 disables rating_curves.csv)
+        #[arg(long)]
+        max_rating_curve_points: Option<usize>,
+        /// Compress output GeoTIFFs with DEFLATE
+        #[arg(short = 'c', long)]
+        compress: bool,
         /// Print summary as JSON
         #[arg(long)]
         json: bool,
@@ -690,7 +1582,7 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Mosaic multiple rasters into a single GeoTIFF
+    /// Mosaic multiple rasters into a single GeoTIFF or COG
     Mosaic {
         /// Input raster files
         #[arg(required = true)]
@@ -698,6 +1590,15 @@ enum Commands {
         /// Output mosaic GeoTIFF
         #[arg(short = 'o', long)]
         output: PathBuf,
+        /// Resampling method (nearest, bilinear, cubic, etc.)
+        #[arg(short = 'r', long, default_value = "nearest")]
+        resampling: String,
+        /// Compress output GeoTIFF with DEFLATE
+        #[arg(short = 'c', long)]
+        compress: bool,
+        /// Write output as a Cloud Optimized GeoTIFF (COG) with overviews
+        #[arg(long)]
+        cog: bool,
         /// Print summary as JSON
         #[arg(long)]
         json: bool,
@@ -717,6 +1618,12 @@ enum Commands {
         /// Optional target pixel resolution
         #[arg(long)]
         resolution: Option<f64>,
+        /// Compress output GeoTIFF with DEFLATE
+        #[arg(short = 'c', long)]
+        compress: bool,
+        /// Write output as a Cloud Optimized GeoTIFF (COG) with overviews
+        #[arg(long)]
+        cog: bool,
         /// Print summary as JSON
         #[arg(long)]
         json: bool,
@@ -733,6 +1640,12 @@ enum Commands {
         /// Resampling method (nearest, bilinear, cubic, etc.)
         #[arg(short = 'r', long, default_value = "bilinear")]
         resampling: String,
+        /// Compress output GeoTIFF with DEFLATE
+        #[arg(short = 'c', long)]
+        compress: bool,
+        /// Write output as a Cloud Optimized GeoTIFF (COG) with overviews
+        #[arg(long)]
+        cog: bool,
         /// Print summary as JSON
         #[arg(long)]
         json: bool,
@@ -745,6 +1658,12 @@ enum Commands {
         mask: PathBuf,
         /// Output clipped raster
         output: PathBuf,
+        /// Compress output GeoTIFF with DEFLATE
+        #[arg(short = 'c', long)]
+        compress: bool,
+        /// Write output as a Cloud Optimized GeoTIFF (COG) with overviews
+        #[arg(long)]
+        cog: bool,
         /// Print summary as JSON
         #[arg(long)]
         json: bool,
@@ -835,126 +1754,17 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = CliClassifyGroundMethod::Csf)]
         method: CliClassifyGroundMethod,
         #[command(flatten)]
-        ground_filter: GroundFilterArgs,
+        ground_filter: Box<GroundFilterArgs>,
         /// Print summary as JSON
         #[arg(long)]
         json: bool,
     },
     /// Grid a LiDAR point cloud into a Digital Surface Model (DSM) GeoTIFF
-    LidarToDsm {
-        /// Input point cloud file (LAS, LAZ, COPC, PLY, E57)
-        input: PathBuf,
-        /// Output DSM GeoTIFF
-        output: PathBuf,
-        /// Output pixel resolution
-        #[arg(long, default_value_t = 1.0)]
-        resolution: f64,
-        /// Optional search radius around each cell center
-        #[arg(long)]
-        radius: Option<f64>,
-        /// Optional minimum Z filter
-        #[arg(long, allow_hyphen_values = true)]
-        min_z: Option<f64>,
-        /// Optional maximum Z filter
-        #[arg(long, allow_hyphen_values = true)]
-        max_z: Option<f64>,
-        /// Optional ASPRS classification codes to keep (comma-separated, e.g. "2" or "2,6")
-        #[arg(long)]
-        classification: Option<String>,
-        /// Optional pulse return kinds to keep (comma-separated: first,last,intermediate,only)
-        #[arg(long)]
-        return_kind: Option<String>,
-        /// Grid statistic (max, min, mean, idw, count, stdev)
-        #[arg(long, default_value = "max")]
-        stat: String,
-        /// Gridding method (statistics, linear, nearest)
-        #[arg(long, default_value = "statistics")]
-        method: String,
-        /// Gap-filling window size in cells (0 = none)
-        #[arg(long, default_value_t = 0)]
-        window_size: usize,
-        /// Print summary as JSON
-        #[arg(long)]
-        json: bool,
-    },
+    LidarToDsm(Box<LidarToDsmArgs>),
     /// Generate a bare-earth Digital Terrain Model (DTM) from a LiDAR point cloud using CSF/PMF/SMRF/preclassified ground points
-    LidarToDtm {
-        /// Input point cloud file (LAS, LAZ, COPC, PLY, E57)
-        input: PathBuf,
-        /// Output DTM GeoTIFF
-        output: PathBuf,
-        /// Ground classification method (preclassified, csf, pmf, smrf)
-        #[arg(long, value_enum, default_value_t = CliGroundMethod::Csf)]
-        ground_method: CliGroundMethod,
-        /// ASPRS ground class code (default 2)
-        #[arg(long, default_value_t = 2)]
-        ground_class: u8,
-        /// Output pixel resolution
-        #[arg(long, default_value_t = 1.0)]
-        resolution: f64,
-        /// Optional search radius around each cell center
-        #[arg(long)]
-        radius: Option<f64>,
-        /// Gridding method (linear, statistics, nearest)
-        #[arg(long, default_value = "linear")]
-        method: String,
-        /// Grid statistic when --method=statistics (idw, min, mean, max, count, stdev)
-        #[arg(long, default_value = "idw")]
-        stat: String,
-        /// Gap-filling window size in cells
-        #[arg(long, default_value_t = 5)]
-        window_size: usize,
-        /// Strip ASPRS low/high noise outliers via ELM before ground selection
-        #[arg(long)]
-        remove_outliers: bool,
-        /// ELM cell size in CRS horizontal units when --remove-outliers is set
-        #[arg(long, default_value_t = 10.0)]
-        outlier_cell: f64,
-        /// ELM elevation drop threshold in CRS vertical units when --remove-outliers is set
-        #[arg(long, default_value_t = 1.0)]
-        outlier_threshold: f64,
-        #[command(flatten)]
-        ground_filter: GroundFilterArgs,
-        /// Print summary as JSON
-        #[arg(long)]
-        json: bool,
-    },
+    LidarToDtm(Box<LidarToDtmArgs>),
     /// Generate a Canopy Height Model (CHM = DSM - DTM) from a LiDAR point cloud
-    LidarToChm {
-        /// Input point cloud file (LAS, LAZ, COPC, PLY, E57)
-        input: PathBuf,
-        /// Output CHM GeoTIFF
-        output: PathBuf,
-        /// Ground classification method (preclassified, csf, pmf, smrf)
-        #[arg(long, value_enum, default_value_t = CliGroundMethod::Csf)]
-        ground_method: CliGroundMethod,
-        /// ASPRS ground class code (default 2)
-        #[arg(long, default_value_t = 2)]
-        ground_class: u8,
-        /// Output pixel resolution
-        #[arg(long, default_value_t = 1.0)]
-        resolution: f64,
-        /// Optional search radius around each cell center
-        #[arg(long)]
-        radius: Option<f64>,
-        /// Gap-filling window size in cells
-        #[arg(long, default_value_t = 5)]
-        window_size: usize,
-        /// Strip ASPRS low/high noise outliers via ELM before ground selection
-        #[arg(long)]
-        remove_outliers: bool,
-        /// ELM cell size in CRS horizontal units when --remove-outliers is set
-        #[arg(long, default_value_t = 10.0)]
-        outlier_cell: f64,
-        /// ELM elevation drop threshold in CRS vertical units when --remove-outliers is set
-        #[arg(long, default_value_t = 1.0)]
-        outlier_threshold: f64,
-        #[command(flatten)]
-        ground_filter: GroundFilterArgs,
-        /// Print summary as JSON
-        #[arg(long)]
-        json: bool,
-    },
+    LidarToChm(Box<LidarToChmArgs>),
     /// Breach depressions using Lindsay (2016) least-cost breaching (complete, selective, or constrained)
     BreachDepressions {
         /// Input DEM raster
@@ -1005,171 +1815,11 @@ enum Commands {
         json: bool,
     },
     /// Run the complete in-memory hydrology pipeline from a raw DEM to vectors, rating curves, connectivity graph, and inundation rasters
-    Pipeline {
-        /// Input raw DEM raster (may be omitted when provided in --config)
-        #[arg(required_unless_present = "config")]
-        input: Option<PathBuf>,
-        /// Output directory (may be omitted when provided in --config)
-        #[arg(required_unless_present = "config")]
-        out_dir: Option<PathBuf>,
-        /// Optional TOML or JSON pipeline configuration file (CLI flags override config values; relative paths inside config files resolve against the current working directory)
-        #[arg(long)]
-        config: Option<PathBuf>,
-        /// Median filter kernel size (1 = skip filtering; default 3)
-        #[arg(short = 'k', long)]
-        kernel: Option<usize>,
-        /// Minimum depression size in pixels (default 1000)
-        #[arg(short = 'm', long)]
-        min_size: Option<usize>,
-        /// Minimum depression depth (default 0.3)
-        #[arg(short = 'd', long)]
-        min_depth: Option<f64>,
-        /// Vertical level-set slicing interval (default 0.3)
-        #[arg(short = 'i', long)]
-        interval: Option<f64>,
-        /// Rainfall intensity in cm/h (default 5.0)
-        #[arg(long)]
-        rain_intensity: Option<f64>,
-        /// Total rainfall duration in hours (defaults to 24.0 when --scs-type2-mm is set, else 50.0)
-        #[arg(long)]
-        duration: Option<f64>,
-        /// Simulation time step in hours (default 1.0)
-        #[arg(long)]
-        time_step: Option<f64>,
-        /// Optional breaching mode (complete, selective, constrained; enables Lindsay 2016 pre-conditioning)
-        #[arg(long, value_enum)]
-        breach_mode: Option<CliBreachMode>,
-        /// Optional selective breaching maximum depth (enables Lindsay 2016 pre-conditioning; pass 0 for unlimited)
-        #[arg(long)]
-        breach_max_depth: Option<f64>,
-        /// Optional selective breaching maximum path length in cells (defaults to 50 when --breach-max-depth is set; pass 0 for unlimited)
-        #[arg(long)]
-        breach_max_length: Option<u32>,
-        /// Fill remaining unbreached depressions after selective/constrained breaching (supports =true/=false to override --config)
-        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
-        breach_fill_remaining: Option<bool>,
-        /// Optional culvert vector (.gpkg, .geojson, .shp) to burn before sink extraction
-        #[arg(long)]
-        culverts: Option<PathBuf>,
-        /// Optional spatially variable runoff-coefficient raster (GeoTIFF, values 0..=1)
-        #[arg(long, conflicts_with_all = ["curve_number", "cn"])]
-        runoff_coeff: Option<PathBuf>,
-        /// Optional NRCS Curve Number (0..=100) raster (GeoTIFF) converted to runoff coefficient via TR-55
-        #[arg(long, conflicts_with_all = ["runoff_coeff", "cn"])]
-        curve_number: Option<PathBuf>,
-        /// Optional uniform NRCS Curve Number in (0, 100] converted to runoff coefficient via TR-55
-        #[arg(long, conflicts_with_all = ["runoff_coeff", "curve_number"])]
-        cn: Option<f64>,
-        /// Optional spatially variable infiltration loss raster (GeoTIFF, cm/h)
-        #[arg(long)]
-        infiltration: Option<PathBuf>,
-        /// Optional antecedent water depth raster (GeoTIFF)
-        #[arg(long)]
-        antecedent_depth: Option<PathBuf>,
-        /// Optional SCS Type II design storm total precipitation in mm (overrides constant rainfall)
-        #[arg(long)]
-        scs_type2_mm: Option<f64>,
-        /// Hydrologic routing mode (static = independent level-set timing, fsm = dynamic Fill-Spill-Merge cascade mass-balance; default static)
-        #[arg(long, value_enum)]
-        routing: Option<CliRoutingMode>,
-        /// Optional stream network vector (.gpkg, .geojson, .shp) for distance-to-stream graph metrics
-        #[arg(long)]
-        streams: Option<PathBuf>,
-        /// Load DEM as f32 (halves peak RAM on large rasters; supports =true/=false to override --config)
-        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
-        use_f32: Option<bool>,
-        /// Skip writing output GeoTIFF rasters (keep CSV, GeoPackage, and graph outputs; supports =true/=false to override --config)
-        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
-        no_rasters: Option<bool>,
-        /// Skip writing output GeoPackage vectors (supports =true/=false to override --config)
-        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
-        no_vectors: Option<bool>,
-        /// Skip writing rating curves and connectivity graph (supports =true/=false to override --config)
-        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
-        no_graph: Option<bool>,
-        /// Compress output GeoTIFFs with DEFLATE (supports =true/=false to override --config)
-        #[arg(short = 'c', long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
-        compress: Option<bool>,
-        /// Print summary as JSON
-        #[arg(long)]
-        json: bool,
-    },
+    Pipeline(Box<PipelineArgs>),
     /// Delineate nested depressions across large DEMs using parallel overlapping tiles
-    TiledDepressions {
-        /// Input DEM raster
-        input: PathBuf,
-        /// Output directory
-        out_dir: PathBuf,
-        /// Core tile width/height in pixels
-        #[arg(long, default_value_t = 2048)]
-        tile_size: usize,
-        /// Overlap halo around each tile in pixels
-        #[arg(long, default_value_t = 128)]
-        overlap: usize,
-        /// Median filter kernel size (1 = skip)
-        #[arg(short = 'k', long, default_value_t = 3)]
-        kernel: usize,
-        /// Minimum depression size in pixels
-        #[arg(short = 'm', long, default_value_t = 1000)]
-        min_size: usize,
-        /// Minimum depression depth
-        #[arg(short = 'd', long, default_value_t = 0.3)]
-        min_depth: f64,
-        /// Vertical level-set slicing interval
-        #[arg(short = 'i', long, default_value_t = 0.3)]
-        interval: f64,
-        /// Connectivity topology for per-tile depression filling (d8 or d4)
-        #[arg(short = 't', long, value_enum, default_value_t = CliTopology::D8)]
-        topology: CliTopology,
-        /// Load DEM in f64 precision on the eager/in-memory fallback path (windowed GeoTIFF/COG inputs always read one tile at a time directly into f64)
-        #[arg(long, conflicts_with = "use_f32")]
-        use_f64: bool,
-        /// Load DEM in f32 precision on the eager/in-memory fallback path (default for non-windowed formats; windowed GeoTIFF/COG inputs read one tile at a time directly into f64)
-        #[arg(long, hide = true)]
-        use_f32: bool,
-        /// Print summary as JSON
-        #[arg(long)]
-        json: bool,
-    },
+    TiledDepressions(Box<TiledDepressionsArgs>),
     /// Export numbered PNG inundation frames with optional scale bar and legend
-    ExportFrames {
-        /// Background DEM raster
-        dem: PathBuf,
-        /// Fill-time raster (fill_time.tif)
-        fill_time: PathBuf,
-        /// Output directory for numbered PNG frames
-        out_dir: PathBuf,
-        /// Number of frames to export
-        #[arg(long, default_value_t = 10)]
-        num_steps: usize,
-        /// Time step in hours
-        #[arg(long, default_value_t = 1.0)]
-        time_step: f64,
-        /// Optional rainfall intensity in cm/h for banner labels
-        #[arg(long)]
-        rain_intensity: Option<f64>,
-        /// Water overlay opacity (0.0..=1.0)
-        #[arg(long, default_value_t = 0.55)]
-        water_alpha: f32,
-        /// Optional maximum width/height in pixels
-        #[arg(long)]
-        max_dim: Option<usize>,
-        /// Draw a metric scale bar on each frame
-        #[arg(long)]
-        scale_bar: bool,
-        /// Draw a legend box on each frame
-        #[arg(long)]
-        legend: bool,
-        /// Hillshade azimuth in degrees
-        #[arg(long, default_value_t = 135.0)]
-        azimuth: f64,
-        /// Hillshade elevation angle in degrees
-        #[arg(long, default_value_t = 45.0)]
-        elevation: f64,
-        /// Print summary as JSON
-        #[arg(long)]
-        json: bool,
-    },
+    ExportFrames(Box<ExportFramesArgs>),
     /// Delineate contributing catchments for extracted sinks (ports 2_Delineate_Catchment.py)
     DelineateCatchments {
         /// Partially-filled / refined DEM raster (e.g. dem.tif from extract-sinks)
@@ -1219,168 +1869,12 @@ enum Commands {
         json: bool,
     },
     /// Simulate surface inundation dynamics over time (ports 6_Simulate Inundation.py)
-    SimulateInundation {
-        /// Input sink elevation raster (sink.tif)
-        sink: PathBuf,
-        /// Input catchment hierarchy raster (catchment_hir.tif)
-        catchment: PathBuf,
-        /// Output directory for flood_*.tif frames, fill_time.tif, and summary CSV
-        out_dir: PathBuf,
-        /// Minimum depression size in pixels
-        #[arg(short = 'm', long, default_value_t = 1000)]
-        min_size: usize,
-        /// Minimum depression depth
-        #[arg(short = 'd', long, default_value_t = 0.2)]
-        min_depth: f64,
-        /// Vertical level-set slicing interval (positive; sliced top-down)
-        #[arg(short = 'i', long, default_value_t = 0.2)]
-        interval: f64,
-        /// Rainfall intensity in cm/h
-        #[arg(long, default_value_t = 5.0)]
-        rain_intensity: f64,
-        /// Total rainfall duration in hours (defaults to 24.0 when --scs-type2-mm is set, else 50.0)
-        #[arg(long)]
-        duration: Option<f64>,
-        /// Simulation time step in hours
-        #[arg(long, default_value_t = 1.0)]
-        time_step: f64,
-        /// Hydrologic routing mode (static = independent level-set timing, fsm = dynamic Fill-Spill-Merge cascade mass-balance)
-        #[arg(long, value_enum, default_value_t = CliRoutingMode::Static)]
-        routing: CliRoutingMode,
-        /// Required when --routing fsm; refined DEM raster (e.g. dem.tif) used to compute D8 catchments and overland routing
-        #[arg(long)]
-        dem: Option<PathBuf>,
-        /// Optional SCS Type II design storm total precipitation in mm (overrides constant rainfall)
-        #[arg(long)]
-        scs_type2_mm: Option<f64>,
-        /// Optional runoff coefficient scalar (0..=1) or aligned GeoTIFF raster path
-        #[arg(long)]
-        runoff_coeff: Option<String>,
-        /// Optional vertical infiltration loss rate scalar (cm/h, >= 0) or aligned GeoTIFF raster path
-        #[arg(long)]
-        infiltration: Option<String>,
-        /// Optional antecedent ponded water depth scalar (>= 0) or aligned GeoTIFF raster path
-        #[arg(long)]
-        antecedent_depth: Option<String>,
-        /// Compress output GeoTIFFs with DEFLATE
-        #[arg(short = 'c', long)]
-        compress: bool,
-        /// Print summary as JSON
-        #[arg(long)]
-        json: bool,
-    },
+    SimulateInundation(Box<SimulateInundationArgs>),
     /// Render shaded-relief inundation animation as an animated GIF (ports 7_Play_Animation.py)
-    AnimateInundation {
-        /// Background DEM raster (e.g. dem.tif)
-        dem: PathBuf,
-        /// Directory containing flood_*.tif rasters from simulate-inundation
-        flood_dir: PathBuf,
-        /// Output animated GIF path (e.g. inundation.gif)
-        output: PathBuf,
-        /// Delay between frames in milliseconds
-        #[arg(long, default_value_t = 200)]
-        delay_ms: u16,
-        /// Play only rising water (disable rising-then-falling ping-pong playback)
-        #[arg(long)]
-        no_ping_pong: bool,
-        /// Number of GIF loops (0 = infinite)
-        #[arg(long, default_value_t = 0)]
-        loops: u16,
-        /// Water overlay opacity (0.0..=1.0)
-        #[arg(long, default_value_t = 0.55)]
-        water_alpha: f32,
-        /// Optional maximum width/height in pixels for downscaling large DEMs
-        #[arg(long)]
-        max_dim: Option<usize>,
-        /// Optional time step in hours for frame labels
-        #[arg(long, default_value_t = 1.0)]
-        time_step: f64,
-        /// Optional rainfall intensity in cm/h for the banner title
-        #[arg(long)]
-        rain_intensity: Option<f64>,
-        /// Hillshade azimuth in degrees
-        #[arg(long, default_value_t = 135.0)]
-        azimuth: f64,
-        /// Hillshade elevation angle in degrees
-        #[arg(long, default_value_t = 45.0)]
-        elevation: f64,
-        /// Draw a metric scale bar on each frame
-        #[arg(long)]
-        scale_bar: bool,
-        /// Draw a legend box on each frame
-        #[arg(long)]
-        legend: bool,
-        /// Print summary as JSON
-        #[arg(long)]
-        json: bool,
-    },
+    AnimateInundation(Box<AnimateInundationArgs>),
     /// Download authoritative open U.S. federal data (USGS 3DEP DEM/LPC, WBD, NHD, Transportation, USFWS NWI, NOAA Atlas 14) for a region
     #[cfg(feature = "download")]
-    Download {
-        /// Output directory for downloaded federal datasets and manifest.json
-        #[arg(short = 'o', long)]
-        out_dir: PathBuf,
-        /// WGS 84 bounding box as 'min_lon,min_lat,max_lon,max_lat'
-        #[arg(long, allow_hyphen_values = true, conflicts_with_all = ["huc", "region"])]
-        bbox: Option<String>,
-        /// USGS WBD Hydrologic Unit Code (2, 4, 6, 8, 10, or 12 digits, e.g. 10160002)
-        #[arg(long, conflicts_with_all = ["bbox", "region"])]
-        huc: Option<String>,
-        /// Local polygon vector file (.geojson, .gpkg, .shp) defining the region of interest
-        #[arg(long, conflicts_with_all = ["bbox", "huc"])]
-        region: Option<PathBuf>,
-        /// Comma-separated datasets to download ('all' or subset of wbd,dem,nhd,nwi,roads,culverts,noaa)
-        #[arg(long, default_value = "all")]
-        datasets: String,
-        /// USGS 3DEP product to download (1m, 10m, 30m, lpc)
-        #[arg(long, default_value = "1m")]
-        dem_product: String,
-        /// USGS WBD hierarchy level (2, 4, 6, 8, 10, or 12)
-        #[arg(long, default_value = "12")]
-        wbd_level: String,
-        /// Optional shared cache directory for 3DEP tiles
-        #[arg(long)]
-        tile_cache: Option<PathBuf>,
-        /// Keep all overlapping 3DEP tile vintages instead of deduplicating to newest publicationDate
-        #[arg(long)]
-        no_deduplicate: bool,
-        /// Skip mosaicking downloaded 3DEP GeoTIFF tiles into dem.tif
-        #[arg(long)]
-        no_mosaic: bool,
-        /// Skip clipping downloaded DEM/vectors to the HUC or vector region boundary
-        #[arg(long)]
-        no_clip: bool,
-        /// Culvert synthesis half-length along stream flowlines in meters
-        #[arg(long, default_value_t = 25.0)]
-        culvert_half_length: f64,
-        /// Culvert synthesis snapping distance in meters
-        #[arg(long, default_value_t = 15.0)]
-        culvert_snap_distance: f64,
-        /// Maximum TNM product records to scan across paginated pages (default 1000)
-        #[arg(long)]
-        max_products: Option<usize>,
-        /// Comma-separated USGS National Transportation MapServer layer IDs (default "29,30,31,32,33,38")
-        #[arg(long)]
-        transportation_layers: Option<String>,
-        /// Per-request HTTP timeout in seconds (default 120)
-        #[arg(long)]
-        timeout_secs: Option<u64>,
-        /// Maximum retry attempts for transient network or 5xx errors (default 4)
-        #[arg(long)]
-        max_retries: Option<usize>,
-        /// ArcGIS ObjectID chunk size for paginated vector downloads (default 250)
-        #[arg(long)]
-        oid_chunk_size: Option<usize>,
-        /// Re-download files even if they already exist locally
-        #[arg(long)]
-        overwrite: bool,
-        /// Query matching USGS 3DEP tiles without downloading data
-        #[arg(long)]
-        dry_run: bool,
-        /// Print summary as JSON
-        #[arg(long)]
-        json: bool,
-    },
+    Download(Box<DownloadArgs>),
     /// Fetch NOAA Atlas 14 precipitation frequency depth table (mm) for a WGS 84 latitude/longitude point
     #[cfg(feature = "download")]
     NoaaAtlas14 {
@@ -1428,46 +1922,7 @@ enum Commands {
         json: bool,
     },
     /// Render a shaded-relief PNG preview of a DEM, optional depression depth overlay, or inundation snapshot
-    Preview {
-        /// Input DEM or DSM raster
-        dem: PathBuf,
-        /// Output PNG file path (in MCP mode, omit -o to return the PNG directly as inline image content)
-        #[arg(short = 'o', long)]
-        output: Option<PathBuf>,
-        /// Optional fill-time raster (fill_time.tif) to overlay inundation at --hour
-        #[arg(long, conflicts_with = "depth")]
-        fill_time: Option<PathBuf>,
-        /// Inundation snapshot time in hours when --fill-time is set; shows cells first inundated by
-        /// this time (defaults to max finite fill time, which can exceed the storm duration because
-        /// constant-rain fill_time.tif assumes sustained rainfall; pass the storm duration to stop
-        /// at storm end)
-        #[arg(long, requires = "fill_time")]
-        hour: Option<f64>,
-        /// Optional depression depth raster (depth.tif or sink.tif) to overlay positive-depth basins
-        #[arg(long, conflicts_with = "fill_time")]
-        depth: Option<PathBuf>,
-        /// Maximum output width/height in pixels (0 = native resolution)
-        #[arg(long, default_value_t = 1024)]
-        max_dim: usize,
-        /// Overlay opacity (0.0..=1.0)
-        #[arg(long, default_value_t = 0.55)]
-        water_alpha: f32,
-        /// Draw a metric scale bar on the preview
-        #[arg(long)]
-        scale_bar: bool,
-        /// Draw a color legend box on the preview (when an overlay is shown)
-        #[arg(long)]
-        legend: bool,
-        /// Hillshade azimuth in degrees
-        #[arg(long, default_value_t = 135.0)]
-        azimuth: f64,
-        /// Hillshade elevation angle in degrees
-        #[arg(long, default_value_t = 45.0)]
-        elevation: f64,
-        /// Print summary as JSON
-        #[arg(long)]
-        json: bool,
-    },
+    Preview(Box<PreviewArgs>),
     /// Print metadata summary for a raster, vector dataset, or LiDAR point cloud
     Info {
         /// Input raster, vector, or point cloud file
@@ -1526,57 +1981,21 @@ enum Commands {
         /// Vertical level-set slicing interval
         #[arg(short = 'i', long, default_value_t = 0.3)]
         interval: f64,
-        /// Optional stage sampling interval for rating curves (defaults to --interval)
+        /// Optional stage sampling interval for rating curves (defaults to --interval; ignored with --delineation-method merge-tree)
         #[arg(long)]
         curve_interval: Option<f64>,
         /// Connectivity topology for sink extraction (d8 or d4)
         #[arg(short = 't', long, value_enum, default_value_t = CliTopology::D8)]
         topology: CliTopology,
+        /// Depression delineation algorithm (level-set or merge-tree)
+        #[arg(long, value_enum, default_value_t = CliDelineationMethod::LevelSet)]
+        delineation_method: CliDelineationMethod,
         /// Print rating curves (or summary when -o is provided) as JSON
         #[arg(long)]
         json: bool,
     },
     /// Build a directed depression fill-and-spill / merge connectivity graph (JSON, GraphML, or edge CSV)
-    ConnectivityGraph {
-        /// Input DEM raster
-        input: PathBuf,
-        /// Optional output file path (.json, .graphml, or .csv; prints to stdout if omitted)
-        #[arg(short = 'o', long)]
-        output: Option<PathBuf>,
-        /// Output graph serialization format (json, graphml, csv; inferred from -o extension when omitted)
-        #[arg(long, value_enum)]
-        format: Option<CliGraphFormat>,
-        /// Median filter kernel size (1 = skip filtering)
-        #[arg(short = 'k', long, default_value_t = 3)]
-        kernel: usize,
-        /// Minimum depression size in pixels
-        #[arg(short = 'm', long, default_value_t = 1000)]
-        min_size: usize,
-        /// Minimum depression depth
-        #[arg(short = 'd', long, default_value_t = 0.3)]
-        min_depth: f64,
-        /// Vertical level-set slicing interval
-        #[arg(short = 'i', long, default_value_t = 0.3)]
-        interval: f64,
-        /// Rainfall intensity in cm/h
-        #[arg(long, default_value_t = 5.0)]
-        rain_intensity: f64,
-        /// Total rainfall duration in hours
-        #[arg(long, default_value_t = 50.0)]
-        duration: f64,
-        /// Simulation time step in hours
-        #[arg(long, default_value_t = 1.0)]
-        time_step: f64,
-        /// Hydrologic routing mode (static or fsm)
-        #[arg(long, value_enum, default_value_t = CliRoutingMode::Static)]
-        routing: CliRoutingMode,
-        /// Optional stream network vector (.gpkg, .geojson, .shp) for distance-to-stream edge metrics
-        #[arg(long)]
-        streams: Option<PathBuf>,
-        /// Print graph (or summary when -o is provided) as JSON
-        #[arg(long)]
-        json: bool,
-    },
+    ConnectivityGraph(Box<ConnectivityGraphArgs>),
     /// Generate shell completion scripts (bash, zsh, fish, powershell, elvish)
     Completions {
         /// Target shell
@@ -1645,6 +2064,312 @@ fn dispatch(
                 }))?;
             } else if !verbosity.is_quiet() {
                 println!("Saved Gaussian-filtered raster to {}", output.display());
+            }
+        }
+        Commands::BilateralFilter {
+            input,
+            output,
+            spatial_sigma,
+            range_sigma,
+            json,
+        } => {
+            ensure_no_cli_path_collision(&input, &output)?;
+            bilateral_filter_file(&input, spatial_sigma, range_sigma, Some(&output))?;
+            if json {
+                print_json(&json!({
+                    "output": output,
+                    "spatial_sigma": spatial_sigma,
+                    "range_sigma": range_sigma,
+                }))?;
+            } else if !verbosity.is_quiet() {
+                println!("Saved bilateral-filtered raster to {}", output.display());
+            }
+        }
+        Commands::FeaturePreservingSmoothing {
+            input,
+            output,
+            filter_size,
+            norm_diff,
+            num_iter,
+            max_z_change,
+            compress,
+            json,
+        } => {
+            ensure_no_cli_path_collision(&input, &output)?;
+            let opts = FeaturePreservingOptions {
+                filter_size,
+                norm_diff_deg: norm_diff,
+                num_iter,
+                max_z_change,
+                compress,
+            };
+            feature_preserving_smoothing_file(&input, &opts, Some(&output))?;
+            if json {
+                print_json(&json!({
+                    "output": output,
+                    "filter_size": filter_size,
+                    "norm_diff": norm_diff,
+                    "num_iter": num_iter,
+                    "max_z_change": max_z_change,
+                }))?;
+            } else if !verbosity.is_quiet() {
+                println!(
+                    "Saved feature-preserving smoothed raster to {}",
+                    output.display()
+                );
+            }
+        }
+        Commands::Dinf {
+            input,
+            direction,
+            accumulation,
+            compress,
+            json,
+        } => {
+            if let Some(ref p) = direction {
+                ensure_no_cli_path_collision(&input, p)?;
+            }
+            if let Some(ref p) = accumulation {
+                ensure_no_cli_path_collision(&input, p)?;
+            }
+            let dem = load_raster::<f64>(&input, None)?;
+            if let Some(ref dir_path) = direction {
+                let dir = dinf_flow_direction(&dem)?;
+                save_raster(&dir, dir_path, Some("dinf_flow_direction"), compress)?;
+            }
+            if let Some(ref acc_path) = accumulation {
+                let acc = dinf_flow_accumulation(&dem)?;
+                save_raster(&acc, acc_path, Some("dinf_flow_accumulation"), compress)?;
+            }
+            if json {
+                print_json(&json!({
+                    "input": input,
+                    "direction": direction,
+                    "accumulation": accumulation,
+                    "width": dem.width(),
+                    "height": dem.height(),
+                }))?;
+            } else if !verbosity.is_quiet() {
+                if let Some(ref p) = direction {
+                    println!("Saved D-infinity flow direction to {}", p.display());
+                }
+                if let Some(ref p) = accumulation {
+                    println!("Saved D-infinity flow accumulation to {}", p.display());
+                }
+            }
+        }
+        Commands::Mfd {
+            input,
+            output,
+            exponent,
+            compress,
+            json,
+        } => {
+            ensure_no_cli_path_collision(&input, &output)?;
+            let dem = load_raster::<f64>(&input, None)?;
+            let acc = mfd_flow_accumulation(&dem, exponent)?;
+            save_raster(&acc, &output, Some("mfd_flow_accumulation"), compress)?;
+            if json {
+                print_json(&json!({
+                    "output": output,
+                    "exponent": exponent,
+                    "width": acc.width(),
+                    "height": acc.height(),
+                }))?;
+            } else if !verbosity.is_quiet() {
+                println!("Saved MFD flow accumulation to {}", output.display());
+            }
+        }
+        Commands::Twi {
+            input,
+            output,
+            flow_acc,
+            compress,
+            json,
+        } => {
+            ensure_no_cli_path_collision(&input, &output)?;
+            if let Some(ref fa_path) = flow_acc {
+                ensure_no_cli_path_collision(fa_path, &output)?;
+            }
+            let dem = load_raster::<f64>(&input, None)?;
+            let fa = match &flow_acc {
+                Some(p) => Some(load_raster::<f64>(p, None)?),
+                None => None,
+            };
+            let twi = compute_twi(&dem, fa.as_ref())?;
+            save_raster(&twi, &output, Some("twi"), compress)?;
+            if json {
+                print_json(&json!({
+                    "output": output,
+                    "width": twi.width(),
+                    "height": twi.height(),
+                }))?;
+            } else if !verbosity.is_quiet() {
+                println!("Saved TWI raster to {}", output.display());
+            }
+        }
+        Commands::Hand {
+            input,
+            output,
+            stream_mask,
+            stream_threshold,
+            compress,
+            json,
+        } => {
+            ensure_no_cli_path_collision(&input, &output)?;
+            if let Some(ref mask_path) = stream_mask {
+                ensure_no_cli_path_collision(mask_path, &output)?;
+            }
+            let dem = load_raster::<f64>(&input, None)?;
+            let hand = if let Some(ref mask_path) = stream_mask {
+                let raw_mask = load_raster::<f64>(mask_path, None)?;
+                let nd = raw_mask.no_data();
+                let u8_data: Vec<u8> = raw_mask
+                    .data()
+                    .iter()
+                    .map(|&v| u8::from(v.is_finite() && !v.rd_eq(nd) && v > 0.0))
+                    .collect();
+                let mut mask =
+                    lidar::Array2D::from_vec(raw_mask.width(), raw_mask.height(), u8_data)?;
+                mask.copy_metadata_from(&raw_mask);
+                mask.set_no_data(0);
+                compute_hand(&dem, &mask)?
+            } else {
+                let thresh = stream_threshold.unwrap_or(100.0);
+                compute_hand_from_threshold(&dem, thresh)?
+            };
+            save_raster(&hand, &output, Some("hand"), compress)?;
+            if json {
+                print_json(&json!({
+                    "output": output,
+                    "width": hand.width(),
+                    "height": hand.height(),
+                }))?;
+            } else if !verbosity.is_quiet() {
+                println!("Saved HAND raster to {}", output.display());
+            }
+        }
+        Commands::BurnStreams {
+            input,
+            streams,
+            output,
+            depth,
+            width,
+            buffer_cells,
+            smooth_drop,
+            compress,
+            json,
+        } => {
+            ensure_no_cli_path_collision(&input, &output)?;
+            ensure_no_cli_path_collision(&streams, &output)?;
+            let opts = BurnStreamsOptions {
+                burn_depth: depth,
+                stream_width_cells: width,
+                buffer_cells,
+                smooth_drop,
+                compress,
+            };
+            let (_dem, burned_cells) = burn_streams_file(&input, &streams, &output, &opts)?;
+            if json {
+                print_json(&json!({
+                    "output": output,
+                    "cells_burned": burned_cells,
+                }))?;
+            } else if !verbosity.is_quiet() {
+                println!(
+                    "Burned streams ({burned_cells} cells modified) to {}",
+                    output.display()
+                );
+            }
+        }
+        Commands::MergeTree {
+            input,
+            out_dir,
+            dem,
+            dem_is_refined,
+            min_size,
+            min_depth,
+            topology,
+            max_rating_curve_points,
+            compress,
+            json,
+        } => {
+            std::fs::create_dir_all(&out_dir)?;
+            let id_path = out_dir.join("depression_id.tif");
+            let lvl_path = out_dir.join("depression_level.tif");
+            let csv_path = out_dir.join("depressions_info.csv");
+            let nodes_path = out_dir.join("merge_tree_nodes.json");
+            let curves_path = out_dir.join("rating_curves.csv");
+            for cand in [&id_path, &lvl_path, &csv_path, &nodes_path, &curves_path] {
+                ensure_no_cli_path_collision(&input, cand)?;
+                if let Some(ref d) = dem {
+                    ensure_no_cli_path_collision(d, cand)?;
+                }
+            }
+            let sink_arr = load_raster::<f64>(&input, None)?;
+            let opts = MergeTreeOptions {
+                min_size,
+                min_depth,
+                topology: topology.into(),
+                dem_is_refined,
+                max_rating_curve_points,
+            };
+            let control = make_progress_control(verbosity);
+            let res = match &dem {
+                Some(dem_path) => {
+                    let dem_arr = load_raster::<f64>(dem_path, None)?;
+                    delineate_depressions_merge_tree_with_dem_in_memory_with_control(
+                        &sink_arr, &dem_arr, &opts, &control,
+                    )?
+                }
+                None => delineate_depressions_merge_tree_in_memory_with_control(
+                    &sink_arr, &opts, &control,
+                )?,
+            };
+            save_raster(
+                &res.depressions.depression_id,
+                &id_path,
+                Some("merge_tree: depression_id"),
+                compress,
+            )?;
+            save_raster(
+                &res.depressions.depression_level,
+                &lvl_path,
+                Some("merge_tree: depression_level"),
+                compress,
+            )?;
+            write_depressions_csv(&res.depressions.depressions, &csv_path)?;
+            let nodes_json = serde_json::to_string_pretty(&res.nodes)
+                .map_err(|e| lidar::Error::Algorithm(e.to_string()))?;
+            std::fs::write(&nodes_path, nodes_json)?;
+            let wrote_curves = if !res.rating_curves.is_empty() {
+                write_rating_curves_csv(&res.rating_curves, &curves_path)?;
+                Some(curves_path)
+            } else {
+                None
+            };
+            if json {
+                print_json(&json!({
+                    "out_dir": out_dir,
+                    "num_nodes": res.nodes.len(),
+                    "num_regions": res.depressions.num_regions,
+                    "max_level": res.depressions.max_level,
+                    "num_rating_curve_points": res.rating_curves.len(),
+                    "depression_id_path": id_path,
+                    "depression_level_path": lvl_path,
+                    "csv_path": csv_path,
+                    "nodes_json_path": nodes_path,
+                    "rating_curves_csv_path": wrote_curves,
+                }))?;
+            } else if !verbosity.is_quiet() {
+                println!(
+                    "Merge-tree delineation complete: {} node(s) across {} region(s) (max level = {})",
+                    res.nodes.len(),
+                    res.depressions.num_regions,
+                    res.depressions.max_level
+                );
+                println!("  nodes JSON: {}", nodes_path.display());
+                println!("  csv:        {}", csv_path.display());
             }
         }
         Commands::ExtractSinks {
@@ -1803,13 +2528,21 @@ fn dispatch(
         Commands::Mosaic {
             inputs,
             output,
+            resampling,
+            compress,
+            cog,
             json,
         } => {
-            mosaic(&inputs, &output)?;
+            let r = parse_resampling(&resampling)?;
+            let out_opts = RasterOutputOptions { compress, cog };
+            mosaic_with_options(&inputs, &output, r, &out_opts)?;
             if json {
                 print_json(&json!({
                     "output": output,
                     "input_count": inputs.len(),
+                    "resampling": resampling,
+                    "compress": compress,
+                    "cog": cog,
                 }))?;
             } else if !verbosity.is_quiet() {
                 println!(
@@ -1825,17 +2558,22 @@ fn dispatch(
             crs,
             resampling,
             resolution,
+            compress,
+            cog,
             json,
         } => {
             let r = parse_resampling(&resampling)?;
             let res_pair = resolution.map(|v| (v, v));
-            reproject_image(&input, &output, &crs, r, res_pair)?;
+            let out_opts = RasterOutputOptions { compress, cog };
+            reproject_image_with_options(&input, &output, &crs, r, res_pair, &out_opts)?;
             if json {
                 print_json(&json!({
                     "output": output,
                     "crs": crs,
                     "resampling": resampling,
                     "resolution": resolution,
+                    "compress": compress,
+                    "cog": cog,
                 }))?;
             } else if !verbosity.is_quiet() {
                 println!("Reprojected to {} ({crs})", output.display());
@@ -1846,15 +2584,20 @@ fn dispatch(
             output,
             resolution,
             resampling,
+            compress,
+            cog,
             json,
         } => {
             let r = parse_resampling(&resampling)?;
-            resample(&input, &output, resolution, r)?;
+            let out_opts = RasterOutputOptions { compress, cog };
+            resample_with_options(&input, &output, resolution, r, &out_opts)?;
             if json {
                 print_json(&json!({
                     "output": output,
                     "resolution": resolution,
                     "resampling": resampling,
+                    "compress": compress,
+                    "cog": cog,
                 }))?;
             } else if !verbosity.is_quiet() {
                 println!(
@@ -1867,14 +2610,19 @@ fn dispatch(
             input,
             mask,
             output,
+            compress,
+            cog,
             json,
         } => {
-            clip_image(&input, &mask, &output)?;
+            let out_opts = RasterOutputOptions { compress, cog };
+            clip_image_with_options(&input, &mask, &output, &out_opts)?;
             if json {
                 print_json(&json!({
                     "input": input,
                     "mask": mask,
                     "output": output,
+                    "compress": compress,
+                    "cog": cog,
                 }))?;
             } else if !verbosity.is_quiet() {
                 println!("Clipped raster saved to {}", output.display());
@@ -1981,6 +2729,9 @@ fn dispatch(
             if let Some(radius) = ground_filter.ror_radius {
                 cloud = filter_outliers_ror(&cloud, radius, ground_filter.ror_min_neighbors)?;
             }
+            if let Some(k) = ground_filter.sor_k {
+                cloud = filter_outliers_statistical(&cloud, k, ground_filter.sor_sigma, true)?;
+            }
             let opts = GroundClassifyOptions {
                 method: method.into(),
                 csf: ground_filter.build_csf(DEFAULT_GROUND_CLASS),
@@ -2011,20 +2762,23 @@ fn dispatch(
                 );
             }
         }
-        Commands::LidarToDsm {
-            input,
-            output,
-            resolution,
-            radius,
-            min_z,
-            max_z,
-            classification,
-            return_kind,
-            stat,
-            method,
-            window_size,
-            json,
-        } => {
+        Commands::LidarToDsm(args) => {
+            let LidarToDsmArgs {
+                input,
+                output,
+                resolution,
+                radius,
+                min_z,
+                max_z,
+                classification,
+                return_kind,
+                stat,
+                method,
+                window_size,
+                compress,
+                cog,
+                json,
+            } = *args;
             let classifications = classification.as_deref().map(parse_u8_list).transpose()?;
             let return_kinds = return_kind.as_deref().map(parse_return_kinds).transpose()?;
             let opts = LidarToDsmOptions {
@@ -2037,6 +2791,8 @@ fn dispatch(
                 stat: GridStat::parse(&stat)?,
                 method: GridMethod::parse(&method)?,
                 window_size,
+                compress,
+                cog,
                 ..Default::default()
             };
             let (cols, rows) = lidar_to_dsm(&input, &output, &opts)?;
@@ -2046,27 +2802,35 @@ fn dispatch(
                     "width": cols,
                     "height": rows,
                     "resolution": resolution,
+                    "compress": compress,
+                    "cog": cog,
                 }))?;
             } else if !verbosity.is_quiet() {
                 println!("Generated {cols}x{rows} DSM at {}", output.display());
             }
         }
-        Commands::LidarToDtm {
-            input,
-            output,
-            ground_method,
-            ground_class,
-            resolution,
-            radius,
-            method,
-            stat,
-            window_size,
-            remove_outliers,
-            outlier_cell,
-            outlier_threshold,
-            ground_filter,
-            json,
-        } => {
+        Commands::LidarToDtm(args) => {
+            let LidarToDtmArgs {
+                input,
+                output,
+                ground_method,
+                ground_class,
+                resolution,
+                radius,
+                method,
+                stat,
+                window_size,
+                remove_outliers,
+                outlier_cell,
+                outlier_threshold,
+                compress,
+                cog,
+                tiled,
+                tile_size,
+                overlap,
+                ground_filter,
+                json,
+            } = *args;
             let mut opts = LidarToDtmOptions {
                 resolution,
                 ground_method: ground_method.into(),
@@ -2078,10 +2842,23 @@ fn dispatch(
                 remove_outliers,
                 outlier_cell,
                 outlier_threshold,
+                compress,
+                cog,
                 ..Default::default()
             };
             ground_filter.apply_to_dtm(&mut opts);
-            let (cols, rows) = lidar_to_dtm(&input, &output, &opts)?;
+            let (cols, rows) = if tiled {
+                let control = make_progress_control(verbosity);
+                let tiled_opts = TiledPointCloudOptions {
+                    tile_size,
+                    overlap,
+                    dtm: opts,
+                    ..Default::default()
+                };
+                lidar_to_dtm_tiled_with_control(&input, &output, &tiled_opts, &control)?
+            } else {
+                lidar_to_dtm(&input, &output, &opts)?
+            };
             if json {
                 print_json(&json!({
                     "output": output,
@@ -2089,25 +2866,37 @@ fn dispatch(
                     "height": rows,
                     "resolution": resolution,
                     "remove_outliers": remove_outliers,
+                    "compress": compress,
+                    "cog": cog,
+                    "tiled": tiled,
                 }))?;
             } else if !verbosity.is_quiet() {
                 println!("Generated {cols}x{rows} DTM at {}", output.display());
             }
         }
-        Commands::LidarToChm {
-            input,
-            output,
-            ground_method,
-            ground_class,
-            resolution,
-            radius,
-            window_size,
-            remove_outliers,
-            outlier_cell,
-            outlier_threshold,
-            ground_filter,
-            json,
-        } => {
+        Commands::LidarToChm(args) => {
+            let LidarToChmArgs {
+                input,
+                output,
+                ground_method,
+                ground_class,
+                resolution,
+                radius,
+                window_size,
+                remove_outliers,
+                outlier_cell,
+                outlier_threshold,
+                pit_free,
+                height_thresholds,
+                max_triangle_edge,
+                compress,
+                cog,
+                tiled,
+                tile_size,
+                overlap,
+                ground_filter,
+                json,
+            } = *args;
             let mut opts = LidarToDtmOptions {
                 resolution,
                 ground_method: ground_method.into(),
@@ -2117,10 +2906,38 @@ fn dispatch(
                 remove_outliers,
                 outlier_cell,
                 outlier_threshold,
+                compress,
+                cog,
                 ..Default::default()
             };
             ground_filter.apply_to_dtm(&mut opts);
-            let (cols, rows) = lidar_to_chm(&input, &output, &opts)?;
+            let (cols, rows) = if pit_free {
+                let thresholds = match height_thresholds.as_deref() {
+                    Some(s) => parse_f64_list(s)?,
+                    None => PitFreeChmOptions::default().height_thresholds,
+                };
+                let pf_opts = PitFreeChmOptions {
+                    resolution,
+                    height_thresholds: thresholds,
+                    max_triangle_edge,
+                    dtm: opts,
+                    compress,
+                    cog,
+                };
+                let arr = lidar_to_chm_pit_free(&input, &output, &pf_opts)?;
+                (arr.width(), arr.height())
+            } else if tiled {
+                let control = make_progress_control(verbosity);
+                let tiled_opts = TiledPointCloudOptions {
+                    tile_size,
+                    overlap,
+                    dtm: opts,
+                    ..Default::default()
+                };
+                lidar_to_chm_tiled_with_control(&input, &output, &tiled_opts, &control)?
+            } else {
+                lidar_to_chm(&input, &output, &opts)?
+            };
             if json {
                 print_json(&json!({
                     "output": output,
@@ -2128,6 +2945,10 @@ fn dispatch(
                     "height": rows,
                     "resolution": resolution,
                     "remove_outliers": remove_outliers,
+                    "pit_free": pit_free,
+                    "compress": compress,
+                    "cog": cog,
+                    "tiled": tiled,
                 }))?;
             } else if !verbosity.is_quiet() {
                 println!("Generated {cols}x{rows} CHM at {}", output.display());
@@ -2195,37 +3016,49 @@ fn dispatch(
                 );
             }
         }
-        Commands::Pipeline {
-            input,
-            out_dir,
-            config,
-            kernel,
-            min_size,
-            min_depth,
-            interval,
-            rain_intensity,
-            duration,
-            time_step,
-            breach_mode,
-            breach_max_depth,
-            breach_max_length,
-            breach_fill_remaining,
-            culverts,
-            runoff_coeff,
-            curve_number,
-            cn,
-            infiltration,
-            antecedent_depth,
-            scs_type2_mm,
-            routing,
-            streams,
-            use_f32,
-            no_rasters,
-            no_vectors,
-            no_graph,
-            compress,
-            json,
-        } => {
+        Commands::Pipeline(args) => {
+            let PipelineArgs {
+                input,
+                out_dir,
+                config,
+                kernel,
+                min_size,
+                min_depth,
+                interval,
+                delineation_method,
+                rain_intensity,
+                duration,
+                time_step,
+                breach_mode,
+                breach_max_depth,
+                breach_max_length,
+                breach_fill_remaining,
+                culverts,
+                runoff_coeff,
+                curve_number,
+                cn,
+                infiltration,
+                antecedent_depth,
+                scs_type2_mm,
+                routing,
+                green_ampt_ks,
+                green_ampt_psi,
+                green_ampt_dtheta,
+                hazard_dir,
+                recession_et_cm_h,
+                recession_seepage_cm_h,
+                recession_max_h,
+                attenuate_travel_time_h,
+                attenuate_dt_h,
+                attenuate_reservoirs,
+                streams,
+                use_f32,
+                no_rasters,
+                no_vectors,
+                no_graph,
+                compress,
+                json,
+            } = *args;
             if config.is_some() && std::env::var_os("LIDAR_MCP_TOOL").is_some() {
                 return Err(lidar::Error::InvalidArgument(
                     "--config is disabled inside MCP tool invocations; pass explicit validated CLI flags instead"
@@ -2286,6 +3119,47 @@ fn dispatch(
                     .transpose()?
                     .unwrap_or(CliRoutingMode::Static),
             };
+            let delineation_method = match delineation_method {
+                Some(m) => m,
+                None => cfg
+                    .delineation_method
+                    .as_deref()
+                    .map(parse_delineation_method_str)
+                    .transpose()?
+                    .unwrap_or(CliDelineationMethod::LevelSet),
+            };
+            let ga_ks = green_ampt_ks.or(cfg.green_ampt_ks);
+            let ga_psi = green_ampt_psi.or(cfg.green_ampt_psi);
+            let ga_dtheta = green_ampt_dtheta.or(cfg.green_ampt_dtheta);
+            let green_ampt = match (ga_ks, ga_psi, ga_dtheta) {
+                (None, None, None) => None,
+                (Some(ks_cm_h), Some(psi_cm), Some(delta_theta)) => {
+                    let ga = GreenAmptParams {
+                        ks_cm_h,
+                        psi_cm,
+                        delta_theta,
+                    };
+                    ga.validate()?;
+                    Some(ga)
+                }
+                _ => {
+                    return Err(lidar::Error::InvalidArgument(
+                        "Green-Ampt infiltration requires all three of --green-ampt-ks, --green-ampt-psi, and --green-ampt-dtheta"
+                            .into(),
+                    ));
+                }
+            };
+            let want_recession = recession_et_cm_h.is_some()
+                || recession_seepage_cm_h.is_some()
+                || recession_max_h.is_some();
+            let want_post_fsm =
+                hazard_dir.is_some() || want_recession || attenuate_travel_time_h.is_some();
+            if want_post_fsm && !matches!(routing, CliRoutingMode::Fsm) {
+                return Err(lidar::Error::InvalidArgument(
+                    "--hazard-dir, --recession-*, and --attenuate-travel-time-h require --routing fsm"
+                        .into(),
+                ));
+            }
             let use_f32 = use_f32.or(cfg.use_f32).unwrap_or(false);
             let no_rasters = no_rasters.or(cfg.no_rasters).unwrap_or(false);
             let no_vectors = no_vectors.or(cfg.no_vectors).unwrap_or(false);
@@ -2410,6 +3284,7 @@ fn dispatch(
                 kernel_size: kernel,
                 breach,
                 culverts_vector: culverts,
+                delineation_method: delineation_method.into(),
                 simulation: SimulateInundationOptions {
                     min_size,
                     min_depth,
@@ -2424,6 +3299,7 @@ fn dispatch(
                 infiltration_path: infiltration,
                 antecedent_depth_path: antecedent_depth,
                 hyetograph,
+                green_ampt,
                 stream_vector: streams,
                 use_f32,
                 save_rasters: !no_rasters,
@@ -2433,8 +3309,166 @@ fn dispatch(
             };
             let control = make_progress_control(verbosity);
             let res = run_pipeline_with_control(&input, &out_dir, &opts, &control)?;
+
+            // Optional post-storm FSM analyses (hazard rasters, post-storm recession,
+            // Nash-cascade hydrograph attenuation).
+            let mut hazard_paths: Option<(PathBuf, PathBuf, PathBuf)> = None;
+            let mut recession_paths: Option<(PathBuf, PathBuf)> = None;
+            let mut attenuated_csv: Option<PathBuf> = None;
+            if want_post_fsm {
+                let mut dem_post = load_raster::<f64>(&input, None)?;
+                if opts.kernel_size > 1 {
+                    dem_post = median_filter(&dem_post, opts.kernel_size)?;
+                }
+                if let Some(ref culv) = opts.culverts_vector {
+                    let (burned, _) = lidar::burn_culverts(&dem_post, culv, &opts.burn_culverts)?;
+                    dem_post = burned;
+                }
+                if let Some(ref b_opts) = opts.breach {
+                    dem_post = lidar::breach_depressions(&dem_post, b_opts)?;
+                }
+                let sinks_post =
+                    extract_sinks_in_memory(&dem_post, opts.simulation.min_size, Topology::D8)?;
+                let deps_post = match opts.delineation_method {
+                    DelineationMethod::LevelSet => delineate_depressions_in_memory(
+                        &sinks_post.sink,
+                        opts.simulation.min_size,
+                        opts.simulation.min_depth,
+                        opts.simulation.interval,
+                    )?,
+                    DelineationMethod::MergeTree => {
+                        let mt = lidar::delineate_depressions_merge_tree_with_dem_in_memory(
+                            &sinks_post.sink,
+                            &sinks_post.dem_refined,
+                            &MergeTreeOptions {
+                                min_size: opts.simulation.min_size,
+                                min_depth: opts.simulation.min_depth,
+                                topology: Topology::D8,
+                                dem_is_refined: true,
+                                max_rating_curve_points: Some(0),
+                            },
+                        )?;
+                        mt.depressions
+                    }
+                };
+                let rc_arr = opts
+                    .runoff_coeff_path
+                    .as_deref()
+                    .map(|p| load_raster::<f64>(p, None))
+                    .transpose()?;
+                let inf_arr = opts
+                    .infiltration_path
+                    .as_deref()
+                    .map(|p| load_raster::<f64>(p, None))
+                    .transpose()?;
+                let ant_arr = opts
+                    .antecedent_depth_path
+                    .as_deref()
+                    .map(|p| load_raster::<f64>(p, None))
+                    .transpose()?;
+                let fsm_forcing = FsmForcing {
+                    base: InundationForcing {
+                        runoff_coeff: rc_arr.as_ref(),
+                        infiltration_cm_h: inf_arr.as_ref(),
+                        antecedent_depth: ant_arr.as_ref(),
+                        hyetograph: opts.hyetograph.as_deref(),
+                    },
+                    green_ampt: opts.green_ampt,
+                    green_ampt_substep_h: None,
+                };
+                let fsm_res = simulate_fill_spill_merge_with_green_ampt_in_memory(
+                    &sinks_post.dem_refined,
+                    &sinks_post.sink,
+                    &deps_post,
+                    &opts.simulation,
+                    &fsm_forcing,
+                )?;
+                if let Some(ref hdir) = hazard_dir {
+                    let hazards = compute_fsm_hazard_rasters(
+                        &sinks_post.dem_refined,
+                        &fsm_res.fill_time,
+                        &deps_post,
+                        &fsm_res,
+                        fsm_res.mass_balance.duration_h,
+                    )?;
+                    hazard_paths = Some(write_fsm_hazard_rasters(&hazards, hdir, compress)?);
+                }
+                if want_recession {
+                    let defaults = RecessionOptions::default();
+                    let rec_opts = RecessionOptions {
+                        et_cm_h: recession_et_cm_h.unwrap_or(defaults.et_cm_h),
+                        seepage_cm_h: recession_seepage_cm_h.unwrap_or(defaults.seepage_cm_h),
+                        max_recession_h: recession_max_h.unwrap_or(defaults.max_recession_h),
+                    };
+                    let rec = simulate_post_storm_recession(
+                        &sinks_post.dem_refined,
+                        &deps_post,
+                        &fsm_res,
+                        &rec_opts,
+                    )?;
+                    let drain_tif = out_dir.join("fsm_recession_drain_time.tif");
+                    let curve_csv = out_dir.join("fsm_recession_curve.csv");
+                    save_raster(
+                        &rec.drain_time_h,
+                        &drain_tif,
+                        Some("fsm_recession_drain_time"),
+                        compress,
+                    )?;
+                    let mut csv_buf =
+                        String::from("time_h,stored_vol_m3,inundated_area_m2,wet_basin_count\n");
+                    for pt in &rec.curve {
+                        use std::fmt::Write as _;
+                        let _ = writeln!(
+                            csv_buf,
+                            "{:.6},{:.4},{:.4},{}",
+                            pt.time_h, pt.stored_vol_m3, pt.inundated_area_m2, pt.wet_basin_count
+                        );
+                    }
+                    std::fs::write(&curve_csv, csv_buf)?;
+                    recession_paths = Some((drain_tif, curve_csv));
+                }
+                if let Some(tt_h) = attenuate_travel_time_h {
+                    let att_opts = SpillAttenuationOptions {
+                        mean_travel_time_h: tt_h,
+                        dt_h: attenuate_dt_h,
+                        num_reservoirs: attenuate_reservoirs,
+                        tail_duration_h: None,
+                    };
+                    let attenuated =
+                        attenuate_fsm_hydrograph_with_options(&fsm_res.hydrograph, &att_opts)?;
+                    let att_path = out_dir.join("fsm_hydrograph_attenuated.csv");
+                    write_fsm_hydrograph_csv(&attenuated, &att_path)?;
+                    attenuated_csv = Some(att_path);
+                }
+            }
             if json {
-                print_json(&res)?;
+                let mut val = serde_json::to_value(&res)
+                    .map_err(|e| lidar::Error::Algorithm(e.to_string()))?;
+                if let Some(obj) = val.as_object_mut() {
+                    if let Some((ref md, ref wse, ref dur)) = hazard_paths {
+                        obj.insert(
+                            "fsm_hazard_rasters".into(),
+                            json!({
+                                "max_depth": md,
+                                "wse": wse,
+                                "duration_h": dur,
+                            }),
+                        );
+                    }
+                    if let Some((ref dt, ref rc)) = recession_paths {
+                        obj.insert(
+                            "fsm_recession".into(),
+                            json!({
+                                "drain_time_tif": dt,
+                                "recession_curve_csv": rc,
+                            }),
+                        );
+                    }
+                    if let Some(ref att) = attenuated_csv {
+                        obj.insert("fsm_hydrograph_attenuated_csv".into(), json!(att));
+                    }
+                }
+                print_json(&val)?;
             } else if !verbosity.is_quiet() {
                 println!(
                     "Pipeline complete: {} nested depression(s) across {} sink region(s) (max level = {}), {} spill path(s)",
@@ -2474,20 +3508,53 @@ fn dispatch(
                 println!("  summary JSON:     {}", res.summary_json.display());
             }
         }
-        Commands::TiledDepressions {
-            input,
-            out_dir,
-            tile_size,
-            overlap,
-            kernel,
-            min_size,
-            min_depth,
-            interval,
-            topology,
-            use_f64,
-            use_f32: _,
-            json,
-        } => {
+        Commands::TiledDepressions(args) => {
+            let TiledDepressionsArgs {
+                input,
+                out_dir,
+                tile_size,
+                overlap,
+                kernel,
+                min_size,
+                min_depth,
+                interval,
+                topology,
+                delineation_method,
+                write_rasters,
+                write_gpkg,
+                breach_mode,
+                breach_max_depth,
+                breach_max_length,
+                breach_fill_remaining,
+                compress,
+                use_f64,
+                use_f32: _,
+                json,
+            } = *args;
+            if breach_max_length.is_some() && breach_max_depth.is_none() && breach_mode.is_none() {
+                return Err(lidar::Error::InvalidArgument(
+                    "--breach-max-length requires --breach-max-depth or --breach-mode".into(),
+                ));
+            }
+            let breach = if breach_mode.is_some() || breach_max_depth.is_some() {
+                let mode: BreachMode = breach_mode.map(Into::into).unwrap_or(BreachMode::Selective);
+                let md_arg = breach_max_depth.filter(|&md| md != 0.0);
+                let mut b_opts = BreachOptions::for_mode(mode, md_arg, breach_max_length);
+                if breach_max_depth == Some(0.0) {
+                    b_opts.max_depth = None;
+                }
+                if breach_max_length == Some(0) {
+                    b_opts.max_length = None;
+                }
+                b_opts.fill_remaining = breach_fill_remaining;
+                Some(b_opts)
+            } else if breach_fill_remaining {
+                return Err(lidar::Error::InvalidArgument(
+                    "--breach-fill-remaining requires --breach-mode or --breach-max-depth".into(),
+                ));
+            } else {
+                None
+            };
             let opts = TiledDelineationOptions {
                 tile_size,
                 overlap,
@@ -2497,15 +3564,17 @@ fn dispatch(
                 interval,
                 topology: topology.into(),
                 use_f32: !use_f64,
-                ..Default::default()
+                delineation_method: delineation_method.into(),
+            };
+            let out_opts = TiledOutputOptions {
+                write_rasters,
+                write_gpkg,
+                breach,
+                compress,
             };
             let control = make_progress_control(verbosity);
             let res = delineate_depressions_tiled_with_control(
-                &input,
-                &out_dir,
-                &opts,
-                &TiledOutputOptions::default(),
-                &control,
+                &input, &out_dir, &opts, &out_opts, &control,
             )?;
             if json {
                 print_json(&res)?;
@@ -2519,21 +3588,22 @@ fn dispatch(
                 println!("  csv: {}", res.csv_path.display());
             }
         }
-        Commands::ExportFrames {
-            dem,
-            fill_time,
-            out_dir,
-            num_steps,
-            time_step,
-            rain_intensity,
-            water_alpha,
-            max_dim,
-            scale_bar,
-            legend,
-            azimuth,
-            elevation,
-            json,
-        } => {
+        Commands::ExportFrames(args) => {
+            let ExportFramesArgs {
+                dem,
+                fill_time,
+                out_dir,
+                num_steps,
+                time_step,
+                rain_intensity,
+                water_alpha,
+                max_dim,
+                scale_bar,
+                legend,
+                azimuth,
+                elevation,
+                json,
+            } = *args;
             let dem_arr = load_raster::<f64>(&dem, None)?;
             let ft_arr = load_raster::<f64>(&fill_time, None)?;
             let opts = AnimateInundationOptions {
@@ -2652,25 +3722,26 @@ fn dispatch(
                 );
             }
         }
-        Commands::SimulateInundation {
-            sink,
-            catchment,
-            out_dir,
-            min_size,
-            min_depth,
-            interval,
-            rain_intensity,
-            duration,
-            time_step,
-            routing,
-            dem,
-            scs_type2_mm,
-            runoff_coeff,
-            infiltration,
-            antecedent_depth,
-            compress,
-            json,
-        } => {
+        Commands::SimulateInundation(args) => {
+            let SimulateInundationArgs {
+                sink,
+                catchment,
+                out_dir,
+                min_size,
+                min_depth,
+                interval,
+                rain_intensity,
+                duration,
+                time_step,
+                routing,
+                dem,
+                scs_type2_mm,
+                runoff_coeff,
+                infiltration,
+                antecedent_depth,
+                compress,
+                json,
+            } = *args;
             let duration = duration.unwrap_or(if scs_type2_mm.is_some() { 24.0 } else { 50.0 });
             let routing_mode: RoutingMode = routing.into();
             let opts = SimulateInundationOptions {
@@ -2755,23 +3826,24 @@ fn dispatch(
                 }
             }
         }
-        Commands::AnimateInundation {
-            dem,
-            flood_dir,
-            output,
-            delay_ms,
-            no_ping_pong,
-            loops,
-            water_alpha,
-            max_dim,
-            time_step,
-            rain_intensity,
-            azimuth,
-            elevation,
-            scale_bar,
-            legend,
-            json,
-        } => {
+        Commands::AnimateInundation(args) => {
+            let AnimateInundationArgs {
+                dem,
+                flood_dir,
+                output,
+                delay_ms,
+                no_ping_pong,
+                loops,
+                water_alpha,
+                max_dim,
+                time_step,
+                rain_intensity,
+                azimuth,
+                elevation,
+                scale_bar,
+                legend,
+                json,
+            } = *args;
             let opts = AnimateInundationOptions {
                 frame_delay_ms: delay_ms,
                 ping_pong: !no_ping_pong,
@@ -2803,29 +3875,30 @@ fn dispatch(
             }
         }
         #[cfg(feature = "download")]
-        Commands::Download {
-            out_dir,
-            bbox,
-            huc,
-            region,
-            datasets,
-            dem_product,
-            wbd_level,
-            tile_cache,
-            no_deduplicate,
-            no_mosaic,
-            no_clip,
-            culvert_half_length,
-            culvert_snap_distance,
-            max_products,
-            transportation_layers,
-            timeout_secs,
-            max_retries,
-            oid_chunk_size,
-            overwrite,
-            dry_run,
-            json,
-        } => {
+        Commands::Download(args) => {
+            let DownloadArgs {
+                out_dir,
+                bbox,
+                huc,
+                region,
+                datasets,
+                dem_product,
+                wbd_level,
+                tile_cache,
+                no_deduplicate,
+                no_mosaic,
+                no_clip,
+                culvert_half_length,
+                culvert_snap_distance,
+                max_products,
+                transportation_layers,
+                timeout_secs,
+                max_retries,
+                oid_chunk_size,
+                overwrite,
+                dry_run,
+                json,
+            } = *args;
             let reg = match (bbox, huc, region) {
                 (Some(bb), None, None) => Region::Bbox(bb.parse::<Bbox>()?),
                 (None, Some(code), None) => Region::Huc(Region::validate_huc(&code)?),
@@ -3000,20 +4073,21 @@ fn dispatch(
                 );
             }
         }
-        Commands::Preview {
-            dem,
-            output,
-            fill_time,
-            hour,
-            depth,
-            max_dim,
-            water_alpha,
-            scale_bar,
-            legend,
-            azimuth,
-            elevation,
-            json,
-        } => {
+        Commands::Preview(args) => {
+            let PreviewArgs {
+                dem,
+                output,
+                fill_time,
+                hour,
+                depth,
+                max_dim,
+                water_alpha,
+                scale_bar,
+                legend,
+                azimuth,
+                elevation,
+                json,
+            } = *args;
             let out_path = output.ok_or_else(|| {
                 lidar::Error::InvalidArgument(
                     "output path (-o / --output) is required on the command line (in MCP mode, omit -o to receive inline image content)"
@@ -3193,6 +4267,7 @@ fn dispatch(
             interval,
             curve_interval,
             topology,
+            delineation_method,
             json,
         } => {
             if let Some(ref out_path) = output {
@@ -3208,7 +4283,7 @@ fn dispatch(
                     interval,
                     curve_interval,
                     topology: topology.into(),
-                    ..Default::default()
+                    delineation_method: delineation_method.into(),
                 },
             )?;
             if let Some(out_path) = output {
@@ -3237,21 +4312,23 @@ fn dispatch(
                 print!("{}", rating_curves_to_csv_string(&points));
             }
         }
-        Commands::ConnectivityGraph {
-            input,
-            output,
-            format,
-            kernel,
-            min_size,
-            min_depth,
-            interval,
-            rain_intensity,
-            duration,
-            time_step,
-            routing,
-            streams,
-            json,
-        } => {
+        Commands::ConnectivityGraph(args) => {
+            let ConnectivityGraphArgs {
+                input,
+                output,
+                format,
+                kernel,
+                min_size,
+                min_depth,
+                interval,
+                delineation_method,
+                rain_intensity,
+                duration,
+                time_step,
+                routing,
+                streams,
+                json,
+            } = *args;
             if let Some(ref out_path) = output {
                 ensure_no_cli_path_collision(&input, out_path)?;
                 if let Some(ref streams_path) = streams {
@@ -3263,6 +4340,7 @@ fn dispatch(
                 &dem,
                 &InMemoryFullPipelineOptions {
                     kernel_size: kernel,
+                    delineation_method: delineation_method.into(),
                     simulation: SimulateInundationOptions {
                         min_size,
                         min_depth,
@@ -3442,11 +4520,9 @@ mod tests {
             let cli =
                 Cli::try_parse_from(["lidar", "tiled-depressions", "dem.tif", "out"]).unwrap();
             match cli.command {
-                Commands::TiledDepressions {
-                    use_f64, use_f32, ..
-                } => {
-                    assert!(!use_f64);
-                    assert!(!use_f32);
+                Commands::TiledDepressions(args) => {
+                    assert!(!args.use_f64);
+                    assert!(!args.use_f32);
                 }
                 _ => panic!("expected TiledDepressions"),
             }
@@ -3455,7 +4531,7 @@ mod tests {
                 Cli::try_parse_from(["lidar", "tiled-depressions", "dem.tif", "out", "--use-f32"])
                     .unwrap();
             match cli_compat.command {
-                Commands::TiledDepressions { use_f64, .. } => assert!(!use_f64),
+                Commands::TiledDepressions(args) => assert!(!args.use_f64),
                 _ => panic!("expected TiledDepressions"),
             }
 
@@ -3463,7 +4539,7 @@ mod tests {
                 Cli::try_parse_from(["lidar", "tiled-depressions", "dem.tif", "out", "--use-f64"])
                     .unwrap();
             match cli_f64.command {
-                Commands::TiledDepressions { use_f64, .. } => assert!(use_f64),
+                Commands::TiledDepressions(args) => assert!(args.use_f64),
                 _ => panic!("expected TiledDepressions"),
             }
 
@@ -3509,13 +4585,9 @@ mod tests {
             ])
             .unwrap();
             match cli.command {
-                Commands::Pipeline {
-                    breach_max_depth,
-                    breach_max_length,
-                    ..
-                } => {
-                    assert_eq!(breach_max_depth, Some(1.5));
-                    assert_eq!(breach_max_length, Some(0));
+                Commands::Pipeline(args) => {
+                    assert_eq!(args.breach_max_depth, Some(1.5));
+                    assert_eq!(args.breach_max_length, Some(0));
                 }
                 _ => panic!("expected Pipeline"),
             }
@@ -3678,23 +4750,14 @@ mod tests {
             ])
             .unwrap();
             match cli.command {
-                Commands::SimulateInundation {
-                    routing,
-                    scs_type2_mm,
-                    runoff_coeff,
-                    infiltration,
-                    antecedent_depth,
-                    duration,
-                    json,
-                    ..
-                } => {
-                    assert_eq!(RoutingMode::from(routing), RoutingMode::FillSpillMerge);
-                    assert_eq!(scs_type2_mm, Some(100.0));
-                    assert_eq!(runoff_coeff.as_deref(), Some("0.75"));
-                    assert_eq!(infiltration.as_deref(), Some("0.2"));
-                    assert_eq!(antecedent_depth.as_deref(), Some("0.05"));
-                    assert_eq!(duration, None);
-                    assert!(json);
+                Commands::SimulateInundation(args) => {
+                    assert_eq!(RoutingMode::from(args.routing), RoutingMode::FillSpillMerge);
+                    assert_eq!(args.scs_type2_mm, Some(100.0));
+                    assert_eq!(args.runoff_coeff.as_deref(), Some("0.75"));
+                    assert_eq!(args.infiltration.as_deref(), Some("0.2"));
+                    assert_eq!(args.antecedent_depth.as_deref(), Some("0.05"));
+                    assert_eq!(args.duration, None);
+                    assert!(args.json);
                 }
                 _ => panic!("expected SimulateInundation"),
             }
@@ -3713,15 +4776,10 @@ mod tests {
             ])
             .unwrap();
             match cli.command {
-                Commands::Pipeline {
-                    curve_number,
-                    breach_mode,
-                    breach_fill_remaining,
-                    ..
-                } => {
-                    assert_eq!(curve_number, Some(PathBuf::from("cn.tif")));
-                    assert!(matches!(breach_mode, Some(CliBreachMode::Constrained)));
-                    assert_eq!(breach_fill_remaining, Some(true));
+                Commands::Pipeline(args) => {
+                    assert_eq!(args.curve_number, Some(PathBuf::from("cn.tif")));
+                    assert!(matches!(args.breach_mode, Some(CliBreachMode::Constrained)));
+                    assert_eq!(args.breach_fill_remaining, Some(true));
                 }
                 _ => panic!("expected Pipeline"),
             }
@@ -3770,8 +4828,8 @@ mod tests {
                 Cli::try_parse_from(["lidar", "tiled-depressions", "dem.tif", "out", "-t", "d4"])
                     .unwrap();
             match cli.command {
-                Commands::TiledDepressions { topology, .. } => {
-                    assert_eq!(Topology::from(topology), Topology::D4);
+                Commands::TiledDepressions(args) => {
+                    assert_eq!(Topology::from(args.topology), Topology::D4);
                 }
                 _ => panic!("expected TiledDepressions"),
             }
@@ -3832,19 +4890,12 @@ mod tests {
             ])
             .unwrap();
             match cli.command {
-                Commands::Download {
-                    max_products,
-                    transportation_layers,
-                    timeout_secs,
-                    max_retries,
-                    oid_chunk_size,
-                    ..
-                } => {
-                    assert_eq!(max_products, Some(50));
-                    assert_eq!(transportation_layers.as_deref(), Some("29,30,38"));
-                    assert_eq!(timeout_secs, Some(45));
-                    assert_eq!(max_retries, Some(2));
-                    assert_eq!(oid_chunk_size, Some(100));
+                Commands::Download(args) => {
+                    assert_eq!(args.max_products, Some(50));
+                    assert_eq!(args.transportation_layers.as_deref(), Some("29,30,38"));
+                    assert_eq!(args.timeout_secs, Some(45));
+                    assert_eq!(args.max_retries, Some(2));
+                    assert_eq!(args.oid_chunk_size, Some(100));
                 }
                 _ => panic!("expected Download"),
             }
@@ -4196,7 +5247,8 @@ mod tests {
             ])
             .unwrap();
             match cli_dtm.command {
-                Commands::LidarToDtm { ground_filter, .. } => {
+                Commands::LidarToDtm(args) => {
+                    let ground_filter = &args.ground_filter;
                     assert_eq!(ground_filter.pmf_max_window, Some(25.0));
                     assert_eq!(ground_filter.pmf_slope, Some(0.8));
                     assert_eq!(ground_filter.pmf_initial_distance, Some(0.2));
@@ -4227,7 +5279,8 @@ mod tests {
             ])
             .unwrap();
             match cli_chm.command {
-                Commands::LidarToChm { ground_filter, .. } => {
+                Commands::LidarToChm(args) => {
+                    let ground_filter = &args.ground_filter;
                     assert_eq!(ground_filter.smrf_cell_size, Some(1.2));
                     assert_eq!(ground_filter.smrf_slope, Some(0.2));
                     assert_eq!(ground_filter.smrf_window, Some(20.0));
@@ -4573,6 +5626,15 @@ mod tests {
                 streams_dummy.as_os_str().to_os_string(),
             ]),
             1
+        );
+    }
+
+    #[test]
+    fn commands_enum_stays_compact_for_small_stacks() {
+        let sz = std::mem::size_of::<Commands>();
+        assert!(
+            sz <= 256,
+            "Commands enum grew too large ({sz} bytes); box large variants into Args structs"
         );
     }
 }

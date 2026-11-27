@@ -76,8 +76,11 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
 
-/// A queued tool call: request id, tool name, and CLI arguments.
-type ToolCall = (Value, String, Vec<OsString>);
+/// A queued tool call: request id, tool name, CLI arguments, and optional MCP progress token.
+type ToolCall = (Value, String, Vec<OsString>, Option<Value>);
+
+/// Prefix emitted on stderr by `lidar` subcommands when `LIDAR_MCP_PROGRESS=1` is set.
+pub(crate) const MCP_PROGRESS_PREFIX: &str = "__LIDAR_PROGRESS__:";
 
 /// Session-wide concurrency limiter shared across standalone calls and JSON-RPC batches.
 struct ConcurrencyLimiter {
@@ -333,11 +336,12 @@ impl Server {
                             ),
                         ));
                     }
+                    let progress_token = extract_progress_token(&params);
                     match calls {
                         Some((calls, _)) => {
-                            calls.push((id, name, args));
+                            calls.push((id, name, args, progress_token));
                         }
-                        None => self.spawn(id, name, args),
+                        None => self.spawn(id, name, args, progress_token),
                     }
                     return None;
                 }
@@ -349,8 +353,14 @@ impl Server {
         })
     }
 
-    fn spawn(&mut self, id: Value, name: String, args: Vec<OsString>) {
-        let run = self.start((id, name, args));
+    fn spawn(
+        &mut self,
+        id: Value,
+        name: String,
+        args: Vec<OsString>,
+        progress_token: Option<Value>,
+    ) {
+        let run = self.start((id, name, args, progress_token));
         let send = self.send.clone();
         self.workers.retain(|w| !w.is_finished());
         self.workers.push(std::thread::spawn(move || {
@@ -394,7 +404,7 @@ impl Server {
 
     fn start(
         &mut self,
-        (id, name, args): ToolCall,
+        (id, name, args, progress_token): ToolCall,
     ) -> impl FnOnce() -> Option<Value> + Send + 'static + use<> {
         let key = id.to_string();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -404,10 +414,11 @@ impl Server {
             .unwrap_or_else(PoisonError::into_inner)
             .insert(key.clone(), cancel.clone());
         debug_assert!(previous.is_none(), "a running call's id was reused");
-        let (lidar, running, limiter) = (
+        let (lidar, running, limiter, send) = (
             self.lidar.clone(),
             self.running.clone(),
             self.limiter.clone(),
+            self.send.clone(),
         );
         move || {
             let reply = match limiter.acquire(&cancel) {
@@ -416,8 +427,9 @@ impl Server {
                     if cancel.load(Ordering::Relaxed) {
                         None
                     } else {
+                        let progress = progress_token.map(|tok| (tok, send));
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            call_tool(&lidar, &name, args, &cancel)
+                            call_tool_with_progress(&lidar, &name, args, &cancel, progress)
                         }))
                         .map(|r| r.map(|r| json!({"jsonrpc": "2.0", "id": id, "result": r})))
                         .unwrap_or_else(|_| {
@@ -673,23 +685,38 @@ pub(crate) fn validate_allowed_dirs(
     Ok(())
 }
 
+/// Extracts optional MCP `params._meta.progressToken` (string or number per MCP spec).
+pub(crate) fn extract_progress_token(params: &Value) -> Option<Value> {
+    params
+        .get("_meta")
+        .and_then(|m| m.get("progressToken"))
+        .filter(|v| matches!(v, Value::String(_) | Value::Number(_)))
+        .cloned()
+}
+
 /// Executes `lidar <name> <args>`, returning `None` if cancelled before completion.
-pub(crate) fn call_tool(
+fn call_tool_with_progress(
     lidar: &[OsString],
     name: &str,
     args: Vec<OsString>,
     cancel: &AtomicBool,
+    progress: Option<(Value, Sender<String>)>,
 ) -> Option<Value> {
     if name == "preview" {
-        return call_preview(lidar, args, cancel);
+        return call_preview(lidar, args, cancel, progress);
     }
-    call_command(lidar, name, args, cancel)
+    call_command(lidar, name, args, cancel, progress)
 }
 
 /// Runs `lidar preview` and attaches the generated PNG as MCP `image` content so multimodal
 /// agents can inspect the DEM/inundation directly. When `-o`/`--output` is omitted, writes into
 /// a private temporary directory and removes it afterwards.
-fn call_preview(lidar: &[OsString], mut args: Vec<OsString>, cancel: &AtomicBool) -> Option<Value> {
+fn call_preview(
+    lidar: &[OsString],
+    mut args: Vec<OsString>,
+    cancel: &AtomicBool,
+    progress: Option<(Value, Sender<String>)>,
+) -> Option<Value> {
     let failed =
         |text: String| Some(json!({"content": [{"type": "text", "text": text}], "isError": true}));
 
@@ -775,7 +802,7 @@ fn call_preview(lidar: &[OsString], mut args: Vec<OsString>, cancel: &AtomicBool
         }
     };
 
-    let mut result = call_command(lidar, "preview", args, cancel);
+    let mut result = call_command(lidar, "preview", args, cancel, progress);
     // Attach inline PNG image content only when the caller omitted -o (temporary server output);
     // explicit -o FILE saves to disk and returns the child's text confirmation only.
     if let (Some((path, _dir)), Some(res)) = (
@@ -839,8 +866,9 @@ fn call_command(
     name: &str,
     args: Vec<OsString>,
     cancel: &AtomicBool,
+    progress: Option<(Value, Sender<String>)>,
 ) -> Option<Value> {
-    let (text, failed) = match run_child(lidar, name, args, cancel) {
+    let (text, failed) = match run_child(lidar, name, args, cancel, progress) {
         Ok(None) => return None,
         Ok(Some((status, stdout, stderr))) => {
             let failed = !status.success();
@@ -920,22 +948,33 @@ fn run_child(
     name: &str,
     args: Vec<OsString>,
     cancel: &AtomicBool,
+    progress: Option<(Value, Sender<String>)>,
 ) -> std::io::Result<Option<(ExitStatus, BoundedOutput, BoundedOutput)>> {
     let (program, before) = lidar
         .split_first()
         .expect("lidar command line must contain a program");
-    let child = Command::new(program)
-        .args(before)
+    let mut cmd = Command::new(program);
+    cmd.args(before)
         .arg(name)
         .args(args)
         .env("LIDAR_MCP_TOOL", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    if progress.is_some() {
+        cmd.env("LIDAR_MCP_PROGRESS", "1");
+    }
+    let child = cmd.spawn()?;
     let mut guard = ChildGuard(Some(child));
     let stdout = read_bounded(guard.as_mut().stdout.take().expect("piped stdout"))?;
-    let stderr = read_bounded(guard.as_mut().stderr.take().expect("piped stderr"))?;
+    let stderr = match progress {
+        Some((token, send)) => read_stderr_with_progress(
+            guard.as_mut().stderr.take().expect("piped stderr"),
+            token,
+            send,
+        )?,
+        None => read_bounded(guard.as_mut().stderr.take().expect("piped stderr"))?,
+    };
     let status = loop {
         if let Some(status) = guard.as_mut().try_wait()? {
             guard.disarm();
@@ -952,6 +991,59 @@ fn run_child(
     };
     let joined = |h: JoinHandle<BoundedOutput>| h.join().unwrap_or_default();
     Ok(Some((status, joined(stdout), joined(stderr))))
+}
+
+fn read_stderr_with_progress(
+    r: impl Read + Send + 'static,
+    token: Value,
+    send: Sender<String>,
+) -> std::io::Result<JoinHandle<BoundedOutput>> {
+    std::thread::Builder::new().spawn(move || {
+        let mut reader = std::io::BufReader::new(r);
+        let (mut kept, mut total) = (Vec::new(), 0usize);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let n = match reader.read_until(b'\n', &mut line) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
+            if let Ok(s) = std::str::from_utf8(&line)
+                && let Some(payload) = s
+                    .trim_end_matches(['\r', '\n'])
+                    .strip_prefix(MCP_PROGRESS_PREFIX)
+                && let Ok(ev) = serde_json::from_str::<Value>(payload)
+            {
+                let frac = ev
+                    .get("fraction")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
+                let mut params = serde_json::Map::new();
+                params.insert("progressToken".into(), token.clone());
+                params.insert("progress".into(), json!(frac));
+                params.insert("total".into(), json!(1.0));
+                if let Some(msg) = ev.get("message").and_then(Value::as_str) {
+                    params.insert("message".into(), Value::String(msg.to_string()));
+                } else if let Some(stage) = ev.get("stage").and_then(Value::as_str) {
+                    params.insert("message".into(), Value::String(stage.to_string()));
+                }
+                let notif = json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/progress",
+                    "params": Value::Object(params),
+                });
+                let _ = send.send(notif.to_string());
+                continue;
+            }
+            let room = MAX_OUTPUT.saturating_sub(kept.len());
+            kept.extend_from_slice(&line[..n.min(room)]);
+            total += n;
+        }
+        (kept, total)
+    })
 }
 
 fn read_bounded(mut r: impl Read + Send + 'static) -> std::io::Result<JoinHandle<BoundedOutput>> {
@@ -1763,7 +1855,7 @@ mod tests {
             OsString::from("sh"),
         ];
         for flag in ["-h", "--help", "-V", "--version", "--json-usage", "-o"] {
-            let res = call_preview(&echo_cmd, vec![OsString::from(flag)], &cancel).unwrap();
+            let res = call_preview(&echo_cmd, vec![OsString::from(flag)], &cancel, None).unwrap();
             let text = res["content"][0]["text"].as_str().unwrap();
             assert!(
                 !text.contains("lidar-preview-"),
@@ -1964,5 +2056,47 @@ mod tests {
             .0,
             INVALID_PARAMS
         );
+    }
+
+    #[test]
+    fn mcp_progress_token_and_stderr_notifications_forward_cleanly() {
+        assert_eq!(
+            extract_progress_token(
+                &json!({"name": "pipeline", "_meta": {"progressToken": "tok-1"}})
+            ),
+            Some(json!("tok-1"))
+        );
+        assert_eq!(
+            extract_progress_token(&json!({"name": "pipeline", "_meta": {"progressToken": 42}})),
+            Some(json!(42))
+        );
+        assert_eq!(extract_progress_token(&json!({"name": "pipeline"})), None);
+
+        let fake_stderr = format!(
+            "{MCP_PROGRESS_PREFIX}{{\"stage\":\"load\",\"fraction\":0.25,\"message\":\"Loading DEM\"}}\nnormal warning line\n{MCP_PROGRESS_PREFIX}{{\"stage\":\"complete\",\"fraction\":1.0,\"message\":\"Done\"}}\n"
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = read_stderr_with_progress(
+            std::io::Cursor::new(fake_stderr.into_bytes()),
+            json!("p1"),
+            tx,
+        )
+        .unwrap();
+        let (kept, _total) = handle.join().unwrap();
+        let kept_str = String::from_utf8(kept).unwrap();
+        assert_eq!(kept_str, "normal warning line\n");
+
+        let msgs: Vec<Value> = rx
+            .try_iter()
+            .map(|s| serde_json::from_str::<Value>(&s).unwrap())
+            .collect();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["method"], "notifications/progress");
+        assert_eq!(msgs[0]["params"]["progressToken"], "p1");
+        assert_eq!(msgs[0]["params"]["progress"], 0.25);
+        assert_eq!(msgs[0]["params"]["total"], 1.0);
+        assert_eq!(msgs[0]["params"]["message"], "Loading DEM");
+        assert_eq!(msgs[1]["params"]["progress"], 1.0);
+        assert_eq!(msgs[1]["params"]["message"], "Done");
     }
 }
