@@ -1,9 +1,10 @@
 name: Release
 
 # On version tags (`v*`), publishes Python wheels + sdist (`lidar-rs`) to PyPI, publishes
-# `lidar` and `lidar-cli` to crates.io, and attaches prebuilt CLI binaries to the GitHub
-# Release. Both registries use OIDC trusted publishing via the `pypi` and `crates-io` GitHub
-# environments (no long-lived API tokens stored in repository secrets).
+# `lidar` and `lidar-cli` to crates.io, publishes `lidar-wasm` to npm, and attaches prebuilt
+# CLI binaries to the GitHub Release. All three registries use OIDC trusted publishing via the
+# `pypi`, `crates-io`, and `npm` GitHub environments (no long-lived API tokens stored in
+# repository secrets).
 on:
   push:
     tags: ["v*"]
@@ -122,9 +123,53 @@ jobs:
             fi
           done
 
+  npm:
+    name: Publish to npm
+    needs: [verify, ci]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment: npm
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master; toolchain set by input
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: js
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+        with:
+          tool: wasm-pack@0.15.1
+      # npm OIDC trusted publishing requires npm >= 11.5.1 and a Trusted Publisher configured on
+      # npmjs.com for `lidar-wasm` (owner: opengeos, repo: lidar-rs, workflow: release.yml,
+      # environment: npm). Versions already on npm are skipped cleanly.
+      - name: Ensure npm supports OIDC trusted publishing (>= 11.5.1)
+        run: |
+          if ! node -e 'const [a,b,c] = process.argv[1].split(".").map(Number); process.exit((a > 11 || (a === 11 && (b > 5 || (b === 5 && c >= 1)))) ? 0 : 1);' "$(npm --version)"; then
+            npm install -g npm@latest
+          fi
+          npm --version
+      - name: Publish lidar-wasm to npm
+        working-directory: js
+        run: |
+          name=$(jq -r '.name' package.json)
+          version=$(jq -r '.version' package.json)
+          if curl -sf "https://registry.npmjs.org/${name}/${version}" > /dev/null; then
+            echo "${name}@${version} is already on npm"
+          else
+            npm publish --provenance --access public
+          fi
+
   github-release:
     name: Create GitHub Release
-    needs: [build, publish, crates]
+    needs: [build, publish, crates, npm]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
