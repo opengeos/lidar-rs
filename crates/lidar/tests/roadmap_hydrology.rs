@@ -187,6 +187,7 @@ fn weighted_catchment_hierarchy_controls_static_fill_time_by_upland_c() {
             },
             scalar_runoff_coeff: 1.0,
             stream_vector: None,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -203,6 +204,7 @@ fn weighted_catchment_hierarchy_controls_static_fill_time_by_upland_c() {
             },
             scalar_runoff_coeff: 1.0,
             stream_vector: None,
+            ..Default::default()
         },
     )
     .unwrap();

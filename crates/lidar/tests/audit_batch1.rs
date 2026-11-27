@@ -1076,6 +1076,7 @@ fn core_numerical_and_edge_case_regressions() {
             interval: 0.5,
             topology: Topology::D8,
             use_f32: false,
+            ..Default::default()
         },
     )
     .unwrap();

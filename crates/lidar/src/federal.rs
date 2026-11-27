@@ -1831,16 +1831,25 @@ fn is_disallowed_ipv4(v4: std::net::Ipv4Addr) -> bool {
 
 /// Lexical URL-level safety check for remote download URLs returned by federal catalogs.
 ///
-/// Rejects non-HTTPS schemes, embedded userinfo, localhost/single-label hostnames, numeric
-/// shorthand IPv4 encodings, and literal loopback/private/link-local/CGNAT/ULA IP addresses
-/// (including IPv4-mapped IPv6). This is a lexical pre-flight filter only: it does not perform
-/// DNS resolution or revalidate HTTP redirect targets.
+/// Rejects non-HTTPS schemes, ASCII control/whitespace characters, backslashes or percent-encoding
+/// in the authority, embedded userinfo, localhost/single-label hostnames, numeric shorthand IPv4
+/// encodings, and literal loopback/private/link-local/CGNAT/ULA IP addresses (including
+/// IPv4-mapped IPv6). This is a lexical pre-flight filter only: it does not perform DNS
+/// resolution, pin resolved IPs, revalidate HTTP redirect targets, or inspect child URLs fetched
+/// from remote catalog/EPT manifests.
 fn is_safe_https_download_url(url: &str) -> bool {
+    if url.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+        return false;
+    }
     let Some(rest) = url.strip_prefix("https://") else {
         return false;
     };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if authority.is_empty() || authority.contains('@') {
+    let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or("");
+    if authority.is_empty()
+        || authority.contains('@')
+        || authority.contains('%')
+        || rest.as_bytes().get(authority.len()) == Some(&b'\\')
+    {
         return false;
     }
     let host = if let Some(inner) = authority.strip_prefix('[') {
@@ -1882,10 +1891,7 @@ fn is_safe_https_download_url(url: &str) -> bool {
                     !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit())
                 }))
     });
-    if all_numeric_labels {
-        return false;
-    }
-    true
+    !all_numeric_labels
 }
 
 fn bbox_iou(a: &Bbox, b: &Bbox) -> f64 {
@@ -2945,9 +2951,269 @@ pub fn download_federal_data(
     Ok(result)
 }
 
+/// Queries USGS The National Map (TNM) for 3DEP Lidar Point Cloud (COPC / LAZ / LAS) products
+/// intersecting `region` without downloading full tile payloads.
+pub fn query_3dep_copc_products(
+    region: &Region,
+    opts: &DownloadOptions,
+) -> Result<Vec<TnmProductItem>> {
+    let mut lpc_opts = opts.clone();
+    lpc_opts.dem_product = DemProduct::LidarPointCloud;
+    query_3dep_products(region, &lpc_opts)
+}
+
+/// Projects a WGS 84 geographic [`Bbox`] into `target_crs` by sampling perimeter points along
+/// all four edges so curved map projections (UTM, Albers, Lambert) do not clip AOI corners.
+///
+/// Returns `Err(Error::InvalidArgument)` when `target_crs` is unknown so geographic degrees
+/// are never silently applied to projected or unreferenced point clouds.
+pub fn transform_wgs84_bbox_to_crs(bbox: &Bbox, target_crs: &SpatialRef) -> Result<[f64; 4]> {
+    bbox.validate()?;
+    if target_crs.is_unknown() {
+        return Err(Error::InvalidArgument(
+            "cannot project WGS 84 AOI bounding box into unknown target CRS; supply bounds_native instead"
+                .into(),
+        ));
+    }
+    if target_crs.epsg == Some(4326) {
+        return Ok([bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat]);
+    }
+    let wgs84 = SpatialRef::from_epsg(4326)?;
+    let xform = Transformer::new(&wgs84, target_crs)?;
+    let (min_x, min_y, max_x, max_y) = xform
+        .transform_bounds_densified((bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat), 21)?;
+    if !min_x.is_finite() || !min_y.is_finite() || !max_x.is_finite() || !max_y.is_finite() {
+        return Err(Error::Algorithm(
+            "failed to project WGS 84 AOI bounding box into target CRS".into(),
+        ));
+    }
+    Ok([min_x, min_y, max_x, max_y])
+}
+
+/// Options for streaming an Area of Interest (AOI) from a remote COPC (`https://...copc.laz`)
+/// or Entwine Point Tile (`https://.../ept.json`) dataset via HTTP range requests.
+#[cfg(feature = "pointcloud")]
+#[derive(Debug, Clone, Default)]
+pub struct EptStreamOptions {
+    /// Public HTTPS URL to a remote COPC (`.copc.laz`) or EPT (`ept.json`) dataset.
+    pub source_url: String,
+    /// Optional WGS 84 geographic AOI bounding box (automatically projected into the point
+    /// cloud's native CRS).
+    pub bounds_wgs84: Option<Bbox>,
+    /// Optional native-CRS 2D bounding box `[min_x, min_y, max_x, max_y]` (intersected with
+    /// `bounds_wgs84` when both are provided).
+    pub bounds_native: Option<[f64; 4]>,
+    /// Optional COPC/EPT LOD spacing in native CRS horizontal units.
+    pub resolution: Option<f64>,
+    /// Optional maximum octree depth level to stream (`0` = root).
+    pub max_level: Option<u32>,
+    /// Optional approximate maximum point count cap.
+    pub max_points: Option<usize>,
+    /// Optional ASPRS classification codes to keep (empty = keep all).
+    pub classifications: Vec<u8>,
+    /// Optional pulse return kinds to keep (empty = keep all).
+    pub return_kinds: Vec<terrio::pointcloud::ReturnKind>,
+}
+
+#[cfg(feature = "pointcloud")]
+fn stream_pointcloud_aoi_impl(
+    source: &str,
+    opts: &EptStreamOptions,
+) -> Result<terrio::pointcloud::PointCloud> {
+    if let Some([x0, y0, x1, y1]) = opts.bounds_native {
+        if !x0.is_finite() || !y0.is_finite() || !x1.is_finite() || !y1.is_finite() {
+            return Err(Error::InvalidArgument(
+                "bounds_native coordinates must be finite".into(),
+            ));
+        }
+        if x0 > x1 || y0 > y1 {
+            return Err(Error::InvalidArgument(format!(
+                "invalid bounds_native [{x0}, {y0}, {x1}, {y1}]: expected min <= max"
+            )));
+        }
+    }
+    if let Some(res) = opts.resolution
+        && (!res.is_finite() || res <= 0.0)
+    {
+        return Err(Error::InvalidArgument(format!(
+            "resolution must be finite and > 0, got {res}"
+        )));
+    }
+    if opts.max_points == Some(0) {
+        return Err(Error::InvalidArgument("max_points must be > 0".into()));
+    }
+
+    let mut reader = terrio::pointcloud::open_points(source)?;
+    let cloud_crs = reader.crs().clone();
+
+    let proj_wgs = match opts.bounds_wgs84 {
+        Some(bb) => Some(transform_wgs84_bbox_to_crs(&bb, &cloud_crs)?),
+        None => None,
+    };
+    let effective_bounds = match (proj_wgs, opts.bounds_native) {
+        (None, None) => None,
+        (Some(b), None) | (None, Some(b)) => Some(b),
+        (Some(a), Some(b)) => {
+            let inter = [
+                a[0].max(b[0]),
+                a[1].max(b[1]),
+                a[2].min(b[2]),
+                a[3].min(b[3]),
+            ];
+            if inter[0] > inter[2] || inter[1] > inter[3] {
+                let dims = reader
+                    .dimensions()
+                    .into_iter()
+                    .map(|(name, vt)| {
+                        let vals = match vt {
+                            terrio::pointcloud::ValueType::U8 => {
+                                terrio::pointcloud::Values::U8(Vec::new())
+                            }
+                            terrio::pointcloud::ValueType::I8 => {
+                                terrio::pointcloud::Values::I8(Vec::new())
+                            }
+                            terrio::pointcloud::ValueType::U16 => {
+                                terrio::pointcloud::Values::U16(Vec::new())
+                            }
+                            terrio::pointcloud::ValueType::I16 => {
+                                terrio::pointcloud::Values::I16(Vec::new())
+                            }
+                            terrio::pointcloud::ValueType::U32 => {
+                                terrio::pointcloud::Values::U32(Vec::new())
+                            }
+                            terrio::pointcloud::ValueType::I32 => {
+                                terrio::pointcloud::Values::I32(Vec::new())
+                            }
+                            terrio::pointcloud::ValueType::U64 => {
+                                terrio::pointcloud::Values::U64(Vec::new())
+                            }
+                            terrio::pointcloud::ValueType::I64 => {
+                                terrio::pointcloud::Values::I64(Vec::new())
+                            }
+                            terrio::pointcloud::ValueType::F32 => {
+                                terrio::pointcloud::Values::F32(Vec::new())
+                            }
+                            terrio::pointcloud::ValueType::F64 => {
+                                terrio::pointcloud::Values::F64(Vec::new())
+                            }
+                        };
+                        terrio::pointcloud::Dimension::new(&name, vals)
+                    })
+                    .collect();
+                return Ok(terrio::pointcloud::PointCloud::new(dims, cloud_crs));
+            }
+            Some(inter)
+        }
+    };
+
+    let read_opts = terrio::pointcloud::PointReadOptions {
+        filter: terrio::pointcloud::PointFilter {
+            bounds: effective_bounds,
+            z_range: None,
+            classes: opts.classifications.clone(),
+            returns: opts.return_kinds.clone(),
+        },
+        max_level: opts.max_level,
+        resolution: opts.resolution,
+        max_points: opts.max_points.map(|n| n as u64),
+    };
+    Ok(reader.read(&read_opts)?)
+}
+
+/// Streams only the octree chunks overlapping an Area of Interest from a remote public HTTPS
+/// COPC (`.copc.laz`) or Entwine Point Tile (`ept.json`) dataset using HTTP range requests.
+///
+/// Performs a **lexical-only** pre-flight URL check rejecting non-HTTPS schemes, control
+/// characters, embedded credentials, and literal loopback/private/link-local hosts. It does
+/// **not** perform DNS resolution / IP pinning, inspect HTTP redirect targets, or validate child
+/// `ept-data`/`ept-hierarchy` URLs referenced inside an EPT manifest (those requests are issued
+/// directly by `terrio`'s remote reader). Callers exposing this to untrusted URLs should enforce
+/// egress controls at the network/sandbox layer.
+#[cfg(feature = "pointcloud")]
+pub fn stream_remote_pointcloud_aoi(
+    opts: &EptStreamOptions,
+) -> Result<terrio::pointcloud::PointCloud> {
+    if !is_safe_https_download_url(&opts.source_url) {
+        return Err(Error::InvalidArgument(
+            "remote COPC/EPT source_url must be a safe public https:// URL".into(),
+        ));
+    }
+    stream_pointcloud_aoi_impl(&opts.source_url, opts)
+}
+
+/// Streams an AOI from a remote COPC/EPT dataset via [`stream_remote_pointcloud_aoi`] and
+/// writes the resulting point cloud to `out_path` (`.laz`, `.las`, `.copc.laz`, `.ply`, `.e57`),
+/// returning the number of points written.
+#[cfg(feature = "pointcloud")]
+pub fn stream_remote_pointcloud_to_file(
+    opts: &EptStreamOptions,
+    out_path: impl AsRef<Path>,
+) -> Result<usize> {
+    let cloud = stream_remote_pointcloud_aoi(opts)?;
+    let n = cloud.len();
+    crate::pointcloud::write_lidar(
+        &cloud,
+        out_path,
+        &terrio::pointcloud::PointWriteOptions::default(),
+    )?;
+    Ok(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "pointcloud")]
+    #[test]
+    fn stream_pointcloud_aoi_impl_windows_local_copc_with_wgs84_bbox() {
+        use crate::pointcloud::{Dimension, PointCloud, PointWriteOptions, Values, write_lidar};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let copc_path = tmp.path().join("sample.copc.laz");
+        let utm = SpatialRef::from_epsg(32615).unwrap();
+        let mut xs = Vec::new();
+        let mut ys = Vec::new();
+        let mut zs = Vec::new();
+        let mut cls = Vec::new();
+        // Create points spanning 500_000..500_100 E, 4_980_000..4_980_100 N in UTM 15N
+        for iy in 0..10 {
+            for ix in 0..10 {
+                xs.push(500_000.0 + ix as f64 * 10.0);
+                ys.push(4_980_000.0 + iy as f64 * 10.0);
+                zs.push(250.0 + ix as f64);
+                cls.push(if ix % 2 == 0 { 2u8 } else { 5u8 });
+            }
+        }
+        let cloud = PointCloud::new(
+            vec![
+                Dimension::new("x", Values::F64(xs)),
+                Dimension::new("y", Values::F64(ys)),
+                Dimension::new("z", Values::F64(zs)),
+                Dimension::new("classification", Values::U8(cls)),
+            ],
+            utm.clone(),
+        );
+        write_lidar(&cloud, &copc_path, &PointWriteOptions::default()).unwrap();
+
+        // Stream a subset using native bounds + class 2 filter
+        let opts = EptStreamOptions {
+            source_url: "https://example.org/ignored.copc.laz".into(),
+            bounds_wgs84: None,
+            bounds_native: Some([500_000.0, 4_980_000.0, 500_045.0, 4_980_045.0]),
+            classifications: vec![2],
+            ..Default::default()
+        };
+        let sub = stream_pointcloud_aoi_impl(copc_path.to_str().unwrap(), &opts).unwrap();
+        assert!(!sub.is_empty() && sub.len() < cloud.len());
+        // Disjoint native + WGS 84 bounds yields empty cloud cleanly
+        let far_bb = Bbox::new(-80.0, 35.0, -79.9, 35.1).unwrap();
+        let empty_opts = EptStreamOptions {
+            bounds_wgs84: Some(far_bb),
+            ..opts
+        };
+        let empty = stream_pointcloud_aoi_impl(copc_path.to_str().unwrap(), &empty_opts).unwrap();
+        assert_eq!(empty.len(), 0);
+    }
 
     #[test]
     fn bbox_parse_validate_and_intersect() {

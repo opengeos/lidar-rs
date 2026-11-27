@@ -192,6 +192,9 @@ pub struct RatingCurvesFromDemOptions {
     pub curve_interval: Option<f64>,
     /// Connectivity topology for sink extraction (default `Topology::D8`).
     pub topology: Topology,
+    /// Nested depression delineation algorithm (`DelineationMethod::LevelSet` by default, or
+    /// `DelineationMethod::MergeTree` for exact interval-free merge-tree rating curves).
+    pub delineation_method: crate::slicing::DelineationMethod,
 }
 
 impl Default for RatingCurvesFromDemOptions {
@@ -204,6 +207,7 @@ impl Default for RatingCurvesFromDemOptions {
             interval: 0.3,
             curve_interval: None,
             topology: Topology::D8,
+            delineation_method: crate::slicing::DelineationMethod::LevelSet,
         }
     }
 }
@@ -214,8 +218,8 @@ pub fn compute_rating_curves_from_dem(
     in_dem: impl AsRef<Path>,
     options: &RatingCurvesFromDemOptions,
 ) -> Result<(usize, Vec<RatingCurvePoint>)> {
-    let sink = if options.is_sink {
-        load_raster::<f64>(in_dem, None)?
+    let (sink, dem_refined) = if options.is_sink {
+        (load_raster::<f64>(in_dem, None)?, None)
     } else {
         let raw = load_raster::<f64>(in_dem, None)?;
         let dem = if options.kernel_size > 1 {
@@ -223,19 +227,46 @@ pub fn compute_rating_curves_from_dem(
         } else {
             raw
         };
-        extract_sinks_in_memory(&dem, options.min_size, options.topology)?.sink
+        let extracted = extract_sinks_in_memory(&dem, options.min_size, options.topology)?;
+        (extracted.sink, Some(extracted.dem_refined))
     };
-    let deps = delineate_depressions_in_memory(
-        &sink,
-        options.min_size,
-        options.min_depth,
-        options.interval,
-    )?;
-    let step = options
-        .curve_interval
-        .unwrap_or_else(|| options.interval.abs());
-    let points = compute_rating_curves(&sink, &deps, step)?;
-    Ok((deps.depressions.len(), points))
+    match options.delineation_method {
+        crate::slicing::DelineationMethod::LevelSet => {
+            drop(dem_refined);
+            let deps = delineate_depressions_in_memory(
+                &sink,
+                options.min_size,
+                options.min_depth,
+                options.interval,
+            )?;
+            let step = options
+                .curve_interval
+                .unwrap_or_else(|| options.interval.abs());
+            let points = compute_rating_curves(&sink, &deps, step)?;
+            Ok((deps.depressions.len(), points))
+        }
+        crate::slicing::DelineationMethod::MergeTree => {
+            // MergeTree produces exact, interval-free breakpoints independent of `curve_interval`.
+            let mt_opts = crate::merge_tree::MergeTreeOptions {
+                min_size: options.min_size,
+                min_depth: options.min_depth,
+                topology: options.topology,
+                dem_is_refined: dem_refined.is_some(),
+                max_rating_curve_points: None,
+            };
+            let mt = match dem_refined.as_ref() {
+                Some(ref_dem) => {
+                    crate::merge_tree::delineate_depressions_merge_tree_with_dem_in_memory(
+                        &sink, ref_dem, &mt_opts,
+                    )?
+                }
+                None => {
+                    crate::merge_tree::delineate_depressions_merge_tree_in_memory(&sink, &mt_opts)?
+                }
+            };
+            Ok((mt.depressions.depressions.len(), mt.rating_curves))
+        }
+    }
 }
 
 /// Writes stage-storage-area rating curves to CSV.

@@ -2497,6 +2497,7 @@ fn dispatch(
                 interval,
                 topology: topology.into(),
                 use_f32: !use_f64,
+                ..Default::default()
             };
             let control = make_progress_control(verbosity);
             let res = delineate_depressions_tiled_with_control(
@@ -3207,6 +3208,7 @@ fn dispatch(
                     interval,
                     curve_interval,
                     topology: topology.into(),
+                    ..Default::default()
                 },
             )?;
             if let Some(out_path) = output {

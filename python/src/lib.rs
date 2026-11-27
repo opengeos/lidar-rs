@@ -2870,6 +2870,7 @@ fn build_connectivity_graph_from_dem<'py>(
                 },
                 scalar_runoff_coeff: 1.0,
                 stream_vector: stream_path.as_deref(),
+                ..Default::default()
             };
             let pipe = lidar::run_full_pipeline_in_memory(&raw_dem, &opts)?;
             Ok(pipe.connectivity_graph)
@@ -3043,6 +3044,7 @@ fn simulate_inundation_array<'py>(
                 },
                 scalar_runoff_coeff: 1.0,
                 stream_vector: None,
+                ..Default::default()
             };
             lidar::run_full_pipeline_in_memory(&raw_dem, &opts)
         })
