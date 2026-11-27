@@ -467,7 +467,9 @@ const sinksForMt = lidar.extractSinks(medBytes, "median.tif", 1000);
 const mt = lidar.delineateDepressionsMergeTree(sinksForMt.sinkTif(), "sink.tif", 1000, 0.3, 16);
 assert.ok(mt.maxLevel >= 2, `expected merge-tree maxLevel >= 2, got ${mt.maxLevel}`);
 const mtNodes = JSON.parse(mt.nodesJson());
-assert.ok(mtNodes.length >= 2, "expected multiple merge-tree nodes");
+assert.ok(Array.isArray(mtNodes) && mtNodes.length >= 2, "expected multiple merge-tree nodes");
+assert.equal(typeof mtNodes[0].id, "number");
+assert.ok(Array.isArray(mtNodes[0].children_ids));
 assert.ok(mt.ratingCurvesCsv().startsWith("dep_id,level,region_id,stage,depth,area,volume"));
 assert.ok(mt.idTif().length > 1000);
 mt.free();
@@ -491,11 +493,15 @@ const simMtFsm = lidar.simulateInundationAdvanced(
 );
 const hydroJson = simMtFsm.fsmHydrographJson();
 const hydroPts = JSON.parse(hydroJson);
-assert.ok(hydroPts.length >= 2, "expected FSM hydrograph points");
+assert.ok(Array.isArray(hydroPts) && hydroPts.length >= 2, "expected FSM hydrograph points");
+assert.equal(typeof hydroPts[0].time_h, "number");
+assert.equal(typeof hydroPts[0].q_boundary_m3_s, "number");
 assert.ok(simMtFsm.fsmHydrographCsv().startsWith("time_h,"));
 const attJson = lidar.attenuateFsmHydrograph(hydroJson, 1.0, 0.5, 2);
 const attPts = JSON.parse(attJson);
-assert.ok(attPts.length >= 2, "expected attenuated FSM hydrograph points");
+assert.ok(Array.isArray(attPts) && attPts.length >= 2, "expected attenuated FSM hydrograph points");
+assert.equal(typeof attPts[0].time_h, "number");
+assert.equal(typeof attPts[0].q_boundary_m3_s, "number");
 simMtFsm.free();
 
 console.log("ALL lidar-wasm WASM TESTS PASSED!");

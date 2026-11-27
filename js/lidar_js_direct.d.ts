@@ -353,6 +353,7 @@ export interface MergeTreeNode {
 
 /** Output container returned by {@link delineateDepressionsMergeTree}. Call `.free()` when done. */
 export class MergeTreeOutput {
+  private constructor();
   free(): void;
   readonly width: number;
   readonly height: number;

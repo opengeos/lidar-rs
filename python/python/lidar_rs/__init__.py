@@ -239,6 +239,16 @@ def bilateral_filter(
 
 @overload
 def bilateral_filter(
+    in_dem: PathLikeStr,
+    spatial_sigma: float,
+    range_sigma: float,
+    out_file: PathLikeStr,
+    no_data: float | None = None,
+) -> str: ...
+
+
+@overload
+def bilateral_filter(
     in_dem: PathLikeStr | SpatialArrayLike,
     spatial_sigma: float = 1.5,
     range_sigma: float = 0.5,
@@ -283,6 +293,23 @@ def feature_preserving_smoothing(
     max_z_change: float | None = None,
     *,
     out_file: PathLikeStr,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+    compress: bool = False,
+) -> str: ...
+
+
+@overload
+def feature_preserving_smoothing(
+    in_dem: PathLikeStr,
+    filter_size: int,
+    norm_diff: float,
+    num_iter: int,
+    max_z_change: float | None,
+    out_file: PathLikeStr,
+    *,
     no_data: float | None = None,
     cell_size: float = 1.0,
     geotransform: Geotransform | None = None,
@@ -341,6 +368,10 @@ def feature_preserving_smoothing(
             float(cell_size),
             gt,
             resolved_crs,
+        )
+    if geotransform is not None or crs is not None or cell_size != 1.0:
+        raise ValueError(
+            "cell_size, geotransform, and crs overrides are not supported when in_dem is a file path"
         )
     out_str = _as_path_str(out_file) if out_file is not None else None
     res = _lidar_rs.feature_preserving_smoothing_file(
@@ -1886,6 +1917,20 @@ def mfd_flow_accumulation(
 
 @overload
 def mfd_flow_accumulation(
+    dem: PathLikeStr,
+    exponent: float,
+    out_file: PathLikeStr,
+    *,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+    compress: bool = False,
+) -> str: ...
+
+
+@overload
+def mfd_flow_accumulation(
     dem: PathLikeStr | SpatialArrayLike,
     exponent: float = 1.1,
     out_file: None = None,
@@ -1979,7 +2024,16 @@ def delineate_depressions_merge_tree(
     )
     dem_np: NDArray[np.float64] | None = None
     if dem_arr is not None:
-        dem_np, _dgt, _dcrs, _dnd = extract_spatial_array(dem_arr, no_data=nd)
+        dem_np, dgt, dcrs, _dnd = extract_spatial_array(dem_arr, no_data=nd)
+        _check_aux_grid_alignment(
+            "dem_arr",
+            dgt,
+            dcrs,
+            gt,
+            resolved_crs,
+            dem_shape=(int(arr.shape[0]), int(arr.shape[1])),
+            cell_size=float(cell_size),
+        )
     return _lidar_rs.delineate_depressions_merge_tree(
         arr,
         dem_np,

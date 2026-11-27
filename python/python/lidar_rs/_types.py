@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Protocol, TypedDict
+from typing import Any, NotRequired, Protocol, TypedDict
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -441,6 +441,13 @@ class InundationArrayResult(TypedDict):
     fsm_mass_balance: FsmMassBalance | None
     fsm_basins: list[FsmBasinSummary] | None
     fsm_hydrograph: list[FsmHydrographPoint] | None
+    fsm_hazard_max_depth: NotRequired[NDArray[np.float64]]
+    fsm_hazard_wse: NotRequired[NDArray[np.float64]]
+    fsm_hazard_duration_h: NotRequired[NDArray[np.float64]]
+    fsm_recession_drain_time_h: NotRequired[NDArray[np.float64]]
+    fsm_recession_remaining_m3: NotRequired[float]
+    fsm_recession_drained_m3: NotRequired[float]
+    fsm_recession_curve: NotRequired[list[RecessionCurvePoint]]
     geotransform: Geotransform
     crs: str | None
 

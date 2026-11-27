@@ -69,9 +69,19 @@ fn fsm_hydrograph_point_to_dict<'py>(
 }
 
 fn dict_to_fsm_hydrograph_point(d: &Bound<'_, PyDict>) -> PyResult<FsmHydrographPoint> {
+    let time_h: f64 = d
+        .get_item("time_h")?
+        .ok_or_else(|| PyValueError::new_err("hydrograph dict missing required key 'time_h'"))?
+        .extract()?;
+    let q_boundary_m3_s: f64 = d
+        .get_item("q_boundary_m3_s")?
+        .ok_or_else(|| {
+            PyValueError::new_err("hydrograph dict missing required key 'q_boundary_m3_s'")
+        })?
+        .extract()?;
     Ok(FsmHydrographPoint {
-        time_h: dict_get_or(d, "time_h", 0.0f64)?,
-        q_boundary_m3_s: dict_get_or(d, "q_boundary_m3_s", 0.0f64)?,
+        time_h,
+        q_boundary_m3_s,
         total_stored_m3: dict_get_or(d, "total_stored_m3", 0.0f64)?,
         connected_area_fraction: dict_get_or(d, "connected_area_fraction", 0.0f64)?,
         spilling_basin_count: dict_get_or(d, "spilling_basin_count", 0usize)?,
@@ -1772,6 +1782,23 @@ fn lidar_to_chm_pit_free(
     compress: bool,
     cog: bool,
 ) -> PyResult<(usize, usize)> {
+    let (csf, pmf, smrf) = build_ground_options(
+        ground_class,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )?;
     let defaults = LidarToDtmOptions::default();
     let dtm = LidarToDtmOptions {
         resolution,
@@ -1782,6 +1809,9 @@ fn lidar_to_chm_pit_free(
         ror_min_neighbors: ror_min_neighbors.unwrap_or(defaults.ror_min_neighbors),
         sor_k,
         sor_sigma: sor_sigma.unwrap_or(defaults.sor_sigma),
+        csf,
+        pmf,
+        smrf,
         ..defaults
     };
     let mut opts = PitFreeChmOptions {
@@ -1828,6 +1858,23 @@ fn lidar_to_dtm_tiled(
     read_resolution: Option<f64>,
     max_level: Option<u32>,
 ) -> PyResult<(usize, usize)> {
+    let (csf, pmf, smrf) = build_ground_options(
+        ground_class,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )?;
     let defaults = LidarToDtmOptions::default();
     let dtm = LidarToDtmOptions {
         resolution,
@@ -1843,6 +1890,9 @@ fn lidar_to_dtm_tiled(
         sor_sigma: sor_sigma.unwrap_or(defaults.sor_sigma),
         compress,
         cog,
+        csf,
+        pmf,
+        smrf,
         ..defaults
     };
     let opts = TiledPointCloudOptions {
@@ -1881,6 +1931,23 @@ fn lidar_to_chm_tiled(
     read_resolution: Option<f64>,
     max_level: Option<u32>,
 ) -> PyResult<(usize, usize)> {
+    let (csf, pmf, smrf) = build_ground_options(
+        ground_class,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )?;
     let defaults = LidarToDtmOptions::default();
     let dtm = LidarToDtmOptions {
         resolution,
@@ -1894,6 +1961,9 @@ fn lidar_to_chm_tiled(
         sor_sigma: sor_sigma.unwrap_or(defaults.sor_sigma),
         compress,
         cog,
+        csf,
+        pmf,
+        smrf,
         ..defaults
     };
     let opts = TiledPointCloudOptions {
@@ -3856,7 +3926,7 @@ fn simulate_inundation_array<'py>(
                         &fsm_res.fill_time,
                         &pipe.depressions,
                         &fsm_res,
-                        sim_opts.rain_duration_h,
+                        fsm_res.mass_balance.duration_h,
                     )?);
                 }
                 if want_recession {
