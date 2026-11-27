@@ -3892,7 +3892,6 @@ fn simulate_inundation_array<'py>(
                 },
                 scalar_runoff_coeff: 1.0,
                 stream_vector: None,
-                ..Default::default()
             };
             let mut pipe = lidar::run_full_pipeline_in_memory(&raw_dem, &opts)?;
 
@@ -3990,6 +3989,29 @@ fn simulate_inundation_array<'py>(
                         eff_rain,
                         scaled_hyeto.as_deref(),
                     );
+                    pipe.spill_paths = fsm_res.spill_paths;
+                    let mut graph = lidar::build_connectivity_graph(
+                        &pipe.depressions,
+                        &pipe.catchment_records,
+                        &pipe.fill_time,
+                        &pipe.spill_paths,
+                        eff_rain,
+                        scaled_hyeto.as_deref(),
+                        None,
+                    )?;
+                    let merge_by_id: std::collections::HashMap<u32, Option<f64>> = fsm_res
+                        .basins
+                        .iter()
+                        .map(|b| (b.dep_id, b.merge_time_h))
+                        .collect();
+                    for edge in &mut graph.edges {
+                        if edge.edge_type == "merge"
+                            && let Some(&Some(mt)) = merge_by_id.get(&edge.from_id)
+                        {
+                            edge.merge_time_h = Some(mt);
+                        }
+                    }
+                    pipe.connectivity_graph = graph;
                     pipe.fsm_mass_balance = Some(fsm_res.mass_balance);
                     pipe.fsm_basins = Some(fsm_res.basins);
                     pipe.fsm_hydrograph = Some(fsm_res.hydrograph);

@@ -324,7 +324,7 @@ def delineate_depressions_merge_tree(
 ) -> MergeTreeResult: ...
 
 def attenuate_fsm_hydrograph(
-    hydrograph: Sequence[FsmHydrographPoint],
+    hydrograph: list[FsmHydrographPoint],
     mean_travel_time_h: float,
     dt_h: float = 0.25,
     num_reservoirs: int = 2,
