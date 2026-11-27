@@ -1392,6 +1392,26 @@ def test_v06_python_api_parity_filters_derivatives_merge_tree_fsm_and_pointcloud
     ft = sim["fill_time"]
     expected_wet = int(np.sum(np.isfinite(ft) & (ft >= 0.0) & (ft <= 6.0)))
     assert sim["steps"][-1]["inundated_cells"] == expected_wet
+    # Verify Green-Ampt + runoff_coeff_arr scales cumulative runoff in inundation_curve_csv
+    sim_rc = lidar_rs.simulate_inundation_array(
+        dem,
+        kernel_size=1,
+        min_size=4,
+        min_depth=0.1,
+        interval=0.2,
+        rain_intensity_cm_h=8.0,
+        rain_duration_h=6.0,
+        time_step_h=2.0,
+        runoff_coeff_arr=np.full_like(dem, 0.5),
+        routing="fsm",
+        green_ampt=(0.5, 10.0, 0.3),
+        geotransform=gt,
+        crs="EPSG:32614",
+    )
+    last_row = [ln for ln in sim_rc["inundation_curve_csv"].splitlines() if ln.strip()][-1]
+    cum_runoff_mm = float(last_row.split(",")[2])
+    # 8.0 cm/h * 0.5 * 6 h = 24 cm = 240 mm (not 480 mm)
+    assert cum_runoff_mm == pytest.approx(240.0, rel=1e-3)
     att = lidar_rs.attenuate_fsm_hydrograph(
         sim["fsm_hydrograph"], mean_travel_time_h=1.0, dt_h=0.5, num_reservoirs=2
     )

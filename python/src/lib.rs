@@ -3952,10 +3952,42 @@ fn simulate_inundation_array<'py>(
                         num_steps,
                         sim_opts.time_step_h,
                     );
+                    let runoff_scale = if let Some(rc_grid) = rc.as_ref() {
+                        let dem_nd = pipe.sinks.dem_refined.no_data();
+                        let rc_nd = rc_grid.no_data();
+                        let mut sum = 0.0f64;
+                        let mut cnt = 0usize;
+                        for (&dv, &cv) in pipe
+                            .sinks
+                            .dem_refined
+                            .data()
+                            .iter()
+                            .zip(rc_grid.data().iter())
+                        {
+                            if dv.is_finite() && !(dem_nd.is_finite() && dv == dem_nd) {
+                                let eff = if cv.is_finite() && !(rc_nd.is_finite() && cv == rc_nd) {
+                                    cv.clamp(0.0, 1.0)
+                                } else {
+                                    1.0
+                                };
+                                sum += eff;
+                                cnt += 1;
+                            }
+                        }
+                        if cnt > 0 { sum / cnt as f64 } else { 1.0 }
+                    } else {
+                        1.0
+                    };
+                    let eff_rain = sim_opts.rain_intensity_cm_h * runoff_scale;
+                    let scaled_hyeto: Option<Vec<(f64, f64)>> = hyetograph.as_ref().map(|h| {
+                        h.iter()
+                            .map(|&(dt, cm_h)| (dt, cm_h * runoff_scale))
+                            .collect()
+                    });
                     pipe.inundation_curve_csv = lidar::format_inundation_curve_csv(
                         &pipe.steps,
-                        sim_opts.rain_intensity_cm_h,
-                        hyetograph.as_deref(),
+                        eff_rain,
+                        scaled_hyeto.as_deref(),
                     );
                     pipe.fsm_mass_balance = Some(fsm_res.mass_balance);
                     pipe.fsm_basins = Some(fsm_res.basins);
