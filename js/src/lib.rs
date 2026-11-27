@@ -1443,6 +1443,7 @@ pub fn simulate_inundation_advanced(
         },
         scalar_runoff_coeff: runoff_coeff,
         stream_vector: None,
+        ..Default::default()
     };
     let pipe = run_full_pipeline_in_memory(&raw_dem, &opts).map_err(to_js_err)?;
 

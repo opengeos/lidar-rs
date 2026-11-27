@@ -2955,9 +2955,18 @@ pub fn query_3dep_copc_products(
 
 /// Projects a WGS 84 geographic [`Bbox`] into `target_crs` by sampling perimeter points along
 /// all four edges so curved map projections (UTM, Albers, Lambert) do not clip AOI corners.
+///
+/// Returns `Err(Error::InvalidArgument)` when `target_crs` is unknown so geographic degrees
+/// are never silently applied to projected or unreferenced point clouds.
 pub fn transform_wgs84_bbox_to_crs(bbox: &Bbox, target_crs: &SpatialRef) -> Result<[f64; 4]> {
     bbox.validate()?;
-    if target_crs.is_unknown() || target_crs.epsg == Some(4326) {
+    if target_crs.is_unknown() {
+        return Err(Error::InvalidArgument(
+            "cannot project WGS 84 AOI bounding box into unknown target CRS; supply bounds_native instead"
+                .into(),
+        ));
+    }
+    if target_crs.epsg == Some(4326) {
         return Ok([bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat]);
     }
     let wgs84 = SpatialRef::from_epsg(4326)?;
@@ -3082,7 +3091,9 @@ fn stream_pointcloud_aoi_impl(
 /// Streams only the octree chunks overlapping an Area of Interest from a remote public HTTPS
 /// COPC (`.copc.laz`) or Entwine Point Tile (`ept.json`) dataset using HTTP range requests.
 ///
-/// Rejects non-HTTPS schemes, loopback/private/link-local hosts, and embedded credentials.
+/// Performs a lexical pre-flight check rejecting non-HTTPS schemes, loopback/private/link-local
+/// hosts, and embedded credentials (note: DNS resolution and downstream redirects are handled
+/// by `terrio`'s remote reader).
 #[cfg(feature = "pointcloud")]
 pub fn stream_remote_pointcloud_aoi(
     opts: &EptStreamOptions,

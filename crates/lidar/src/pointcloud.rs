@@ -2721,22 +2721,24 @@ fn lidar_to_tiled_grid_impl(
     }
     let total_tiles = (row_bands.len() * col_strips.len()).max(1);
 
-    // Stream directly into `out_raster` when writing a GeoTIFF, or stage to a temporary GeoTIFF
-    // before converting to a Cloud Optimized GeoTIFF with overviews when `cog == true`.
-    let temp_stage = if options.dtm.cog {
-        let stem = out_raster
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("tiled");
-        let uniq = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        Some(out_raster.with_file_name(format!(".{stem}.tmp_{}_{uniq}.tif", std::process::id())))
-    } else {
-        None
-    };
+    // Always stage into a sibling temp GeoTIFF and atomically move (or convert to COG) upon
+    // completion so mid-run cancellation or I/O errors never leave a partial/corrupt output file.
+    let stem = out_raster
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("tiled");
+    let uniq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let temp_stage =
+        out_raster.with_file_name(format!(".{stem}.tmp_{}_{uniq}.tif", std::process::id()));
 
     struct TempFileGuard(Option<PathBuf>);
+    impl TempFileGuard {
+        fn disarm(&mut self) {
+            self.0 = None;
+        }
+    }
     impl Drop for TempFileGuard {
         fn drop(&mut self) {
             if let Some(ref p) = self.0 {
@@ -2744,9 +2746,8 @@ fn lidar_to_tiled_grid_impl(
             }
         }
     }
-    let _temp_guard = TempFileGuard(temp_stage.clone());
-    let stream_path = temp_stage.as_deref().unwrap_or(out_raster);
-    let stream_str = path_to_str(stream_path)?;
+    let mut temp_guard = TempFileGuard(Some(temp_stage.clone()));
+    let stream_str = path_to_str(&temp_stage)?;
 
     let header_ds = build_streaming_f64_header(width, height, gt, &crs, nodata);
     let mut write_opts = RasterWriteOptions::default();
@@ -2794,18 +2795,28 @@ fn lidar_to_tiled_grid_impl(
                 return Ok((core_c0, core_c1, core_vals));
             }
 
+            let is_empty_tile_err = |err: &Error| match err {
+                Error::Algorithm(msg) => {
+                    msg.starts_with("no ground points found") || msg == "input point cloud is empty"
+                }
+                _ => false,
+            };
             let tile_arr = match product {
                 TiledGridProduct::Dtm => {
                     match points_to_dtm_with_bounds(&cloud, &options.dtm, Some(pad_bounds)) {
                         Ok(a) => a,
-                        Err(Error::Algorithm(_)) => return Ok((core_c0, core_c1, core_vals)),
+                        Err(e) if is_empty_tile_err(&e) => {
+                            return Ok((core_c0, core_c1, core_vals));
+                        }
                         Err(e) => return Err(e),
                     }
                 }
                 TiledGridProduct::Chm => {
                     match points_to_chm_with_bounds(&cloud, &options.dtm, Some(pad_bounds)) {
                         Ok(a) => a,
-                        Err(Error::Algorithm(_)) => return Ok((core_c0, core_c1, core_vals)),
+                        Err(e) if is_empty_tile_err(&e) => {
+                            return Ok((core_c0, core_c1, core_vals));
+                        }
                         Err(e) => return Err(e),
                     }
                 }
@@ -2871,14 +2882,21 @@ fn lidar_to_tiled_grid_impl(
 
     writer.finish()?;
 
-    if let Some(ref tmp) = temp_stage {
+    if options.dtm.cog {
         control.check_cancelled()?;
         control.report("cog", 0.97, Some("Converting tiled raster to COG".into()));
         crate::raster_ops::image_to_cog(
-            tmp,
+            &temp_stage,
             out_raster,
             options.dtm.compress.then_some("DEFLATE"),
         )?;
+    } else {
+        control.check_cancelled()?;
+        if out_raster.exists() {
+            let _ = std::fs::remove_file(out_raster);
+        }
+        std::fs::rename(&temp_stage, out_raster)?;
+        temp_guard.disarm();
     }
 
     control.check_cancelled()?;
@@ -2891,8 +2909,9 @@ fn lidar_to_tiled_grid_impl(
 }
 
 /// Generates a bare-earth Digital Terrain Model (DTM) GeoTIFF (or COG) from a large LiDAR
-/// point cloud in bounded memory by streaming overlapping tiles via [`read_lidar_windowed`]
-/// and writing row bands incrementally with `terrio::GeoTiffWriter`.
+/// point cloud by streaming overlapping tiles via [`read_lidar_windowed`] and writing row
+/// strips incrementally with `terrio::GeoTiffWriter` (working raster memory scales as
+/// `O(tile_rows * full_width)` rather than `O(full_height * full_width)`).
 pub fn lidar_to_dtm_tiled(
     in_lidar: impl AsRef<Path>,
     out_dtm: impl AsRef<Path>,

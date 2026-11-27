@@ -246,6 +246,7 @@ pub fn compute_rating_curves_from_dem(
             Ok((deps.depressions.len(), points))
         }
         crate::slicing::DelineationMethod::MergeTree => {
+            // MergeTree produces exact, interval-free breakpoints independent of `curve_interval`.
             let mt_opts = crate::merge_tree::MergeTreeOptions {
                 min_size: options.min_size,
                 min_depth: options.min_depth,
