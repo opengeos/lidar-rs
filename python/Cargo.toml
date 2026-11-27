@@ -2,7 +2,7 @@
 name = "lidar-py"
 description = "Python bindings for lidar-rs (pure-Rust port of opengeos/lidar with terrio and richdem)"
 publish = false
-version = "0.6.2"
+version = "0.7.0"
 edition = "2024"
 # Compiled wheel bundles richdem (GPL-3.0-only); lidar-rs source code itself is MIT.
 license = "GPL-3.0-only"
