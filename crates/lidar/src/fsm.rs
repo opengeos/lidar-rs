@@ -3266,6 +3266,7 @@ pub fn compute_fsm_hazard_rasters(
 
     let is_subwindow = storm_duration_h < fsm.mass_balance.duration_h - STORM_TIME_EPS_H;
     let has_history = fsm.basin_vol_history.len() == fsm.basins.len();
+    let use_history_duration = fsm.basin_had_draining && has_history;
 
     // Build hierarchy maps and per-depression sorted subtree elevations.
     let mut id_to_idx: HashMap<u32, usize> = HashMap::with_capacity(m);
@@ -3294,14 +3295,29 @@ pub fn compute_fsm_hazard_rasters(
     }
 
     // For each basin, compute exact sorted subtree elevations, cumulative storage table,
-    // and storm peak WSE clipped to `[0, storm_duration_h]`.
-    let mut subtree_elevs: Vec<Vec<f64>> = vec![Vec::new(); m];
-    let mut subtree_prefix_v: Vec<Vec<f64>> = vec![Vec::new(); m];
+    // and storm peak WSE clipped to `[0, storm_duration_h]`. Retain the per-basin elevation
+    // and prefix-volume tables only when `use_history_duration` needs per-pixel stage lookups.
+    let mut subtree_elevs: Vec<Vec<f64>> = if use_history_duration {
+        vec![Vec::new(); m]
+    } else {
+        Vec::new()
+    };
+    let mut subtree_prefix_v: Vec<Vec<f64>> = if use_history_duration {
+        vec![Vec::new(); m]
+    } else {
+        Vec::new()
+    };
     let mut basin_peak_wse: Vec<Option<f64>> = vec![None; m];
 
+    let mut desc_ids: HashSet<u32> = HashSet::new();
+    let mut stack: Vec<u32> = Vec::new();
+    let mut elevs: Vec<f64> = Vec::new();
+    let mut pref_v: Vec<f64> = Vec::new();
+
     for (idx, d) in depressions.depressions.iter().enumerate() {
-        let mut desc_ids: HashSet<u32> = HashSet::new();
-        let mut stack = vec![d.id];
+        desc_ids.clear();
+        stack.clear();
+        stack.push(d.id);
         while let Some(cid) = stack.pop() {
             if desc_ids.insert(cid)
                 && let Some(kids) = children_map.get(&cid)
@@ -3309,7 +3325,7 @@ pub fn compute_fsm_hazard_rasters(
                 stack.extend(kids.iter().copied());
             }
         }
-        let mut elevs: Vec<f64> = Vec::new();
+        elevs.clear();
         for &cid in &desc_ids {
             if let Some(pts) = pixels_by_id.get(&cid) {
                 for &gi in pts {
@@ -3322,7 +3338,8 @@ pub fn compute_fsm_hazard_rasters(
         }
         elevs.sort_by(f64::total_cmp);
         let k = elevs.len();
-        let mut pref_v = Vec::with_capacity(k);
+        pref_v.clear();
+        pref_v.reserve(k.saturating_sub(pref_v.capacity()));
         let mut sum_z_above_min = 0.0f64;
         if k > 0 {
             let z0 = elevs[0];
@@ -3380,8 +3397,10 @@ pub fn compute_fsm_hazard_rasters(
                 basin_peak_wse[idx] = Some(wse);
             }
         }
-        subtree_elevs[idx] = elevs;
-        subtree_prefix_v[idx] = pref_v;
+        if use_history_duration {
+            subtree_elevs[idx] = std::mem::take(&mut elevs);
+            subtree_prefix_v[idx] = std::mem::take(&mut pref_v);
+        }
     }
 
     // Helper: exact cumulative storage volume threshold for elevation `z` inside basin `bidx`.
@@ -3401,7 +3420,7 @@ pub fn compute_fsm_hazard_rasters(
     };
 
     let storm_end = storm_duration_h + STORM_TIME_EPS_H;
-    let use_history_duration = fsm.basin_had_draining && has_history;
+    let mut merged_chain: Vec<(u32, usize)> = Vec::new();
 
     for idx in 0..n {
         let z = zdata[idx];
@@ -3425,7 +3444,10 @@ pub fn compute_fsm_hazard_rasters(
         // within `[0, storm_duration_h]`.
         let mut best_wse = basin_peak_wse[start_bidx].unwrap_or(z);
         let mut cur_id = start_id;
-        let mut merged_chain: Vec<(u32, usize)> = vec![(start_id, start_bidx)];
+        if use_history_duration {
+            merged_chain.clear();
+            merged_chain.push((start_id, start_bidx));
+        }
         while let Some(&pid) = parent_map.get(&cur_id) {
             let cur_merged_in_storm = fsm_idx_by_id.get(&cur_id).is_some_and(|&fi| {
                 fsm.basins[fi]
@@ -3441,7 +3463,9 @@ pub fn compute_fsm_hazard_rasters(
                 {
                     best_wse = pw;
                 }
-                merged_chain.push((pid, p_bidx));
+                if use_history_duration {
+                    merged_chain.push((pid, p_bidx));
+                }
                 cur_id = pid;
             } else {
                 break;
@@ -5140,6 +5164,109 @@ mod tests {
             "Waiting parent final_routed_cat_area_m2 ({}) must equal local_cat_area_m2 ({}) with no stale accumulation",
             parent.final_routed_cat_area_m2,
             parent.local_cat_area_m2
+        );
+    }
+
+    #[test]
+    fn fsm_hazard_rasters_cover_non_draining_and_draining_merged_paths() {
+        let (dem_refined, sink, deps) = build_two_sibling_compound_dem();
+
+        // 1. Non-draining path (`!use_history_duration`): merged compound basin retains peak WSE
+        //    and exact `storm_duration_h - fill_time` duration without retaining subtree tables.
+        let opts_nodrain = SimulateInundationOptions {
+            min_size: 10,
+            min_depth: 0.3,
+            interval: 0.3,
+            rain_intensity_cm_h: 50.0,
+            rain_duration_h: 20.0,
+            time_step_h: 1.0,
+            compress: false,
+        };
+        let res_nodrain = simulate_fill_spill_merge_in_memory(
+            &dem_refined,
+            &sink,
+            &deps,
+            &opts_nodrain,
+            &InundationForcing::default(),
+        )
+        .unwrap();
+        assert!(!res_nodrain.basin_had_draining);
+        assert!(res_nodrain.num_merge_events >= 1);
+
+        let haz_nodrain = compute_fsm_hazard_rasters(
+            &dem_refined,
+            &res_nodrain.fill_time,
+            &deps,
+            &res_nodrain,
+            opts_nodrain.rain_duration_h,
+        )
+        .unwrap();
+        let mut wet_cells_nodrain = 0usize;
+        for idx in 0..(dem_refined.width() * dem_refined.height()) {
+            let ft = res_nodrain.fill_time.get_i(idx);
+            if ft.is_finite() && ft >= 0.0 && ft <= opts_nodrain.rain_duration_h + 1e-9 {
+                wet_cells_nodrain += 1;
+                let expected_dur =
+                    (opts_nodrain.rain_duration_h - ft).clamp(0.0, opts_nodrain.rain_duration_h);
+                assert!(
+                    (haz_nodrain.duration_h.get_i(idx) - expected_dur).abs() < 1e-9,
+                    "non-draining duration mismatch at cell {idx}"
+                );
+                assert!(haz_nodrain.max_depth.get_i(idx) >= 0.0);
+                assert!(haz_nodrain.wse.get_i(idx) >= dem_refined.get_i(idx) - 1e-9);
+            }
+        }
+        assert!(wet_cells_nodrain > 0);
+
+        // 2. Draining path (`use_history_duration == true`): burst of rain followed by dry
+        //    infiltration drains merged basins and computes bounded history durations via the
+        //    hoisted `merged_chain` buffer.
+        let mut infil = Array2D::from_vec(
+            dem_refined.width(),
+            dem_refined.height(),
+            vec![30.0; dem_refined.width() * dem_refined.height()],
+        )
+        .unwrap();
+        infil.copy_metadata_from(&dem_refined);
+        let hyeto = vec![(5.0, 50.0), (15.0, 0.0)];
+        let forcing_drain = InundationForcing {
+            hyetograph: Some(&hyeto),
+            infiltration_cm_h: Some(&infil),
+            ..Default::default()
+        };
+        let res_drain = simulate_fill_spill_merge_in_memory(
+            &dem_refined,
+            &sink,
+            &deps,
+            &opts_nodrain,
+            &forcing_drain,
+        )
+        .unwrap();
+        assert!(res_drain.basin_had_draining);
+
+        let haz_drain = compute_fsm_hazard_rasters(
+            &dem_refined,
+            &res_drain.fill_time,
+            &deps,
+            &res_drain,
+            opts_nodrain.rain_duration_h,
+        )
+        .unwrap();
+        let mut shorter_dur_cells = 0usize;
+        for idx in 0..(dem_refined.width() * dem_refined.height()) {
+            let ft = res_drain.fill_time.get_i(idx);
+            if ft.is_finite() && ft >= 0.0 && ft <= opts_nodrain.rain_duration_h + 1e-9 {
+                let d = haz_drain.duration_h.get_i(idx);
+                assert!((0.0..=opts_nodrain.rain_duration_h + 1e-9).contains(&d));
+                assert!(haz_drain.max_depth.get_i(idx) >= 0.0);
+                if d + 1e-3 < opts_nodrain.rain_duration_h - ft {
+                    shorter_dur_cells += 1;
+                }
+            }
+        }
+        assert!(
+            shorter_dur_cells > 0,
+            "draining path must produce shorter inundation durations than storm_duration - fill_time"
         );
     }
 }
