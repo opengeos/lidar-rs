@@ -52,6 +52,7 @@ use crate::inundation::{
     solve_green_ampt_ponded, trace_downstream_away_from_source, validate_forcing_grids,
     validate_grid_alignment, validate_options_with_hyetograph,
 };
+use crate::progress::ExecutionControl;
 use crate::region::crs_metric_basis;
 use crate::slicing::{InMemoryDepressions, NestedDepression};
 
@@ -944,12 +945,40 @@ pub fn simulate_fill_spill_merge_in_memory(
     options: &SimulateInundationOptions,
     forcing: &InundationForcing<'_>,
 ) -> Result<FsmSimulationResult> {
+    simulate_fill_spill_merge_in_memory_with_control(
+        dem_refined,
+        sink,
+        depressions,
+        options,
+        forcing,
+        &ExecutionControl::default(),
+    )
+}
+
+/// Runs [`simulate_fill_spill_merge_in_memory`] with progress reporting and cooperative
+/// cancellation via [`ExecutionControl`].
+pub fn simulate_fill_spill_merge_in_memory_with_control(
+    dem_refined: &Array2D<f64>,
+    sink: &Array2D<f64>,
+    depressions: &InMemoryDepressions,
+    options: &SimulateInundationOptions,
+    forcing: &InundationForcing<'_>,
+    control: &ExecutionControl,
+) -> Result<FsmSimulationResult> {
     let fsm_forcing = FsmForcing {
         base: forcing.clone(),
         green_ampt: None,
         green_ampt_substep_h: None,
     };
-    simulate_fill_spill_merge_impl(dem_refined, sink, depressions, options, &fsm_forcing, None)
+    simulate_fill_spill_merge_impl(
+        dem_refined,
+        sink,
+        depressions,
+        options,
+        &fsm_forcing,
+        None,
+        control,
+    )
 }
 
 /// Runs dynamic event-driven Fill-Spill-Merge routing with extended [`FsmForcing`],
@@ -961,42 +990,74 @@ pub fn simulate_fill_spill_merge_with_green_ampt_in_memory(
     options: &SimulateInundationOptions,
     forcing: &FsmForcing<'_>,
 ) -> Result<FsmSimulationResult> {
-    simulate_fill_spill_merge_impl(dem_refined, sink, depressions, options, forcing, None)
+    simulate_fill_spill_merge_with_green_ampt_in_memory_with_control(
+        dem_refined,
+        sink,
+        depressions,
+        options,
+        forcing,
+        &ExecutionControl::default(),
+    )
+}
+
+/// Runs [`simulate_fill_spill_merge_with_green_ampt_in_memory`] with progress reporting and
+/// cooperative cancellation via [`ExecutionControl`].
+pub fn simulate_fill_spill_merge_with_green_ampt_in_memory_with_control(
+    dem_refined: &Array2D<f64>,
+    sink: &Array2D<f64>,
+    depressions: &InMemoryDepressions,
+    options: &SimulateInundationOptions,
+    forcing: &FsmForcing<'_>,
+    control: &ExecutionControl,
+) -> Result<FsmSimulationResult> {
+    simulate_fill_spill_merge_impl(
+        dem_refined,
+        sink,
+        depressions,
+        options,
+        forcing,
+        None,
+        control,
+    )
 }
 
 /// Internal variant of [`simulate_fill_spill_merge_in_memory`] reusing precomputed
 /// resolved D8 flow directions (`d8_flow_directions_resolved`) across pipeline stages.
-pub(crate) fn simulate_fill_spill_merge_with_flowdirs(
+pub(crate) fn simulate_fill_spill_merge_with_flowdirs_and_control(
     dem_refined: &Array2D<f64>,
     sink: &Array2D<f64>,
     depressions: &InMemoryDepressions,
     options: &SimulateInundationOptions,
     forcing: &InundationForcing<'_>,
     flowdirs: &Array2D<D8Flowdir>,
+    control: &ExecutionControl,
 ) -> Result<FsmSimulationResult> {
     let fsm_forcing = FsmForcing {
         base: forcing.clone(),
         green_ampt: None,
         green_ampt_substep_h: None,
     };
-    simulate_fill_spill_merge_with_forcing_and_flowdirs(
+    simulate_fill_spill_merge_with_forcing_and_flowdirs_and_control(
         dem_refined,
         sink,
         depressions,
         options,
         &fsm_forcing,
         flowdirs,
+        control,
     )
 }
 
-/// Internal variant accepting full [`FsmForcing`] and precomputed resolved D8 flow directions.
-pub(crate) fn simulate_fill_spill_merge_with_forcing_and_flowdirs(
+/// Internal variant accepting full [`FsmForcing`], precomputed resolved D8 flow directions,
+/// and [`ExecutionControl`].
+pub(crate) fn simulate_fill_spill_merge_with_forcing_and_flowdirs_and_control(
     dem_refined: &Array2D<f64>,
     sink: &Array2D<f64>,
     depressions: &InMemoryDepressions,
     options: &SimulateInundationOptions,
     forcing: &FsmForcing<'_>,
     flowdirs: &Array2D<D8Flowdir>,
+    control: &ExecutionControl,
 ) -> Result<FsmSimulationResult> {
     if flowdirs.width() != dem_refined.width() || flowdirs.height() != dem_refined.height() {
         return Err(Error::DimensionMismatch(format!(
@@ -1014,6 +1075,7 @@ pub(crate) fn simulate_fill_spill_merge_with_forcing_and_flowdirs(
         options,
         forcing,
         Some(flowdirs),
+        control,
     )
 }
 
@@ -1024,7 +1086,9 @@ fn simulate_fill_spill_merge_impl(
     options: &SimulateInundationOptions,
     fsm_forcing: &FsmForcing<'_>,
     precomputed_flowdirs: Option<&Array2D<D8Flowdir>>,
+    control: &ExecutionControl,
 ) -> Result<FsmSimulationResult> {
+    control.check_cancelled()?;
     let forcing = &fsm_forcing.base;
     let green_ampt = fsm_forcing.green_ampt;
     if let Some(ga) = green_ampt {
@@ -1321,6 +1385,12 @@ fn simulate_fill_spill_merge_impl(
 
     // 4. Discover topographic spill outlets for every depression (parallel when enabled),
     // checking out reusable scratch buffers from a pool strictly bounded by active worker count.
+    control.check_cancelled()?;
+    control.report(
+        "outlets",
+        0.25,
+        Some("Discovering topographic spill outlets".into()),
+    );
     let exterior_nodata = compute_exterior_nodata_mask(fdata, w, h);
     #[cfg(feature = "parallel")]
     let outlets: Vec<Option<TopographicOutlet>> = {
@@ -1379,6 +1449,12 @@ fn simulate_fill_spill_merge_impl(
     };
 
     // 5. Build O(N) exact hypsometric storage curves, infiltration rates, and antecedent volumes.
+    control.check_cancelled()?;
+    control.report(
+        "hypsometry",
+        0.45,
+        Some("Building basin hypsometric storage curves".into()),
+    );
     // Every sink pixel belongs to exactly one depression (`pixels_by_id`), so each depression
     // collects and sorts ONLY its own cells (`O(N)` total memory, sorted in parallel with Rayon).
     // Subtree capacities, rim elevations, and infiltration loss rates propagate bottom-up in O(m),
@@ -2204,9 +2280,19 @@ fn simulate_fill_spill_merge_impl(
     let mut hydrograph: Vec<FsmHydrographPoint> = Vec::with_capacity(segments.len() + 8);
     let mut any_basin_drained_in_storm = false;
 
+    let num_segments = segments.len().max(1);
     for (seg_idx, (seg_dt, rain_m_h, in_storm_window, snapshot_after_segment)) in
         segments.into_iter().enumerate()
     {
+        control.check_cancelled()?;
+        control.report(
+            "routing",
+            0.55 + 0.40 * (seg_idx as f64 / num_segments as f64),
+            Some(format!(
+                "Routing FSM segment {}/{num_segments}",
+                seg_idx + 1
+            )),
+        );
         if in_storm_window && seg_dt.is_finite() && seg_dt > 0.0 {
             last_storm_seg_dt = seg_dt;
         }
@@ -2252,6 +2338,9 @@ fn simulate_fill_spill_merge_impl(
 
         while t_cur < t_seg_end - 1e-12 && iter_guard < max_iters {
             iter_guard += 1;
+            if iter_guard.is_multiple_of(64) {
+                control.check_cancelled()?;
+            }
 
             if topology_dirty {
                 resolve_merges_and_cycles(
@@ -2728,6 +2817,13 @@ fn simulate_fill_spill_merge_impl(
         .collect();
     let basin_vol_history: Vec<Vec<BasinVolumeSegment>> =
         basins.into_iter().map(|b| b.storm_vol_history).collect();
+
+    control.check_cancelled()?;
+    control.report(
+        "complete",
+        1.0,
+        Some("Fill-Spill-Merge routing complete".into()),
+    );
 
     Ok(FsmSimulationResult {
         fill_time,

@@ -347,6 +347,7 @@ fn main() -> lidar::Result<()> {
                     interval: 0.3,
                     topology: Topology::D8,
                     use_f32: false,
+                    ..Default::default()
                 },
             )
             .unwrap()
@@ -502,6 +503,7 @@ fn main() -> lidar::Result<()> {
                         interval: 0.3,
                         topology: Topology::D8,
                         use_f32: false,
+                        ..Default::default()
                     },
                 )
                 .unwrap()

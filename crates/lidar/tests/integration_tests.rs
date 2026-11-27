@@ -1061,6 +1061,7 @@ fn test_fill_spill_merge_end_to_end_on_sample_dem() {
             forcing: InundationForcing::default(),
             scalar_runoff_coeff: 1.0,
             stream_vector: None,
+            ..Default::default()
         },
     )
     .unwrap();

@@ -31,10 +31,15 @@ use rayon::prelude::*;
 use richdem::{Array2D, DemNum, array2d_to_dataset};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
+use terrio::crs::SpatialRef;
 use terrio::formats::RasterDriver;
-use terrio::{Geometry, RasterWriteOptions, VectorOpenOptions};
+use terrio::raster::RasterData;
+use terrio::{
+    DataType, GeoTiffWriter, Geometry, Raster, RasterDataset, RasterWriteOptions, VectorOpenOptions,
+};
 
 use crate::error::{Error, Result};
+use crate::progress::ExecutionControl;
 
 fn path_to_str(path: &Path) -> Result<&str> {
     path.to_str()
@@ -1551,6 +1556,14 @@ fn select_ground_points(raw: &PointCloud, options: &LidarToDtmOptions) -> Result
 /// Grids an in-memory [`PointCloud`] into a bare-earth Digital Terrain Model (DTM)
 /// [`Array2D<f64>`], applying configured outlier filters and ground classification.
 pub fn points_to_dtm(cloud: &PointCloud, options: &LidarToDtmOptions) -> Result<Array2D<f64>> {
+    points_to_dtm_with_bounds(cloud, options, None)
+}
+
+fn points_to_dtm_with_bounds(
+    cloud: &PointCloud,
+    options: &LidarToDtmOptions,
+    bounds: Option<[f64; 4]>,
+) -> Result<Array2D<f64>> {
     validate_dtm_options(options)?;
     let cleaned = if has_dtm_outlier_filters(options) {
         apply_dtm_outlier_filters(cloud, options)?
@@ -1571,6 +1584,7 @@ pub fn points_to_dtm(cloud: &PointCloud, options: &LidarToDtmOptions) -> Result<
         dimension: "z".to_string(),
         radius: options.radius,
         window_size: options.window_size,
+        bounds,
         nodata: options.nodata,
         ..Default::default()
     };
@@ -1644,6 +1658,14 @@ pub fn lidar_to_dtm(
 /// Computes an in-memory Canopy Height Model (`CHM = max(0, DSM - DTM)`) [`Array2D<f64>`]
 /// directly from a [`PointCloud`].
 pub fn points_to_chm(cloud: &PointCloud, options: &LidarToDtmOptions) -> Result<Array2D<f64>> {
+    points_to_chm_with_bounds(cloud, options, None)
+}
+
+fn points_to_chm_with_bounds(
+    cloud: &PointCloud,
+    options: &LidarToDtmOptions,
+    bounds: Option<[f64; 4]>,
+) -> Result<Array2D<f64>> {
     validate_dtm_options(options)?;
     let raw = if has_dtm_outlier_filters(options) {
         apply_dtm_outlier_filters(cloud, options)?
@@ -1661,8 +1683,8 @@ pub fn points_to_chm(cloud: &PointCloud, options: &LidarToDtmOptions) -> Result<
         )));
     }
 
-    // Use the raw cloud's XY extent for both DSM and DTM so both grids share one exact lattice.
-    let shared_bounds = raw.bounds().map(|b| [b[0], b[1], b[3], b[4]]);
+    // Use the requested or raw cloud XY extent for both DSM and DTM so both grids share one exact lattice.
+    let shared_bounds = bounds.or_else(|| raw.bounds().map(|b| [b[0], b[1], b[3], b[4]]));
 
     let dsm_opts = GridOptions {
         resolution: options.resolution,
@@ -2545,6 +2567,383 @@ pub fn lidar_to_chm_pit_free(
     let chm = points_to_chm_pit_free(&cloud, options)?;
     write_array2d_raster(&chm, out_path, options.compress, options.cog)?;
     Ok(chm)
+}
+
+/// Options for bounded-memory tiled point-cloud gridding ([`lidar_to_dtm_tiled`] and
+/// [`lidar_to_chm_tiled`]).
+#[derive(Debug, Clone)]
+pub struct TiledPointCloudOptions {
+    /// Core tile size in CRS horizontal units (default `500.0`).
+    pub tile_size: f64,
+    /// Overlap halo around each tile in CRS horizontal units to prevent edge artifacts in
+    /// ground classification and TIN/IDW interpolation (default `25.0`).
+    pub overlap: f64,
+    /// Ground classification, outlier removal, and gridding options for each tile.
+    pub dtm: LidarToDtmOptions,
+    /// Optional COPC/EPT LOD spacing forwarded to [`read_lidar_windowed`].
+    pub read_resolution: Option<f64>,
+    /// Optional COPC/EPT maximum octree level forwarded to [`read_lidar_windowed`].
+    pub max_level: Option<u32>,
+}
+
+impl Default for TiledPointCloudOptions {
+    fn default() -> Self {
+        Self {
+            tile_size: 500.0,
+            overlap: 25.0,
+            dtm: LidarToDtmOptions::default(),
+            read_resolution: None,
+            max_level: None,
+        }
+    }
+}
+
+fn validate_tiled_pointcloud_options(opts: &TiledPointCloudOptions) -> Result<()> {
+    validate_dtm_options(&opts.dtm)?;
+    if !opts.tile_size.is_finite() || opts.tile_size <= 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "tile_size must be finite and > 0, got {}",
+            opts.tile_size
+        )));
+    }
+    if !opts.overlap.is_finite() || opts.overlap < 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "overlap must be finite and >= 0, got {}",
+            opts.overlap
+        )));
+    }
+    if let Some(res) = opts.read_resolution
+        && (!res.is_finite() || res <= 0.0)
+    {
+        return Err(Error::InvalidArgument(format!(
+            "read_resolution must be finite and > 0, got {res}"
+        )));
+    }
+    Ok(())
+}
+
+fn build_streaming_f64_header(
+    width: usize,
+    height: usize,
+    gt: [f64; 6],
+    crs: &SpatialRef,
+    nodata: f64,
+) -> RasterDataset {
+    let mut raster = Raster {
+        cols: width,
+        rows: height,
+        bands: 1,
+        x_min: gt[0],
+        y_min: gt[3] + height as f64 * gt[5],
+        cell_size_x: gt[1].abs().max(1e-12),
+        cell_size_y: gt[5].abs().max(1e-12),
+        nodata,
+        data_type: DataType::F64,
+        crs: Default::default(),
+        metadata: Default::default(),
+        data: RasterData::new_filled(DataType::F64, 0, 0.0),
+    };
+    if !crs.is_unknown() {
+        raster.crs = crs.to_crs_info();
+    }
+    let mut ds = RasterDataset::new(raster, true);
+    ds.set_geo_transform(gt);
+    ds
+}
+
+#[derive(Clone, Copy)]
+enum TiledGridProduct {
+    Dtm,
+    Chm,
+}
+
+fn lidar_to_tiled_grid_impl(
+    in_lidar: &Path,
+    out_raster: &Path,
+    options: &TiledPointCloudOptions,
+    product: TiledGridProduct,
+    control: &ExecutionControl,
+) -> Result<(usize, usize)> {
+    control.check_cancelled()?;
+    validate_tiled_pointcloud_options(options)?;
+    crate::raster_ops::ensure_no_path_collision(in_lidar, &[out_raster])?;
+    ensure_parent_dir(out_raster)?;
+
+    let src_str = path_to_str(in_lidar)?;
+    let reader = terrio::pointcloud::open_points(src_str)?;
+    let hdr = reader.header();
+    if hdr.point_count == 0 {
+        return Err(Error::Algorithm("input point cloud is empty".into()));
+    }
+    let min_x = hdr.min[0];
+    let min_y = hdr.min[1];
+    let max_x = hdr.max[0];
+    let max_y = hdr.max[1];
+    if !min_x.is_finite()
+        || !min_y.is_finite()
+        || !max_x.is_finite()
+        || !max_y.is_finite()
+        || max_x < min_x
+        || max_y < min_y
+    {
+        return Err(Error::Algorithm(
+            "input point cloud has invalid spatial bounds".into(),
+        ));
+    }
+    let crs = reader.crs().clone();
+    drop(reader);
+
+    let res = options.dtm.resolution;
+    let width = ((max_x - min_x) / res).ceil().max(1.0) as usize;
+    let height = ((max_y - min_y) / res).ceil().max(1.0) as usize;
+    // Align grid origin to `(min_x, top_y)` where `top_y = min_y + height * res` so bottom row
+    // aligns with `min_y` and north-up cell centers sit at `(min_x + (c+0.5)*res, top_y - (r+0.5)*res)`.
+    let top_y = min_y + height as f64 * res;
+    let gt = [min_x, res, 0.0, top_y, 0.0, -res];
+    let nodata = options.dtm.nodata;
+
+    let tile_cells = (options.tile_size / res).round().max(1.0) as usize;
+    let pad_cells = (options.overlap / res).ceil() as usize;
+
+    let mut row_bands: Vec<(usize, usize)> = Vec::new();
+    let mut r0 = 0usize;
+    while r0 < height {
+        let r1 = (r0 + tile_cells).min(height);
+        row_bands.push((r0, r1));
+        r0 = r1;
+    }
+    let mut col_strips: Vec<(usize, usize)> = Vec::new();
+    let mut c0 = 0usize;
+    while c0 < width {
+        let c1 = (c0 + tile_cells).min(width);
+        col_strips.push((c0, c1));
+        c0 = c1;
+    }
+    let total_tiles = (row_bands.len() * col_strips.len()).max(1);
+
+    // Stream directly into `out_raster` when writing a GeoTIFF, or stage to a temporary GeoTIFF
+    // before converting to a Cloud Optimized GeoTIFF with overviews when `cog == true`.
+    let temp_stage = if options.dtm.cog {
+        let stem = out_raster
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("tiled");
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        Some(out_raster.with_file_name(format!(".{stem}.tmp_{}_{uniq}.tif", std::process::id())))
+    } else {
+        None
+    };
+
+    struct TempFileGuard(Option<PathBuf>);
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            if let Some(ref p) = self.0 {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+    let _temp_guard = TempFileGuard(temp_stage.clone());
+    let stream_path = temp_stage.as_deref().unwrap_or(out_raster);
+    let stream_str = path_to_str(stream_path)?;
+
+    let header_ds = build_streaming_f64_header(width, height, gt, &crs, nodata);
+    let mut write_opts = RasterWriteOptions::default();
+    if options.dtm.compress && !options.dtm.cog {
+        write_opts.compression = Some("DEFLATE".into());
+    }
+    let mut writer = GeoTiffWriter::create(stream_str, &header_ds, &write_opts)?;
+
+    let preclassified_only = matches!(product, TiledGridProduct::Dtm)
+        && !has_dtm_outlier_filters(&options.dtm)
+        && options.dtm.ground_method == GroundFilterMethod::Preclassified;
+
+    let mut tiles_done = 0usize;
+    for &(core_r0, core_r1) in &row_bands {
+        control.check_cancelled()?;
+        let band_rows = core_r1 - core_r0;
+        let pad_r0 = core_r0.saturating_sub(pad_cells);
+        let pad_r1 = (core_r1 + pad_cells).min(height);
+        let pad_y1 = top_y - pad_r0 as f64 * res;
+        let pad_y0 = top_y - pad_r1 as f64 * res;
+
+        let run_tile = |&(core_c0, core_c1): &(usize, usize)| -> Result<(usize, usize, Vec<f64>)> {
+            control.check_cancelled()?;
+            let pad_c0 = core_c0.saturating_sub(pad_cells);
+            let pad_c1 = (core_c1 + pad_cells).min(width);
+            let pad_x0 = min_x + pad_c0 as f64 * res;
+            let pad_x1 = min_x + pad_c1 as f64 * res;
+            let pad_bounds = [pad_x0, pad_y0, pad_x1, pad_y1];
+
+            let read_opts = LidarReadOptions {
+                bounds: Some(pad_bounds),
+                resolution: options.read_resolution,
+                max_level: options.max_level,
+                classifications: if preclassified_only {
+                    vec![options.dtm.ground_class]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            };
+            let cloud = read_lidar_windowed(in_lidar, &read_opts)?;
+            let core_w = core_c1 - core_c0;
+            let mut core_vals = vec![nodata; band_rows * core_w];
+            if cloud.is_empty() {
+                return Ok((core_c0, core_c1, core_vals));
+            }
+
+            let tile_arr = match product {
+                TiledGridProduct::Dtm => {
+                    match points_to_dtm_with_bounds(&cloud, &options.dtm, Some(pad_bounds)) {
+                        Ok(a) => a,
+                        Err(Error::Algorithm(_)) => return Ok((core_c0, core_c1, core_vals)),
+                        Err(e) => return Err(e),
+                    }
+                }
+                TiledGridProduct::Chm => {
+                    match points_to_chm_with_bounds(&cloud, &options.dtm, Some(pad_bounds)) {
+                        Ok(a) => a,
+                        Err(Error::Algorithm(_)) => return Ok((core_c0, core_c1, core_vals)),
+                        Err(e) => return Err(e),
+                    }
+                }
+            };
+
+            let t_nd = tile_arr.no_data();
+            let t_gt = tile_arr.geotransform;
+            let tw = tile_arr.width() as isize;
+            let th = tile_arr.height() as isize;
+            for r in core_r0..core_r1 {
+                let wy = top_y - (r as f64 + 0.5) * res;
+                let tr = ((wy - t_gt[3]) / t_gt[5]).floor() as isize;
+                if tr < 0 || tr >= th {
+                    continue;
+                }
+                let tru = tr as usize;
+                let dst_row = (r - core_r0) * core_w;
+                for c in core_c0..core_c1 {
+                    let wx = min_x + (c as f64 + 0.5) * res;
+                    let tc = ((wx - t_gt[0]) / t_gt[1]).floor() as isize;
+                    if tc < 0 || tc >= tw {
+                        continue;
+                    }
+                    let v = tile_arr.get(tc as usize, tru);
+                    if v.is_finite() && !v.rd_eq(t_nd) {
+                        core_vals[dst_row + (c - core_c0)] = v;
+                    }
+                }
+            }
+            Ok((core_c0, core_c1, core_vals))
+        };
+
+        #[cfg(feature = "parallel")]
+        let strip_results: Vec<(usize, usize, Vec<f64>)> = col_strips
+            .par_iter()
+            .map(run_tile)
+            .collect::<Result<Vec<_>>>()?;
+        #[cfg(not(feature = "parallel"))]
+        let strip_results: Vec<(usize, usize, Vec<f64>)> = col_strips
+            .iter()
+            .map(run_tile)
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut band_buf = vec![nodata; band_rows * width];
+        for (core_c0, core_c1, core_vals) in strip_results {
+            let core_w = core_c1 - core_c0;
+            for lr in 0..band_rows {
+                let dst = &mut band_buf[lr * width + core_c0..lr * width + core_c1];
+                let src = &core_vals[lr * core_w..(lr + 1) * core_w];
+                dst.copy_from_slice(src);
+            }
+        }
+        let rd = RasterData::F64(band_buf);
+        writer.write_rows(&rd, band_rows, None)?;
+
+        tiles_done += col_strips.len();
+        control.report(
+            "tile",
+            (tiles_done as f64 / total_tiles as f64) * 0.95,
+            Some(format!("Gridded tile {tiles_done}/{total_tiles}")),
+        );
+    }
+
+    writer.finish()?;
+
+    if let Some(ref tmp) = temp_stage {
+        control.check_cancelled()?;
+        control.report("cog", 0.97, Some("Converting tiled raster to COG".into()));
+        crate::raster_ops::image_to_cog(
+            tmp,
+            out_raster,
+            options.dtm.compress.then_some("DEFLATE"),
+        )?;
+    }
+
+    control.check_cancelled()?;
+    control.report(
+        "complete",
+        1.0,
+        Some(format!("Tiled raster complete ({width}x{height})")),
+    );
+    Ok((width, height))
+}
+
+/// Generates a bare-earth Digital Terrain Model (DTM) GeoTIFF (or COG) from a large LiDAR
+/// point cloud in bounded memory by streaming overlapping tiles via [`read_lidar_windowed`]
+/// and writing row bands incrementally with `terrio::GeoTiffWriter`.
+pub fn lidar_to_dtm_tiled(
+    in_lidar: impl AsRef<Path>,
+    out_dtm: impl AsRef<Path>,
+    options: &TiledPointCloudOptions,
+) -> Result<(usize, usize)> {
+    lidar_to_dtm_tiled_with_control(in_lidar, out_dtm, options, &ExecutionControl::default())
+}
+
+/// Runs [`lidar_to_dtm_tiled`] with progress reporting and cooperative cancellation via
+/// [`ExecutionControl`].
+pub fn lidar_to_dtm_tiled_with_control(
+    in_lidar: impl AsRef<Path>,
+    out_dtm: impl AsRef<Path>,
+    options: &TiledPointCloudOptions,
+    control: &ExecutionControl,
+) -> Result<(usize, usize)> {
+    lidar_to_tiled_grid_impl(
+        in_lidar.as_ref(),
+        out_dtm.as_ref(),
+        options,
+        TiledGridProduct::Dtm,
+        control,
+    )
+}
+
+/// Generates a Canopy Height Model (`CHM = max(0, DSM - DTM)`) GeoTIFF (or COG) from a large
+/// LiDAR point cloud in bounded memory by streaming overlapping tiles via
+/// [`read_lidar_windowed`] and writing row bands incrementally with `terrio::GeoTiffWriter`.
+pub fn lidar_to_chm_tiled(
+    in_lidar: impl AsRef<Path>,
+    out_chm: impl AsRef<Path>,
+    options: &TiledPointCloudOptions,
+) -> Result<(usize, usize)> {
+    lidar_to_chm_tiled_with_control(in_lidar, out_chm, options, &ExecutionControl::default())
+}
+
+/// Runs [`lidar_to_chm_tiled`] with progress reporting and cooperative cancellation via
+/// [`ExecutionControl`].
+pub fn lidar_to_chm_tiled_with_control(
+    in_lidar: impl AsRef<Path>,
+    out_chm: impl AsRef<Path>,
+    options: &TiledPointCloudOptions,
+    control: &ExecutionControl,
+) -> Result<(usize, usize)> {
+    lidar_to_tiled_grid_impl(
+        in_lidar.as_ref(),
+        out_chm.as_ref(),
+        options,
+        TiledGridProduct::Chm,
+        control,
+    )
 }
 
 #[cfg(test)]
