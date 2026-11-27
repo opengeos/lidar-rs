@@ -42,11 +42,11 @@ pub struct CatchmentRecord {
     pub id: u32,
     /// Number of pixels in the sink footprint.
     pub sink_cells: usize,
-    /// Area of the sink footprint in map units squared.
+    /// Area of the sink footprint in SI square meters when CRS metadata is present (or native map units squared otherwise).
     pub sink_area: f64,
     /// Number of pixels in the contributing catchment (including the sink itself).
     pub catchment_cells: usize,
-    /// Area of the contributing catchment in map units squared (`cat_area`).
+    /// Area of the contributing catchment (`cat_area`) in SI square meters when CRS metadata is present (or native map units squared otherwise).
     pub catchment_area: f64,
     /// Ratio of sink area to catchment area (`dep2catR = sink_area / cat_area`).
     pub dep_to_cat_ratio: f64,
@@ -178,11 +178,11 @@ pub struct FlowPathRecord {
     pub end_elev: f64,
     /// Elevation drop (`start_elev - end_elev`).
     pub diff_elev: f64,
-    /// Overland path length in map units.
+    /// Overland path length in SI meters when CRS metadata is present (or native map units otherwise).
     pub length: f64,
-    /// Upstream sink storage/relief volume in cubic map units.
+    /// Upstream sink storage/relief volume (`cell_area_m2 * depth`; cubic meters when vertical DEM units are meters).
     pub volume: f64,
-    /// Upstream sink contributing catchment area in map units squared.
+    /// Upstream sink contributing catchment area in SI square meters when CRS metadata is present (or native map units squared otherwise).
     pub cat_area: f64,
     /// Equivalent rainfall depth to fill the upstream sink (`volume / cat_area`).
     pub simu_depth: f64,

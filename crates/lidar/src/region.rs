@@ -205,6 +205,8 @@ pub(crate) fn safe_crs_metric_basis(
             scale.cell_area_m2,
         )
     } else if scale.is_geographic {
+        // Geographic CRS with non-finite/degenerate geotransform origin: fall back to unit
+        // pixel-scale basis (1.0 per cell) rather than exposing raw decimal degrees as meters.
         ((1.0, 0.0), (0.0, -1.0), 1.0, 1.0, 1.0)
     } else {
         (
@@ -277,11 +279,12 @@ pub struct RegionProps {
     pub min_elev: f64,
     /// Maximum (spill/boundary) elevation inside the region.
     pub max_elev: f64,
-    /// Perimeter in map units (Benkrid & Crookes 4-neighborhood estimator × `resolution`).
+    /// Perimeter in SI meters when CRS metadata is present (or native map units otherwise;
+    /// Benkrid & Crookes 4-neighborhood estimator).
     pub perimeter: f64,
-    /// Major axis length of the equivalent ellipse in map units.
+    /// Major axis length of the equivalent ellipse in SI meters (or native map units without CRS).
     pub major_axis: f64,
-    /// Minor axis length of the equivalent ellipse in map units (clamped to >= `resolution`).
+    /// Minor axis length of the equivalent ellipse in SI meters (clamped to >= pixel spacing).
     pub minor_axis: f64,
     /// Ratio `major_axis / minor_axis`.
     pub elongatedness: f64,

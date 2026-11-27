@@ -3125,8 +3125,8 @@ pub fn run_full_pipeline_in_memory(
     let rating_curves = compute_rating_curves(&sinks.sink, &depressions, sim_opts.interval.abs())?;
 
     // Scale reported cumulative runoff depth using the mean effective runoff coefficient across
-    // the full valid contributing DEM domain when a runoff_coeff raster is supplied, or
-    // scalar_runoff_coeff otherwise.
+    // the whole valid DEM domain when a runoff_coeff raster is supplied, or scalar_runoff_coeff
+    // otherwise.
     let runoff_scale = effective_runoff_scale(
         &sinks.dem_refined,
         options.forcing.runoff_coeff,
