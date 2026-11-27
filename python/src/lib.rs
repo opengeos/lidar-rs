@@ -3874,7 +3874,19 @@ fn simulate_inundation_array<'py>(
                     )?);
                 }
                 if ga_params.is_some() {
+                    let num_steps = pipe.steps.len();
                     pipe.fill_time = fsm_res.fill_time;
+                    pipe.steps = lidar::compute_inundation_step_summaries(
+                        &pipe.sinks.sink,
+                        &pipe.fill_time,
+                        num_steps,
+                        sim_opts.time_step_h,
+                    );
+                    pipe.inundation_curve_csv = lidar::format_inundation_curve_csv(
+                        &pipe.steps,
+                        sim_opts.rain_intensity_cm_h,
+                        hyetograph.as_deref(),
+                    );
                     pipe.fsm_mass_balance = Some(fsm_res.mass_balance);
                     pipe.fsm_basins = Some(fsm_res.basins);
                     pipe.fsm_hydrograph = Some(fsm_res.hydrograph);

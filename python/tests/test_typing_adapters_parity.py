@@ -1389,6 +1389,9 @@ def test_v06_python_api_parity_filters_derivatives_merge_tree_fsm_and_pointcloud
     )
     assert sim["fsm_hydrograph"] is not None and len(sim["fsm_hydrograph"]) >= 2
     assert "fsm_hazard_max_depth" in sim and "fsm_recession_drain_time_h" in sim
+    ft = sim["fill_time"]
+    expected_wet = int(np.sum(np.isfinite(ft) & (ft >= 0.0) & (ft <= 6.0)))
+    assert sim["steps"][-1]["inundated_cells"] == expected_wet
     att = lidar_rs.attenuate_fsm_hydrograph(
         sim["fsm_hydrograph"], mean_travel_time_h=1.0, dt_h=0.5, num_reservoirs=2
     )

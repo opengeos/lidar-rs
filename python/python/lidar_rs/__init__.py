@@ -1232,7 +1232,13 @@ def stream_remote_pointcloud_aoi(
     resolution: float | None = None,
     max_points: int | None = None,
 ) -> PointCloudDict:
-    """Stream an AOI from a remote public HTTPS COPC or EPT point cloud dataset."""
+    """Stream an AOI from a remote public HTTPS COPC or EPT point cloud dataset.
+
+    Performs a lexical-only pre-flight check on `source_url` (DNS resolution, HTTP redirects,
+    and child EPT manifest URLs are fetched directly by `terrio`; enforce egress controls at the
+    deployment layer for untrusted URLs). Supply `bounds_wgs84`, `bounds_native`, or `max_points`
+    to bound memory usage instead of streaming an entire remote dataset.
+    """
     return _lidar_rs.stream_remote_pointcloud_aoi(
         str(source_url),
         _normalize_bbox(bounds_wgs84),
@@ -2551,7 +2557,8 @@ def simulate_inundation_array(
 
     Set `routing="fsm"` for dynamic Fill-Spill-Merge cascade mass-balance routing.
     Per-forcing NoData sentinels (from spatial adapters or explicit keyword overrides) are
-    forwarded directly to Rust without mutating forcing values in Python.
+    forwarded directly to Rust so `crates/lidar` owns forcing NoData semantics in one place
+    (for `runoff_coeff_arr`, NoData cells fall back to the core default coefficient of `1.0`).
     """
     arr, gt, resolved_crs, nd = extract_spatial_array(
         dem_arr, geotransform=geotransform, crs=crs, no_data=no_data
