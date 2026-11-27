@@ -16,6 +16,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use richdem::{Array2D, DemNum, array2d_to_dataset};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 use terrio::crs::SpatialRef;
 use terrio::formats::RasterDriver;
 use terrio::ops::Resampling;
@@ -164,17 +166,56 @@ pub(crate) fn ensure_no_path_collision(input: &Path, outputs: &[&Path]) -> Resul
     Ok(())
 }
 
+/// Output encoding options for file-based raster utilities (`mosaic`, `reproject_image`,
+/// `resample`, `clip_image`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct RasterOutputOptions {
+    /// Apply lossless DEFLATE compression (default `false`).
+    pub compress: bool,
+    /// Write a Cloud Optimized GeoTIFF with tiled layout and overviews (default `false`;
+    /// automatically applies DEFLATE compression when `cog = true`).
+    pub cog: bool,
+}
+
+impl RasterOutputOptions {
+    pub(crate) fn to_terrio_options(self) -> RasterWriteOptions {
+        if self.cog {
+            RasterWriteOptions {
+                driver: Some(RasterDriver::Cog),
+                compression: Some("DEFLATE".to_string()),
+                ..Default::default()
+            }
+        } else if self.compress {
+            RasterWriteOptions {
+                compression: Some("DEFLATE".to_string()),
+                ..Default::default()
+            }
+        } else {
+            RasterWriteOptions::default()
+        }
+    }
+}
+
 /// Mosaics multiple raster files into a single output GeoTIFF.
 ///
 /// Mirrors `lidar.mosaic`.
 pub fn mosaic<P: AsRef<Path>>(inputs: &[P], output: impl AsRef<Path>) -> Result<()> {
-    mosaic_with_resampling(inputs, output, Resampling::Nearest)
+    mosaic_with_options(
+        inputs,
+        output,
+        Resampling::Nearest,
+        &RasterOutputOptions::default(),
+    )
 }
 
-pub(crate) fn mosaic_with_resampling<P: AsRef<Path>>(
+/// Mosaics multiple raster files into a single output GeoTIFF or COG with explicit resampling
+/// and compression/COG [`RasterOutputOptions`].
+pub fn mosaic_with_options<P: AsRef<Path>>(
     inputs: &[P],
     output: impl AsRef<Path>,
     resampling: Resampling,
+    output_opts: &RasterOutputOptions,
 ) -> Result<()> {
     if inputs.is_empty() {
         return Err(Error::InvalidArgument(
@@ -197,8 +238,17 @@ pub(crate) fn mosaic_with_resampling<P: AsRef<Path>>(
         resampling,
         ..Default::default()
     };
-    mosaic_to_path(&paths, &opts, out_str, &RasterWriteOptions::default())?;
+    mosaic_to_path(&paths, &opts, out_str, &output_opts.to_terrio_options())?;
     Ok(())
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+pub(crate) fn mosaic_with_resampling<P: AsRef<Path>>(
+    inputs: &[P],
+    output: impl AsRef<Path>,
+    resampling: Resampling,
+) -> Result<()> {
+    mosaic_with_options(inputs, output, resampling, &RasterOutputOptions::default())
 }
 
 /// Reprojects a raster to `dst_crs` (e.g., `"EPSG:4326"`, `"EPSG:5070"`, WKT, or PROJ).
@@ -210,6 +260,25 @@ pub fn reproject_image(
     dst_crs: &str,
     resampling: Resampling,
     resolution: Option<(f64, f64)>,
+) -> Result<()> {
+    reproject_image_with_options(
+        input,
+        output,
+        dst_crs,
+        resampling,
+        resolution,
+        &RasterOutputOptions::default(),
+    )
+}
+
+/// Reprojects a raster to `dst_crs` with explicit compression/COG [`RasterOutputOptions`].
+pub fn reproject_image_with_options(
+    input: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    dst_crs: &str,
+    resampling: Resampling,
+    resolution: Option<(f64, f64)>,
+    output_opts: &RasterOutputOptions,
 ) -> Result<()> {
     if let Some((rx, ry)) = resolution
         && (!rx.is_finite() || rx <= 0.0 || !ry.is_finite() || ry <= 0.0)
@@ -234,7 +303,7 @@ pub fn reproject_image(
     };
     let warped = warp(&[&src], &opts)?;
     ensure_parent_dir(out_path)?;
-    terrio::write_raster_dataset(&warped, out_str, &RasterWriteOptions::default())?;
+    terrio::write_raster_dataset(&warped, out_str, &output_opts.to_terrio_options())?;
     Ok(())
 }
 
@@ -246,6 +315,24 @@ pub fn resample(
     output: impl AsRef<Path>,
     resolution: f64,
     resampling: Resampling,
+) -> Result<()> {
+    resample_with_options(
+        input,
+        output,
+        resolution,
+        resampling,
+        &RasterOutputOptions::default(),
+    )
+}
+
+/// Resamples a raster to `(resolution, resolution)` with explicit compression/COG
+/// [`RasterOutputOptions`].
+pub fn resample_with_options(
+    input: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    resolution: f64,
+    resampling: Resampling,
+    output_opts: &RasterOutputOptions,
 ) -> Result<()> {
     if !resolution.is_finite() || resolution <= 0.0 {
         return Err(Error::InvalidArgument(format!(
@@ -266,7 +353,7 @@ pub fn resample(
     };
     let warped = warp(&[&src], &opts)?;
     ensure_parent_dir(out_path)?;
-    terrio::write_raster_dataset(&warped, out_str, &RasterWriteOptions::default())?;
+    terrio::write_raster_dataset(&warped, out_str, &output_opts.to_terrio_options())?;
     Ok(())
 }
 
@@ -278,6 +365,16 @@ pub fn clip_image(
     input: impl AsRef<Path>,
     mask: impl AsRef<Path>,
     output: impl AsRef<Path>,
+) -> Result<()> {
+    clip_image_with_options(input, mask, output, &RasterOutputOptions::default())
+}
+
+/// Clips a raster by a polygon vector mask with explicit compression/COG [`RasterOutputOptions`].
+pub fn clip_image_with_options(
+    input: impl AsRef<Path>,
+    mask: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    output_opts: &RasterOutputOptions,
 ) -> Result<()> {
     let in_path = input.as_ref();
     let mask_path = mask.as_ref();
@@ -297,7 +394,7 @@ pub fn clip_image(
     };
     let clipped = warp(&[&src], &opts)?;
     ensure_parent_dir(out_path)?;
-    terrio::write_raster_dataset(&clipped, out_str, &RasterWriteOptions::default())?;
+    terrio::write_raster_dataset(&clipped, out_str, &output_opts.to_terrio_options())?;
     Ok(())
 }
 

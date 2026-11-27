@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::graph::RatingCurvePoint;
 use crate::inundation::validate_grid_alignment;
+use crate::progress::ExecutionControl;
 use crate::region::{
     affine_basis, benkrid_crookes_perimeter_from_border_set, extended_morphometrics,
 };
@@ -1331,7 +1332,9 @@ fn delineate_merge_tree_impl(
     sink: &Array2D<f64>,
     source_dem: Option<&Array2D<f64>>,
     options: &MergeTreeOptions,
+    control: &ExecutionControl,
 ) -> Result<MergeTreeResult> {
+    control.check_cancelled()?;
     if !options.min_depth.is_finite() || options.min_depth < 0.0 {
         return Err(Error::InvalidArgument(format!(
             "min_depth must be finite and >= 0, got {}",
@@ -1353,6 +1356,11 @@ fn delineate_merge_tree_impl(
     let no_data_raw = sink.no_data();
     let is_valid_sink = |v: f64| -> bool { v.is_finite() && !v.rd_eq(no_data_raw) };
 
+    control.report(
+        "region_group",
+        0.10,
+        Some("Grouping connected sink regions".into()),
+    );
     let min_count = options.min_size.max(1);
     let (label_objects, nb_labels) = label_sink_regions(
         sink.data(),
@@ -1362,6 +1370,7 @@ fn delineate_merge_tree_impl(
         options.topology,
         is_valid_sink,
     );
+    control.check_cancelled()?;
 
     let k = nb_labels as usize;
     let mut bboxes = vec![(usize::MAX, usize::MAX, 0usize, 0usize); k];
@@ -1412,6 +1421,12 @@ fn delineate_merge_tree_impl(
     if let Some(dem) = source_dem
         && k > 0
     {
+        control.check_cancelled()?;
+        control.report(
+            "outlets",
+            0.25,
+            Some("Locating exterior sink outlets".into()),
+        );
         let filled_opt = if options.dem_is_refined {
             None
         } else {
@@ -1419,6 +1434,7 @@ fn delineate_merge_tree_impl(
             richdem::fill_depressions(&mut filled, options.topology);
             Some(filled)
         };
+        control.check_cancelled()?;
         let ddata = dem.data();
         let d_nd = dem.no_data();
         let fdata = filled_opt.as_ref().map(Array2D::data);
@@ -1483,40 +1499,46 @@ fn delineate_merge_tree_impl(
         .map(|(idx, ((bbox, cells), outlet))| (idx, bbox, cells, outlet))
         .collect();
 
+    let done_count = std::sync::Mutex::new(0usize);
+    let run_region = |(idx, bbox, cells, outlet): RegionWorkItem| -> Result<RegionMergeOutput> {
+        control.check_cancelled()?;
+        let out = build_region_merge_tree(
+            idx,
+            (idx + 1) as u32,
+            w,
+            bbox,
+            cells,
+            outlet,
+            &gt,
+            cell_area,
+            options,
+        );
+        control.check_cancelled()?;
+        if control.progress.is_some() && k > 0 {
+            let mut done = done_count
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *done += 1;
+            let frac = 0.30 + 0.65 * (*done as f64 / k as f64);
+            control.report(
+                "merge_tree",
+                frac,
+                Some(format!("Built merge tree for region {}/{k}", *done)),
+            );
+        }
+        Ok(out)
+    };
+
     #[cfg(feature = "parallel")]
     let mut region_results: Vec<RegionMergeOutput> = work
         .into_par_iter()
-        .map(|(idx, bbox, cells, outlet)| {
-            build_region_merge_tree(
-                idx,
-                (idx + 1) as u32,
-                w,
-                bbox,
-                cells,
-                outlet,
-                &gt,
-                cell_area,
-                options,
-            )
-        })
-        .collect();
+        .map(run_region)
+        .collect::<Result<Vec<_>>>()?;
     #[cfg(not(feature = "parallel"))]
     let mut region_results: Vec<RegionMergeOutput> = work
         .into_iter()
-        .map(|(idx, bbox, cells, outlet)| {
-            build_region_merge_tree(
-                idx,
-                (idx + 1) as u32,
-                w,
-                bbox,
-                cells,
-                outlet,
-                &gt,
-                cell_area,
-                options,
-            )
-        })
-        .collect();
+        .map(run_region)
+        .collect::<Result<Vec<_>>>()?;
 
     region_results.sort_by_key(|r| r.region_idx);
 
@@ -1580,6 +1602,17 @@ fn delineate_merge_tree_impl(
     depression_level.copy_metadata_from(sink);
     depression_level.set_no_data(0);
 
+    control.check_cancelled()?;
+    control.report(
+        "complete",
+        1.0,
+        Some(format!(
+            "Built merge tree with {} nodes across {} regions",
+            global_nodes.len(),
+            nb_labels
+        )),
+    );
+
     Ok(MergeTreeResult {
         nodes: global_nodes,
         depressions: InMemoryDepressions {
@@ -1610,7 +1643,17 @@ pub fn delineate_depressions_merge_tree_in_memory(
     sink: &Array2D<f64>,
     options: &MergeTreeOptions,
 ) -> Result<MergeTreeResult> {
-    delineate_merge_tree_impl(sink, None, options)
+    delineate_merge_tree_impl(sink, None, options, &ExecutionControl::default())
+}
+
+/// Runs [`delineate_depressions_merge_tree_in_memory`] with progress reporting and cooperative
+/// cancellation via [`ExecutionControl`].
+pub fn delineate_depressions_merge_tree_in_memory_with_control(
+    sink: &Array2D<f64>,
+    options: &MergeTreeOptions,
+    control: &ExecutionControl,
+) -> Result<MergeTreeResult> {
+    delineate_merge_tree_impl(sink, None, options, control)
 }
 
 /// Delineates the exact nested depression hierarchy using both the masked `sink` raster
@@ -1619,16 +1662,28 @@ pub fn delineate_depressions_merge_tree_in_memory(
 ///
 /// # Performance and Memory
 ///
-/// When at least one sink region is present, this function clones `dem` and runs a
-/// full-grid Priority-Flood depression fill (`O(W * H)` extra memory and `O(N log N)`
-/// time) to distinguish true unfilled rim cells from pruned exterior pits regardless of
-/// whether the caller supplied the original DEM or `dem_refined`.
+/// When at least one sink region is present and `options.dem_is_refined` is `false`, this
+/// function clones `dem` and runs a full-grid Priority-Flood depression fill (`O(W * H)` extra
+/// memory and `O(N log N)` time) to distinguish true unfilled rim cells from pruned exterior pits.
+/// Set `options.dem_is_refined = true` when passing `InMemorySinks::dem_refined` to skip the
+/// extra clone and fill.
 pub fn delineate_depressions_merge_tree_with_dem_in_memory(
     sink: &Array2D<f64>,
     dem: &Array2D<f64>,
     options: &MergeTreeOptions,
 ) -> Result<MergeTreeResult> {
-    delineate_merge_tree_impl(sink, Some(dem), options)
+    delineate_merge_tree_impl(sink, Some(dem), options, &ExecutionControl::default())
+}
+
+/// Runs [`delineate_depressions_merge_tree_with_dem_in_memory`] with progress reporting and
+/// cooperative cancellation via [`ExecutionControl`].
+pub fn delineate_depressions_merge_tree_with_dem_in_memory_with_control(
+    sink: &Array2D<f64>,
+    dem: &Array2D<f64>,
+    options: &MergeTreeOptions,
+    control: &ExecutionControl,
+) -> Result<MergeTreeResult> {
+    delineate_merge_tree_impl(sink, Some(dem), options, control)
 }
 
 #[cfg(test)]

@@ -37,8 +37,9 @@ use crate::filling::{InMemorySinks, extract_sinks_in_memory};
 use crate::filtering::median_filter;
 use crate::fsm::{
     FsmBasinSummary, FsmForcing, FsmHydrographPoint, FsmMassBalance, OutletSearchScratch,
-    RoutingMode, simulate_fill_spill_merge_in_memory, simulate_fill_spill_merge_with_flowdirs,
-    simulate_fill_spill_merge_with_forcing_and_flowdirs, write_fsm_basins_csv,
+    RoutingMode, simulate_fill_spill_merge_in_memory,
+    simulate_fill_spill_merge_with_flowdirs_and_control,
+    simulate_fill_spill_merge_with_forcing_and_flowdirs_and_control, write_fsm_basins_csv,
     write_fsm_hydrograph_csv,
 };
 #[cfg(feature = "serde")]
@@ -47,12 +48,15 @@ use crate::graph::{
     build_connectivity_graph, compute_rating_curves, write_connectivity_graphml,
     write_rating_curves_csv, write_spill_paths_vector,
 };
+use crate::merge_tree::{
+    MergeTreeOptions, delineate_depressions_merge_tree_with_dem_in_memory_with_control,
+};
 use crate::progress::ExecutionControl;
 use crate::raster_ops::ensure_no_path_collision;
 use crate::region::{region_basic_stats, region_group};
 use crate::slicing::{
-    InMemoryDepressions, delineate_depressions_in_memory, write_depressions_csv,
-    write_depressions_vector,
+    DelineationMethod, InMemoryDepressions, delineate_depressions_in_memory,
+    delineate_depressions_in_memory_with_control, write_depressions_csv, write_depressions_vector,
 };
 
 /// Maximum vertical slices permitted per region to guard against tiny intervals.
@@ -331,6 +335,23 @@ pub fn simulate_inundation_in_memory(
     catchment_area: &Array2D<f64>,
     options: &SimulateInundationOptions,
 ) -> Result<(Array2D<f64>, usize)> {
+    simulate_inundation_in_memory_with_control(
+        sink,
+        catchment_area,
+        options,
+        &ExecutionControl::default(),
+    )
+}
+
+/// Runs [`simulate_inundation_in_memory`] with progress reporting and cooperative cancellation
+/// via [`ExecutionControl`].
+pub fn simulate_inundation_in_memory_with_control(
+    sink: &Array2D<f64>,
+    catchment_area: &Array2D<f64>,
+    options: &SimulateInundationOptions,
+    control: &ExecutionControl,
+) -> Result<(Array2D<f64>, usize)> {
+    control.check_cancelled()?;
     let _ = validate_options(options)?;
     validate_grid_alignment(sink, catchment_area, "catchment raster")?;
     let w = sink.width();
@@ -340,9 +361,15 @@ pub fn simulate_inundation_in_memory(
     let nd = sink.no_data();
     let c_nd = catchment_area.no_data();
 
+    control.report(
+        "region_group",
+        0.10,
+        Some("Grouping connected sink regions".into()),
+    );
     let (labels, nb_regions_u32) = region_group(sink.data(), w, h, options.min_size, |v| {
         v.is_finite() && !v.rd_eq(nd)
     });
+    control.check_cancelled()?;
     let nb_regions = nb_regions_u32 as usize;
 
     let mut fill_time_data = vec![-1.0f64; w * h];
@@ -350,6 +377,7 @@ pub fn simulate_inundation_in_memory(
         let mut out = Array2D::from_vec(w, h, fill_time_data)?;
         out.copy_metadata_from(sink);
         out.set_no_data(-1.0);
+        control.report("complete", 1.0, Some("No sink regions to simulate".into()));
         return Ok((out, 0));
     }
 
@@ -412,17 +440,31 @@ pub fn simulate_inundation_in_memory(
         })
         .collect();
 
+    let done_count = std::sync::Mutex::new(0usize);
+    let run_task = |t: &RegionFillTask| -> Result<Vec<f64>> {
+        control.check_cancelled()?;
+        let res = region_fill_times(t, options, metrics)?;
+        control.check_cancelled()?;
+        if control.progress.is_some() && nb_regions > 0 {
+            let mut done = done_count
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *done += 1;
+            let frac = 0.15 + 0.80 * (*done as f64 / nb_regions as f64);
+            control.report(
+                "simulate",
+                frac,
+                Some(format!("Simulated region {}/{nb_regions}", *done)),
+            );
+        }
+        Ok(res)
+    };
+
     #[cfg(feature = "parallel")]
-    let region_results: Result<Vec<Vec<f64>>> = tasks
-        .par_iter()
-        .map(|t| region_fill_times(t, options, metrics))
-        .collect();
+    let region_results: Result<Vec<Vec<f64>>> = tasks.par_iter().map(run_task).collect();
 
     #[cfg(not(feature = "parallel"))]
-    let region_results: Result<Vec<Vec<f64>>> = tasks
-        .iter()
-        .map(|t| region_fill_times(t, options, metrics))
-        .collect();
+    let region_results: Result<Vec<Vec<f64>>> = tasks.iter().map(run_task).collect();
 
     let region_results = region_results?;
     for (task, times) in tasks.iter().zip(region_results) {
@@ -443,6 +485,12 @@ pub fn simulate_inundation_in_memory(
     let mut out = Array2D::from_vec(w, h, fill_time_data)?;
     out.copy_metadata_from(sink);
     out.set_no_data(-1.0);
+    control.check_cancelled()?;
+    control.report(
+        "complete",
+        1.0,
+        Some(format!("Simulated inundation across {nb_regions} regions")),
+    );
     Ok((out, nb_regions))
 }
 
@@ -2787,13 +2835,34 @@ pub fn simulate_inundation_with_weighted_catchment_in_memory(
     options: &SimulateInundationOptions,
     forcing: &InundationForcing<'_>,
 ) -> Result<(Array2D<f64>, usize)> {
+    simulate_inundation_with_weighted_catchment_in_memory_with_control(
+        sink,
+        catchment_area,
+        weighted_catchment_area,
+        options,
+        forcing,
+        &ExecutionControl::default(),
+    )
+}
+
+/// Runs [`simulate_inundation_with_weighted_catchment_in_memory`] with progress reporting and
+/// cooperative cancellation via [`ExecutionControl`].
+pub fn simulate_inundation_with_weighted_catchment_in_memory_with_control(
+    sink: &Array2D<f64>,
+    catchment_area: &Array2D<f64>,
+    weighted_catchment_area: Option<&Array2D<f64>>,
+    options: &SimulateInundationOptions,
+    forcing: &InundationForcing<'_>,
+    control: &ExecutionControl,
+) -> Result<(Array2D<f64>, usize)> {
+    control.check_cancelled()?;
     if weighted_catchment_area.is_none()
         && forcing.runoff_coeff.is_none()
         && forcing.infiltration_cm_h.is_none()
         && forcing.antecedent_depth.is_none()
         && forcing.hyetograph.is_none()
     {
-        return simulate_inundation_in_memory(sink, catchment_area, options);
+        return simulate_inundation_in_memory_with_control(sink, catchment_area, options, control);
     }
     let _ = validate_options_with_hyetograph(options, forcing.hyetograph.is_some())?;
     if let Some(hyeto) = forcing.hyetograph {
@@ -2920,17 +2989,31 @@ pub fn simulate_inundation_with_weighted_catchment_in_memory(
         })
         .collect();
 
+    let done_count = std::sync::Mutex::new(0usize);
+    let run_forced = |t: &ForcedRegionFillTask| -> Result<Vec<f64>> {
+        control.check_cancelled()?;
+        let res = region_fill_times_forced(t, options, forcing.hyetograph, metrics)?;
+        control.check_cancelled()?;
+        if control.progress.is_some() && nb_regions > 0 {
+            let mut done = done_count
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *done += 1;
+            let frac = 0.15 + 0.80 * (*done as f64 / nb_regions as f64);
+            control.report(
+                "simulate",
+                frac,
+                Some(format!("Simulated forced region {}/{nb_regions}", *done)),
+            );
+        }
+        Ok(res)
+    };
+
     #[cfg(feature = "parallel")]
-    let region_results: Result<Vec<Vec<f64>>> = tasks
-        .par_iter()
-        .map(|t| region_fill_times_forced(t, options, forcing.hyetograph, metrics))
-        .collect();
+    let region_results: Result<Vec<Vec<f64>>> = tasks.par_iter().map(run_forced).collect();
 
     #[cfg(not(feature = "parallel"))]
-    let region_results: Result<Vec<Vec<f64>>> = tasks
-        .iter()
-        .map(|t| region_fill_times_forced(t, options, forcing.hyetograph, metrics))
-        .collect();
+    let region_results: Result<Vec<Vec<f64>>> = tasks.iter().map(run_forced).collect();
 
     for (task, times) in tasks.iter().zip(region_results?) {
         let (r0, c0, r1, c1) = task.bbox;
@@ -2950,6 +3033,12 @@ pub fn simulate_inundation_with_weighted_catchment_in_memory(
     let mut out = Array2D::from_vec(w, h, fill_time_data)?;
     out.copy_metadata_from(sink);
     out.set_no_data(-1.0);
+    control.check_cancelled()?;
+    control.report(
+        "complete",
+        1.0,
+        Some(format!("Simulated inundation across {nb_regions} regions")),
+    );
     Ok((out, nb_regions))
 }
 
@@ -2959,6 +3048,8 @@ pub struct InMemoryFullPipelineOptions<'a> {
     pub kernel_size: usize,
     /// Optional selective/constrained depression breaching applied after optional smoothing and prior to sink extraction.
     pub breach: Option<BreachOptions>,
+    /// Algorithm used to delineate the nested depression hierarchy (`LevelSet` by default, or `MergeTree`).
+    pub delineation_method: DelineationMethod,
     /// Level-set and inundation simulation parameters.
     pub simulation: SimulateInundationOptions,
     /// Hydrologic routing strategy (`RoutingMode::Static` or `RoutingMode::FillSpillMerge`).
@@ -2977,6 +3068,7 @@ impl Default for InMemoryFullPipelineOptions<'_> {
         Self {
             kernel_size: 3,
             breach: None,
+            delineation_method: DelineationMethod::LevelSet,
             simulation: SimulateInundationOptions::default(),
             routing: RoutingMode::Static,
             forcing: InundationForcing::default(),
@@ -3046,6 +3138,17 @@ pub fn run_full_pipeline_in_memory(
     raw_dem: &Array2D<f64>,
     options: &InMemoryFullPipelineOptions<'_>,
 ) -> Result<InMemoryFullPipeline> {
+    run_full_pipeline_in_memory_with_control(raw_dem, options, &ExecutionControl::default())
+}
+
+/// Runs [`run_full_pipeline_in_memory`] with progress reporting and cooperative cancellation
+/// via [`ExecutionControl`].
+pub fn run_full_pipeline_in_memory_with_control(
+    raw_dem: &Array2D<f64>,
+    options: &InMemoryFullPipelineOptions<'_>,
+    control: &ExecutionControl,
+) -> Result<InMemoryFullPipeline> {
+    control.check_cancelled()?;
     let num_steps = validate_options_with_hyetograph(
         &options.simulation,
         options.forcing.hyetograph.is_some(),
@@ -3054,19 +3157,76 @@ pub fn run_full_pipeline_in_memory(
 
     let mut dem = std::borrow::Cow::Borrowed(raw_dem);
     if options.kernel_size > 1 {
+        control.report(
+            "filter",
+            0.10,
+            Some(format!(
+                "Applying {}x{} median filter",
+                options.kernel_size, options.kernel_size
+            )),
+        );
         dem = std::borrow::Cow::Owned(median_filter(dem.as_ref(), options.kernel_size)?);
     }
+    control.check_cancelled()?;
     if let Some(ref breach_opts) = options.breach {
+        control.report(
+            "condition",
+            0.20,
+            Some("Applying depression breaching".into()),
+        );
         dem = std::borrow::Cow::Owned(breach_depressions(dem.as_ref(), breach_opts)?);
     }
+    control.check_cancelled()?;
 
+    control.report(
+        "extract_sinks",
+        0.30,
+        Some("Extracting surface sinks".into()),
+    );
     let sinks = extract_sinks_in_memory(dem.as_ref(), sim_opts.min_size, Topology::D8)?;
-    let depressions = delineate_depressions_in_memory(
-        &sinks.sink,
-        sim_opts.min_size,
-        sim_opts.min_depth,
-        sim_opts.interval,
-    )?;
+    control.check_cancelled()?;
+
+    control.report(
+        "delineate",
+        0.45,
+        Some("Delineating nested depression hierarchy".into()),
+    );
+    let sub_cancel = control.cancel_only();
+    let (depressions, precomputed_rating_curves) = match options.delineation_method {
+        DelineationMethod::LevelSet => (
+            delineate_depressions_in_memory_with_control(
+                &sinks.sink,
+                sim_opts.min_size,
+                sim_opts.min_depth,
+                sim_opts.interval,
+                &sub_cancel,
+            )?,
+            None,
+        ),
+        DelineationMethod::MergeTree => {
+            let mt_opts = MergeTreeOptions {
+                min_size: sim_opts.min_size,
+                min_depth: sim_opts.min_depth,
+                topology: Topology::D8,
+                dem_is_refined: true,
+                max_rating_curve_points: None,
+            };
+            let mt = delineate_depressions_merge_tree_with_dem_in_memory_with_control(
+                &sinks.sink,
+                &sinks.dem_refined,
+                &mt_opts,
+                &sub_cancel,
+            )?;
+            (mt.depressions, Some(mt.rating_curves))
+        }
+    };
+    control.check_cancelled()?;
+
+    control.report(
+        "catchments",
+        0.65,
+        Some("Computing D8 flow directions and catchment hierarchy".into()),
+    );
     let flowdirs = d8_flow_directions_resolved(&sinks.dem_refined)?;
     let (catchment_hierarchy, weighted_catchment_hierarchy, catchment_records) =
         if options.routing == RoutingMode::Static && options.forcing.runoff_coeff.is_some() {
@@ -3091,16 +3251,23 @@ pub fn run_full_pipeline_in_memory(
             )?;
             (ch, None, recs)
         };
+    control.check_cancelled()?;
 
+    control.report(
+        "inundation",
+        0.80,
+        Some("Simulating surface inundation dynamics".into()),
+    );
     let (fill_time, num_regions, spill_paths, fsm_basins, fsm_mass_balance, fsm_hydrograph) =
         match options.routing {
             RoutingMode::Static => {
-                let (ft, nr) = simulate_inundation_with_weighted_catchment_in_memory(
+                let (ft, nr) = simulate_inundation_with_weighted_catchment_in_memory_with_control(
                     &sinks.sink,
                     &catchment_hierarchy,
                     weighted_catchment_hierarchy.as_ref(),
                     sim_opts,
                     &options.forcing,
+                    &sub_cancel,
                 )?;
                 let sp = delineate_spill_flow_paths_with_flowdirs(
                     &sinks.dem_refined,
@@ -3111,13 +3278,14 @@ pub fn run_full_pipeline_in_memory(
                 (ft, nr, sp, None, None, None)
             }
             RoutingMode::FillSpillMerge => {
-                let fsm = simulate_fill_spill_merge_with_flowdirs(
+                let fsm = simulate_fill_spill_merge_with_flowdirs_and_control(
                     &sinks.dem_refined,
                     &sinks.sink,
                     &depressions,
                     sim_opts,
                     &options.forcing,
                     &flowdirs,
+                    &sub_cancel,
                 )?;
                 (
                     fsm.fill_time,
@@ -3129,9 +3297,13 @@ pub fn run_full_pipeline_in_memory(
                 )
             }
         };
+    control.check_cancelled()?;
     let steps =
         compute_inundation_step_summaries(&sinks.sink, &fill_time, num_steps, sim_opts.time_step_h);
-    let rating_curves = compute_rating_curves(&sinks.sink, &depressions, sim_opts.interval.abs())?;
+    let rating_curves = match precomputed_rating_curves {
+        Some(curves) => curves,
+        None => compute_rating_curves(&sinks.sink, &depressions, sim_opts.interval.abs())?,
+    };
 
     // Scale reported cumulative runoff depth using the mean effective runoff coefficient across
     // sink cells when a runoff_coeff raster is supplied, or scalar_runoff_coeff otherwise.
@@ -3160,6 +3332,13 @@ pub fn run_full_pipeline_in_memory(
     }
     let inundation_curve_csv =
         format_inundation_curve_csv(&steps, eff_rain, scaled_hyeto.as_deref());
+
+    control.check_cancelled()?;
+    control.report(
+        "complete",
+        1.0,
+        Some("In-memory hydrology pipeline complete".into()),
+    );
 
     Ok(InMemoryFullPipeline {
         sinks,
@@ -3211,6 +3390,9 @@ pub struct RunPipelineOptions {
     pub culverts_vector: Option<PathBuf>,
     /// Culvert burning parameters used when `culverts_vector` is `Some`.
     pub burn_culverts: BurnCulvertsOptions,
+    /// Algorithm used to delineate the nested depression hierarchy (`LevelSet` by default, or `MergeTree`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub delineation_method: DelineationMethod,
     /// Level-set and inundation simulation parameters.
     pub simulation: SimulateInundationOptions,
     /// Hydrologic routing strategy (`RoutingMode::Static` by default, or `RoutingMode::FillSpillMerge`).
@@ -3250,6 +3432,7 @@ impl Default for RunPipelineOptions {
             breach: None,
             culverts_vector: None,
             burn_culverts: BurnCulvertsOptions::default(),
+            delineation_method: DelineationMethod::LevelSet,
             simulation: SimulateInundationOptions::default(),
             routing: RoutingMode::Static,
             runoff_coeff_path: None,
@@ -3488,12 +3671,35 @@ pub fn run_pipeline_with_control(
         0.50,
         Some("Delineating nested depression hierarchy".into()),
     );
-    let depressions = delineate_depressions_in_memory(
-        &sinks.sink,
-        sim_opts.min_size,
-        sim_opts.min_depth,
-        sim_opts.interval,
-    )?;
+    let sub_cancel = control.cancel_only();
+    let (depressions, precomputed_rating_curves) = match options.delineation_method {
+        DelineationMethod::LevelSet => (
+            delineate_depressions_in_memory_with_control(
+                &sinks.sink,
+                sim_opts.min_size,
+                sim_opts.min_depth,
+                sim_opts.interval,
+                &sub_cancel,
+            )?,
+            None,
+        ),
+        DelineationMethod::MergeTree => {
+            let mt_opts = MergeTreeOptions {
+                min_size: sim_opts.min_size,
+                min_depth: sim_opts.min_depth,
+                topology: Topology::D8,
+                dem_is_refined: true,
+                max_rating_curve_points: if options.export_graph { None } else { Some(0) },
+            };
+            let mt = delineate_depressions_merge_tree_with_dem_in_memory_with_control(
+                &sinks.sink,
+                &sinks.dem_refined,
+                &mt_opts,
+                &sub_cancel,
+            )?;
+            (mt.depressions, Some(mt.rating_curves))
+        }
+    };
 
     control.check_cancelled()?;
     control.report(
@@ -3553,13 +3759,15 @@ pub fn run_pipeline_with_control(
     let (fill_time, spill_paths, fsm_basins, fsm_basins_csv, fsm_hydrograph_csv, fsm_mass_balance) =
         match options.routing {
             RoutingMode::Static => {
-                let (ft, _num_sim_regions) = simulate_inundation_with_weighted_catchment_in_memory(
-                    &sinks.sink,
-                    &catchment_hierarchy,
-                    weighted_catchment_hierarchy.as_ref(),
-                    sim_opts,
-                    &forcing,
-                )?;
+                let (ft, _num_sim_regions) =
+                    simulate_inundation_with_weighted_catchment_in_memory_with_control(
+                        &sinks.sink,
+                        &catchment_hierarchy,
+                        weighted_catchment_hierarchy.as_ref(),
+                        sim_opts,
+                        &forcing,
+                        &sub_cancel,
+                    )?;
                 let sp = delineate_spill_flow_paths_with_flowdirs(
                     &sinks.dem_refined,
                     &depressions,
@@ -3574,13 +3782,14 @@ pub fn run_pipeline_with_control(
                     green_ampt: options.green_ampt,
                     green_ampt_substep_h: None,
                 };
-                let fsm = simulate_fill_spill_merge_with_forcing_and_flowdirs(
+                let fsm = simulate_fill_spill_merge_with_forcing_and_flowdirs_and_control(
                     &sinks.dem_refined,
                     &sinks.sink,
                     &depressions,
                     sim_opts,
                     &fsm_forcing,
                     &flowdirs,
+                    &sub_cancel,
                 )?;
                 control.check_cancelled()?;
                 let basins_csv = out_dir.join("fsm_basins.csv");
@@ -3677,7 +3886,10 @@ pub fn run_pipeline_with_control(
     let (rating_curves_csv, connectivity_graph_json, connectivity_graphml) = if options.export_graph
     {
         let rc_path = out_dir.join("rating_curves.csv");
-        let curves = compute_rating_curves(&sinks.sink, &depressions, sim_opts.interval.abs())?;
+        let curves = match precomputed_rating_curves {
+            Some(c) => c,
+            None => compute_rating_curves(&sinks.sink, &depressions, sim_opts.interval.abs())?,
+        };
         write_rating_curves_csv(&curves, &rc_path)?;
 
         let mut graph = build_connectivity_graph(

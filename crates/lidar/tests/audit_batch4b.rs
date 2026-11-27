@@ -818,6 +818,7 @@ fn run_pipeline_fsm_exports_hydrograph_csv_and_in_memory_pipeline_populates_hydr
             forcing: InundationForcing::default(),
             scalar_runoff_coeff: 1.0,
             stream_vector: None,
+            ..Default::default()
         },
     )
     .unwrap();

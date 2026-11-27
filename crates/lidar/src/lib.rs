@@ -91,8 +91,16 @@ pub use federal::{
     Bbox, DemDownloadResult, DemProduct, DownloadOptions, FederalBundleOptions,
     FederalBundleResult, FederalDataset, NoaaAtlas14Table, Region, ResolvedRegion, TnmProductItem,
     WbdLevel, download_3dep_dem, download_federal_data, download_nhd, download_nwi, download_roads,
-    download_wbd, fetch_noaa_atlas14, parse_dataset_list, query_3dep_products, resolve_region,
-    vector_file_bbox_wgs84,
+    download_wbd, fetch_noaa_atlas14, parse_dataset_list, query_3dep_copc_products,
+    query_3dep_products, resolve_region, transform_wgs84_bbox_to_crs, vector_file_bbox_wgs84,
+};
+#[cfg(all(
+    feature = "download",
+    feature = "pointcloud",
+    not(target_arch = "wasm32")
+))]
+pub use federal::{
+    EptStreamOptions, stream_remote_pointcloud_aoi, stream_remote_pointcloud_to_file,
 };
 pub use filling::{
     ExtractSinksOptions, ExtractSinksResult, InMemorySinks, SinkDepression, extract_sinks,
@@ -109,8 +117,11 @@ pub use fsm::{
     SpillAttenuationOptions, attenuate_fsm_hydrograph, attenuate_fsm_hydrograph_with_options,
     compute_fsm_hazard_rasters, estimate_mean_travel_time_h, fsm_basins_to_csv_string,
     fsm_hydrograph_to_csv_string, integrate_fsm_hydrograph_m3, simulate_fill_spill_merge_in_memory,
-    simulate_fill_spill_merge_with_green_ampt_in_memory, simulate_post_storm_recession,
-    write_fsm_basins_csv, write_fsm_hazard_rasters, write_fsm_hydrograph_csv,
+    simulate_fill_spill_merge_in_memory_with_control,
+    simulate_fill_spill_merge_with_green_ampt_in_memory,
+    simulate_fill_spill_merge_with_green_ampt_in_memory_with_control,
+    simulate_post_storm_recession, write_fsm_basins_csv, write_fsm_hazard_rasters,
+    write_fsm_hydrograph_csv,
 };
 #[cfg(feature = "serde")]
 pub use graph::write_connectivity_graph_json;
@@ -129,18 +140,22 @@ pub use inundation::{
     SimulateInundationResult, SpillFlowPath, alternating_block_hyetograph, chicago_hyetograph,
     compute_inundation_step_summaries, cumulative_runoff_mm, delineate_spill_flow_paths_in_memory,
     format_inundation_curve_csv, green_ampt_hyetograph_losses, green_ampt_infiltration_rate_cm_h,
-    load_hyetograph_csv, parse_hyetograph_csv, run_full_pipeline_in_memory, run_pipeline,
-    run_pipeline_with_control, scale_forcing_by_rainfall_grid, scs_cn_incremental_hyetograph,
-    scs_curve_number_runoff, scs_curve_number_runoff_scalar, scs_curve_number_runoff_with_ia,
-    scs_hyetograph, scs_type2_hyetograph, simulate_inundation, simulate_inundation_advanced,
-    simulate_inundation_in_memory, simulate_inundation_pipeline_in_memory,
-    simulate_inundation_with_forcing_in_memory,
-    simulate_inundation_with_weighted_catchment_in_memory, uniform_runoff_coeff_raster_for_cn,
-    write_inundation_summary_csv,
+    load_hyetograph_csv, parse_hyetograph_csv, run_full_pipeline_in_memory,
+    run_full_pipeline_in_memory_with_control, run_pipeline, run_pipeline_with_control,
+    scale_forcing_by_rainfall_grid, scs_cn_incremental_hyetograph, scs_curve_number_runoff,
+    scs_curve_number_runoff_scalar, scs_curve_number_runoff_with_ia, scs_hyetograph,
+    scs_type2_hyetograph, simulate_inundation, simulate_inundation_advanced,
+    simulate_inundation_in_memory, simulate_inundation_in_memory_with_control,
+    simulate_inundation_pipeline_in_memory, simulate_inundation_with_forcing_in_memory,
+    simulate_inundation_with_weighted_catchment_in_memory,
+    simulate_inundation_with_weighted_catchment_in_memory_with_control,
+    uniform_runoff_coeff_raster_for_cn, write_inundation_summary_csv,
 };
 pub use merge_tree::{
     MergeTreeNode, MergeTreeOptions, MergeTreeResult, delineate_depressions_merge_tree_in_memory,
+    delineate_depressions_merge_tree_in_memory_with_control,
     delineate_depressions_merge_tree_with_dem_in_memory,
+    delineate_depressions_merge_tree_with_dem_in_memory_with_control,
 };
 pub use mounts::{
     DelineateMountsResult, delineate_mounts, delineate_mounts_in_memory, flip_dem, flip_dem_file,
@@ -148,10 +163,12 @@ pub use mounts::{
 #[cfg(feature = "pointcloud")]
 pub use pointcloud::{
     CsfOptions, GroundClassifyOptions, GroundFilterMethod, LidarReadOptions, LidarToDsmOptions,
-    LidarToDtmOptions, PitFreeChmOptions, PmfOptions, ReturnKind, SmrfOptions, classify_ground,
-    classify_ground_with_options, convert_lidar, filter_by_classification, filter_outliers_elm,
-    filter_outliers_ror, filter_outliers_statistical, lidar_to_chm, lidar_to_chm_pit_free,
-    lidar_to_dsm, lidar_to_dtm, normalize_hag, points_to_chm, points_to_chm_pit_free,
+    LidarToDtmOptions, PitFreeChmOptions, PmfOptions, ReturnKind, SmrfOptions,
+    TiledPointCloudOptions, classify_ground, classify_ground_with_options, convert_lidar,
+    filter_by_classification, filter_outliers_elm, filter_outliers_ror,
+    filter_outliers_statistical, lidar_to_chm, lidar_to_chm_pit_free, lidar_to_chm_tiled,
+    lidar_to_chm_tiled_with_control, lidar_to_dsm, lidar_to_dtm, lidar_to_dtm_tiled,
+    lidar_to_dtm_tiled_with_control, normalize_hag, points_to_chm, points_to_chm_pit_free,
     points_to_dsm, points_to_dtm, read_lidar, read_lidar_filtered, read_lidar_in_polygon,
     read_lidar_windowed, write_lidar,
 };
@@ -159,17 +176,20 @@ pub use progress::{
     CancellationToken, ExecutionControl, FnProgress, ProgressCallback, ProgressEvent,
 };
 pub use raster_ops::{
-    add_crs, clip_image, csv_points_to_vector, image_to_cog, join_csv_to_vector, mosaic,
-    parse_resampling, polygonize, polygonize_array, reproject_image, resample,
+    RasterOutputOptions, add_crs, clip_image, clip_image_with_options, csv_points_to_vector,
+    image_to_cog, join_csv_to_vector, mosaic, mosaic_with_options, parse_resampling, polygonize,
+    polygonize_array, reproject_image, reproject_image_with_options, resample,
+    resample_with_options,
 };
 pub use region::{
     CrsMetricScale, RegionProps, crs_metric_scale, region_group, region_group_slice, region_props,
     region_props_xy,
 };
 pub use slicing::{
-    DelineateOptions, DelineateResult, InMemoryDepressions, NestedDepression,
+    DelineateOptions, DelineateResult, DelineationMethod, InMemoryDepressions, NestedDepression,
     build_enclosing_depressions_layer, delineate_depressions, delineate_depressions_in_memory,
-    write_depressions_csv, write_depressions_vector, write_depressions_vector_with_enclosing,
+    delineate_depressions_in_memory_with_control, write_depressions_csv, write_depressions_vector,
+    write_depressions_vector_with_enclosing,
 };
 pub use tiling::{
     TiledDelineationOptions, TiledDelineationResult, TiledOutputOptions,

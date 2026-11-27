@@ -172,6 +172,46 @@ impl ExecutionControl {
         }
         Ok(())
     }
+
+    /// Derives a child [`ExecutionControl`] sharing the same [`CancellationToken`] without
+    /// forwarding sub-stage progress events (preserving outer stage names while still honoring
+    /// cooperative cancellation inside inner algorithms).
+    pub fn cancel_only(&self) -> Self {
+        Self {
+            progress: None,
+            cancel: self.cancel.clone(),
+        }
+    }
+
+    /// Derives a child [`ExecutionControl`] sharing the same [`CancellationToken`] while
+    /// linearly remapping reported progress fractions from `[0.0, 1.0]` into `[start, end]`.
+    ///
+    /// Useful when orchestrating sub-algorithms inside a larger pipeline so overall progress
+    /// advances monotonically without jumping backwards.
+    pub fn sub_range(&self, start: f64, end: f64) -> Self {
+        let s = if start.is_finite() {
+            start.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let e = if end.is_finite() {
+            end.clamp(s, 1.0)
+        } else {
+            1.0
+        };
+        let progress = self.progress.as_ref().map(|parent| {
+            let parent = Arc::clone(parent);
+            Arc::new(FnProgress(move |ev: &ProgressEvent| {
+                let mapped = s + (e - s) * ev.fraction;
+                let remapped = ProgressEvent::new(ev.stage.clone(), mapped, ev.message.clone());
+                parent.on_progress(&remapped);
+            })) as Arc<dyn ProgressCallback>
+        });
+        Self {
+            progress,
+            cancel: self.cancel.clone(),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -47,7 +47,7 @@ use crate::filling::extract_sinks_in_memory;
 use crate::filtering::median_filter;
 use crate::progress::ExecutionControl;
 use crate::slicing::{
-    NestedDepression, delineate_depressions_in_memory, write_depressions_csv,
+    DelineationMethod, NestedDepression, delineate_depressions_in_memory, write_depressions_csv,
     write_depressions_vector_with_enclosing,
 };
 
@@ -80,6 +80,10 @@ pub struct TiledDelineationOptions {
     /// formats that do not support windowed lazy reads; default `true`). Windowed GeoTIFF/COG
     /// inputs read one padded tile at a time directly into `f64`.
     pub use_f32: bool,
+    /// Nested depression delineation algorithm (`DelineationMethod::LevelSet` by default, or
+    /// `DelineationMethod::MergeTree` for exact interval-free merge-tree delineation).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub delineation_method: DelineationMethod,
 }
 
 impl Default for TiledDelineationOptions {
@@ -93,6 +97,7 @@ impl Default for TiledDelineationOptions {
             interval: 0.3,
             topology: Topology::D8,
             use_f32: true,
+            delineation_method: DelineationMethod::LevelSet,
         }
     }
 }
@@ -434,12 +439,29 @@ fn process_one_tile(
         smoothed
     };
     let sinks = extract_sinks_in_memory(&conditioned, options.min_size, options.topology)?;
-    let deps = delineate_depressions_in_memory(
-        &sinks.sink,
-        options.min_size,
-        options.min_depth,
-        options.interval,
-    )?;
+    let deps = match options.delineation_method {
+        DelineationMethod::LevelSet => delineate_depressions_in_memory(
+            &sinks.sink,
+            options.min_size,
+            options.min_depth,
+            options.interval,
+        )?,
+        DelineationMethod::MergeTree => {
+            let mt_opts = crate::merge_tree::MergeTreeOptions {
+                min_size: options.min_size,
+                min_depth: options.min_depth,
+                topology: options.topology,
+                dem_is_refined: true,
+                max_rating_curve_points: Some(0),
+            };
+            crate::merge_tree::delineate_depressions_merge_tree_with_dem_in_memory(
+                &sinks.sink,
+                &sinks.dem_refined,
+                &mt_opts,
+            )?
+            .depressions
+        }
+    };
     if deps.depressions.is_empty() {
         return Ok(Vec::new());
     }
@@ -1511,6 +1533,7 @@ mod tests {
             interval: 0.5,
             topology: Topology::D8,
             use_f32: false,
+            delineation_method: DelineationMethod::LevelSet,
         };
         let res = delineate_depressions_tiled_with_outputs(
             &tif,
@@ -1601,6 +1624,7 @@ mod tests {
             interval: 0.5,
             topology: Topology::D8,
             use_f32: false,
+            delineation_method: DelineationMethod::LevelSet,
         };
         let out_opts = TiledOutputOptions {
             write_rasters: true,
@@ -1708,6 +1732,7 @@ mod tests {
             interval: 0.5,
             topology: Topology::D8,
             use_f32: false,
+            delineation_method: DelineationMethod::LevelSet,
         };
 
         // 1. Monotonic tile progress across 16 tiles (4x4).

@@ -789,6 +789,7 @@ fn tiled_out_of_core_stitches_seamless_rasters_and_gpkg_on_synthetic_and_sample_
         interval: 0.5,
         topology: Topology::D8,
         use_f32: false,
+        ..Default::default()
     };
     let out_opts = TiledOutputOptions {
         write_rasters: true,
@@ -874,6 +875,7 @@ fn tiled_out_of_core_stitches_seamless_rasters_and_gpkg_on_synthetic_and_sample_
             interval: 0.3,
             topology: Topology::D8,
             use_f32: true,
+            ..Default::default()
         },
         &out_opts,
     )

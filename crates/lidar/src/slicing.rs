@@ -22,6 +22,7 @@ use terrio::{
 };
 
 use crate::error::{Error, Result};
+use crate::progress::ExecutionControl;
 use crate::raster_ops::{ensure_no_path_collision, polygonize};
 use crate::region::{
     RegionProps, extended_morphometrics, region_basic_stats, region_group, region_group_slice,
@@ -93,6 +94,18 @@ pub struct NestedDepression {
     /// Heuristic flag for likely linear ditch / road-embankment artifacts.
     #[cfg_attr(feature = "serde", serde(default))]
     pub artifact_flag: bool,
+}
+
+/// Algorithm used to delineate the nested depression hierarchy from extracted sinks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum DelineationMethod {
+    /// Wu et al. (2019) top-down vertical level-set slicing (default).
+    #[default]
+    LevelSet,
+    /// Exact bottom-up Union-Find merge-tree delineation (interval-free saddles and pour points).
+    MergeTree,
 }
 
 /// Options controlling [`delineate_depressions`] and [`crate::mounts::delineate_mounts`].
@@ -1065,6 +1078,25 @@ pub fn delineate_depressions_in_memory(
     min_depth: f64,
     interval: f64,
 ) -> Result<InMemoryDepressions> {
+    delineate_depressions_in_memory_with_control(
+        sink,
+        min_size,
+        min_depth,
+        interval,
+        &ExecutionControl::default(),
+    )
+}
+
+/// Runs [`delineate_depressions_in_memory`] with progress reporting and cooperative cancellation
+/// via [`ExecutionControl`].
+pub fn delineate_depressions_in_memory_with_control(
+    sink: &Array2D<f64>,
+    min_size: usize,
+    min_depth: f64,
+    interval: f64,
+    control: &ExecutionControl,
+) -> Result<InMemoryDepressions> {
+    control.check_cancelled()?;
     if !min_depth.is_finite() || min_depth < 0.0 {
         return Err(Error::InvalidArgument(format!(
             "min_depth must be finite and >= 0, got {min_depth}"
@@ -1102,7 +1134,13 @@ pub fn delineate_depressions_in_memory(
     // preserving valid negative (below-sea-level) sink elevations.
     let is_valid_sink = |v: f64| -> bool { v.is_finite() && !v.rd_eq(no_data_raw) };
 
+    control.report(
+        "region_group",
+        0.10,
+        Some("Grouping connected sink regions".into()),
+    );
     let (label_objects, nb_labels) = region_group(sink.data(), w, h, min_size, is_valid_sink);
+    control.check_cancelled()?;
 
     // Extract bounding boxes for each top-level region.
     let k = nb_labels as usize;
@@ -1132,9 +1170,11 @@ pub fn delineate_depressions_in_memory(
 
     type RegionBbox = (usize, usize, usize, usize);
     type RegionResult = Result<(usize, RegionBbox, Vec<u32>, Vec<NestedDepression>)>;
+    let done_count = std::sync::Mutex::new(0usize);
 
     // Build cropped sub-images per region and run level_set independently (parallel when enabled).
     let run_one = |idx: usize| -> RegionResult {
+        control.check_cancelled()?;
         let region_id = (idx + 1) as u32;
         let bbox = bboxes[idx];
         let (r0, c0, r1, c1) = bbox;
@@ -1154,6 +1194,19 @@ pub fn delineate_depressions_in_memory(
             &sub_img, bw, bh, region_id, min_size, min_depth, interval, &gt, res_x, res_y,
             cell_area,
         )?;
+        control.check_cancelled()?;
+        if control.progress.is_some() && k > 0 {
+            let mut done = done_count
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *done += 1;
+            let frac = 0.15 + 0.80 * (*done as f64 / k as f64);
+            control.report(
+                "delineate",
+                frac,
+                Some(format!("Delineated region {}/{k}", *done)),
+            );
+        }
         Ok((idx, bbox, local_obj, local_deps))
     };
 
@@ -1216,6 +1269,17 @@ pub fn delineate_depressions_in_memory(
     let mut depression_level = Array2D::from_vec(w, h, level_vec)?;
     depression_level.copy_metadata_from(sink);
     depression_level.set_no_data(0);
+
+    control.check_cancelled()?;
+    control.report(
+        "complete",
+        1.0,
+        Some(format!(
+            "Delineated {} depressions across {} regions",
+            global_deps.len(),
+            nb_labels
+        )),
+    );
 
     Ok(InMemoryDepressions {
         depression_id,
