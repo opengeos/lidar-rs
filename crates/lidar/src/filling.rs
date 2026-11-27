@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::raster_ops::{ensure_no_path_collision, join_csv_to_vector, polygonize};
-use crate::region::{RegionProps, region_group, region_props_affine};
+use crate::region::{RegionProps, region_group};
 
 /// Geometric and topographic attributes of an extracted sink (depression region).
 ///
@@ -288,8 +288,19 @@ pub fn extract_sinks_with_filled_in_memory(
     depth.copy_metadata_from(dem);
     depth.set_no_data(0.0);
 
-    // Depression properties on original DEM elevations.
-    let props = region_props_affine(&labels, nb_labels, dem.data(), w, h, &gt);
+    // Depression properties on original DEM elevations (CRS-aware metric basis).
+    let (vx_m, vy_m, _, _, cell_area_m2) =
+        crate::region::safe_crs_metric_basis(&dem.projection, &gt, w, h);
+    let props = crate::region::region_props_affine_basis(
+        &labels,
+        nb_labels,
+        dem.data(),
+        w,
+        h,
+        vx_m,
+        vy_m,
+        cell_area_m2,
+    );
     let depressions: Vec<SinkDepression> = props.iter().map(SinkDepression::from).collect();
 
     // Region ID raster (i32, 0 outside).

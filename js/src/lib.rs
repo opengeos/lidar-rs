@@ -1282,6 +1282,7 @@ impl InundationOutput {
             max_dimension: if max_dim > 0 { Some(max_dim) } else { None },
             time_step_h: Some(self.time_step_h),
             rain_intensity_cm_h: Some(eff_intensity_cm_h),
+            scaled_hyetograph: self.scaled_hyetograph.clone(),
             ..Default::default()
         };
         let paths: &[SpillFlowPath] = if show_spill_paths.unwrap_or(true) {

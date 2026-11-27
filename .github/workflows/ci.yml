@@ -70,15 +70,45 @@ jobs:
         run: cargo fmt --manifest-path python/Cargo.toml -- --check
       - name: Clippy (python)
         run: cargo clippy --manifest-path python/Cargo.toml --all-targets -- -D warnings
-      - name: Build, lint, and test Python package
+      - name: Build, lint, typecheck, and test Python package
         working-directory: python
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install maturin pytest numpy ruff
+          pip install maturin pytest numpy ruff mypy
           ruff check python tests
+          mypy --ignore-missing-imports python/lidar_rs
           maturin develop --release
           pytest -v
+      - name: Test real optional spatial adapters (networkx, xarray, geopandas, rasterio)
+        if: matrix.python-version == '3.12'
+        working-directory: python
+        run: |
+          source .venv/bin/activate
+          pip install networkx xarray geopandas shapely rasterio
+          python -c '
+          import pathlib, networkx as nx, xarray as xr, geopandas as gpd, rasterio, lidar_rs
+          dem_path = pathlib.Path("../test_data/dem.tif")
+          with rasterio.open(dem_path) as src:
+              sinks = lidar_rs.extract_sinks_array(src, min_size=1000)
+              sim = lidar_rs.simulate_inundation_array(
+                  src, kernel_size=3, min_size=1000, min_depth=0.3, interval=0.3,
+                  rain_intensity_cm_h=5.0, rain_duration_h=10.0, time_step_h=2.0,
+              )
+          deps = lidar_rs.delineate_depressions_array(
+              sinks["sink"], min_size=1000, min_depth=0.3, interval=0.3,
+              geotransform=sinks["geotransform"], crs=sinks["crs"],
+          )
+          gdf = lidar_rs.depressions_to_geodataframe(deps)
+          assert isinstance(gdf, gpd.GeoDataFrame) and len(gdf) == len(deps["depressions"])
+          da = lidar_rs.array_to_xarray(sinks["depth"], sinks["geotransform"], crs=sinks["crs"], name="depth")
+          assert isinstance(da, xr.DataArray) and da.shape == sinks["depth"].shape
+          g_di = lidar_rs.connectivity_to_networkx(sim["connectivity_graph"])
+          assert isinstance(g_di, nx.DiGraph) and g_di.number_of_nodes() == len(sim["connectivity_graph"]["nodes"])
+          g_multi = lidar_rs.connectivity_to_networkx(sim["connectivity_graph"], multi=True)
+          assert isinstance(g_multi, nx.MultiDiGraph) and g_multi.number_of_edges() == len(sim["connectivity_graph"]["edges"])
+          print("Real optional spatial adapters verified:", len(gdf), g_di.number_of_nodes(), g_multi.number_of_edges())
+          '
 
   wasm:
     name: WebAssembly (lidar-wasm)
@@ -105,10 +135,12 @@ jobs:
         run: cargo fmt --manifest-path js/Cargo.toml -- --check
       - name: Clippy (wasm32)
         run: cargo clippy --manifest-path js/Cargo.toml --locked --target wasm32-unknown-unknown -- -D warnings
-      - name: Check Playground JS syntax
+      - name: Check Playground JS syntax and TypeScript declarations
         run: |
+          node --check docs/javascripts/gif-encoder.js
           node --check docs/javascripts/playground.js
           node --check docs/javascripts/playground-worker.js
+          npx --yes --package=typescript@5 tsc --noEmit --strict --lib es2022,dom js/lidar_js.d.ts js/lidar_js_direct.d.ts
       - name: Build and test Node.js WASM bundle
         working-directory: js
         run: |

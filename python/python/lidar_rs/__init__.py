@@ -1347,34 +1347,6 @@ def compute_hillshade(
     )
 
 
-@overload
-def compute_twi(
-    dem: PathLikeStr,
-    out_file: PathLikeStr,
-    flow_acc: PathLikeStr | None = None,
-    *,
-    no_data: float | None = None,
-    cell_size: float = 1.0,
-    geotransform: Geotransform | None = None,
-    crs: str | None = None,
-    compress: bool = False,
-) -> str: ...
-
-
-@overload
-def compute_twi(
-    dem: PathLikeStr | SpatialArrayLike,
-    out_file: None = None,
-    flow_acc: PathLikeStr | SpatialArrayLike | None = None,
-    *,
-    no_data: float | None = None,
-    cell_size: float = 1.0,
-    geotransform: Geotransform | None = None,
-    crs: str | None = None,
-    compress: bool = False,
-) -> NDArray[np.float64]: ...
-
-
 def _check_aux_grid_alignment(
     name: str,
     aux_gt: Geotransform | None,
@@ -1413,6 +1385,34 @@ def _check_aux_grid_alignment(
             raise ValueError(
                 f"{name} CRS {aux_crs!r} does not match DEM CRS {dem_crs!r}"
             )
+
+
+@overload
+def compute_twi(
+    dem: PathLikeStr,
+    out_file: PathLikeStr,
+    flow_acc: PathLikeStr | None = None,
+    *,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+    compress: bool = False,
+) -> str: ...
+
+
+@overload
+def compute_twi(
+    dem: PathLikeStr | SpatialArrayLike,
+    out_file: None = None,
+    flow_acc: PathLikeStr | SpatialArrayLike | None = None,
+    *,
+    no_data: float | None = None,
+    cell_size: float = 1.0,
+    geotransform: Geotransform | None = None,
+    crs: str | None = None,
+    compress: bool = False,
+) -> NDArray[np.float64]: ...
 
 
 def compute_twi(
@@ -1814,7 +1814,7 @@ def build_connectivity_graph(
         if resolved_crs is None and dem_or_depressions.get("crs") is not None:
             resolved_crs = str(dem_or_depressions["crs"])
 
-        ft_src = fill_time if fill_time is not None else dem_or_depressions.get("fill_time")
+        ft_src: Any = fill_time if fill_time is not None else dem_or_depressions.get("fill_time")
         ft_arr = (
             _extract_array_masking_nodata(ft_src) if ft_src is not None else None
         )

@@ -42,11 +42,11 @@ pub struct CatchmentRecord {
     pub id: u32,
     /// Number of pixels in the sink footprint.
     pub sink_cells: usize,
-    /// Area of the sink footprint in map units squared.
+    /// Area of the sink footprint in SI square meters when CRS metadata is present (or native map units squared otherwise).
     pub sink_area: f64,
     /// Number of pixels in the contributing catchment (including the sink itself).
     pub catchment_cells: usize,
-    /// Area of the contributing catchment in map units squared (`cat_area`).
+    /// Area of the contributing catchment (`cat_area`) in SI square meters when CRS metadata is present (or native map units squared otherwise).
     pub catchment_area: f64,
     /// Ratio of sink area to catchment area (`dep2catR = sink_area / cat_area`).
     pub dep_to_cat_ratio: f64,
@@ -178,11 +178,11 @@ pub struct FlowPathRecord {
     pub end_elev: f64,
     /// Elevation drop (`start_elev - end_elev`).
     pub diff_elev: f64,
-    /// Overland path length in map units.
+    /// Overland path length in SI meters when CRS metadata is present (or native map units otherwise).
     pub length: f64,
-    /// Upstream sink storage/relief volume in cubic map units.
+    /// Upstream sink storage/relief volume (`cell_area_m2 * depth`; cubic meters when vertical DEM units are meters).
     pub volume: f64,
-    /// Upstream sink contributing catchment area in map units squared.
+    /// Upstream sink contributing catchment area in SI square meters when CRS metadata is present (or native map units squared otherwise).
     pub cat_area: f64,
     /// Equivalent rainfall depth to fill the upstream sink (`volume / cat_area`).
     pub simu_depth: f64,
@@ -227,23 +227,14 @@ pub struct DelineateFlowPathsResult {
     pub records: Vec<FlowPathRecord>,
 }
 
-fn affine_cell_area(gt: &[f64; 6]) -> f64 {
-    let det = (gt[1] * gt[5] - gt[2] * gt[4]).abs();
-    if det > 0.0 && det.is_finite() {
-        det
-    } else {
-        1.0
-    }
-}
-
-fn affine_cell_size(gt: &[f64; 6]) -> f64 {
-    let res_x = gt[1].hypot(gt[4]);
-    let res_y = gt[2].hypot(gt[5]);
-    if res_x > 0.0 && res_y > 0.0 && res_x.is_finite() && res_y.is_finite() {
-        0.5 * (res_x + res_y)
-    } else {
-        1.0
-    }
+fn raster_metric_area(dem: &Array2D<f64>) -> f64 {
+    crate::region::safe_crs_metric_basis(
+        &dem.projection,
+        &dem.geotransform,
+        dem.width(),
+        dem.height(),
+    )
+    .4
 }
 
 fn cell_center_xy(gt: &[f64; 6], col: usize, row: usize) -> (f64, f64) {
@@ -550,7 +541,7 @@ pub fn delineate_catchments_in_memory(
 ) -> Result<InMemoryCatchments> {
     let flow_directions = d8_flow_directions_resolved(dem)?;
     let watershed = d8_watersheds(&flow_directions, sink_labels)?;
-    let cell_area = affine_cell_area(&dem.geotransform);
+    let cell_area = raster_metric_area(dem);
 
     let mut sink_counts: BTreeMap<u32, usize> = BTreeMap::new();
     for &lbl in sink_labels {
@@ -894,7 +885,7 @@ pub fn delineate_catchment_hierarchy(
     let w = dem.width();
     let h = dem.height();
     let n = w * h;
-    let cell_area = affine_cell_area(&dem.geotransform);
+    let cell_area = raster_metric_area(&dem);
     let flowdirs = d8_flow_directions_resolved(&dem)?;
 
     // Pass 1: scan each level file one at a time (O(1) peak level memory) to build the
@@ -1384,7 +1375,7 @@ fn delineate_catchment_hierarchy_impl(
         });
     }
 
-    let cell_area = affine_cell_area(&dem.geotransform);
+    let cell_area = raster_metric_area(dem);
     let owned_flowdirs;
     let flowdirs = match precomputed_flowdirs {
         Some(f) => f,
@@ -1792,8 +1783,13 @@ pub fn delineate_flow_paths(
     let mut dem_filled = load_raster::<f64>(in_dem_filled, None)?;
     let w = dem_filled.width();
     let h = dem_filled.height();
-    let cell_area = affine_cell_area(&dem_filled.geotransform);
-    let cell_size = affine_cell_size(&dem_filled.geotransform);
+    let (vx_m, vy_m, rx_m, ry_m, cell_area) = crate::region::safe_crs_metric_basis(
+        &dem_filled.projection,
+        &dem_filled.geotransform,
+        w,
+        h,
+    );
+    let cell_size = 0.5 * (rx_m + ry_m);
     let min_path_len = 2.0 * cell_size;
     let rain_m_h = options.rain_intensity_cm_h / 100.0;
 
@@ -1881,6 +1877,7 @@ pub fn delineate_flow_paths(
         let mut steps = 0usize;
         let mut left_origin = false;
         let mut coords: Vec<Coord> = Vec::new();
+        let mut path_cells: Vec<(usize, usize)> = Vec::new();
         let mut elevs: Vec<f64> = Vec::new();
         let mut end_sink = 0u32;
 
@@ -1903,10 +1900,12 @@ pub fn delineate_flow_paths(
                     let (or_r, or_c) = last_origin_rc;
                     let (ox, oy) = cell_center_xy(&dem_filled.geotransform, or_c, or_r);
                     coords.push(Coord::xy(ox, oy));
+                    path_cells.push((or_c, or_r));
                     elevs.push(zdata[or_r * w + or_c]);
 
                     let (x, y) = cell_center_xy(&dem_filled.geotransform, cur_c, cur_r);
                     coords.push(Coord::xy(x, y));
+                    path_cells.push((cur_c, cur_r));
                     elevs.push(zdata[idx]);
                     if lbl > 0 {
                         end_sink = lbl;
@@ -1916,6 +1915,7 @@ pub fn delineate_flow_paths(
             } else {
                 let (x, y) = cell_center_xy(&dem_filled.geotransform, cur_c, cur_r);
                 coords.push(Coord::xy(x, y));
+                path_cells.push((cur_c, cur_r));
                 elevs.push(zdata[idx]);
                 if lbl > 0 && lbl != sid {
                     end_sink = lbl;
@@ -1941,8 +1941,12 @@ pub fn delineate_flow_paths(
         }
 
         let mut length = 0.0;
-        for pair in coords.windows(2) {
-            length += (pair[1].x - pair[0].x).hypot(pair[1].y - pair[0].y);
+        for pair in path_cells.windows(2) {
+            let dc = pair[1].0 as f64 - pair[0].0 as f64;
+            let dr = pair[1].1 as f64 - pair[0].1 as f64;
+            let dx_m = dc * vx_m.0 + dr * vy_m.0;
+            let dy_m = dc * vx_m.1 + dr * vy_m.1;
+            length += dx_m.hypot(dy_m);
         }
         // Keep direct sink-to-sink connections regardless of length; filter tiny boundary stubs.
         if end_sink == 0 && length <= min_path_len {

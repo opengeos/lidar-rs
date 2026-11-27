@@ -45,7 +45,7 @@ Every delineated depression (and mount) computes 24 geometric, topological, and 
 | `id` | `u32` | Unique 1-based depression identifier |
 | `level` | `u32` | Hierarchy level (`1` = innermost leaf depression; higher = enclosing compound basin) |
 | `count` | `usize` | Number of pixels inside the depression footprint |
-| `area` | `f64` | Surface area in map units squared (`count * cell_area`) |
+| `area` | `f64` | Surface area in SI m^2 when CRS metadata is present, or native map units squared (`count * cell_area`) |
 | `volume` | `f64` | Relief storage volume below `max_elev` (`avg_depth * area`) |
 | `avg_depth` | `f64` | Mean depth below the spill rim (`max_elev - mean_elev`) |
 | `max_depth` | `f64` | Maximum depth (`max_elev - min_elev`) |
@@ -53,7 +53,7 @@ Every delineated depression (and mount) computes 24 geometric, topological, and 
 | `max_elev` | `f64` | Maximum elevation (spill rim) |
 | `children_id` / `children_ids` | `string` / `list[int]` | Direct child depression IDs: colon-delimited string `children_id` in CSV/GeoPackage, list `children_ids` in Python dicts and Rust structs (empty for leaves) |
 | `region_id` | `u32` | Top-level enclosing sink region ID (1-based) |
-| `perimeter` | `f64` | Perimeter in map units (Benkrid-Crookes estimator) |
+| `perimeter` | `f64` | Perimeter in SI meters when CRS metadata is present, or native map units (Benkrid-Crookes estimator) |
 | `major_axis` | `f64` | Equivalent-ellipse major axis length |
 | `minor_axis` | `f64` | Equivalent-ellipse minor axis length |
 | `elongatedness` | `f64` | Aspect ratio (`major_axis / minor_axis`) |

@@ -62,13 +62,12 @@ pub fn compute_rating_curves(
         )));
     }
     validate_grid_alignment(sink, &deps.depression_id, "depression_id")?;
-    let gt = sink.geotransform;
-    let det = (gt[1] * gt[5] - gt[2] * gt[4]).abs();
-    let cell_area = if det.is_finite() && det > 0.0 {
-        det
-    } else {
-        1.0
-    };
+    let (_, _, _, _, cell_area) = crate::region::safe_crs_metric_basis(
+        &sink.projection,
+        &sink.geotransform,
+        sink.width(),
+        sink.height(),
+    );
     let nd = sink.no_data();
 
     // Build parent lookup and gather owned elevation values per depression ID using adaptive
@@ -561,7 +560,11 @@ impl StreamSegmentIndex {
     }
 }
 
-fn load_stream_segments(path: &Path, dem_projection: &str) -> Result<StreamSegmentIndex> {
+fn load_stream_segments(
+    path: &Path,
+    dem_projection: &str,
+    axis_scale_m: (f64, f64),
+) -> Result<StreamSegmentIndex> {
     let p_str = path.to_str().ok_or_else(|| {
         Error::InvalidArgument(format!("non-UTF-8 stream vector path: {}", path.display()))
     })?;
@@ -573,11 +576,12 @@ fn load_stream_segments(path: &Path, dem_projection: &str) -> Result<StreamSegme
             .ok()
             .filter(|s| !s.is_unknown())
     };
+    let (sx, sy) = axis_scale_m;
     let mut segs = Vec::new();
-    fn push_geom(g: &Geometry, segs: &mut Vec<([f64; 2], [f64; 2])>) {
+    fn push_geom(g: &Geometry, sx: f64, sy: f64, segs: &mut Vec<([f64; 2], [f64; 2])>) {
         let mut push_pair = |a: &Coord, b: &Coord| {
             if a.x.is_finite() && a.y.is_finite() && b.x.is_finite() && b.y.is_finite() {
-                segs.push(([a.x, a.y], [b.x, b.y]));
+                segs.push(([a.x * sx, a.y * sy], [b.x * sx, b.y * sy]));
             }
         };
         match g {
@@ -595,7 +599,7 @@ fn load_stream_segments(path: &Path, dem_projection: &str) -> Result<StreamSegme
             }
             Geometry::GeometryCollection(gs) => {
                 for sub in gs {
-                    push_geom(sub, segs);
+                    push_geom(sub, sx, sy, segs);
                 }
             }
             _ => {}
@@ -615,7 +619,7 @@ fn load_stream_segments(path: &Path, dem_projection: &str) -> Result<StreamSegme
         }
         for feat in &layer.features {
             if let Some(ref g) = feat.geometry {
-                push_geom(g, &mut segs);
+                push_geom(g, sx, sy, &mut segs);
             }
         }
     }
@@ -797,8 +801,18 @@ pub fn build_connectivity_graph(
         })
         .collect();
 
+    let axis_scale_m = crate::region::crs_axis_meters_per_unit(
+        &deps.depression_id.projection,
+        &gt,
+        deps.depression_id.width(),
+        deps.depression_id.height(),
+    );
     let stream_index = match stream_vector {
-        Some(p) => Some(load_stream_segments(p, &deps.depression_id.projection)?),
+        Some(p) => Some(load_stream_segments(
+            p,
+            &deps.depression_id.projection,
+            axis_scale_m,
+        )?),
         None => None,
     };
     let mut stream_seen: Vec<u32> = stream_index
@@ -807,6 +821,12 @@ pub fn build_connectivity_graph(
         .unwrap_or_default();
     let mut query_stamp = 0u32;
 
+    let (vx_m, vy_m, _, _, _) = crate::region::safe_crs_metric_basis(
+        &deps.depression_id.projection,
+        &gt,
+        deps.depression_id.width(),
+        deps.depression_id.height(),
+    );
     let mut edges = Vec::with_capacity(spill_paths.len() + deps.depressions.len());
     // 1. Overland spill edges
     for sp in spill_paths {
@@ -814,9 +834,11 @@ pub fn build_connectivity_graph(
         let end_xy = sp.cells.last().map(|&(c, r)| cell_center_xy(&gt, c, r));
         let mut length_m = 0.0f64;
         for pair in sp.cells.windows(2) {
-            let a = cell_center_xy(&gt, pair[0].0, pair[0].1);
-            let b = cell_center_xy(&gt, pair[1].0, pair[1].1);
-            length_m += (b[0] - a[0]).hypot(b[1] - a[1]);
+            let dc = pair[1].0 as f64 - pair[0].0 as f64;
+            let dr = pair[1].1 as f64 - pair[0].1 as f64;
+            let dx_m = dc * vx_m.0 + dr * vy_m.0;
+            let dy_m = dc * vx_m.1 + dr * vy_m.1;
+            length_m += dx_m.hypot(dy_m);
         }
         let dist_to_stream = match (end_xy, &stream_index) {
             (Some([ex, ey]), Some(idx)) if !idx.is_empty() => {
@@ -825,7 +847,12 @@ pub fn build_connectivity_graph(
                     stream_seen.fill(0);
                     query_stamp = 1;
                 }
-                Some(idx.nearest_dist(ex, ey, &mut stream_seen, query_stamp))
+                Some(idx.nearest_dist(
+                    ex * axis_scale_m.0,
+                    ey * axis_scale_m.1,
+                    &mut stream_seen,
+                    query_stamp,
+                ))
             }
             _ => None,
         };
@@ -1116,6 +1143,32 @@ pub fn write_spill_paths_vector(
         layer.schema.add_field(FieldDef::new(name, ftype));
     }
 
+    // Hoist CRS parsing and metric basis evaluation outside the per-path loop. For geographic
+    // CRSs, evaluate at the cell-center midpoint of all spill paths (+0.5 pixel-center offset).
+    let (sum_c, sum_r, total_pts) = spill_paths
+        .iter()
+        .fold((0.0f64, 0.0f64, 0usize), |acc, sp| {
+            sp.cells.iter().fold(acc, |(sc, sr, n), &(c, r)| {
+                (sc + c as f64 + 0.5, sr + r as f64 + 0.5, n + 1)
+            })
+        });
+    let (vx_m, vy_m, _, _, _) = if total_pts > 0 {
+        let mid_c = sum_c / total_pts as f64;
+        let mid_r = sum_r / total_pts as f64;
+        let shifted_gt = [
+            geotransform[0] + mid_c * geotransform[1] + mid_r * geotransform[2],
+            geotransform[1],
+            geotransform[2],
+            geotransform[3] + mid_c * geotransform[4] + mid_r * geotransform[5],
+            geotransform[4],
+            geotransform[5],
+        ];
+        // Width/height = 0 evaluates `crs_metric_basis` directly at the shifted midpoint origin.
+        crate::region::safe_crs_metric_basis(projection, &shifted_gt, 0, 0)
+    } else {
+        crate::region::safe_crs_metric_basis(projection, geotransform, 0, 0)
+    };
+
     for (idx, sp) in spill_paths.iter().enumerate() {
         if sp.cells.len() < 2 {
             continue;
@@ -1129,8 +1182,12 @@ pub fn write_spill_paths_vector(
             })
             .collect();
         let mut length_m = 0.0f64;
-        for w in coords.windows(2) {
-            length_m += (w[1].x - w[0].x).hypot(w[1].y - w[0].y);
+        for pair in sp.cells.windows(2) {
+            let dc = pair[1].0 as f64 - pair[0].0 as f64;
+            let dr = pair[1].1 as f64 - pair[0].1 as f64;
+            let dx_m = dc * vx_m.0 + dr * vy_m.0;
+            let dy_m = dc * vx_m.1 + dr * vy_m.1;
+            length_m += dx_m.hypot(dy_m);
         }
         layer.features.push(Feature {
             fid: (idx + 1) as u64,
@@ -1309,7 +1366,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = load_stream_segments(&tmp, "EPSG:26916");
+        let err = load_stream_segments(&tmp, "EPSG:26916", (1.0, 1.0));
         let _ = std::fs::remove_file(&tmp);
         assert!(
             matches!(err, Err(Error::InvalidArgument(ref msg)) if msg.contains("CRS")),
