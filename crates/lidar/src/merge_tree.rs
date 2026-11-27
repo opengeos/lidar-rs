@@ -30,7 +30,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::graph::RatingCurvePoint;
 use crate::inundation::validate_grid_alignment;
-use crate::region::{affine_basis, extended_morphometrics, region_props_from_sparse_cells};
+use crate::region::{
+    extended_morphometrics, region_props_from_sparse_cells_basis, safe_crs_metric_basis,
+};
 use crate::slicing::{InMemoryDepressions, NestedDepression};
 
 /// Options controlling [`delineate_depressions_merge_tree_in_memory`] and
@@ -370,6 +372,8 @@ fn build_region_merge_tree(
     mut cells: Vec<SinkCell>,
     root_outlet: Option<RootOutlet>,
     gt: &[f64; 6],
+    vx_m: (f64, f64),
+    vy_m: (f64, f64),
     cell_area: f64,
     options: &MergeTreeOptions,
 ) -> RegionMergeOutput {
@@ -953,10 +957,12 @@ fn build_region_merge_tree(
         nodes[node_idx].volume = node_volume;
         nodes[node_idx].avg_depth = node_avg_depth;
 
-        let props = region_props_from_sparse_cells(
+        let props = region_props_from_sparse_cells_basis(
             node_id,
             &subtree_coords,
-            gt,
+            vx_m,
+            vy_m,
+            cell_area,
             node_area,
             node_volume,
             node_avg_depth,
@@ -1032,7 +1038,7 @@ fn delineate_merge_tree_impl(
         .ok_or_else(|| Error::DimensionMismatch(format!("raster dimensions overflow ({w}x{h})")))?;
 
     let gt = sink.geotransform;
-    let (_, _, cell_area) = affine_basis(&gt);
+    let (vx_m, vy_m, _, _, cell_area) = safe_crs_metric_basis(&sink.projection, &gt, w, h);
     let no_data_raw = sink.no_data();
     let is_valid_sink = |v: f64| -> bool { v.is_finite() && !v.rd_eq(no_data_raw) };
 
@@ -1170,6 +1176,8 @@ fn delineate_merge_tree_impl(
                 cells,
                 outlet,
                 &gt,
+                vx_m,
+                vy_m,
                 cell_area,
                 options,
             )
@@ -1187,6 +1195,8 @@ fn delineate_merge_tree_impl(
                 cells,
                 outlet,
                 &gt,
+                vx_m,
+                vy_m,
                 cell_area,
                 options,
             )

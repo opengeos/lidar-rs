@@ -181,6 +181,7 @@ pub(crate) fn validate_options_with_hyetograph(
     Ok(n_steps_f as usize)
 }
 
+#[allow(dead_code)]
 pub(crate) fn affine_metrics(gt: &[f64; 6]) -> (f64, f64, f64) {
     let res_x = gt[1].hypot(gt[4]);
     let res_y = gt[2].hypot(gt[5]);
@@ -336,7 +337,9 @@ pub fn simulate_inundation_in_memory(
     let w = sink.width();
     let h = sink.height();
 
-    let metrics = affine_metrics(&sink.geotransform);
+    let (_, _, rx, ry, cell_area) =
+        crate::region::safe_crs_metric_basis(&sink.projection, &sink.geotransform, w, h);
+    let metrics = (rx, ry, cell_area);
     let nd = sink.no_data();
     let c_nd = catchment_area.no_data();
 
@@ -1220,7 +1223,12 @@ pub fn compute_inundation_step_summaries(
     num_steps: usize,
     time_step_h: f64,
 ) -> Vec<InundationStepSummary> {
-    let (_, _, cell_area) = affine_metrics(&sink.geotransform);
+    let (_, _, _, _, cell_area) = crate::region::safe_crs_metric_basis(
+        &sink.projection,
+        &sink.geotransform,
+        sink.width(),
+        sink.height(),
+    );
     let sink_nd = sink.no_data();
     let total_sink_cells = sink
         .data()
@@ -2818,7 +2826,9 @@ pub fn simulate_inundation_with_weighted_catchment_in_memory(
     }
     validate_forcing_grids(sink, forcing)?;
 
-    let metrics = affine_metrics(&sink.geotransform);
+    let (_, _, rx, ry, cell_area) =
+        crate::region::safe_crs_metric_basis(&sink.projection, &sink.geotransform, w, h);
+    let metrics = (rx, ry, cell_area);
     let nd = sink.no_data();
     let c_nd = catchment_area.no_data();
     let wc_nd = weighted_catchment_area.map(|wc| wc.no_data());
@@ -2977,7 +2987,11 @@ impl Default for InMemoryFullPipelineOptions<'_> {
         Self {
             kernel_size: 3,
             breach: None,
-            simulation: SimulateInundationOptions::default(),
+            simulation: SimulateInundationOptions {
+                min_depth: 0.3,
+                interval: 0.3,
+                ..SimulateInundationOptions::default()
+            },
             routing: RoutingMode::Static,
             forcing: InundationForcing::default(),
             scalar_runoff_coeff: 1.0,
@@ -3134,9 +3148,10 @@ pub fn run_full_pipeline_in_memory(
     let rating_curves = compute_rating_curves(&sinks.sink, &depressions, sim_opts.interval.abs())?;
 
     // Scale reported cumulative runoff depth using the mean effective runoff coefficient across
-    // sink cells when a runoff_coeff raster is supplied, or scalar_runoff_coeff otherwise.
+    // the full valid contributing DEM domain when a runoff_coeff raster is supplied, or
+    // scalar_runoff_coeff otherwise.
     let runoff_scale = effective_runoff_scale(
-        &sinks.sink,
+        &sinks.dem_refined,
         options.forcing.runoff_coeff,
         options.scalar_runoff_coeff,
     );
@@ -3250,7 +3265,11 @@ impl Default for RunPipelineOptions {
             breach: None,
             culverts_vector: None,
             burn_culverts: BurnCulvertsOptions::default(),
-            simulation: SimulateInundationOptions::default(),
+            simulation: SimulateInundationOptions {
+                min_depth: 0.3,
+                interval: 0.3,
+                ..SimulateInundationOptions::default()
+            },
             routing: RoutingMode::Static,
             runoff_coeff_path: None,
             infiltration_path: None,
@@ -3608,7 +3627,12 @@ pub fn run_pipeline_with_control(
     );
     control.check_cancelled()?;
 
-    let (_, _, cell_area) = affine_metrics(&dem.geotransform);
+    let (_, _, _, _, cell_area) = crate::region::safe_crs_metric_basis(
+        &dem.projection,
+        &dem.geotransform,
+        dem.width(),
+        dem.height(),
+    );
     let d_nd = sinks.depth.no_data();
     let total_storage_m3: f64 = sinks
         .depth
@@ -3618,7 +3642,7 @@ pub fn run_pipeline_with_control(
         .map(|&v| v * cell_area)
         .sum();
 
-    let runoff_scale = effective_runoff_scale(&sinks.sink, rc_arr.as_ref(), 1.0);
+    let runoff_scale = effective_runoff_scale(&sinks.dem_refined, rc_arr.as_ref(), 1.0);
     let eff_rain = sim_opts.rain_intensity_cm_h * runoff_scale;
     let scaled_hyeto: Option<Vec<(f64, f64)>> = options.hyetograph.as_ref().map(|h| {
         h.iter()
@@ -3904,7 +3928,8 @@ fn write_inundation_frames_and_summary(
 
     let w = sink.width();
     let h = sink.height();
-    let (_, _, cell_area) = affine_metrics(&sink.geotransform);
+    let (_, _, _, _, cell_area) =
+        crate::region::safe_crs_metric_basis(&sink.projection, &sink.geotransform, w, h);
     let nd = sink.no_data();
     let total_sink_cells = sink
         .data()

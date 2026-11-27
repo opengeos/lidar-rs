@@ -62,13 +62,12 @@ pub fn compute_rating_curves(
         )));
     }
     validate_grid_alignment(sink, &deps.depression_id, "depression_id")?;
-    let gt = sink.geotransform;
-    let det = (gt[1] * gt[5] - gt[2] * gt[4]).abs();
-    let cell_area = if det.is_finite() && det > 0.0 {
-        det
-    } else {
-        1.0
-    };
+    let (_, _, _, _, cell_area) = crate::region::safe_crs_metric_basis(
+        &sink.projection,
+        &sink.geotransform,
+        sink.width(),
+        sink.height(),
+    );
     let nd = sink.no_data();
 
     // Build parent lookup and gather owned elevation values per depression ID using adaptive
@@ -776,6 +775,12 @@ pub fn build_connectivity_graph(
         .unwrap_or_default();
     let mut query_stamp = 0u32;
 
+    let (vx_m, vy_m, _, _, _) = crate::region::safe_crs_metric_basis(
+        &deps.depression_id.projection,
+        &gt,
+        deps.depression_id.width(),
+        deps.depression_id.height(),
+    );
     let mut edges = Vec::with_capacity(spill_paths.len() + deps.depressions.len());
     // 1. Overland spill edges
     for sp in spill_paths {
@@ -783,9 +788,11 @@ pub fn build_connectivity_graph(
         let end_xy = sp.cells.last().map(|&(c, r)| cell_center_xy(&gt, c, r));
         let mut length_m = 0.0f64;
         for pair in sp.cells.windows(2) {
-            let a = cell_center_xy(&gt, pair[0].0, pair[0].1);
-            let b = cell_center_xy(&gt, pair[1].0, pair[1].1);
-            length_m += (b[0] - a[0]).hypot(b[1] - a[1]);
+            let dc = pair[1].0 as f64 - pair[0].0 as f64;
+            let dr = pair[1].1 as f64 - pair[0].1 as f64;
+            let dx_m = dc * vx_m.0 + dr * vy_m.0;
+            let dy_m = dc * vx_m.1 + dr * vy_m.1;
+            length_m += dx_m.hypot(dy_m);
         }
         let dist_to_stream = match (end_xy, &stream_index) {
             (Some([ex, ey]), Some(idx)) if !idx.is_empty() => {
@@ -1097,9 +1104,25 @@ pub fn write_spill_paths_vector(
                 Coord::xy(x, y)
             })
             .collect();
+        let mid_c = sp.cells.iter().map(|&(c, _)| c as f64).sum::<f64>() / sp.cells.len() as f64;
+        let mid_r = sp.cells.iter().map(|&(_, r)| r as f64).sum::<f64>() / sp.cells.len() as f64;
+        let shifted_gt = [
+            geotransform[0] + mid_c * geotransform[1] + mid_r * geotransform[2],
+            geotransform[1],
+            geotransform[2],
+            geotransform[3] + mid_c * geotransform[4] + mid_r * geotransform[5],
+            geotransform[4],
+            geotransform[5],
+        ];
+        let (vx_m, vy_m, _, _, _) =
+            crate::region::safe_crs_metric_basis(projection, &shifted_gt, 0, 0);
         let mut length_m = 0.0f64;
-        for w in coords.windows(2) {
-            length_m += (w[1].x - w[0].x).hypot(w[1].y - w[0].y);
+        for pair in sp.cells.windows(2) {
+            let dc = pair[1].0 as f64 - pair[0].0 as f64;
+            let dr = pair[1].1 as f64 - pair[0].1 as f64;
+            let dx_m = dc * vx_m.0 + dr * vy_m.0;
+            let dy_m = dc * vx_m.1 + dr * vy_m.1;
+            length_m += dx_m.hypot(dy_m);
         }
         layer.features.push(Feature {
             fid: (idx + 1) as u64,

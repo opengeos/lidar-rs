@@ -663,7 +663,8 @@ pub fn mfd_flow_accumulation(dem: &Array2D<f64>, exponent: f64) -> Result<Array2
 
 /// Computes the Topographic Wetness Index (`TWI = ln(a / tan(beta))`; Beven & Kirkby, 1979).
 ///
-/// - `a` is specific catchment area in map units (`flow_acc_cells * cell_area / cell_size`),
+/// - `a` is specific catchment area in SI meters (`flow_acc_cells * cell_area_m2 / cell_size_m`,
+///   scaled via [`crate::region::crs_metric_scale`] for both geographic and projected CRSs),
 ///   computed from [`dinf_flow_accumulation`] when `flow_acc` is `None`, or from the provided
 ///   cell-count `flow_acc` raster when `Some`.
 /// - `tan(beta)` is the local D-Infinity steepest downslope gradient, clamped to a positive
@@ -682,9 +683,23 @@ pub fn compute_twi(dem: &Array2D<f64>, flow_acc: Option<&Array2D<f64>>) -> Resul
     let zdata = dem.data();
     let z_nd = dem.no_data();
     let out_nd = safe_nodata(z_nd, -1000.0);
-    let (dx, dy, cell_area) = checked_derivative_cell_scale(dem)?;
-    let cell_size = 0.5 * (dx + dy);
-    let sca_scale = cell_area / cell_size.max(1e-12);
+    // Validate derivative cell spacing and compute SI metric SCA via crs_metric_scale.
+    let _ = checked_derivative_cell_scale(dem)?;
+    let metric = crs_metric_scale(&dem.projection, &dem.geotransform, w, h);
+    if !metric.cell_width_m.is_finite()
+        || !metric.cell_height_m.is_finite()
+        || !metric.cell_area_m2.is_finite()
+        || metric.cell_width_m <= 0.0
+        || metric.cell_height_m <= 0.0
+        || metric.cell_area_m2 <= 0.0
+    {
+        return Err(Error::InvalidArgument(
+            "DEM geotransform or CRS produced non-finite or non-positive metric cell spacing"
+                .into(),
+        ));
+    }
+    let cell_size_m = 0.5 * (metric.cell_width_m + metric.cell_height_m);
+    let sca_scale = metric.cell_area_m2 / cell_size_m.max(1e-12);
 
     let computed_acc;
     let (acc_ref, slopes) = match flow_acc {

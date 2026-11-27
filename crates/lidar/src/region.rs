@@ -160,6 +160,53 @@ pub(crate) fn crs_metric_basis(
     )
 }
 
+/// Computes a safe metric basis `(vx_m, vy_m, cell_width_m, cell_height_m, cell_area_m2)`
+/// from a raster's CRS projection, geotransform, and dimensions, falling back to native
+/// affine basis (or unit basis) when the geotransform or CRS yields non-finite or
+/// non-positive cell spacing/area.
+pub(crate) fn safe_crs_metric_basis(
+    projection: &str,
+    geotransform: &[f64; 6],
+    width: usize,
+    height: usize,
+) -> ((f64, f64), (f64, f64), f64, f64, f64) {
+    let (vx_m, vy_m, scale) = crs_metric_basis(projection, geotransform, width, height);
+    if scale.cell_width_m.is_finite()
+        && scale.cell_width_m > 0.0
+        && scale.cell_height_m.is_finite()
+        && scale.cell_height_m > 0.0
+        && scale.cell_area_m2.is_finite()
+        && scale.cell_area_m2 > 0.0
+        && vx_m.0.is_finite()
+        && vx_m.1.is_finite()
+        && vy_m.0.is_finite()
+        && vy_m.1.is_finite()
+    {
+        (
+            vx_m,
+            vy_m,
+            scale.cell_width_m,
+            scale.cell_height_m,
+            scale.cell_area_m2,
+        )
+    } else {
+        let (vx, vy, raw_area) = affine_basis(geotransform);
+        let rx = vx.0.hypot(vx.1);
+        let ry = vy.0.hypot(vy.1);
+        if rx.is_finite()
+            && rx > 0.0
+            && ry.is_finite()
+            && ry > 0.0
+            && raw_area.is_finite()
+            && raw_area > 0.0
+        {
+            (vx, vy, rx, ry, raw_area)
+        } else {
+            ((1.0, 0.0), (0.0, -1.0), 1.0, 1.0, 1.0)
+        }
+    }
+}
+
 /// Geometric and elevation statistics of a single labeled connected component.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -504,7 +551,7 @@ pub fn region_props_xy(
     res_y: f64,
     cell_area: f64,
 ) -> Vec<RegionProps> {
-    region_props_affine_inner(
+    region_props_affine_basis(
         labels,
         nb_labels,
         elev,
@@ -768,10 +815,12 @@ fn benkrid_crookes_perimeter_sparse(
 /// coordinates in `O(|cells|)` memory, avoiding dense bounding-box allocations for sparse
 /// or elongated regions.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn region_props_from_sparse_cells(
+pub(crate) fn region_props_from_sparse_cells_basis(
     label: u32,
     cells: &[(usize, usize)],
-    gt: &[f64; 6],
+    vx: (f64, f64),
+    vy: (f64, f64),
+    cell_area: f64,
     area: f64,
     volume: f64,
     mean_depth: f64,
@@ -779,7 +828,6 @@ pub(crate) fn region_props_from_sparse_cells(
     min_elev: f64,
     max_elev: f64,
 ) -> RegionProps {
-    let (vx, vy, cell_area) = affine_basis(gt);
     let res_x = vx.0.hypot(vx.1);
     let res_y = vy.0.hypot(vy.1);
     let max_side = res_x.max(res_y);
@@ -926,6 +974,7 @@ pub(crate) fn region_props_from_sparse_cells(
 /// Promotes a single [`RegionBasicStats`] entry to full [`RegionProps`] by computing
 /// its affine-aware Benkrid & Crookes perimeter and equivalent-ellipse moments over its
 /// bounding box only. Produces results identical to [`region_props_affine`].
+#[cfg(test)]
 pub(crate) fn region_props_for_single_label(
     labels: &[u32],
     basic: &RegionBasicStats,
@@ -933,6 +982,17 @@ pub(crate) fn region_props_for_single_label(
     gt: &[f64; 6],
 ) -> RegionProps {
     let (vx, vy, cell_area) = affine_basis(gt);
+    region_props_for_single_label_basis(labels, basic, width, vx, vy, cell_area)
+}
+
+pub(crate) fn region_props_for_single_label_basis(
+    labels: &[u32],
+    basic: &RegionBasicStats,
+    width: usize,
+    vx: (f64, f64),
+    vy: (f64, f64),
+    cell_area: f64,
+) -> RegionProps {
     let res_x = vx.0.hypot(vx.1);
     let res_y = vy.0.hypot(vy.1);
     let max_side = res_x.max(res_y);
@@ -1035,6 +1095,7 @@ pub(crate) fn region_props_for_single_label(
 /// Computes region properties using a full 6-element GDAL-style affine geotransform,
 /// accurately handling anisotropic pixel spacings, rotation, and shear in both
 /// perimeter and second central spatial moments.
+#[cfg(test)]
 pub(crate) fn region_props_affine(
     labels: &[u32],
     nb_labels: u32,
@@ -1044,11 +1105,11 @@ pub(crate) fn region_props_affine(
     gt: &[f64; 6],
 ) -> Vec<RegionProps> {
     let (vx, vy, cell_area) = affine_basis(gt);
-    region_props_affine_inner(labels, nb_labels, elev, width, height, vx, vy, cell_area)
+    region_props_affine_basis(labels, nb_labels, elev, width, height, vx, vy, cell_area)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn region_props_affine_inner(
+pub(crate) fn region_props_affine_basis(
     labels: &[u32],
     nb_labels: u32,
     elev: &[f64],
