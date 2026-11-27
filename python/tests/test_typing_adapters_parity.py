@@ -1072,10 +1072,11 @@ def test_audit_v06_python_forcing_nodata_types_and_sequence(
 
     def _spy_sim(*args: Any, **kwargs: Any) -> Any:
         captured["rc"] = args[8]
+        captured["rc_nd"] = args[18]
         return orig_sim(*args, **kwargs)
 
     monkeypatch.setattr(lidar_rs._lidar_rs, "simulate_inundation_array", _spy_sim)
-    lidar_rs.simulate_inundation_array(
+    res_rc = lidar_rs.simulate_inundation_array(
         dem,
         kernel_size=1,
         min_size=1,
@@ -1086,10 +1087,14 @@ def test_audit_v06_python_forcing_nodata_types_and_sequence(
         time_step_h=1.0,
         runoff_coeff_arr=fake_rc,
     )
-    assert captured["rc"][0, 0] == pytest.approx(0.0), (
-        "finite runoff_coeff NoData must be masked to 0.0 (no runoff)"
+    assert captured["rc"][0, 0] == pytest.approx(-9999.0), (
+        "forcing array must be forwarded unmutated to Rust"
+    )
+    assert captured["rc_nd"] == pytest.approx(-9999.0), (
+        "finite runoff_coeff NoData sentinel must be plumbed through PyO3 ABI"
     )
     assert captured["rc"][4, 4] == pytest.approx(0.5)
+    assert res_rc["fill_time"].shape == dem.shape
 
     # 3. download_federal_data accepts arbitrary Sequence[str] (not just list/tuple).
     seen_ds: dict[str, str] = {}
@@ -1296,3 +1301,233 @@ def test_classify_embankment_artifacts_array_and_file():
         lidar_rs.classify_embankment_artifacts(TEST_DATA / "dem.tif", geotransform=gt)
     with pytest.raises(ValueError, match="file path"):
         lidar_rs.classify_embankment_artifacts(TEST_DATA / "dem.tif", cell_size=2.0)
+
+
+def test_v06_python_api_parity_filters_derivatives_merge_tree_fsm_and_pointcloud(
+    tmp_path: Path,
+) -> None:
+    """Exercise all v0.6.0 Python parity functions and options end to end."""
+    h, w = 24, 24
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
+    dem = 110.0 - 0.05 * xx + 0.02 * yy
+    d1 = np.hypot(xx - 8.0, yy - 12.0)
+    d2 = np.hypot(xx - 16.0, yy - 12.0)
+    dem -= np.where(d1 < 5.0, 2.0 * (1.0 - (d1 / 5.0) ** 2), 0.0)
+    dem -= np.where(d2 < 4.5, 1.5 * (1.0 - (d2 / 4.5) ** 2), 0.0)
+    gt = (500_000.0, 2.0, 0.0, 4_500_000.0 + h * 2.0, 0.0, -2.0)
+
+    # 1. Bilateral & feature-preserving smoothing (array + file)
+    bil = lidar_rs.bilateral_filter(dem, spatial_sigma=1.5, range_sigma=0.8)
+    fps = lidar_rs.feature_preserving_smoothing(
+        dem, filter_size=5, norm_diff=15.0, num_iter=2, geotransform=gt, crs="EPSG:32614"
+    )
+    assert bil.shape == dem.shape and fps.shape == dem.shape
+    bil_file = tmp_path / "bil.tif"
+    fps_file = tmp_path / "fps.tif"
+    assert lidar_rs.bilateral_filter(TEST_DATA / "dem.tif", out_file=bil_file) == str(bil_file)
+    assert lidar_rs.feature_preserving_smoothing(
+        TEST_DATA / "dem.tif", filter_size=5, num_iter=1, out_file=fps_file, compress=True
+    ) == str(fps_file)
+    assert bil_file.exists() and fps_file.exists()
+
+    # 2. D-inf flow direction / accumulation, MFD flow accumulation (array + file)
+    breached = lidar_rs.breach_depressions(
+        dem, mode="selective", max_depth=3.0, fill_remaining=True, geotransform=gt, crs="EPSG:32614"
+    )
+    dinf_dir = lidar_rs.dinf_flow_direction(breached, geotransform=gt, crs="EPSG:32614")
+    dinf_acc = lidar_rs.dinf_flow_accumulation(breached, geotransform=gt, crs="EPSG:32614")
+    mfd_acc = lidar_rs.mfd_flow_accumulation(
+        breached, exponent=1.1, geotransform=gt, crs="EPSG:32614"
+    )
+    assert dinf_dir.shape == dem.shape
+    assert np.nanmax(dinf_acc) >= 1.0
+    assert np.nanmax(mfd_acc) >= 1.0
+
+    # 3. Exact Merge-Tree delineation + merge_tree rating curves
+    sinks = lidar_rs.extract_sinks_array(dem, min_size=4, geotransform=gt, crs="EPSG:32614")
+    mt = lidar_rs.delineate_depressions_merge_tree(
+        sinks["sink"],
+        dem_arr=sinks["dem_refined"],
+        min_size=4,
+        min_depth=0.1,
+        dem_is_refined=True,
+        max_rating_curve_points=12,
+        geotransform=gt,
+        crs="EPSG:32614",
+    )
+    assert len(mt["nodes"]) >= 1
+    assert len(mt["rating_curves"]) >= 2
+    rc_mt = lidar_rs.compute_rating_curves(
+        sinks["sink"],
+        min_size=4,
+        min_depth=0.1,
+        geotransform=gt,
+        crs="EPSG:32614",
+        delineation_method="merge_tree",
+    )
+    assert len(rc_mt) >= 1
+
+    # 4. FSM simulate_inundation_array with merge_tree, Green-Ampt, hazard, recession, hydrograph attenuation
+    sim = lidar_rs.simulate_inundation_array(
+        dem,
+        kernel_size=1,
+        min_size=4,
+        min_depth=0.1,
+        interval=0.2,
+        rain_intensity_cm_h=8.0,
+        rain_duration_h=6.0,
+        time_step_h=2.0,
+        routing="fsm",
+        delineation_method="merge_tree",
+        green_ampt=(0.5, 10.0, 0.3),
+        compute_hazard=True,
+        recession_et_cm_h=0.5,
+        recession_seepage_cm_h=0.5,
+        recession_max_h=24.0,
+        geotransform=gt,
+        crs="EPSG:32614",
+    )
+    assert sim["fsm_hydrograph"] is not None and len(sim["fsm_hydrograph"]) >= 2
+    assert "fsm_hazard_max_depth" in sim and "fsm_recession_drain_time_h" in sim
+    ft = sim["fill_time"]
+    expected_wet = int(np.sum(np.isfinite(ft) & (ft >= 0.0) & (ft <= 6.0)))
+    assert sim["steps"][-1]["inundated_cells"] == expected_wet
+    # Verify Green-Ampt + runoff_coeff_arr scales cumulative runoff in inundation_curve_csv
+    sim_rc = lidar_rs.simulate_inundation_array(
+        dem,
+        kernel_size=1,
+        min_size=4,
+        min_depth=0.1,
+        interval=0.2,
+        rain_intensity_cm_h=8.0,
+        rain_duration_h=6.0,
+        time_step_h=2.0,
+        runoff_coeff_arr=np.full_like(dem, 0.5),
+        routing="fsm",
+        green_ampt=(0.5, 10.0, 0.3),
+        geotransform=gt,
+        crs="EPSG:32614",
+    )
+    last_row = [ln for ln in sim_rc["inundation_curve_csv"].splitlines() if ln.strip()][-1]
+    cum_runoff_mm = float(last_row.split(",")[2])
+    # 8.0 cm/h * 0.5 * 6 h = 24 cm = 240 mm (not 480 mm)
+    assert cum_runoff_mm == pytest.approx(240.0, rel=1e-3)
+    # Verify passing recession_max_h alone enables recession with core defaults
+    sim_rec_only = lidar_rs.simulate_inundation_array(
+        dem,
+        kernel_size=1,
+        min_size=4,
+        min_depth=0.1,
+        interval=0.2,
+        rain_intensity_cm_h=8.0,
+        rain_duration_h=6.0,
+        time_step_h=2.0,
+        routing="fsm",
+        recession_max_h=12.0,
+        geotransform=gt,
+        crs="EPSG:32614",
+    )
+    assert "fsm_recession_drain_time_h" in sim_rec_only
+    att = lidar_rs.attenuate_fsm_hydrograph(
+        sim["fsm_hydrograph"], mean_travel_time_h=1.0, dt_h=0.5, num_reservoirs=2
+    )
+    assert len(att) >= 2
+
+    # 5. Raster output options (compress + cog) + hard-link collision guard + tiled merge-tree
+    import os
+    import shutil
+
+    if os.name != "nt":
+        dem_copy = tmp_path / "dem_copy.tif"
+        shutil.copy2(TEST_DATA / "dem.tif", dem_copy)
+        dem_hardlink = tmp_path / "dem_hardlink.tif"
+        os.link(dem_copy, dem_hardlink)
+        with pytest.raises(ValueError, match="must not overwrite"):
+            lidar_rs.bilateral_filter(dem_copy, out_file=dem_hardlink)
+
+    reproj_cog = tmp_path / "reproj_cog.tif"
+    lidar_rs.reproject_image(
+        TEST_DATA / "dem.tif", reproj_cog, dst_crs="EPSG:4326", compress=True, cog=True
+    )
+    resamp_cog = tmp_path / "resamp_cog.tif"
+    lidar_rs.resample(
+        TEST_DATA / "dem.tif", resamp_cog, resolution=4.0, compress=True, cog=True
+    )
+    assert reproj_cog.exists() and resamp_cog.exists()
+
+    tiled_out = tmp_path / "tiled_mt"
+    td = lidar_rs.delineate_depressions_tiled(
+        TEST_DATA / "dem.tif",
+        tiled_out,
+        tile_size=256,
+        overlap=32,
+        min_size=1000,
+        delineation_method="merge_tree",
+        write_rasters=True,
+        write_gpkg=True,
+        compress=True,
+    )
+    assert len(td["depressions"]) >= 1
+    assert (tiled_out / "depression_id.tif").exists()
+
+    # 6. Point-cloud pit-free CHM, tiled DTM/CHM, SOR/COG flags, and URL validation on remote COPC
+    las_path = tmp_path / "pts.las"
+    px, py_, pz, pcls = [], [], [], []
+    for r in range(16):
+        for c in range(16):
+            px.append(500_000.0 + c)
+            py_.append(4_500_000.0 + r)
+            pz.append(100.0)
+            pcls.append(2)
+            if 4 <= r < 12 and 4 <= c < 12:
+                px.append(500_000.0 + c + 0.2)
+                py_.append(4_500_000.0 + r + 0.2)
+                pz.append(110.0)
+                pcls.append(5)
+    lidar_rs.write_lidar(
+        las_path,
+        np.array(px),
+        np.array(py_),
+        np.array(pz),
+        classification=np.array(pcls, dtype=np.uint8),
+        crs="EPSG:32614",
+    )
+    chm_pf = tmp_path / "chm_pf.tif"
+    dtm_tiled = tmp_path / "dtm_tiled.tif"
+    chm_tiled = tmp_path / "chm_tiled.tif"
+    cw, ch = lidar_rs.lidar_to_chm_pit_free(
+        las_path,
+        chm_pf,
+        resolution=2.0,
+        ground_method="preclassified",
+        height_thresholds=[0.0, 2.0, 5.0],
+        compress=True,
+        cog=True,
+    )
+    dw, dh = lidar_rs.lidar_to_dtm_tiled(
+        las_path,
+        dtm_tiled,
+        tile_size=8.0,
+        overlap=2.0,
+        resolution=2.0,
+        ground_method="preclassified",
+        sor_k=4,
+        sor_sigma=2.5,
+        compress=True,
+        cog=True,
+    )
+    tcw, tch = lidar_rs.lidar_to_chm_tiled(
+        las_path,
+        chm_tiled,
+        tile_size=8.0,
+        overlap=2.0,
+        resolution=2.0,
+        ground_method="preclassified",
+        compress=True,
+    )
+    assert cw > 0 and ch > 0 and chm_pf.exists()
+    assert dw > 0 and dh > 0 and dtm_tiled.exists()
+    assert tcw == dw and tch == dh and chm_tiled.exists()
+
+    with pytest.raises(ValueError, match="https://"):
+        lidar_rs.stream_remote_pointcloud_aoi("http://127.0.0.1/test.copc.laz")

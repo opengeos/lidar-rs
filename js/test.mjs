@@ -441,4 +441,87 @@ for (const [label, args] of [
   );
 }
 
+// 9. v0.6.0 parity: bilateral, feature-preserving smoothing, D-inf, MFD, TWI, HAND, MergeTree, FSM hydrograph & attenuation
+const bilBytes = lidar.bilateralFilter(demBytes, "dem.tif", 1.5, 0.5);
+assert.ok(bilBytes.length > 1000);
+const fpsBytes = lidar.featurePreservingSmoothing(demBytes, "dem.tif", 5, 15.0, 2, null);
+assert.ok(fpsBytes.length > 1000);
+
+const breachedForDeriv = lidar.breachDem(demBytes, "dem.tif", "selective", 2.0, 40, true);
+const dinfDirBytes = lidar.dinfFlowDirection(breachedForDeriv, "breached.tif");
+const dinfAccBytes = lidar.dinfFlowAccumulation(breachedForDeriv, "breached.tif");
+const mfdAccBytes = lidar.mfdFlowAccumulation(breachedForDeriv, "breached.tif", 1.1);
+const twiBytes = lidar.computeTwi(breachedForDeriv, "breached.tif");
+const handBytes = lidar.computeHand(breachedForDeriv, "breached.tif", 100.0);
+for (const [name, buf] of [
+  ["dinfDir", dinfDirBytes],
+  ["dinfAcc", dinfAccBytes],
+  ["mfdAcc", mfdAccBytes],
+  ["twi", twiBytes],
+  ["hand", handBytes],
+]) {
+  assert.ok(buf.length > 1000, `expected non-empty GeoTIFF for ${name}`);
+}
+
+const sinksForMt = lidar.extractSinks(medBytes, "median.tif", 1000);
+const mt = lidar.delineateDepressionsMergeTree(sinksForMt.sinkTif(), "sink.tif", 1000, 0.3, 16);
+assert.ok(mt.maxLevel >= 2, `expected merge-tree maxLevel >= 2, got ${mt.maxLevel}`);
+const mtNodes = JSON.parse(mt.nodesJson());
+assert.ok(Array.isArray(mtNodes) && mtNodes.length >= 2, "expected multiple merge-tree nodes");
+assert.equal(typeof mtNodes[0].id, "number");
+assert.ok(Array.isArray(mtNodes[0].children_ids));
+assert.ok(mt.ratingCurvesCsv().startsWith("dep_id,level,region_id,stage,depth,area,volume"));
+assert.ok(mt.idTif().length > 1000);
+mt.free();
+sinksForMt.free();
+
+const simMtFsm = lidar.simulateInundationAdvanced(
+  demBytes,
+  "dem.tif",
+  3,
+  1000,
+  0.3,
+  0.3,
+  5.0,
+  10.0,
+  2.0,
+  null,
+  1.0,
+  null,
+  "fsm",
+  "merge_tree",
+);
+const hydroJson = simMtFsm.fsmHydrographJson();
+const hydroPts = JSON.parse(hydroJson);
+assert.ok(Array.isArray(hydroPts) && hydroPts.length >= 2, "expected FSM hydrograph points");
+assert.equal(typeof hydroPts[0].time_h, "number");
+assert.equal(typeof hydroPts[0].q_boundary_m3_s, "number");
+assert.ok(simMtFsm.fsmHydrographCsv().startsWith("time_h,"));
+const attJson = lidar.attenuateFsmHydrograph(hydroJson, 1.0, 0.5, 2);
+const attPts = JSON.parse(attJson);
+assert.ok(Array.isArray(attPts) && attPts.length >= 2, "expected attenuated FSM hydrograph points");
+assert.equal(typeof attPts[0].time_h, "number");
+assert.equal(typeof attPts[0].q_boundary_m3_s, "number");
+// Verify attenuation reduces peak discharge and conserves integrated volume on a positive pulse
+const pulse = JSON.stringify([
+  { time_h: 0.0, q_boundary_m3_s: 0.0, total_stored_m3: 0.0, connected_area_fraction: 0.0, spilling_basin_count: 0 },
+  { time_h: 0.5, q_boundary_m3_s: 10.0, total_stored_m3: 0.0, connected_area_fraction: 1.0, spilling_basin_count: 1 },
+  { time_h: 1.0, q_boundary_m3_s: 10.0, total_stored_m3: 0.0, connected_area_fraction: 1.0, spilling_basin_count: 1 },
+  { time_h: 1.5, q_boundary_m3_s: 0.0, total_stored_m3: 0.0, connected_area_fraction: 0.0, spilling_basin_count: 0 },
+]);
+const pulseAtt = JSON.parse(lidar.attenuateFsmHydrograph(pulse, 1.5, 0.25, 2));
+const peakAtt = Math.max(...pulseAtt.map((p) => p.q_boundary_m3_s));
+assert.ok(peakAtt > 0 && peakAtt < 10.0, `expected attenuated peak in (0, 10), got ${peakAtt}`);
+let volIn = 0.0;
+const pulseIn = JSON.parse(pulse);
+for (let i = 1; i < pulseIn.length; i++) {
+  volIn += 0.5 * (pulseIn[i - 1].q_boundary_m3_s + pulseIn[i].q_boundary_m3_s) * (pulseIn[i].time_h - pulseIn[i - 1].time_h) * 3600.0;
+}
+let volOut = 0.0;
+for (let i = 1; i < pulseAtt.length; i++) {
+  volOut += 0.5 * (pulseAtt[i - 1].q_boundary_m3_s + pulseAtt[i].q_boundary_m3_s) * (pulseAtt[i].time_h - pulseAtt[i - 1].time_h) * 3600.0;
+}
+assert.ok(Math.abs(volOut - volIn) / volIn < 0.05, `expected volume conservation within 5%: in=${volIn}, out=${volOut}`);
+simMtFsm.free();
+
 console.log("ALL lidar-wasm WASM TESTS PASSED!");

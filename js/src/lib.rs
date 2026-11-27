@@ -18,16 +18,23 @@ use terrio::{
 use wasm_bindgen::prelude::*;
 
 use lidar::{
-    ANIMATION_BANNER_HEIGHT, AnimateInundationOptions, BreachMode, BreachOptions, HillshadeOptions,
-    InMemoryFullPipelineOptions, InundationForcing, NestedDepression, RoutingMode,
-    SimulateInundationOptions, SinkDepression, SpillFlowPath,
-    animate_inundation_to_bytes_with_spill_paths, breach_depressions as core_breach_depressions,
-    compute_hillshade_rgb, connectivity_graph_to_graphml_string, delineate_catchments_in_memory,
-    delineate_depressions_in_memory, delineate_mounts_in_memory, extract_sink_labels_from_raster,
-    extract_sinks_in_memory, flip_dem as core_flip_dem, fsm_basins_to_csv_string,
+    ANIMATION_BANNER_HEIGHT, AnimateInundationOptions, BreachMode, BreachOptions,
+    DelineationMethod, FeaturePreservingOptions, FsmHydrographPoint, HillshadeOptions,
+    InMemoryFullPipelineOptions, InundationForcing, MergeTreeOptions, NestedDepression,
+    RoutingMode, SimulateInundationOptions, SinkDepression, SpillAttenuationOptions, SpillFlowPath,
+    animate_inundation_to_bytes_with_spill_paths, attenuate_fsm_hydrograph_with_options,
+    bilateral_filter as core_bilateral_filter, breach_depressions as core_breach_depressions,
+    compute_hand_from_threshold, compute_hillshade_rgb, compute_twi as core_compute_twi,
+    connectivity_graph_to_graphml_string, delineate_catchments_in_memory,
+    delineate_depressions_in_memory, delineate_depressions_merge_tree_in_memory,
+    delineate_mounts_in_memory, dinf_flow_accumulation as core_dinf_flow_accumulation,
+    dinf_flow_direction as core_dinf_flow_direction, extract_sink_labels_from_raster,
+    extract_sinks_in_memory, feature_preserving_smoothing as core_feature_preserving_smoothing,
+    flip_dem as core_flip_dem, fsm_basins_to_csv_string, fsm_hydrograph_to_csv_string,
     gaussian_filter as core_gaussian_filter, mean_filter as core_mean_filter,
-    median_filter as core_median_filter, rating_curves_to_csv_string,
-    render_inundation_frame_png_bytes, run_full_pipeline_in_memory, scs_type2_hyetograph,
+    median_filter as core_median_filter, mfd_flow_accumulation as core_mfd_flow_accumulation,
+    rating_curves_to_csv_string, render_inundation_frame_png_bytes, run_full_pipeline_in_memory,
+    scs_type2_hyetograph,
 };
 
 /// Upper bound on total pixels (`frames * width * height`) encoded in a single synchronous
@@ -532,6 +539,110 @@ pub fn gaussian_filter(bytes: &[u8], filename: &str, sigma: f64) -> Result<Vec<u
     write_array2d_tif(&out, "gaussian.tif")
 }
 
+/// Applies an edge-preserving 2D bilateral filter to a DEM GeoTIFF byte buffer.
+#[wasm_bindgen(js_name = bilateralFilter)]
+pub fn bilateral_filter(
+    bytes: &[u8],
+    filename: &str,
+    spatial_sigma: f64,
+    range_sigma: f64,
+) -> Result<Vec<u8>, JsValue> {
+    let dem = read_array2d_f64(bytes, filename)?;
+    let out = core_bilateral_filter(&dem, spatial_sigma, range_sigma).map_err(to_js_err)?;
+    write_array2d_tif(&out, "bilateral.tif")
+}
+
+/// Applies Lindsay et al. (2019) feature-preserving DEM smoothing to a GeoTIFF byte buffer.
+#[wasm_bindgen(js_name = featurePreservingSmoothing)]
+pub fn feature_preserving_smoothing(
+    bytes: &[u8],
+    filename: &str,
+    filter_size: usize,
+    norm_diff: f64,
+    num_iter: usize,
+    max_z_change: Option<f64>,
+) -> Result<Vec<u8>, JsValue> {
+    let dem = read_array2d_f64(bytes, filename)?;
+    let opts = FeaturePreservingOptions {
+        filter_size,
+        norm_diff_deg: norm_diff,
+        num_iter,
+        max_z_change,
+        ..Default::default()
+    };
+    let out = core_feature_preserving_smoothing(&dem, &opts).map_err(to_js_err)?;
+    write_array2d_tif(&out, "fps.tif")
+}
+
+/// Computes Tarboton (1997) D-infinity flow direction (radians in `[0, 2*pi)`).
+#[wasm_bindgen(js_name = dinfFlowDirection)]
+pub fn dinf_flow_direction(bytes: &[u8], filename: &str) -> Result<Vec<u8>, JsValue> {
+    let dem = read_array2d_f64(bytes, filename)?;
+    let out = core_dinf_flow_direction(&dem).map_err(to_js_err)?;
+    write_array2d_tif(&out, "dinf_dir.tif")
+}
+
+/// Computes Tarboton (1997) D-infinity flow accumulation (contributing area in cells).
+#[wasm_bindgen(js_name = dinfFlowAccumulation)]
+pub fn dinf_flow_accumulation(bytes: &[u8], filename: &str) -> Result<Vec<u8>, JsValue> {
+    let dem = read_array2d_f64(bytes, filename)?;
+    let out = core_dinf_flow_accumulation(&dem).map_err(to_js_err)?;
+    write_array2d_tif(&out, "dinf_acc.tif")
+}
+
+/// Computes Multiple Flow Direction (MFD; Quinn 1991 / Freeman 1991) flow accumulation.
+#[wasm_bindgen(js_name = mfdFlowAccumulation)]
+pub fn mfd_flow_accumulation(
+    bytes: &[u8],
+    filename: &str,
+    exponent: f64,
+) -> Result<Vec<u8>, JsValue> {
+    let dem = read_array2d_f64(bytes, filename)?;
+    let out = core_mfd_flow_accumulation(&dem, exponent).map_err(to_js_err)?;
+    write_array2d_tif(&out, "mfd_acc.tif")
+}
+
+/// Computes the Topographic Wetness Index (`TWI = ln(a / tan(beta))`) from a DEM GeoTIFF buffer.
+#[wasm_bindgen(js_name = computeTwi)]
+pub fn compute_twi(bytes: &[u8], filename: &str) -> Result<Vec<u8>, JsValue> {
+    let dem = read_array2d_f64(bytes, filename)?;
+    let out = core_compute_twi(&dem, None).map_err(to_js_err)?;
+    write_array2d_tif(&out, "twi.tif")
+}
+
+/// Computes Height Above Nearest Drainage (HAND) using a D-infinity flow-accumulation threshold.
+#[wasm_bindgen(js_name = computeHand)]
+pub fn compute_hand(
+    bytes: &[u8],
+    filename: &str,
+    acc_threshold_cells: f64,
+) -> Result<Vec<u8>, JsValue> {
+    let dem = read_array2d_f64(bytes, filename)?;
+    let out = compute_hand_from_threshold(&dem, acc_threshold_cells).map_err(to_js_err)?;
+    write_array2d_tif(&out, "hand.tif")
+}
+
+/// Applies volume-conserving Nash linear-reservoir travel-time attenuation to a JSON-serialized
+/// FSM outlet hydrograph (`FsmHydrographPoint[]`), returning the attenuated hydrograph as JSON.
+#[wasm_bindgen(js_name = attenuateFsmHydrograph)]
+pub fn attenuate_fsm_hydrograph(
+    hydrograph_json: &str,
+    mean_travel_time_h: f64,
+    dt_h: f64,
+    num_reservoirs: usize,
+) -> Result<String, JsValue> {
+    let points: Vec<FsmHydrographPoint> =
+        serde_json::from_str(hydrograph_json).map_err(to_js_err)?;
+    let opts = SpillAttenuationOptions {
+        mean_travel_time_h,
+        dt_h,
+        num_reservoirs,
+        tail_duration_h: None,
+    };
+    let attenuated = attenuate_fsm_hydrograph_with_options(&points, &opts).map_err(to_js_err)?;
+    serde_json::to_string(&attenuated).map_err(to_js_err)
+}
+
 /// Flips a DEM upside-down (`-dem + max + delta`) and returns GeoTIFF bytes.
 #[wasm_bindgen(js_name = flipDem)]
 pub fn flip_dem(bytes: &[u8], filename: &str, delta: f64) -> Result<Vec<u8>, JsValue> {
@@ -812,6 +923,144 @@ fn marshal_depressions(
     })
 }
 
+/// Output container returned by [`delineate_depressions_merge_tree`].
+#[wasm_bindgen]
+pub struct MergeTreeOutput {
+    width: usize,
+    height: usize,
+    projection: String,
+    max_level: u32,
+    num_regions: usize,
+    depressions_json: String,
+    nodes_json: String,
+    rating_curves_json: String,
+    rating_curves_csv: String,
+    depression_id: Array2D<i32>,
+    id_tif: Vec<u8>,
+    level_tif: Vec<u8>,
+    geojson: String,
+    level_rgba: Vec<u8>,
+}
+
+#[wasm_bindgen]
+impl MergeTreeOutput {
+    #[wasm_bindgen(getter)]
+    pub fn width(&self) -> usize {
+        self.width
+    }
+    #[wasm_bindgen(getter)]
+    pub fn height(&self) -> usize {
+        self.height
+    }
+    #[wasm_bindgen(getter)]
+    pub fn projection(&self) -> String {
+        self.projection.clone()
+    }
+    #[wasm_bindgen(js_name = boundsWgs84)]
+    pub fn bounds_wgs84(&self) -> Option<Vec<f64>> {
+        compute_wgs84_bounds(
+            self.width,
+            self.height,
+            &self.depression_id.geotransform,
+            &self.projection,
+        )
+    }
+    #[wasm_bindgen(getter, js_name = maxLevel)]
+    pub fn max_level(&self) -> u32 {
+        self.max_level
+    }
+    #[wasm_bindgen(getter, js_name = numRegions)]
+    pub fn num_regions(&self) -> usize {
+        self.num_regions
+    }
+    #[wasm_bindgen(js_name = depressionsJson)]
+    pub fn depressions_json(&self) -> String {
+        self.depressions_json.clone()
+    }
+    #[wasm_bindgen(js_name = nodesJson)]
+    pub fn nodes_json(&self) -> String {
+        self.nodes_json.clone()
+    }
+    #[wasm_bindgen(js_name = ratingCurvesJson)]
+    pub fn rating_curves_json(&self) -> String {
+        self.rating_curves_json.clone()
+    }
+    #[wasm_bindgen(js_name = ratingCurvesCsv)]
+    pub fn rating_curves_csv(&self) -> String {
+        self.rating_curves_csv.clone()
+    }
+    #[wasm_bindgen(js_name = depressionIdValues)]
+    pub fn depression_id_values(&self) -> Vec<i32> {
+        self.depression_id.data().to_vec()
+    }
+    #[wasm_bindgen(js_name = idTif)]
+    pub fn id_tif(&self) -> Vec<u8> {
+        self.id_tif.clone()
+    }
+    #[wasm_bindgen(js_name = levelTif)]
+    pub fn level_tif(&self) -> Vec<u8> {
+        self.level_tif.clone()
+    }
+    pub fn geojson(&self) -> String {
+        self.geojson.clone()
+    }
+    #[wasm_bindgen(js_name = levelRgba)]
+    pub fn level_rgba(&self) -> Vec<u8> {
+        self.level_rgba.clone()
+    }
+}
+
+/// Delineates the exact bottom-up Union-Find merge-tree nested depression hierarchy and
+/// interval-free rating curves from a sink GeoTIFF buffer.
+#[wasm_bindgen(js_name = delineateDepressionsMergeTree)]
+pub fn delineate_depressions_merge_tree(
+    sink_bytes: &[u8],
+    filename: &str,
+    min_size: usize,
+    min_depth: f64,
+    max_rating_curve_points: Option<usize>,
+) -> Result<MergeTreeOutput, JsValue> {
+    let sink = read_array2d_f64(sink_bytes, filename)?;
+    let opts = MergeTreeOptions {
+        min_size,
+        min_depth,
+        topology: Topology::D8,
+        dem_is_refined: false,
+        max_rating_curve_points,
+    };
+    let mt = delineate_depressions_merge_tree_in_memory(&sink, &opts).map_err(to_js_err)?;
+    let depressions_json = serde_json::to_string(&mt.depressions.depressions).map_err(to_js_err)?;
+    let nodes_json = serde_json::to_string(&mt.nodes).map_err(to_js_err)?;
+    let rating_curves_json = serde_json::to_string(&mt.rating_curves).map_err(to_js_err)?;
+    let rating_curves_csv = rating_curves_to_csv_string(&mt.rating_curves);
+    let id_tif = write_array2d_tif(&mt.depressions.depression_id, "depression_id.tif")?;
+    let level_tif = write_array2d_tif(&mt.depressions.depression_level, "depression_level.tif")?;
+    let geojson = polygonize_depressions_to_geojson(
+        &mt.depressions.depression_id,
+        &mt.depressions.depressions,
+    )?;
+    let level_rgba = colorize_i32_rgba(&mt.depressions.depression_level);
+    let width = mt.depressions.depression_id.width();
+    let height = mt.depressions.depression_id.height();
+    let projection = mt.depressions.depression_id.projection.clone();
+    Ok(MergeTreeOutput {
+        width,
+        height,
+        projection,
+        max_level: mt.depressions.max_level,
+        num_regions: mt.depressions.num_regions as usize,
+        depressions_json,
+        nodes_json,
+        rating_curves_json,
+        rating_curves_csv,
+        depression_id: mt.depressions.depression_id,
+        id_tif,
+        level_tif,
+        geojson,
+        level_rgba,
+    })
+}
+
 /// Delineates the nested depression hierarchy (Wu et al. 2019) from a sink GeoTIFF buffer.
 #[wasm_bindgen(js_name = delineateDepressions)]
 pub fn delineate_depressions(
@@ -1006,6 +1255,8 @@ pub struct InundationOutput {
     fsm_mass_balance_json: String,
     fsm_basins_json: String,
     fsm_basins_csv: String,
+    fsm_hydrograph_json: String,
+    fsm_hydrograph_csv: String,
 }
 
 #[wasm_bindgen]
@@ -1173,6 +1424,16 @@ impl InundationOutput {
     pub fn fsm_basins_csv(&self) -> String {
         self.fsm_basins_csv.clone()
     }
+    /// Dynamic Fill-Spill-Merge outlet hydrograph as JSON (`"[]"` in static mode).
+    #[wasm_bindgen(js_name = fsmHydrographJson)]
+    pub fn fsm_hydrograph_json(&self) -> String {
+        self.fsm_hydrograph_json.clone()
+    }
+    /// Dynamic Fill-Spill-Merge outlet hydrograph formatted as CSV (empty string in static mode).
+    #[wasm_bindgen(js_name = fsmHydrographCsv)]
+    pub fn fsm_hydrograph_csv(&self) -> String {
+        self.fsm_hydrograph_csv.clone()
+    }
     /// Renders a single inundation time step (`0`-based, or `0` = dry, `1..=numSteps`) as PNG bytes
     /// with optional scale bar, legend, and active spill flow paths.
     #[wasm_bindgen(js_name = renderFramePng)]
@@ -1336,13 +1597,14 @@ pub fn simulate_inundation(
         1.0,
         None,
         None,
+        None,
     )
 }
 
 /// Runs the full in-memory hydrology & inundation pipeline with optional selective breaching
 /// (`breach_max_depth`), effective runoff coefficient (`runoff_coeff` in `(0, 1]`), optional
-/// SCS Type II design storm depth (`scs_type2_mm`), and optional routing mode
-/// (`"static"` default, or `"fsm"` for dynamic Fill-Spill-Merge cascade mass-balance routing).
+/// SCS Type II design storm depth (`scs_type2_mm`), optional routing mode (`"static"` or `"fsm"`),
+/// and optional delineation method (`"level_set"` default or `"merge_tree"`).
 #[wasm_bindgen(js_name = simulateInundationAdvanced)]
 #[allow(clippy::too_many_arguments)]
 pub fn simulate_inundation_advanced(
@@ -1359,6 +1621,7 @@ pub fn simulate_inundation_advanced(
     runoff_coeff: f64,
     scs_type2_mm: Option<f64>,
     routing: Option<String>,
+    delineation_method: Option<String>,
 ) -> Result<InundationOutput, JsValue> {
     if !runoff_coeff.is_finite() || runoff_coeff <= 0.0 || runoff_coeff > 1.0 {
         return Err(to_js_err(format!(
@@ -1368,6 +1631,18 @@ pub fn simulate_inundation_advanced(
     let routing_mode: RoutingMode = match routing.as_deref() {
         Some(r) if !r.trim().is_empty() => r.parse().map_err(to_js_err)?,
         _ => RoutingMode::Static,
+    };
+    let delin_method: DelineationMethod = match delineation_method.as_deref() {
+        Some(m) if !m.trim().is_empty() => match m.trim().to_ascii_lowercase().as_str() {
+            "level_set" | "level-set" | "levelset" => DelineationMethod::LevelSet,
+            "merge_tree" | "merge-tree" | "mergetree" => DelineationMethod::MergeTree,
+            other => {
+                return Err(to_js_err(format!(
+                    "invalid delineation_method '{other}'; expected 'level_set' or 'merge_tree'"
+                )));
+            }
+        },
+        _ => DelineationMethod::LevelSet,
     };
     let raw_dem = read_array2d_f64(dem_bytes, filename)?;
     let breach = match breach_max_depth {
@@ -1426,6 +1701,7 @@ pub fn simulate_inundation_advanced(
     let opts = InMemoryFullPipelineOptions {
         kernel_size,
         breach,
+        delineation_method: delin_method,
         simulation: SimulateInundationOptions {
             min_size,
             min_depth,
@@ -1463,6 +1739,15 @@ pub fn simulate_inundation_advanced(
         .fsm_basins
         .as_deref()
         .map(fsm_basins_to_csv_string)
+        .unwrap_or_default();
+    let fsm_hydrograph_json = match pipe.fsm_hydrograph.as_ref() {
+        Some(h) => serde_json::to_string(h).map_err(to_js_err)?,
+        None => "[]".to_string(),
+    };
+    let fsm_hydrograph_csv = pipe
+        .fsm_hydrograph
+        .as_deref()
+        .map(fsm_hydrograph_to_csv_string)
         .unwrap_or_default();
 
     let hillshade_rgb =
@@ -1514,5 +1799,7 @@ pub fn simulate_inundation_advanced(
         fsm_mass_balance_json,
         fsm_basins_json,
         fsm_basins_csv,
+        fsm_hydrograph_json,
+        fsm_hydrograph_csv,
     })
 }

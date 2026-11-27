@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Protocol, TypedDict
+from typing import Any, NotRequired, Protocol, TypedDict
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -356,6 +356,61 @@ class FsmBasinSummary(TypedDict):
     infiltrated_volume_m3: float
 
 
+class FsmHydrographPoint(TypedDict):
+    """Single point on a Fill-Spill-Merge watershed outlet hydrograph."""
+
+    time_h: float
+    q_boundary_m3_s: float
+    total_stored_m3: float
+    connected_area_fraction: float
+    spilling_basin_count: int
+
+
+class RecessionCurvePoint(TypedDict):
+    """Single point on a post-storm pond recession curve."""
+
+    time_h: float
+    stored_vol_m3: float
+    inundated_area_m2: float
+    wet_basin_count: int
+
+
+class MergeTreeNode(TypedDict):
+    """Exact bottom-up merge-tree depression node."""
+
+    id: int
+    parent_id: int
+    children_ids: list[int]
+    level: int
+    region_id: int
+    min_elev: float
+    saddle_elev: float
+    pour_point_row: int
+    pour_point_col: int
+    pour_point_x: float
+    pour_point_y: float
+    count: int
+    area: float
+    volume: float
+    max_depth: float
+    avg_depth: float
+    is_leaf: bool
+
+
+class MergeTreeResult(TypedDict):
+    """In-memory output of `delineate_depressions_merge_tree`."""
+
+    depression_id: NDArray[np.int32]
+    depression_level: NDArray[np.int32]
+    max_level: int
+    num_regions: int
+    depressions: list[DepressionRecord]
+    nodes: list[MergeTreeNode]
+    rating_curves: list[RatingCurvePoint]
+    geotransform: Geotransform
+    crs: str | None
+
+
 class InundationResult(TypedDict):
     """Output paths and time steps produced by file-based `simulate_inundation`."""
 
@@ -385,6 +440,14 @@ class InundationArrayResult(TypedDict):
     graph_edge_count: int
     fsm_mass_balance: FsmMassBalance | None
     fsm_basins: list[FsmBasinSummary] | None
+    fsm_hydrograph: list[FsmHydrographPoint] | None
+    fsm_hazard_max_depth: NotRequired[NDArray[np.float64]]
+    fsm_hazard_wse: NotRequired[NDArray[np.float64]]
+    fsm_hazard_duration_h: NotRequired[NDArray[np.float64]]
+    fsm_recession_drain_time_h: NotRequired[NDArray[np.float64]]
+    fsm_recession_remaining_m3: NotRequired[float]
+    fsm_recession_drained_m3: NotRequired[float]
+    fsm_recession_curve: NotRequired[list[RecessionCurvePoint]]
     geotransform: Geotransform
     crs: str | None
 
@@ -537,6 +600,7 @@ __all__ = [
     "FederalDataResult",
     "FlowPathRecord",
     "FsmBasinSummary",
+    "FsmHydrographPoint",
     "FsmMassBalance",
     "Geotransform",
     "GraphEdge",
@@ -546,12 +610,15 @@ __all__ = [
     "InundationResult",
     "InundationStepRecord",
     "InundationStepSummaryRecord",
+    "MergeTreeNode",
+    "MergeTreeResult",
     "NoaaAtlas14Table",
     "PathLikeStr",
     "PipelineResult",
     "PointCloudDict",
     "RatingCurve",
     "RatingCurvePoint",
+    "RecessionCurvePoint",
     "SinkDepressionRecord",
     "SpatialArrayLike",
     "SpillFlowPathRecord",

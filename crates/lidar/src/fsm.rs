@@ -1021,33 +1021,6 @@ pub fn simulate_fill_spill_merge_with_green_ampt_in_memory_with_control(
     )
 }
 
-/// Internal variant of [`simulate_fill_spill_merge_in_memory`] reusing precomputed
-/// resolved D8 flow directions (`d8_flow_directions_resolved`) across pipeline stages.
-pub(crate) fn simulate_fill_spill_merge_with_flowdirs_and_control(
-    dem_refined: &Array2D<f64>,
-    sink: &Array2D<f64>,
-    depressions: &InMemoryDepressions,
-    options: &SimulateInundationOptions,
-    forcing: &InundationForcing<'_>,
-    flowdirs: &Array2D<D8Flowdir>,
-    control: &ExecutionControl,
-) -> Result<FsmSimulationResult> {
-    let fsm_forcing = FsmForcing {
-        base: forcing.clone(),
-        green_ampt: None,
-        green_ampt_substep_h: None,
-    };
-    simulate_fill_spill_merge_with_forcing_and_flowdirs_and_control(
-        dem_refined,
-        sink,
-        depressions,
-        options,
-        &fsm_forcing,
-        flowdirs,
-        control,
-    )
-}
-
 /// Internal variant accepting full [`FsmForcing`], precomputed resolved D8 flow directions,
 /// and [`ExecutionControl`].
 pub(crate) fn simulate_fill_spill_merge_with_forcing_and_flowdirs_and_control(
