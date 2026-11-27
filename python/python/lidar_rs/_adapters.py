@@ -450,6 +450,7 @@ def connectivity_to_networkx(
         g.add_node(node_id, **attrs)
 
     existing_edges: dict[tuple[Any, Any], dict[str, Any]] = {}
+    multi_key_counts: dict[tuple[Any, Any, str], int] = {}
     for edge in graph.get("edges", []):
         u = edge["from_id"]
         v = edge["to_id"]
@@ -461,7 +462,11 @@ def connectivity_to_networkx(
         if multi:
             edge_key = attrs.get("edge_type")
             if edge_key is not None:
-                g.add_edge(u, v, key=edge_key, **attrs)
+                key_str = str(edge_key)
+                count = multi_key_counts.get((u, v, key_str), 0) + 1
+                multi_key_counts[(u, v, key_str)] = count
+                unique_key = key_str if count == 1 else f"{key_str}#{count}"
+                g.add_edge(u, v, key=unique_key, **attrs)
             else:
                 g.add_edge(u, v, **attrs)
             continue
@@ -493,12 +498,15 @@ def connectivity_to_networkx(
                 prev_types.append(new_type)
 
             # Merge non-None attributes without clobbering existing non-None values;
-            # store prefixed copies for the incoming edge so neither edge loses data.
+            # store prefixed copies for the first incoming edge of each type so neither
+            # distinct-type nor same-type parallel edges overwrite earlier attributes.
             for k, val in attrs.items():
                 if k in ("edge_type", "edge_types", "parallel_edges"):
                     continue
                 if val is not None:
-                    prev[f"{new_type}_{k}"] = val
+                    prefixed = f"{new_type}_{k}"
+                    if prefixed not in prev:
+                        prev[prefixed] = val
                     if prev.get(k) is None or (k == "merge_time_h" and new_type == "merge"):
                         prev[k] = val
 

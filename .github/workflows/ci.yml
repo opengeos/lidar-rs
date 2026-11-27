@@ -90,17 +90,23 @@ jobs:
           import pathlib, networkx as nx, xarray as xr, geopandas as gpd, rasterio, lidar_rs
           dem_path = pathlib.Path("../test_data/dem.tif")
           with rasterio.open(dem_path) as src:
-              sinks = lidar_rs.extract_sinks(src, min_size=1000)
-          deps = lidar_rs.delineate_depressions(sinks["sink"], min_size=1000, min_depth=0.3, interval=0.3)
+              sinks = lidar_rs.extract_sinks_array(src, min_size=1000)
+              sim = lidar_rs.simulate_inundation_array(
+                  src, kernel_size=3, min_size=1000, min_depth=0.3, interval=0.3,
+                  rain_intensity_cm_h=5.0, rain_duration_h=10.0, time_step_h=2.0,
+              )
+          deps = lidar_rs.delineate_depressions_array(
+              sinks["sink"], min_size=1000, min_depth=0.3, interval=0.3,
+              geotransform=sinks["geotransform"], crs=sinks["crs"],
+          )
           gdf = lidar_rs.depressions_to_geodataframe(deps)
           assert isinstance(gdf, gpd.GeoDataFrame) and len(gdf) == len(deps["depressions"])
           da = lidar_rs.array_to_xarray(sinks["depth"], sinks["geotransform"], crs=sinks["crs"], name="depth")
           assert isinstance(da, xr.DataArray) and da.shape == sinks["depth"].shape
-          pipe = lidar_rs.run_full_pipeline_in_memory(dem_path, min_size=1000, min_depth=0.3, interval=0.3)
-          g_di = lidar_rs.connectivity_to_networkx(pipe["connectivity_graph"])
-          assert isinstance(g_di, nx.DiGraph) and g_di.number_of_nodes() == len(pipe["connectivity_graph"]["nodes"])
-          g_multi = lidar_rs.connectivity_to_networkx(pipe["connectivity_graph"], multi=True)
-          assert isinstance(g_multi, nx.MultiDiGraph)
+          g_di = lidar_rs.connectivity_to_networkx(sim["connectivity_graph"])
+          assert isinstance(g_di, nx.DiGraph) and g_di.number_of_nodes() == len(sim["connectivity_graph"]["nodes"])
+          g_multi = lidar_rs.connectivity_to_networkx(sim["connectivity_graph"], multi=True)
+          assert isinstance(g_multi, nx.MultiDiGraph) and g_multi.number_of_edges() == len(sim["connectivity_graph"]["edges"])
           print("Real optional spatial adapters verified:", len(gdf), g_di.number_of_nodes(), g_multi.number_of_edges())
           '
 

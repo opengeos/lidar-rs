@@ -444,6 +444,40 @@ def test_output_adapters_import_errors_and_conversion(monkeypatch: pytest.Monkey
         assert g_multi.edges[(1, 2, "spill")]["length_m"] == 12.5
         assert g_multi.edges[(1, 2, "merge")]["merge_time_h"] == 4.5
 
+        # Multiple same-type ("spill" + "spill") edges between the same (u, v) pair
+        # must keep distinct keys in MultiDiGraph and preserve first spill_* in DiGraph.
+        dup_spill_graph = {
+            "rain_intensity_cm_h": 5.0,
+            "nodes": parallel_graph["nodes"],
+            "edges": [
+                parallel_graph["edges"][0],
+                {
+                    "from_id": 1,
+                    "to_id": 2,
+                    "edge_type": "spill",
+                    "spill_time_h": 2.0,
+                    "spill_runoff_mm": 100.0,
+                    "merge_time_h": 4.0,
+                    "spill_elev": 2.2,
+                    "length_m": 25.0,
+                    "start_xy": [10.0, 21.0],
+                    "end_xy": [35.0, 21.0],
+                    "dist_to_stream": 5.0,
+                },
+            ],
+        }
+        g_dup_di = lidar_rs.connectivity_to_networkx(dup_spill_graph)
+        dup_edge = g_dup_di.edges[(1, 2)]
+        assert dup_edge["spill_length_m"] == 12.5
+        assert len(dup_edge["parallel_edges"]) == 2
+        assert dup_edge["parallel_edges"][1]["length_m"] == 25.0
+
+        g_dup_multi = lidar_rs.connectivity_to_networkx(dup_spill_graph, multi=True)
+        assert (1, 2, "spill") in g_dup_multi.edges
+        assert (1, 2, "spill#2") in g_dup_multi.edges
+        assert g_dup_multi.edges[(1, 2, "spill")]["length_m"] == 12.5
+        assert g_dup_multi.edges[(1, 2, "spill#2")]["length_m"] == 25.0
+
     # 2. depressions_to_geodataframe
     class _StubPolygon:
         def __init__(self, coords: list[tuple[float, float]] | None = None) -> None:
