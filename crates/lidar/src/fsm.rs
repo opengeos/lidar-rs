@@ -3339,7 +3339,7 @@ pub fn compute_fsm_hazard_rasters(
         elevs.sort_by(f64::total_cmp);
         let k = elevs.len();
         pref_v.clear();
-        pref_v.reserve(k.saturating_sub(pref_v.capacity()));
+        pref_v.reserve(k);
         let mut sum_z_above_min = 0.0f64;
         if k > 0 {
             let z0 = elevs[0];
@@ -5173,7 +5173,7 @@ mod tests {
 
         // 1. Non-draining path (`!use_history_duration`): merged compound basin retains peak WSE
         //    and exact `storm_duration_h - fill_time` duration without retaining subtree tables.
-        let opts_nodrain = SimulateInundationOptions {
+        let opts = SimulateInundationOptions {
             min_size: 10,
             min_depth: 0.3,
             interval: 0.3,
@@ -5186,7 +5186,7 @@ mod tests {
             &dem_refined,
             &sink,
             &deps,
-            &opts_nodrain,
+            &opts,
             &InundationForcing::default(),
         )
         .unwrap();
@@ -5198,16 +5198,15 @@ mod tests {
             &res_nodrain.fill_time,
             &deps,
             &res_nodrain,
-            opts_nodrain.rain_duration_h,
+            opts.rain_duration_h,
         )
         .unwrap();
         let mut wet_cells_nodrain = 0usize;
         for idx in 0..(dem_refined.width() * dem_refined.height()) {
             let ft = res_nodrain.fill_time.get_i(idx);
-            if ft.is_finite() && ft >= 0.0 && ft <= opts_nodrain.rain_duration_h + 1e-9 {
+            if ft.is_finite() && ft >= 0.0 && ft <= opts.rain_duration_h + 1e-9 {
                 wet_cells_nodrain += 1;
-                let expected_dur =
-                    (opts_nodrain.rain_duration_h - ft).clamp(0.0, opts_nodrain.rain_duration_h);
+                let expected_dur = (opts.rain_duration_h - ft).clamp(0.0, opts.rain_duration_h);
                 assert!(
                     (haz_nodrain.duration_h.get_i(idx) - expected_dur).abs() < 1e-9,
                     "non-draining duration mismatch at cell {idx}"
@@ -5234,32 +5233,28 @@ mod tests {
             infiltration_cm_h: Some(&infil),
             ..Default::default()
         };
-        let res_drain = simulate_fill_spill_merge_in_memory(
-            &dem_refined,
-            &sink,
-            &deps,
-            &opts_nodrain,
-            &forcing_drain,
-        )
-        .unwrap();
+        let res_drain =
+            simulate_fill_spill_merge_in_memory(&dem_refined, &sink, &deps, &opts, &forcing_drain)
+                .unwrap();
         assert!(res_drain.basin_had_draining);
+        assert!(res_drain.num_merge_events >= 1);
 
         let haz_drain = compute_fsm_hazard_rasters(
             &dem_refined,
             &res_drain.fill_time,
             &deps,
             &res_drain,
-            opts_nodrain.rain_duration_h,
+            opts.rain_duration_h,
         )
         .unwrap();
         let mut shorter_dur_cells = 0usize;
         for idx in 0..(dem_refined.width() * dem_refined.height()) {
             let ft = res_drain.fill_time.get_i(idx);
-            if ft.is_finite() && ft >= 0.0 && ft <= opts_nodrain.rain_duration_h + 1e-9 {
+            if ft.is_finite() && ft >= 0.0 && ft <= opts.rain_duration_h + 1e-9 {
                 let d = haz_drain.duration_h.get_i(idx);
-                assert!((0.0..=opts_nodrain.rain_duration_h + 1e-9).contains(&d));
+                assert!((0.0..=opts.rain_duration_h + 1e-9).contains(&d));
                 assert!(haz_drain.max_depth.get_i(idx) >= 0.0);
-                if d + 1e-3 < opts_nodrain.rain_duration_h - ft {
+                if d + 1e-3 < opts.rain_duration_h - ft {
                     shorter_dur_cells += 1;
                 }
             }
@@ -5267,6 +5262,48 @@ mod tests {
         assert!(
             shorter_dur_cells > 0,
             "draining path must produce shorter inundation durations than storm_duration - fill_time"
+        );
+
+        // Pin exact merged-chain duration for the global-minimum cell of the compound region:
+        // its storage threshold is 0 in both its leaf basin and its enclosing merged parent, so
+        // its duration must equal the sum of leaf + parent history durations.
+        let parent_dep = deps.depressions.iter().find(|d| d.level > 1).unwrap();
+        let parent_fidx = res_drain
+            .basins
+            .iter()
+            .position(|b| b.dep_id == parent_dep.id)
+            .unwrap();
+        let (min_idx, _) = (0..(dem_refined.width() * dem_refined.height()))
+            .filter(|&i| deps.depression_id.get_i(i) > 0)
+            .map(|i| (i, dem_refined.get_i(i)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap();
+        let leaf_id = deps.depression_id.get_i(min_idx) as u32;
+        assert_ne!(leaf_id, parent_dep.id);
+        let leaf_fidx = res_drain
+            .basins
+            .iter()
+            .position(|b| b.dep_id == leaf_id)
+            .unwrap();
+        assert!(res_drain.basins[leaf_fidx].merge_time_h.is_some());
+        let leaf_dur = wet_duration_from_history(
+            &res_drain.basin_vol_history[leaf_fidx],
+            0.0,
+            opts.rain_duration_h,
+        );
+        let parent_dur = wet_duration_from_history(
+            &res_drain.basin_vol_history[parent_fidx],
+            0.0,
+            opts.rain_duration_h,
+        );
+        assert!(leaf_dur > 0.0 && parent_dur > 0.0);
+        let expected_merged_dur = (leaf_dur + parent_dur).clamp(0.0, opts.rain_duration_h);
+        assert!(
+            (haz_drain.duration_h.get_i(min_idx) - expected_merged_dur).abs() < 1e-9,
+            "merged leaf-floor duration ({}) must equal leaf ({}) + parent ({}) history sum",
+            haz_drain.duration_h.get_i(min_idx),
+            leaf_dur,
+            parent_dur
         );
     }
 }
