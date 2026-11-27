@@ -755,10 +755,10 @@ struct LidarToChmArgs {
     #[arg(long, conflicts_with = "tiled")]
     pit_free: bool,
     /// Comma-separated height-above-ground thresholds for --pit-free (default "0,2,5,10,15")
-    #[arg(long)]
+    #[arg(long, requires = "pit_free")]
     height_thresholds: Option<String>,
     /// Maximum 2D TIN triangle edge length for --pit-free partial canopy surfaces (default 3 * resolution)
-    #[arg(long)]
+    #[arg(long, requires = "pit_free")]
     max_triangle_edge: Option<f64>,
     /// Compress output GeoTIFF with DEFLATE
     #[arg(short = 'c', long)]
@@ -3493,6 +3493,18 @@ fn dispatch(
                 println!("  inundation curve: {}", res.inundation_csv.display());
                 if let Some(ref p) = res.fsm_basins_csv {
                     println!("  FSM basins CSV:   {}", p.display());
+                }
+                if let Some((ref md, ref wse, ref dur)) = hazard_paths {
+                    println!("  FSM max depth:    {}", md.display());
+                    println!("  FSM WSE:          {}", wse.display());
+                    println!("  FSM duration:     {}", dur.display());
+                }
+                if let Some((ref dt, ref rc)) = recession_paths {
+                    println!("  FSM drain time:   {}", dt.display());
+                    println!("  FSM recession:    {}", rc.display());
+                }
+                if let Some(ref att) = attenuated_csv {
+                    println!("  FSM attenuated:   {}", att.display());
                 }
                 if let Some(ref mb) = res.fsm_mass_balance {
                     println!(

@@ -994,53 +994,105 @@ fn run_child(
 }
 
 fn read_stderr_with_progress(
-    r: impl Read + Send + 'static,
+    mut r: impl Read + Send + 'static,
     token: Value,
     send: Sender<String>,
 ) -> std::io::Result<JoinHandle<BoundedOutput>> {
     std::thread::Builder::new().spawn(move || {
-        let mut reader = std::io::BufReader::new(r);
+        // Bound per-line buffering so a child writing a huge newline-free stderr stream
+        // cannot grow memory without limit (matching `read_bounded`).
+        const MAX_LINE_BYTES: usize = 16 * 1024;
         let (mut kept, mut total) = (Vec::new(), 0usize);
+        let mut buf = [0u8; 8192];
         let mut line = Vec::new();
+        let mut line_overflowed = false;
+
+        let flush_line =
+            |line: &mut Vec<u8>, overflowed: &mut bool, kept: &mut Vec<u8>, total: &mut usize| {
+                if !*overflowed
+                    && let Ok(s) = std::str::from_utf8(line)
+                    && let Some(payload) = s
+                        .trim_end_matches(['\r', '\n'])
+                        .strip_prefix(MCP_PROGRESS_PREFIX)
+                    && let Ok(ev) = serde_json::from_str::<Value>(payload)
+                {
+                    let frac = ev
+                        .get("fraction")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0)
+                        .clamp(0.0, 1.0);
+                    let mut params = serde_json::Map::new();
+                    params.insert("progressToken".into(), token.clone());
+                    params.insert("progress".into(), json!(frac));
+                    params.insert("total".into(), json!(1.0));
+                    if let Some(msg) = ev.get("message").and_then(Value::as_str) {
+                        params.insert("message".into(), Value::String(msg.to_string()));
+                    } else if let Some(stage) = ev.get("stage").and_then(Value::as_str) {
+                        params.insert("message".into(), Value::String(stage.to_string()));
+                    }
+                    let notif = json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/progress",
+                        "params": Value::Object(params),
+                    });
+                    let _ = send.send(notif.to_string());
+                } else if !line.is_empty() {
+                    let room = MAX_OUTPUT.saturating_sub(kept.len());
+                    kept.extend_from_slice(&line[..line.len().min(room)]);
+                    *total += line.len();
+                }
+                line.clear();
+                *overflowed = false;
+            };
+
         loop {
-            line.clear();
-            let n = match reader.read_until(b'\n', &mut line) {
+            let n = match r.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             };
-            if let Ok(s) = std::str::from_utf8(&line)
-                && let Some(payload) = s
-                    .trim_end_matches(['\r', '\n'])
-                    .strip_prefix(MCP_PROGRESS_PREFIX)
-                && let Ok(ev) = serde_json::from_str::<Value>(payload)
-            {
-                let frac = ev
-                    .get("fraction")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0)
-                    .clamp(0.0, 1.0);
-                let mut params = serde_json::Map::new();
-                params.insert("progressToken".into(), token.clone());
-                params.insert("progress".into(), json!(frac));
-                params.insert("total".into(), json!(1.0));
-                if let Some(msg) = ev.get("message").and_then(Value::as_str) {
-                    params.insert("message".into(), Value::String(msg.to_string()));
-                } else if let Some(stage) = ev.get("stage").and_then(Value::as_str) {
-                    params.insert("message".into(), Value::String(stage.to_string()));
+            let mut slice = &buf[..n];
+            while !slice.is_empty() {
+                if let Some(nl) = slice.iter().position(|&b| b == b'\n') {
+                    let seg = &slice[..=nl];
+                    if line_overflowed {
+                        total += seg.len();
+                        line_overflowed = false;
+                    } else if line.len() + seg.len() <= MAX_LINE_BYTES {
+                        line.extend_from_slice(seg);
+                        flush_line(&mut line, &mut line_overflowed, &mut kept, &mut total);
+                    } else {
+                        let room = MAX_OUTPUT.saturating_sub(kept.len());
+                        kept.extend_from_slice(&line[..line.len().min(room)]);
+                        total += line.len();
+                        line.clear();
+                        let room2 = MAX_OUTPUT.saturating_sub(kept.len());
+                        kept.extend_from_slice(&seg[..seg.len().min(room2)]);
+                        total += seg.len();
+                    }
+                    slice = &slice[nl + 1..];
+                } else {
+                    if line_overflowed {
+                        total += slice.len();
+                    } else if line.len() + slice.len() <= MAX_LINE_BYTES {
+                        line.extend_from_slice(slice);
+                    } else {
+                        let room = MAX_OUTPUT.saturating_sub(kept.len());
+                        kept.extend_from_slice(&line[..line.len().min(room)]);
+                        total += line.len();
+                        line.clear();
+                        let room2 = MAX_OUTPUT.saturating_sub(kept.len());
+                        kept.extend_from_slice(&slice[..slice.len().min(room2)]);
+                        total += slice.len();
+                        line_overflowed = true;
+                    }
+                    break;
                 }
-                let notif = json!({
-                    "jsonrpc": "2.0",
-                    "method": "notifications/progress",
-                    "params": Value::Object(params),
-                });
-                let _ = send.send(notif.to_string());
-                continue;
             }
-            let room = MAX_OUTPUT.saturating_sub(kept.len());
-            kept.extend_from_slice(&line[..n.min(room)]);
-            total += n;
+        }
+        if !line.is_empty() {
+            flush_line(&mut line, &mut line_overflowed, &mut kept, &mut total);
         }
         (kept, total)
     })

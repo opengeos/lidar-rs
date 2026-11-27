@@ -1056,26 +1056,53 @@ fn mcp_server_emits_notifications_progress_for_pipeline_with_progress_token() {
     .unwrap();
     stdin.flush().unwrap();
 
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let reader_handle = std::thread::spawn(move || {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if tx.send(line.clone()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
     let mut progress_frames = Vec::new();
     let mut final_resp: Option<Value> = None;
-    let mut line = String::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line).unwrap();
-        if n == 0 {
-            break;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            let _ = child.kill();
+            panic!("timed out waiting for MCP pipeline response");
         }
-        let msg: Value = serde_json::from_str(&line).unwrap();
-        if msg.get("method").and_then(Value::as_str) == Some("notifications/progress") {
-            progress_frames.push(msg);
-        } else if msg.get("id") == Some(&Value::from(2)) {
-            final_resp = Some(msg);
-            break;
+        match rx.recv_timeout(remaining) {
+            Ok(line) => {
+                let msg: Value = serde_json::from_str(&line)
+                    .unwrap_or_else(|e| panic!("MCP emitted non-JSON line ({e}): {line:?}"));
+                if msg.get("method").and_then(Value::as_str) == Some("notifications/progress") {
+                    progress_frames.push(msg);
+                } else if msg.get("id") == Some(&Value::from(2)) {
+                    final_resp = Some(msg);
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let _ = child.kill();
+                panic!("timed out waiting for MCP pipeline response");
+            }
         }
     }
 
     drop(stdin);
     let _ = child.wait();
+    let _ = reader_handle.join();
 
     assert!(
         !progress_frames.is_empty(),
