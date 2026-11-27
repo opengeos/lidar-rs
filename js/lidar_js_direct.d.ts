@@ -330,7 +330,7 @@ export interface FsmHydrographPoint {
   spilling_basin_count: number;
 }
 
-/** Exact merge-tree node metadata parsed from {@link MergeTreeOutput.nodesJson}. */
+/** Merge-tree node metadata parsed from {@link MergeTreeOutput.nodesJson} (internal saddles are exact; sink-only root `saddle_elev` and rating-curve endpoints are lower-bound estimates). */
 export interface MergeTreeNode {
   id: number;
   parent_id: number;

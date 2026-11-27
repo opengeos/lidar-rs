@@ -2057,7 +2057,13 @@ def attenuate_fsm_hydrograph(
     num_reservoirs: int = 2,
     tail_duration_h: float | None = None,
 ) -> list[FsmHydrographPoint]:
-    """Apply volume-conserving Nash linear-reservoir travel-time attenuation to an FSM hydrograph."""
+    """Apply Nash linear-reservoir travel-time attenuation to an FSM hydrograph.
+
+    With automatic tail (`tail_duration_h=None`), the recession tail extends until
+    channel storage drains to solver tolerance so total discharge volume is conserved.
+    Providing an explicit `tail_duration_h` can truncate the discharge series before
+    remaining channel storage drains.
+    """
     return list(
         _lidar_rs.attenuate_fsm_hydrograph(
             list(hydrograph),
@@ -2605,7 +2611,7 @@ def simulate_inundation_array(
     compute_hazard: bool = False,
     recession_et_cm_h: float | None = None,
     recession_seepage_cm_h: float | None = None,
-    recession_max_h: float = 168.0,
+    recession_max_h: float | None = None,
 ) -> InundationArrayResult:
     """Run the complete hydrology and inundation pipeline in memory on a 2D array, xarray DataArray, or rasterio dataset.
 
@@ -2613,6 +2619,8 @@ def simulate_inundation_array(
     Per-forcing NoData sentinels (from spatial adapters or explicit keyword overrides) are
     forwarded directly to Rust so `crates/lidar` owns forcing NoData semantics in one place
     (for `runoff_coeff_arr`, NoData cells fall back to the core default coefficient of `1.0`).
+    Passing any `recession_*` parameter enables post-storm recession (requires `routing="fsm"`),
+    using core defaults for omitted recession fields.
     """
     arr, gt, resolved_crs, nd = extract_spatial_array(
         dem_arr, geotransform=geotransform, crs=crs, no_data=no_data
@@ -2669,7 +2677,7 @@ def simulate_inundation_array(
         bool(compute_hazard),
         float(recession_et_cm_h) if recession_et_cm_h is not None else None,
         float(recession_seepage_cm_h) if recession_seepage_cm_h is not None else None,
-        float(recession_max_h),
+        float(recession_max_h) if recession_max_h is not None else None,
     )
 
 

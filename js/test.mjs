@@ -502,6 +502,26 @@ const attPts = JSON.parse(attJson);
 assert.ok(Array.isArray(attPts) && attPts.length >= 2, "expected attenuated FSM hydrograph points");
 assert.equal(typeof attPts[0].time_h, "number");
 assert.equal(typeof attPts[0].q_boundary_m3_s, "number");
+// Verify attenuation reduces peak discharge and conserves integrated volume on a positive pulse
+const pulse = JSON.stringify([
+  { time_h: 0.0, q_boundary_m3_s: 0.0, total_stored_m3: 0.0, connected_area_fraction: 0.0, spilling_basin_count: 0 },
+  { time_h: 0.5, q_boundary_m3_s: 10.0, total_stored_m3: 0.0, connected_area_fraction: 1.0, spilling_basin_count: 1 },
+  { time_h: 1.0, q_boundary_m3_s: 10.0, total_stored_m3: 0.0, connected_area_fraction: 1.0, spilling_basin_count: 1 },
+  { time_h: 1.5, q_boundary_m3_s: 0.0, total_stored_m3: 0.0, connected_area_fraction: 0.0, spilling_basin_count: 0 },
+]);
+const pulseAtt = JSON.parse(lidar.attenuateFsmHydrograph(pulse, 1.5, 0.25, 2));
+const peakAtt = Math.max(...pulseAtt.map((p) => p.q_boundary_m3_s));
+assert.ok(peakAtt > 0 && peakAtt < 10.0, `expected attenuated peak in (0, 10), got ${peakAtt}`);
+let volIn = 0.0;
+const pulseIn = JSON.parse(pulse);
+for (let i = 1; i < pulseIn.length; i++) {
+  volIn += 0.5 * (pulseIn[i - 1].q_boundary_m3_s + pulseIn[i].q_boundary_m3_s) * (pulseIn[i].time_h - pulseIn[i - 1].time_h) * 3600.0;
+}
+let volOut = 0.0;
+for (let i = 1; i < pulseAtt.length; i++) {
+  volOut += 0.5 * (pulseAtt[i - 1].q_boundary_m3_s + pulseAtt[i].q_boundary_m3_s) * (pulseAtt[i].time_h - pulseAtt[i - 1].time_h) * 3600.0;
+}
+assert.ok(Math.abs(volOut - volIn) / volIn < 0.05, `expected volume conservation within 5%: in=${volIn}, out=${volOut}`);
 simMtFsm.free();
 
 console.log("ALL lidar-wasm WASM TESTS PASSED!");

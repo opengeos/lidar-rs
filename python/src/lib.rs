@@ -20,10 +20,10 @@ use lidar::{
     ConnectivityGraph, DelineateCatchmentsOptions, DelineateFlowPathsOptions, DelineateOptions,
     DelineationMethod, DemProduct, DownloadOptions, EmbankmentArtifactCandidate, EptStreamOptions,
     ExtractSinksOptions, FeaturePreservingOptions, FederalBundleOptions, FsmBasinSummary,
-    FsmForcing, FsmHydrographPoint, FsmMassBalance, GraphEdge, GraphNode, GreenAmptParams,
-    HillshadeOptions, InMemoryDepressions, InundationForcing, MergeTreeNode, MergeTreeOptions,
-    NestedDepression, NoaaAtlas14Table, RasterOutputOptions, RecessionCurvePoint, RecessionOptions,
-    Region, RoutingMode, RunPipelineOptions, SimulateInundationOptions, SinkDepression,
+    FsmHydrographPoint, FsmMassBalance, GraphEdge, GraphNode, GreenAmptParams, HillshadeOptions,
+    InMemoryDepressions, InundationForcing, MergeTreeNode, MergeTreeOptions, NestedDepression,
+    NoaaAtlas14Table, RasterOutputOptions, RecessionCurvePoint, RecessionOptions, Region,
+    RoutingMode, RunPipelineOptions, SimulateInundationOptions, SinkDepression,
     SpillAttenuationOptions, SpillFlowPath, SynthesizeCulvertsOptions, TiledDelineationOptions,
     TiledOutputOptions, TnmProductItem, Topology, WbdLevel,
 };
@@ -996,6 +996,9 @@ fn bilateral_filter_file<'py>(
     out_file: Option<&str>,
     no_data: Option<f64>,
 ) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
+    if let Some(out) = out_file {
+        ensure_no_output_collision(in_dem, out, "in_dem")?;
+    }
     let in_dem = in_dem.to_string();
     let out_file = out_file.map(str::to_string);
     let out = py
@@ -1063,6 +1066,9 @@ fn feature_preserving_smoothing_file<'py>(
     no_data: Option<f64>,
     compress: bool,
 ) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
+    if let Some(out) = out_file {
+        ensure_no_output_collision(in_dem, out, "in_dem")?;
+    }
     let in_dem = in_dem.to_string();
     let out_file = out_file.map(str::to_string);
     let opts = FeaturePreservingOptions {
@@ -1115,6 +1121,9 @@ fn mean_filter_file<'py>(
     out_file: Option<&str>,
     no_data: Option<f64>,
 ) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
+    if let Some(out) = out_file {
+        ensure_no_output_collision(in_dem, out, "in_dem")?;
+    }
     let in_dem = in_dem.to_string();
     let out_file = out_file.map(str::to_string);
     let out = py
@@ -1143,6 +1152,9 @@ fn median_filter_file<'py>(
     out_file: Option<&str>,
     no_data: Option<f64>,
 ) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
+    if let Some(out) = out_file {
+        ensure_no_output_collision(in_dem, out, "in_dem")?;
+    }
     let in_dem = in_dem.to_string();
     let out_file = out_file.map(str::to_string);
     let out = py
@@ -1171,6 +1183,9 @@ fn gaussian_filter_file<'py>(
     out_file: Option<&str>,
     no_data: Option<f64>,
 ) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
+    if let Some(out) = out_file {
+        ensure_no_output_collision(in_dem, out, "in_dem")?;
+    }
     let in_dem = in_dem.to_string();
     let out_file = out_file.map(str::to_string);
     let out = py
@@ -1199,6 +1214,9 @@ fn flip_dem_file<'py>(
     out_file: Option<&str>,
     no_data: Option<f64>,
 ) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
+    if let Some(out) = out_file {
+        ensure_no_output_collision(in_dem, out, "in_dem")?;
+    }
     let in_dem = in_dem.to_string();
     let out_file = out_file.map(str::to_string);
     let out = py
@@ -2869,10 +2887,31 @@ fn canonical_or_lexical_path(p: &Path) -> PathBuf {
     p.to_path_buf()
 }
 
+fn is_same_existing_file(a: &Path, b: &Path) -> bool {
+    let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ma.dev() == mb.dev() && ma.ino() == mb.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (ma, mb);
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(ca), Ok(cb)) => ca == cb,
+            _ => false,
+        }
+    }
+}
+
 fn ensure_no_output_collision(input: &str, output: &str, label: &str) -> PyResult<()> {
-    let in_p = canonical_or_lexical_path(Path::new(input));
-    let out_p = canonical_or_lexical_path(Path::new(output));
-    if in_p == out_p {
+    let in_path = Path::new(input);
+    let out_path = Path::new(output);
+    let in_p = canonical_or_lexical_path(in_path);
+    let out_p = canonical_or_lexical_path(out_path);
+    if in_p == out_p || is_same_existing_file(in_path, out_path) {
         return Err(PyValueError::new_err(format!(
             "out_file ({output}) must not overwrite input {label} ({input})"
         )));
@@ -3800,7 +3839,7 @@ fn build_connectivity_graph_from_parts<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (dem_arr, kernel_size=3, min_size=1000, min_depth=0.3, interval=0.3, rain_intensity_cm_h=5.0, rain_duration_h=50.0, time_step_h=1.0, runoff_coeff_arr=None, infiltration_arr=None, antecedent_depth_arr=None, hyetograph=None, breach_max_depth=None, no_data=None, cell_size=1.0, routing="static", geotransform=None, crs=None, runoff_coeff_no_data=None, infiltration_no_data=None, antecedent_depth_no_data=None, delineation_method="level_set", green_ampt=None, compute_hazard=false, recession_et_cm_h=None, recession_seepage_cm_h=None, recession_max_h=168.0))]
+#[pyo3(signature = (dem_arr, kernel_size=3, min_size=1000, min_depth=0.3, interval=0.3, rain_intensity_cm_h=5.0, rain_duration_h=50.0, time_step_h=1.0, runoff_coeff_arr=None, infiltration_arr=None, antecedent_depth_arr=None, hyetograph=None, breach_max_depth=None, no_data=None, cell_size=1.0, routing="static", geotransform=None, crs=None, runoff_coeff_no_data=None, infiltration_no_data=None, antecedent_depth_no_data=None, delineation_method="level_set", green_ampt=None, compute_hazard=false, recession_et_cm_h=None, recession_seepage_cm_h=None, recession_max_h=None))]
 #[allow(clippy::too_many_arguments)]
 fn simulate_inundation_array<'py>(
     py: Python<'py>,
@@ -3830,7 +3869,7 @@ fn simulate_inundation_array<'py>(
     compute_hazard: bool,
     recession_et_cm_h: Option<f64>,
     recession_seepage_cm_h: Option<f64>,
-    recession_max_h: f64,
+    recession_max_h: Option<f64>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let routing_mode = parse_routing_mode(routing)?;
     let delin_method = parse_delineation_method(delineation_method)?;
@@ -3842,12 +3881,22 @@ fn simulate_inundation_array<'py>(
     if ga_params.is_some() && routing_mode != RoutingMode::FillSpillMerge {
         return Err(PyValueError::new_err("green_ampt requires routing='fsm'"));
     }
-    let want_recession = recession_et_cm_h.is_some() || recession_seepage_cm_h.is_some();
+    let want_recession = recession_et_cm_h.is_some()
+        || recession_seepage_cm_h.is_some()
+        || recession_max_h.is_some();
     if (compute_hazard || want_recession) && routing_mode != RoutingMode::FillSpillMerge {
         return Err(PyValueError::new_err(
             "compute_hazard and recession_* parameters require routing='fsm'",
         ));
     }
+    let fsm_recession = want_recession.then(|| {
+        let rec_defaults = RecessionOptions::default();
+        RecessionOptions {
+            et_cm_h: recession_et_cm_h.unwrap_or(rec_defaults.et_cm_h),
+            seepage_cm_h: recession_seepage_cm_h.unwrap_or(rec_defaults.seepage_cm_h),
+            max_recession_h: recession_max_h.unwrap_or(rec_defaults.max_recession_h),
+        }
+    });
     let raw_dem = from_py_array2_spatial(dem_arr, no_data, cell_size, geotransform, crs)?;
     let out_gt = raw_dem.geotransform;
     let out_crs = crs_to_py(&raw_dem.projection);
@@ -3871,7 +3920,7 @@ fn simulate_inundation_array<'py>(
         compress: false,
     };
 
-    let (pipe, hazard_opt, recession_opt) = py
+    let pipe = py
         .detach(move || -> lidar::Result<_> {
             let breach = breach_max_depth.map(|md| BreachOptions {
                 mode: BreachMode::Selective,
@@ -3882,7 +3931,7 @@ fn simulate_inundation_array<'py>(
                 kernel_size,
                 breach,
                 delineation_method: delin_method,
-                simulation: sim_opts.clone(),
+                simulation: sim_opts,
                 routing: routing_mode,
                 forcing: InundationForcing {
                     runoff_coeff: rc.as_ref(),
@@ -3892,132 +3941,11 @@ fn simulate_inundation_array<'py>(
                 },
                 scalar_runoff_coeff: 1.0,
                 stream_vector: None,
+                green_ampt: ga_params,
+                compute_fsm_hazard: compute_hazard,
+                fsm_recession,
             };
-            let mut pipe = lidar::run_full_pipeline_in_memory(&raw_dem, &opts)?;
-
-            // When Green-Ampt, hazard rasters, or post-storm recession are requested in FSM mode,
-            // run the full FSM simulation (with optional Green-Ampt) to obtain the complete
-            // `FsmSimulationResult` for post-processing.
-            let mut hazard_out = None;
-            let mut recession_out = None;
-            if routing_mode == RoutingMode::FillSpillMerge
-                && (ga_params.is_some() || compute_hazard || want_recession)
-            {
-                let fsm_forcing = FsmForcing {
-                    base: InundationForcing {
-                        runoff_coeff: rc.as_ref(),
-                        infiltration_cm_h: inf.as_ref(),
-                        antecedent_depth: ant.as_ref(),
-                        hyetograph: hyetograph.as_deref(),
-                    },
-                    green_ampt: ga_params,
-                    ..Default::default()
-                };
-                let fsm_res = lidar::simulate_fill_spill_merge_with_green_ampt_in_memory(
-                    &pipe.sinks.dem_refined,
-                    &pipe.sinks.sink,
-                    &pipe.depressions,
-                    &sim_opts,
-                    &fsm_forcing,
-                )?;
-                if compute_hazard {
-                    hazard_out = Some(lidar::compute_fsm_hazard_rasters(
-                        &pipe.sinks.dem_refined,
-                        &fsm_res.fill_time,
-                        &pipe.depressions,
-                        &fsm_res,
-                        fsm_res.mass_balance.duration_h,
-                    )?);
-                }
-                if want_recession {
-                    let rec_defaults = RecessionOptions::default();
-                    let rec_opts = RecessionOptions {
-                        et_cm_h: recession_et_cm_h.unwrap_or(rec_defaults.et_cm_h),
-                        seepage_cm_h: recession_seepage_cm_h.unwrap_or(rec_defaults.seepage_cm_h),
-                        max_recession_h: recession_max_h,
-                    };
-                    recession_out = Some(lidar::simulate_post_storm_recession(
-                        &pipe.sinks.dem_refined,
-                        &pipe.depressions,
-                        &fsm_res,
-                        &rec_opts,
-                    )?);
-                }
-                if ga_params.is_some() {
-                    let num_steps = pipe.steps.len();
-                    pipe.fill_time = fsm_res.fill_time;
-                    pipe.steps = lidar::compute_inundation_step_summaries(
-                        &pipe.sinks.sink,
-                        &pipe.fill_time,
-                        num_steps,
-                        sim_opts.time_step_h,
-                    );
-                    let runoff_scale = if let Some(rc_grid) = rc.as_ref() {
-                        let dem_nd = pipe.sinks.dem_refined.no_data();
-                        let rc_nd = rc_grid.no_data();
-                        let mut sum = 0.0f64;
-                        let mut cnt = 0usize;
-                        for (&dv, &cv) in pipe
-                            .sinks
-                            .dem_refined
-                            .data()
-                            .iter()
-                            .zip(rc_grid.data().iter())
-                        {
-                            if dv.is_finite() && !(dem_nd.is_finite() && dv == dem_nd) {
-                                let eff = if cv.is_finite() && !(rc_nd.is_finite() && cv == rc_nd) {
-                                    cv.clamp(0.0, 1.0)
-                                } else {
-                                    1.0
-                                };
-                                sum += eff;
-                                cnt += 1;
-                            }
-                        }
-                        if cnt > 0 { sum / cnt as f64 } else { 1.0 }
-                    } else {
-                        1.0
-                    };
-                    let eff_rain = sim_opts.rain_intensity_cm_h * runoff_scale;
-                    let scaled_hyeto: Option<Vec<(f64, f64)>> = hyetograph.as_ref().map(|h| {
-                        h.iter()
-                            .map(|&(dt, cm_h)| (dt, cm_h * runoff_scale))
-                            .collect()
-                    });
-                    pipe.inundation_curve_csv = lidar::format_inundation_curve_csv(
-                        &pipe.steps,
-                        eff_rain,
-                        scaled_hyeto.as_deref(),
-                    );
-                    pipe.spill_paths = fsm_res.spill_paths;
-                    let mut graph = lidar::build_connectivity_graph(
-                        &pipe.depressions,
-                        &pipe.catchment_records,
-                        &pipe.fill_time,
-                        &pipe.spill_paths,
-                        eff_rain,
-                        scaled_hyeto.as_deref(),
-                        None,
-                    )?;
-                    let merge_by_id: std::collections::HashMap<u32, Option<f64>> = fsm_res
-                        .basins
-                        .iter()
-                        .map(|b| (b.dep_id, b.merge_time_h))
-                        .collect();
-                    for edge in &mut graph.edges {
-                        if edge.edge_type == "merge"
-                            && let Some(&Some(mt)) = merge_by_id.get(&edge.from_id)
-                        {
-                            edge.merge_time_h = Some(mt);
-                        }
-                    }
-                    pipe.connectivity_graph = graph;
-                    pipe.fsm_mass_balance = Some(fsm_res.mass_balance);
-                    pipe.fsm_basins = Some(fsm_res.basins);
-                    pipe.fsm_hydrograph = Some(fsm_res.hydrograph);
-                }
-            }
-            Ok((pipe, hazard_out, recession_out))
+            lidar::run_full_pipeline_in_memory(&raw_dem, &opts)
         })
         .map_err(to_py_err)?;
 
@@ -4120,12 +4048,12 @@ fn simulate_inundation_array<'py>(
     } else {
         dict.set_item("fsm_hydrograph", py.None())?;
     }
-    if let Some(hz) = hazard_opt {
+    if let Some(hz) = pipe.fsm_hazard {
         dict.set_item("fsm_hazard_max_depth", to_py_array2(py, hz.max_depth)?)?;
         dict.set_item("fsm_hazard_wse", to_py_array2(py, hz.wse)?)?;
         dict.set_item("fsm_hazard_duration_h", to_py_array2(py, hz.duration_h)?)?;
     }
-    if let Some(rec) = recession_opt {
+    if let Some(rec) = pipe.fsm_recession {
         dict.set_item(
             "fsm_recession_drain_time_h",
             to_py_array2(py, rec.drain_time_h)?,

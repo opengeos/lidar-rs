@@ -1412,12 +1412,39 @@ def test_v06_python_api_parity_filters_derivatives_merge_tree_fsm_and_pointcloud
     cum_runoff_mm = float(last_row.split(",")[2])
     # 8.0 cm/h * 0.5 * 6 h = 24 cm = 240 mm (not 480 mm)
     assert cum_runoff_mm == pytest.approx(240.0, rel=1e-3)
+    # Verify passing recession_max_h alone enables recession with core defaults
+    sim_rec_only = lidar_rs.simulate_inundation_array(
+        dem,
+        kernel_size=1,
+        min_size=4,
+        min_depth=0.1,
+        interval=0.2,
+        rain_intensity_cm_h=8.0,
+        rain_duration_h=6.0,
+        time_step_h=2.0,
+        routing="fsm",
+        recession_max_h=12.0,
+        geotransform=gt,
+        crs="EPSG:32614",
+    )
+    assert "fsm_recession_drain_time_h" in sim_rec_only
     att = lidar_rs.attenuate_fsm_hydrograph(
         sim["fsm_hydrograph"], mean_travel_time_h=1.0, dt_h=0.5, num_reservoirs=2
     )
     assert len(att) >= 2
 
-    # 5. Raster output options (compress + cog) + tiled merge-tree delineation + pipeline merge_tree
+    # 5. Raster output options (compress + cog) + hard-link collision guard + tiled merge-tree
+    import os
+    import shutil
+
+    if os.name != "nt":
+        dem_copy = tmp_path / "dem_copy.tif"
+        shutil.copy2(TEST_DATA / "dem.tif", dem_copy)
+        dem_hardlink = tmp_path / "dem_hardlink.tif"
+        os.link(dem_copy, dem_hardlink)
+        with pytest.raises(ValueError, match="must not overwrite"):
+            lidar_rs.bilateral_filter(dem_copy, out_file=dem_hardlink)
+
     reproj_cog = tmp_path / "reproj_cog.tif"
     lidar_rs.reproject_image(
         TEST_DATA / "dem.tif", reproj_cog, dst_crs="EPSG:4326", compress=True, cog=True

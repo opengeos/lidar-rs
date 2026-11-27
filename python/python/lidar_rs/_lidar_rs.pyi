@@ -488,7 +488,7 @@ def simulate_inundation_array(
     compute_hazard: bool = False,
     recession_et_cm_h: float | None = None,
     recession_seepage_cm_h: float | None = None,
-    recession_max_h: float = 168.0,
+    recession_max_h: float | None = None,
 ) -> InundationArrayResult: ...
 
 def run_pipeline(

@@ -36,11 +36,11 @@ use crate::error::{Error, Result};
 use crate::filling::{InMemorySinks, extract_sinks_in_memory};
 use crate::filtering::median_filter;
 use crate::fsm::{
-    FsmBasinSummary, FsmForcing, FsmHydrographPoint, FsmMassBalance, OutletSearchScratch,
-    RoutingMode, simulate_fill_spill_merge_in_memory,
-    simulate_fill_spill_merge_with_flowdirs_and_control,
-    simulate_fill_spill_merge_with_forcing_and_flowdirs_and_control, write_fsm_basins_csv,
-    write_fsm_hydrograph_csv,
+    FsmBasinSummary, FsmForcing, FsmHazardRasters, FsmHydrographPoint, FsmMassBalance,
+    OutletSearchScratch, RecessionOptions, RecessionResult, RoutingMode,
+    compute_fsm_hazard_rasters, simulate_fill_spill_merge_in_memory,
+    simulate_fill_spill_merge_with_forcing_and_flowdirs_and_control, simulate_post_storm_recession,
+    write_fsm_basins_csv, write_fsm_hydrograph_csv,
 };
 #[cfg(feature = "serde")]
 use crate::graph::write_connectivity_graph_json;
@@ -3048,6 +3048,12 @@ pub struct InMemoryFullPipelineOptions<'a> {
     pub scalar_runoff_coeff: f64,
     /// Optional stream polyline vector for computing spill-to-stream distances on the connectivity graph.
     pub stream_vector: Option<&'a Path>,
+    /// Optional Green-Ampt ponding/infiltration parameters (requires `RoutingMode::FillSpillMerge`).
+    pub green_ampt: Option<GreenAmptParams>,
+    /// Compute per-cell FSM hazard rasters (`max_depth`, `wse`, `duration_h`; requires `RoutingMode::FillSpillMerge`).
+    pub compute_fsm_hazard: bool,
+    /// Optional post-storm ET/seepage recession options (requires `RoutingMode::FillSpillMerge`).
+    pub fsm_recession: Option<RecessionOptions>,
 }
 
 impl Default for InMemoryFullPipelineOptions<'_> {
@@ -3065,6 +3071,9 @@ impl Default for InMemoryFullPipelineOptions<'_> {
             forcing: InundationForcing::default(),
             scalar_runoff_coeff: 1.0,
             stream_vector: None,
+            green_ampt: None,
+            compute_fsm_hazard: false,
+            fsm_recession: None,
         }
     }
 }
@@ -3089,6 +3098,10 @@ pub struct InMemoryFullPipeline {
     /// Dynamic Fill-Spill-Merge watershed outlet hydrograph and dynamic connectivity curve
     /// (populated when `routing == RoutingMode::FillSpillMerge`).
     pub fsm_hydrograph: Option<Vec<FsmHydrographPoint>>,
+    /// Optional FSM hazard rasters (populated when `options.compute_fsm_hazard` is `true`).
+    pub fsm_hazard: Option<FsmHazardRasters>,
+    /// Optional post-storm recession result (populated when `options.fsm_recession` is `Some`).
+    pub fsm_recession: Option<RecessionResult>,
 }
 
 fn effective_runoff_scale(
@@ -3140,6 +3153,16 @@ pub fn run_full_pipeline_in_memory_with_control(
     control: &ExecutionControl,
 ) -> Result<InMemoryFullPipeline> {
     control.check_cancelled()?;
+    if options.routing != RoutingMode::FillSpillMerge
+        && (options.green_ampt.is_some()
+            || options.compute_fsm_hazard
+            || options.fsm_recession.is_some())
+    {
+        return Err(Error::InvalidArgument(
+            "green_ampt, compute_fsm_hazard, and fsm_recession require RoutingMode::FillSpillMerge"
+                .into(),
+        ));
+    }
     let num_steps = validate_options_with_hyetograph(
         &options.simulation,
         options.forcing.hyetograph.is_some(),
@@ -3249,45 +3272,81 @@ pub fn run_full_pipeline_in_memory_with_control(
         0.80,
         Some("Simulating surface inundation dynamics".into()),
     );
-    let (fill_time, num_regions, spill_paths, fsm_basins, fsm_mass_balance, fsm_hydrograph) =
-        match options.routing {
-            RoutingMode::Static => {
-                let (ft, nr) = simulate_inundation_with_weighted_catchment_in_memory_with_control(
-                    &sinks.sink,
-                    &catchment_hierarchy,
-                    weighted_catchment_hierarchy.as_ref(),
-                    sim_opts,
-                    &options.forcing,
-                    &sub_cancel,
-                )?;
-                let sp = delineate_spill_flow_paths_with_flowdirs(
+    let (
+        fill_time,
+        num_regions,
+        spill_paths,
+        fsm_basins,
+        fsm_mass_balance,
+        fsm_hydrograph,
+        fsm_hazard,
+        fsm_recession,
+    ) = match options.routing {
+        RoutingMode::Static => {
+            let (ft, nr) = simulate_inundation_with_weighted_catchment_in_memory_with_control(
+                &sinks.sink,
+                &catchment_hierarchy,
+                weighted_catchment_hierarchy.as_ref(),
+                sim_opts,
+                &options.forcing,
+                &sub_cancel,
+            )?;
+            let sp = delineate_spill_flow_paths_with_flowdirs(
+                &sinks.dem_refined,
+                &depressions,
+                &ft,
+                &flowdirs,
+            )?;
+            (ft, nr, sp, None, None, None, None, None)
+        }
+        RoutingMode::FillSpillMerge => {
+            let fsm_forcing = FsmForcing {
+                base: options.forcing.clone(),
+                green_ampt: options.green_ampt,
+                ..Default::default()
+            };
+            let fsm = simulate_fill_spill_merge_with_forcing_and_flowdirs_and_control(
+                &sinks.dem_refined,
+                &sinks.sink,
+                &depressions,
+                sim_opts,
+                &fsm_forcing,
+                &flowdirs,
+                &sub_cancel,
+            )?;
+            let hazard = if options.compute_fsm_hazard {
+                Some(compute_fsm_hazard_rasters(
+                    &sinks.dem_refined,
+                    &fsm.fill_time,
+                    &depressions,
+                    &fsm,
+                    fsm.mass_balance.duration_h,
+                )?)
+            } else {
+                None
+            };
+            let recession = if let Some(ref rec_opts) = options.fsm_recession {
+                Some(simulate_post_storm_recession(
                     &sinks.dem_refined,
                     &depressions,
-                    &ft,
-                    &flowdirs,
-                )?;
-                (ft, nr, sp, None, None, None)
-            }
-            RoutingMode::FillSpillMerge => {
-                let fsm = simulate_fill_spill_merge_with_flowdirs_and_control(
-                    &sinks.dem_refined,
-                    &sinks.sink,
-                    &depressions,
-                    sim_opts,
-                    &options.forcing,
-                    &flowdirs,
-                    &sub_cancel,
-                )?;
-                (
-                    fsm.fill_time,
-                    fsm.num_regions,
-                    fsm.spill_paths,
-                    Some(fsm.basins),
-                    Some(fsm.mass_balance),
-                    Some(fsm.hydrograph),
-                )
-            }
-        };
+                    &fsm,
+                    rec_opts,
+                )?)
+            } else {
+                None
+            };
+            (
+                fsm.fill_time,
+                fsm.num_regions,
+                fsm.spill_paths,
+                Some(fsm.basins),
+                Some(fsm.mass_balance),
+                Some(fsm.hydrograph),
+                hazard,
+                recession,
+            )
+        }
+    };
     control.check_cancelled()?;
     let steps =
         compute_inundation_step_summaries(&sinks.sink, &fill_time, num_steps, sim_opts.time_step_h);
@@ -3347,6 +3406,8 @@ pub fn run_full_pipeline_in_memory_with_control(
         fsm_basins,
         fsm_mass_balance,
         fsm_hydrograph,
+        fsm_hazard,
+        fsm_recession,
     })
 }
 
