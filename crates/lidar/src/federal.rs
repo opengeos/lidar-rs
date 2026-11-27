@@ -3134,10 +3134,9 @@ pub fn stream_remote_pointcloud_aoi(
     opts: &EptStreamOptions,
 ) -> Result<terrio::pointcloud::PointCloud> {
     if !is_safe_https_download_url(&opts.source_url) {
-        return Err(Error::InvalidArgument(format!(
-            "remote COPC/EPT source_url must be a safe public https:// URL, got '{}'",
-            opts.source_url
-        )));
+        return Err(Error::InvalidArgument(
+            "remote COPC/EPT source_url must be a safe public https:// URL".into(),
+        ));
     }
     stream_pointcloud_aoi_impl(&opts.source_url, opts)
 }

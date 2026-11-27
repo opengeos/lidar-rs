@@ -359,8 +359,21 @@ def test_output_adapters_import_errors_and_conversion(monkeypatch: pytest.Monkey
         def add_edge(self, u: Any, v: Any, **attrs: Any) -> None:
             self.edges[(u, v)] = dict(attrs)
 
+    class _StubMultiDiGraph:
+        def __init__(self) -> None:
+            self.graph: dict[str, Any] = {}
+            self.nodes: dict[Any, dict[str, Any]] = {}
+            self.edges: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+
+        def add_node(self, n: Any, **attrs: Any) -> None:
+            self.nodes[n] = dict(attrs)
+
+        def add_edge(self, u: Any, v: Any, key: Any = None, **attrs: Any) -> None:
+            self.edges[(u, v, key)] = dict(attrs)
+
     fake_nx = types.ModuleType("networkx")
     fake_nx.DiGraph = _StubDiGraph  # type: ignore[attr-defined]
+    fake_nx.MultiDiGraph = _StubMultiDiGraph  # type: ignore[attr-defined]
     with monkeypatch.context() as mp:
         mp.setitem(sys.modules, "networkx", fake_nx)
         g = lidar_rs.connectivity_to_networkx(graph)
@@ -373,6 +386,97 @@ def test_output_adapters_import_errors_and_conversion(monkeypatch: pytest.Monkey
             first_edge = next(iter(g.edges.values()))
             for attr in ("pour_row", "pour_col", "spill_elev"):
                 assert attr in first_edge
+
+        # Parallel "spill" + "merge" edges between the same (u, v) pair must preserve both
+        # attributes in DiGraph mode and stay distinct keyed edges when multi=True.
+        parallel_graph = {
+            "rain_intensity_cm_h": 5.0,
+            "nodes": [
+                {"id": 1, "min_elev": 1.0, "max_elev": 2.0, "area": 10.0, "volume": 5.0, "level": 1},
+                {"id": 2, "min_elev": 0.5, "max_elev": 3.0, "area": 40.0, "volume": 30.0, "level": 2},
+            ],
+            "edges": [
+                {
+                    "from_id": 1,
+                    "to_id": 2,
+                    "edge_type": "spill",
+                    "spill_time_h": 1.5,
+                    "spill_runoff_mm": 75.0,
+                    "merge_time_h": 4.0,
+                    "spill_elev": 2.0,
+                    "length_m": 12.5,
+                    "start_xy": [10.0, 20.0],
+                    "end_xy": [22.5, 20.0],
+                    "dist_to_stream": 3.0,
+                },
+                {
+                    "from_id": 1,
+                    "to_id": 2,
+                    "edge_type": "merge",
+                    "spill_time_h": None,
+                    "spill_runoff_mm": None,
+                    "merge_time_h": 4.5,
+                    "spill_elev": 2.1,
+                    "length_m": 0.0,
+                    "start_xy": None,
+                    "end_xy": None,
+                    "dist_to_stream": None,
+                },
+            ],
+        }
+        g_di = lidar_rs.connectivity_to_networkx(parallel_graph)
+        assert isinstance(g_di, _StubDiGraph)
+        merged_edge = g_di.edges[(1, 2)]
+        assert merged_edge["edge_type"] == "spill+merge"
+        assert merged_edge["edge_types"] == ["spill", "merge"]
+        assert merged_edge["spill_time_h"] == 1.5
+        assert merged_edge["spill_runoff_mm"] == 75.0
+        assert merged_edge["length_m"] == 12.5
+        assert merged_edge["spill_merge_time_h"] == 4.0
+        assert merged_edge["merge_merge_time_h"] == 4.5
+        assert merged_edge["merge_time_h"] == 4.5
+        assert len(merged_edge["parallel_edges"]) == 2
+
+        g_multi = lidar_rs.connectivity_to_networkx(parallel_graph, multi=True)
+        assert isinstance(g_multi, _StubMultiDiGraph)
+        assert (1, 2, "spill") in g_multi.edges
+        assert (1, 2, "merge") in g_multi.edges
+        assert g_multi.edges[(1, 2, "spill")]["length_m"] == 12.5
+        assert g_multi.edges[(1, 2, "merge")]["merge_time_h"] == 4.5
+
+        # Multiple same-type ("spill" + "spill") edges between the same (u, v) pair
+        # must keep distinct keys in MultiDiGraph and preserve first spill_* in DiGraph.
+        dup_spill_graph = {
+            "rain_intensity_cm_h": 5.0,
+            "nodes": parallel_graph["nodes"],
+            "edges": [
+                parallel_graph["edges"][0],
+                {
+                    "from_id": 1,
+                    "to_id": 2,
+                    "edge_type": "spill",
+                    "spill_time_h": 2.0,
+                    "spill_runoff_mm": 100.0,
+                    "merge_time_h": 4.0,
+                    "spill_elev": 2.2,
+                    "length_m": 25.0,
+                    "start_xy": [10.0, 21.0],
+                    "end_xy": [35.0, 21.0],
+                    "dist_to_stream": 5.0,
+                },
+            ],
+        }
+        g_dup_di = lidar_rs.connectivity_to_networkx(dup_spill_graph)
+        dup_edge = g_dup_di.edges[(1, 2)]
+        assert dup_edge["spill_length_m"] == 12.5
+        assert len(dup_edge["parallel_edges"]) == 2
+        assert dup_edge["parallel_edges"][1]["length_m"] == 25.0
+
+        g_dup_multi = lidar_rs.connectivity_to_networkx(dup_spill_graph, multi=True)
+        assert (1, 2, "spill") in g_dup_multi.edges
+        assert (1, 2, "spill#2") in g_dup_multi.edges
+        assert g_dup_multi.edges[(1, 2, "spill")]["length_m"] == 12.5
+        assert g_dup_multi.edges[(1, 2, "spill#2")]["length_m"] == 25.0
 
     # 2. depressions_to_geodataframe
     class _StubPolygon:

@@ -160,6 +160,101 @@ pub(crate) fn crs_metric_basis(
     )
 }
 
+/// Computes a safe metric basis `(vx_m, vy_m, cell_width_m, cell_height_m, cell_area_m2)`
+/// from a raster's CRS projection, geotransform, and dimensions, falling back to native
+/// affine basis (or unit basis) when the geotransform or CRS yields non-finite or
+/// non-positive cell spacing/area.
+pub(crate) fn safe_crs_metric_basis(
+    projection: &str,
+    geotransform: &[f64; 6],
+    width: usize,
+    height: usize,
+) -> ((f64, f64), (f64, f64), f64, f64, f64) {
+    // Reject degenerate/zero-size raw geotransforms before CRS unit conversion so
+    // geographic CRSs do not scale fallback unit vectors by meters-per-degree.
+    let raw_rx = geotransform[1].hypot(geotransform[4]);
+    let raw_ry = geotransform[2].hypot(geotransform[5]);
+    let raw_det = (geotransform[1] * geotransform[5] - geotransform[2] * geotransform[4]).abs();
+    if !raw_rx.is_finite()
+        || raw_rx <= 0.0
+        || !raw_ry.is_finite()
+        || raw_ry <= 0.0
+        || !raw_det.is_finite()
+        || raw_det <= 0.0
+    {
+        return ((1.0, 0.0), (0.0, -1.0), 1.0, 1.0, 1.0);
+    }
+
+    let (vx_m, vy_m, scale) = crs_metric_basis(projection, geotransform, width, height);
+    if scale.cell_width_m.is_finite()
+        && scale.cell_width_m > 0.0
+        && scale.cell_height_m.is_finite()
+        && scale.cell_height_m > 0.0
+        && scale.cell_area_m2.is_finite()
+        && scale.cell_area_m2 > 0.0
+        && vx_m.0.is_finite()
+        && vx_m.1.is_finite()
+        && vy_m.0.is_finite()
+        && vy_m.1.is_finite()
+    {
+        (
+            vx_m,
+            vy_m,
+            scale.cell_width_m,
+            scale.cell_height_m,
+            scale.cell_area_m2,
+        )
+    } else if scale.is_geographic {
+        // Geographic CRS with non-finite/degenerate geotransform origin: fall back to unit
+        // pixel-scale basis (1.0 per cell) rather than exposing raw decimal degrees as meters.
+        ((1.0, 0.0), (0.0, -1.0), 1.0, 1.0, 1.0)
+    } else {
+        (
+            (geotransform[1], geotransform[4]),
+            (geotransform[2], geotransform[5]),
+            raw_rx,
+            raw_ry,
+            raw_det,
+        )
+    }
+}
+
+/// Returns `(meters_per_x_unit, meters_per_y_unit)` for converting raw CRS coordinate
+/// differences `(dx, dy)` into SI meters at the raster center.
+pub(crate) fn crs_axis_meters_per_unit(
+    projection: &str,
+    geotransform: &[f64; 6],
+    width: usize,
+    height: usize,
+) -> (f64, f64) {
+    let unit_gt = [geotransform[0], 1.0, 0.0, geotransform[3], 0.0, -1.0];
+    let (vx_m, vy_m, scale) = crs_metric_basis(projection, &unit_gt, 0, 0);
+    if scale.is_geographic {
+        // Evaluate latitude at the true raster center rather than the top-left corner.
+        let mid_lat_raw = geotransform[3]
+            + 0.5 * (width as f64) * geotransform[4]
+            + 0.5 * (height as f64) * geotransform[5];
+        if !mid_lat_raw.is_finite() {
+            return (1.0, 1.0);
+        }
+        let mid_gt = [geotransform[0], 1.0, 0.0, mid_lat_raw, 0.0, -1.0];
+        let (mvx, mvy, _) = crs_metric_basis(projection, &mid_gt, 0, 0);
+        let sx = mvx.0.abs();
+        let sy = mvy.1.abs();
+        if sx.is_finite() && sx > 0.0 && sy.is_finite() && sy > 0.0 {
+            return (sx, sy);
+        }
+        return (1.0, 1.0);
+    }
+    let sx = vx_m.0.abs();
+    let sy = vy_m.1.abs();
+    if sx.is_finite() && sx > 0.0 && sy.is_finite() && sy > 0.0 {
+        (sx, sy)
+    } else {
+        (1.0, 1.0)
+    }
+}
+
 /// Geometric and elevation statistics of a single labeled connected component.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -184,11 +279,12 @@ pub struct RegionProps {
     pub min_elev: f64,
     /// Maximum (spill/boundary) elevation inside the region.
     pub max_elev: f64,
-    /// Perimeter in map units (Benkrid & Crookes 4-neighborhood estimator × `resolution`).
+    /// Perimeter in SI meters when CRS metadata is present (or native map units otherwise;
+    /// Benkrid & Crookes 4-neighborhood estimator).
     pub perimeter: f64,
-    /// Major axis length of the equivalent ellipse in map units.
+    /// Major axis length of the equivalent ellipse in SI meters (or native map units without CRS).
     pub major_axis: f64,
-    /// Minor axis length of the equivalent ellipse in map units (clamped to >= `resolution`).
+    /// Minor axis length of the equivalent ellipse in SI meters (clamped to >= pixel spacing).
     pub minor_axis: f64,
     /// Ratio `major_axis / minor_axis`.
     pub elongatedness: f64,
@@ -504,7 +600,7 @@ pub fn region_props_xy(
     res_y: f64,
     cell_area: f64,
 ) -> Vec<RegionProps> {
-    region_props_affine_inner(
+    region_props_affine_basis(
         labels,
         nb_labels,
         elev,
@@ -754,6 +850,7 @@ pub(crate) fn benkrid_crookes_perimeter_from_border_set(
 /// Promotes a single [`RegionBasicStats`] entry to full [`RegionProps`] by computing
 /// its affine-aware Benkrid & Crookes perimeter and equivalent-ellipse moments over its
 /// bounding box only. Produces results identical to [`region_props_affine`].
+#[cfg(test)]
 pub(crate) fn region_props_for_single_label(
     labels: &[u32],
     basic: &RegionBasicStats,
@@ -761,6 +858,17 @@ pub(crate) fn region_props_for_single_label(
     gt: &[f64; 6],
 ) -> RegionProps {
     let (vx, vy, cell_area) = affine_basis(gt);
+    region_props_for_single_label_basis(labels, basic, width, vx, vy, cell_area)
+}
+
+pub(crate) fn region_props_for_single_label_basis(
+    labels: &[u32],
+    basic: &RegionBasicStats,
+    width: usize,
+    vx: (f64, f64),
+    vy: (f64, f64),
+    cell_area: f64,
+) -> RegionProps {
     let res_x = vx.0.hypot(vx.1);
     let res_y = vy.0.hypot(vy.1);
     let max_side = res_x.max(res_y);
@@ -863,6 +971,7 @@ pub(crate) fn region_props_for_single_label(
 /// Computes region properties using a full 6-element GDAL-style affine geotransform,
 /// accurately handling anisotropic pixel spacings, rotation, and shear in both
 /// perimeter and second central spatial moments.
+#[cfg(test)]
 pub(crate) fn region_props_affine(
     labels: &[u32],
     nb_labels: u32,
@@ -872,11 +981,11 @@ pub(crate) fn region_props_affine(
     gt: &[f64; 6],
 ) -> Vec<RegionProps> {
     let (vx, vy, cell_area) = affine_basis(gt);
-    region_props_affine_inner(labels, nb_labels, elev, width, height, vx, vy, cell_area)
+    region_props_affine_basis(labels, nb_labels, elev, width, height, vx, vy, cell_area)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn region_props_affine_inner(
+pub(crate) fn region_props_affine_basis(
     labels: &[u32],
     nb_labels: u32,
     elev: &[f64],

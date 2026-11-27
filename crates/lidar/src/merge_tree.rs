@@ -33,7 +33,7 @@ use crate::graph::RatingCurvePoint;
 use crate::inundation::validate_grid_alignment;
 use crate::progress::ExecutionControl;
 use crate::region::{
-    affine_basis, benkrid_crookes_perimeter_from_border_set, extended_morphometrics,
+    benkrid_crookes_perimeter_from_border_set, extended_morphometrics, safe_crs_metric_basis,
 };
 use crate::slicing::{InMemoryDepressions, NestedDepression};
 
@@ -390,6 +390,8 @@ fn build_region_merge_tree(
     mut cells: Vec<SinkCell>,
     root_outlet: Option<RootOutlet>,
     gt: &[f64; 6],
+    vx_m: (f64, f64),
+    vy_m: (f64, f64),
     cell_area: f64,
     options: &MergeTreeOptions,
 ) -> RegionMergeOutput {
@@ -946,7 +948,7 @@ fn build_region_merge_tree(
         }
     }
 
-    let (vx, vy, _) = affine_basis(gt);
+    let (vx, vy) = (vx_m, vy_m);
     let res_x = vx.0.hypot(vx.1);
     let res_y = vy.0.hypot(vy.1);
     let max_side = res_x.max(res_y);
@@ -1352,7 +1354,7 @@ fn delineate_merge_tree_impl(
         .ok_or_else(|| Error::DimensionMismatch(format!("raster dimensions overflow ({w}x{h})")))?;
 
     let gt = sink.geotransform;
-    let (_, _, cell_area) = affine_basis(&gt);
+    let (vx_m, vy_m, _, _, cell_area) = safe_crs_metric_basis(&sink.projection, &gt, w, h);
     let no_data_raw = sink.no_data();
     let is_valid_sink = |v: f64| -> bool { v.is_finite() && !v.rd_eq(no_data_raw) };
 
@@ -1510,6 +1512,8 @@ fn delineate_merge_tree_impl(
             cells,
             outlet,
             &gt,
+            vx_m,
+            vy_m,
             cell_area,
             options,
         );

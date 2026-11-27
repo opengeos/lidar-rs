@@ -26,7 +26,7 @@ use crate::progress::ExecutionControl;
 use crate::raster_ops::{ensure_no_path_collision, polygonize};
 use crate::region::{
     RegionProps, extended_morphometrics, region_basic_stats, region_group, region_group_slice,
-    region_props_for_single_label,
+    region_props_for_single_label_basis, safe_crs_metric_basis,
 };
 
 /// Maximum vertical level-set slices permitted per region to guard against
@@ -233,7 +233,8 @@ fn level_set_region(
     min_size: usize,
     min_depth: f64,
     interval: f64,
-    gt: &[f64; 6],
+    vx_m: (f64, f64),
+    vy_m: (f64, f64),
     res_x: f64,
     res_y: f64,
     cell_area: f64,
@@ -395,7 +396,14 @@ fn level_set_region(
 
             if parent_counts.is_empty() || parent_id == 0 {
                 unique_id += 1;
-                let props = region_props_for_single_label(&label_objects, obj, bw, gt);
+                let props = region_props_for_single_label_basis(
+                    &label_objects,
+                    obj,
+                    bw,
+                    vx_m,
+                    vy_m,
+                    cell_area,
+                );
                 dep_list.push(depression_from_props(unique_id, region_id, &props));
                 parent_counts.insert(unique_id, 0);
                 nbr_indices.insert(unique_id, Vec::new());
@@ -428,7 +436,14 @@ fn level_set_region(
                 for child_idx in children {
                     let obj = &objects[child_idx];
                     unique_id += 1;
-                    let props = region_props_for_single_label(&label_objects, obj, bw, gt);
+                    let props = region_props_for_single_label_basis(
+                        &label_objects,
+                        obj,
+                        bw,
+                        vx_m,
+                        vy_m,
+                        cell_area,
+                    );
                     dep_list.push(depression_from_props(unique_id, region_id, &props));
                     dep_list[(key - 1) as usize].children_ids.push(unique_id);
                     parent_counts.insert(unique_id, 0);
@@ -1114,21 +1129,8 @@ pub fn delineate_depressions_in_memory_with_control(
         .ok_or_else(|| Error::DimensionMismatch(format!("raster dimensions overflow ({w}x{h})")))?;
 
     let no_data_raw = sink.no_data();
-    let gt = sink.geotransform;
-    let res_x = gt[1].hypot(gt[4]);
-    let res_y = gt[2].hypot(gt[5]);
-    let det = (gt[1] * gt[5] - gt[2] * gt[4]).abs();
-    let (res_x, res_y, cell_area) = if res_x > 0.0
-        && res_x.is_finite()
-        && res_y > 0.0
-        && res_y.is_finite()
-        && det > 0.0
-        && det.is_finite()
-    {
-        (res_x, res_y, det)
-    } else {
-        (1.0, 1.0, 1.0)
-    };
+    let (vx_m, vy_m, res_x, res_y, cell_area) =
+        safe_crs_metric_basis(&sink.projection, &sink.geotransform, w, h);
 
     // Treat only non-finite cells and the declared NoData sentinel as background,
     // preserving valid negative (below-sea-level) sink elevations.
@@ -1191,7 +1193,7 @@ pub fn delineate_depressions_in_memory_with_control(
             }
         }
         let (local_obj, local_deps) = level_set_region(
-            &sub_img, bw, bh, region_id, min_size, min_depth, interval, &gt, res_x, res_y,
+            &sub_img, bw, bh, region_id, min_size, min_depth, interval, vx_m, vy_m, res_x, res_y,
             cell_area,
         )?;
         control.check_cancelled()?;
@@ -1532,9 +1534,21 @@ mod tests {
                 sub[r * bw + (c + 6)] = 10.0 + (r + c) as f64 * 0.1;
             }
         }
-        let gt = [0.0, 1.0, 0.0, bh as f64, 0.0, -1.0];
-        let (obj, deps) =
-            level_set_region(&sub, bw, bh, 1, 2, 0.0, 0.2, &gt, 1.0, 1.0, 1.0).unwrap();
+        let (obj, deps) = level_set_region(
+            &sub,
+            bw,
+            bh,
+            1,
+            2,
+            0.0,
+            0.2,
+            (1.0, 0.0),
+            (0.0, -1.0),
+            1.0,
+            1.0,
+            1.0,
+        )
+        .unwrap();
         assert_eq!(deps.len(), 2);
         assert!(obj[0] > 0 && obj[6] > 0 && obj[0] != obj[6]);
     }
