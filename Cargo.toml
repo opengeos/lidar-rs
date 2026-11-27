@@ -4,7 +4,7 @@ members = ["crates/lidar", "crates/lidar-cli"]
 exclude = ["python", "js"]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 license = "MIT"
 rust-version = "1.90"
@@ -12,7 +12,7 @@ repository = "https://github.com/opengeos/lidar-rs"
 authors = ["Qiusheng Wu <giswqs@gmail.com>"]
 
 [workspace.dependencies]
-lidar = { path = "crates/lidar", version = "0.6.1" }
+lidar = { path = "crates/lidar", version = "0.6.2" }
 richdem = { version = "0.2", default-features = false, features = ["terrio"] }
 terrio = { version = "0.9", default-features = false, features = ["geotiff", "sqlite"] }
 rayon = "1.10"
