@@ -296,6 +296,52 @@ pub fn compute_hillshade_rgb(dem: &Array2D<f64>, opts: &HillshadeOptions) -> Vec
     rgb
 }
 
+/// Computes shaded-relief RGB directly at the target preview/animation dimensions `(dw, dh)`
+/// by downscaling the DEM before running the finite-difference hillshade kernel.
+///
+/// Scales the affine pixel spacing by `(sw / dw, sh / dh)` so terrain gradients retain the
+/// same physical slope units while reducing work from `O(sw * sh)` to `O(dw * dh)`.
+fn compute_hillshade_rgb_downscaled(
+    dem: &Array2D<f64>,
+    opts: &HillshadeOptions,
+    dw: usize,
+    dh: usize,
+) -> Vec<u8> {
+    let sw = dem.width();
+    let sh = dem.height();
+    if dw == sw && dh == sh {
+        return compute_hillshade_rgb(dem, opts);
+    }
+    if dw == 0 || dh == 0 || sw == 0 || sh == 0 {
+        return Vec::new();
+    }
+    let src = dem.data();
+    let mut small = Vec::with_capacity(dw * dh);
+    for y in 0..dh {
+        let sy = ((y as u64 * sh as u64) / dh as u64) as usize;
+        let row_off = sy.min(sh - 1) * sw;
+        for x in 0..dw {
+            let sx = (((x as u64 * sw as u64) / dw as u64) as usize).min(sw - 1);
+            small.push(src[row_off + sx]);
+        }
+    }
+    let mut small_dem = match Array2D::from_vec(dw, dh, small) {
+        Ok(arr) => arr,
+        Err(_) => {
+            let full = compute_hillshade_rgb(dem, opts);
+            return downscale_rgb(&full, sw, sh, dw, dh);
+        }
+    };
+    small_dem.copy_metadata_from(dem);
+    let sx_ratio = sw as f64 / dw as f64;
+    let sy_ratio = sh as f64 / dh as f64;
+    small_dem.geotransform[1] *= sx_ratio;
+    small_dem.geotransform[4] *= sx_ratio;
+    small_dem.geotransform[2] *= sy_ratio;
+    small_dem.geotransform[5] *= sy_ratio;
+    compute_hillshade_rgb(&small_dem, opts)
+}
+
 /// Minimal 5×7 uppercase/digit/punctuation bitmap glyph table for zero-dependency HUD labels.
 fn glyph_5x7(ch: char) -> [u8; 7] {
     match ch.to_ascii_uppercase() {
@@ -662,8 +708,7 @@ where
     let (dw, dh, total_h) = compute_gif_dimensions(sw, sh, options)?;
     let banner_h = ANIMATION_BANNER_HEIGHT;
 
-    let base_rgb_full = compute_hillshade_rgb(dem, &options.hillshade);
-    let base_rgb = downscale_rgb(&base_rgb_full, sw, sh, dw, dh);
+    let base_rgb = compute_hillshade_rgb_downscaled(dem, &options.hillshade, dw, dh);
 
     let mut encoder = Encoder::new(writer, dw as u16, total_h as u16, &[])
         .map_err(|e| Error::Algorithm(format!("GIF encoder init failed: {e}")))?;
@@ -689,14 +734,89 @@ where
         }
     }
 
+    // Compact bit-packed wet-mask cache for `ping_pong: true` so `load_wet_mask` never decodes
+    // the same frame twice while keeping memory 8x smaller than `Vec<bool>` (or downscaled to
+    // `(dw, dh)` bits when no spill paths need full-resolution wet lookups).
+    struct BitMask {
+        words: Vec<u64>,
+        len: usize,
+    }
+    impl BitMask {
+        fn pack_full(wet: &[bool]) -> Self {
+            let mut words = vec![0u64; wet.len().div_ceil(64)];
+            for (i, &w) in wet.iter().enumerate() {
+                if w {
+                    words[i >> 6] |= 1u64 << (i & 63);
+                }
+            }
+            Self {
+                words,
+                len: wet.len(),
+            }
+        }
+        fn pack_downscaled(wet: &[bool], sw: usize, sh: usize, dw: usize, dh: usize) -> Self {
+            let len = dw * dh;
+            let mut words = vec![0u64; len.div_ceil(64)];
+            for y in 0..dh {
+                let sy = (y * sh / dh).min(sh - 1);
+                let dst_row = y * dw;
+                let src_row = sy * sw;
+                for x in 0..dw {
+                    let sx = (x * sw / dw).min(sw - 1);
+                    if wet[src_row + sx] {
+                        let i = dst_row + x;
+                        words[i >> 6] |= 1u64 << (i & 63);
+                    }
+                }
+            }
+            Self { words, len }
+        }
+        #[inline]
+        fn get(&self, i: usize) -> bool {
+            i < self.len && ((self.words[i >> 6] >> (i & 63)) & 1) != 0
+        }
+        fn unpack(&self) -> Vec<bool> {
+            (0..self.len).map(|i| self.get(i)).collect()
+        }
+    }
+
+    let need_full_wet_for_spills = !spill_paths.is_empty() && options.time_step_h.is_some();
+    let cache_enabled = options.ping_pong && num_steps > 1;
+    let mut cached_wet: Vec<Option<BitMask>> = if cache_enabled {
+        (0..num_steps).map(|_| None).collect()
+    } else {
+        Vec::new()
+    };
+
     let mut frame_rgb = vec![0u8; dw * total_h * 3];
     for &(src_idx, rising) in &sequence {
-        let wet = load_wet_mask(src_idx)?;
-        if wet.len() != sw * sh {
-            return Err(Error::DimensionMismatch(format!(
-                "wet mask length ({}) does not match DEM ({sw}x{sh})",
-                wet.len()
-            )));
+        let mut owned_wet: Option<Vec<bool>> = None;
+        if cache_enabled {
+            if cached_wet[src_idx].is_none() {
+                let loaded = load_wet_mask(src_idx)?;
+                if loaded.len() != sw * sh {
+                    return Err(Error::DimensionMismatch(format!(
+                        "wet mask length ({}) does not match DEM ({sw}x{sh})",
+                        loaded.len()
+                    )));
+                }
+                let packed = if need_full_wet_for_spills {
+                    BitMask::pack_full(&loaded)
+                } else {
+                    BitMask::pack_downscaled(&loaded, sw, sh, dw, dh)
+                };
+                cached_wet[src_idx] = Some(packed);
+                owned_wet = Some(loaded);
+            }
+        } else {
+            let loaded = load_wet_mask(src_idx)?;
+            if loaded.len() != sw * sh {
+                return Err(Error::DimensionMismatch(format!(
+                    "wet mask length ({}) does not match DEM ({sw}x{sh})",
+                    loaded.len()
+                )));
+            }
+            owned_wet = Some(loaded);
         }
 
         let progress = (src_idx + 1) as f64 / num_steps as f64;
@@ -732,17 +852,39 @@ where
 
         let body = &mut frame_rgb[dw * banner_h * 3..];
         body.copy_from_slice(&base_rgb);
-        for y in 0..dh {
-            let sy = (y * sh / dh).min(sh - 1);
-            for x in 0..dw {
-                let sx = (x * sw / dw).min(sw - 1);
-                if wet[sy * sw + sx] {
-                    let p = (y * dw + x) * 3;
-                    body[p] = (body[p] as f32 * inv_alpha + wr as f32 * alpha).round() as u8;
-                    body[p + 1] =
-                        (body[p + 1] as f32 * inv_alpha + wg as f32 * alpha).round() as u8;
-                    body[p + 2] =
-                        (body[p + 2] as f32 * inv_alpha + wb as f32 * alpha).round() as u8;
+        if let Some(ref wet_full) = owned_wet {
+            for y in 0..dh {
+                let sy = (y * sh / dh).min(sh - 1);
+                for x in 0..dw {
+                    let sx = (x * sw / dw).min(sw - 1);
+                    if wet_full[sy * sw + sx] {
+                        let p = (y * dw + x) * 3;
+                        body[p] = (body[p] as f32 * inv_alpha + wr as f32 * alpha).round() as u8;
+                        body[p + 1] =
+                            (body[p + 1] as f32 * inv_alpha + wg as f32 * alpha).round() as u8;
+                        body[p + 2] =
+                            (body[p + 2] as f32 * inv_alpha + wb as f32 * alpha).round() as u8;
+                    }
+                }
+            }
+        } else if let Some(ref packed) = cached_wet[src_idx] {
+            for y in 0..dh {
+                let sy = (y * sh / dh).min(sh - 1);
+                for x in 0..dw {
+                    let is_wet = if need_full_wet_for_spills {
+                        let sx = (x * sw / dw).min(sw - 1);
+                        packed.get(sy * sw + sx)
+                    } else {
+                        packed.get(y * dw + x)
+                    };
+                    if is_wet {
+                        let p = (y * dw + x) * 3;
+                        body[p] = (body[p] as f32 * inv_alpha + wr as f32 * alpha).round() as u8;
+                        body[p + 1] =
+                            (body[p + 1] as f32 * inv_alpha + wg as f32 * alpha).round() as u8;
+                        body[p + 2] =
+                            (body[p + 2] as f32 * inv_alpha + wb as f32 * alpha).round() as u8;
+                    }
                 }
             }
         }
@@ -763,7 +905,18 @@ where
             && let Some(dt) = options.time_step_h
         {
             let t_hours = (src_idx + 1) as f64 * dt;
-            draw_active_spill_paths(body, dw, dh, sw, sh, &wet, t_hours, spill_paths);
+            let unpacked;
+            let wet_slice: &[bool] = match owned_wet.as_deref() {
+                Some(s) => s,
+                None => {
+                    unpacked = cached_wet[src_idx]
+                        .as_ref()
+                        .expect("cached full wet mask")
+                        .unpack();
+                    &unpacked
+                }
+            };
+            draw_active_spill_paths(body, dw, dh, sw, sh, wet_slice, t_hours, spill_paths);
         }
 
         let legend_label = options.legend_label.as_deref().unwrap_or("WATER");
@@ -1345,8 +1498,7 @@ pub fn render_inundation_frame_png_bytes(
     let sh = dem.height();
     crate::inundation::validate_grid_alignment(dem, fill_time, "fill_time")?;
     let (dw, dh, total_h) = compute_gif_dimensions(sw, sh, options)?;
-    let full_bg = compute_hillshade_rgb(dem, &options.hillshade);
-    let bg = downscale_rgb(&full_bg, sw, sh, dw, dh);
+    let bg = compute_hillshade_rgb_downscaled(dem, &options.hillshade, dw, dh);
     let alpha = options.water_alpha.clamp(0.0, 1.0);
     let inv_alpha = 1.0 - alpha;
     let [wr, wg, wb] = options.water_rgb;
@@ -1439,8 +1591,7 @@ pub fn render_dem_preview_png_bytes(
         crate::inundation::validate_grid_alignment(dem, ov, "depth_overlay")?;
     }
     let (dw, dh, _) = compute_gif_dimensions(sw, sh, options)?;
-    let full_bg = compute_hillshade_rgb(dem, &options.hillshade);
-    let mut rgb = downscale_rgb(&full_bg, sw, sh, dw, dh);
+    let mut rgb = compute_hillshade_rgb_downscaled(dem, &options.hillshade, dw, dh);
     let cell_m = dem.geotransform[1].hypot(dem.geotransform[4]);
 
     if let Some(ov) = depth_overlay {
@@ -1506,8 +1657,7 @@ pub fn export_inundation_frames_png(
     let out_dir = out_dir.as_ref();
     std::fs::create_dir_all(out_dir)?;
 
-    let full_bg = compute_hillshade_rgb(dem, &options.hillshade);
-    let bg = downscale_rgb(&full_bg, sw, sh, dw, dh);
+    let bg = compute_hillshade_rgb_downscaled(dem, &options.hillshade, dw, dh);
     let alpha = options.water_alpha.clamp(0.0, 1.0);
     let inv_alpha = 1.0 - alpha;
     let [wr, wg, wb] = options.water_rgb;
@@ -2012,5 +2162,41 @@ mod tests {
         // When allow_overview is false (e.g. overlay alignment), full resolution is loaded.
         let full_arr = load_dem_for_preview(&cog_tif, 256, false).unwrap();
         assert_eq!((full_arr.width(), full_arr.height()), (w, h));
+    }
+
+    #[test]
+    fn ping_pong_gif_decodes_each_frame_once_and_downscales_before_hillshade() {
+        let (w, h) = (64usize, 64usize);
+        let mut data = Vec::with_capacity(w * h);
+        for r in 0..h {
+            for c in 0..w {
+                data.push(100.0 + 0.1 * (r as f64) + 0.05 * (c as f64));
+            }
+        }
+        let mut dem = Array2D::from_vec(w, h, data).unwrap();
+        dem.set_no_data(-9999.0);
+        dem.geotransform = [0.0, 1.0, 0.0, h as f64, 0.0, -1.0];
+
+        let opts = AnimateInundationOptions {
+            max_dimension: Some(32),
+            ping_pong: true,
+            ..Default::default()
+        };
+        let mut calls = vec![0usize; 4];
+        let mut out = Vec::new();
+        let (nframes, dw, _total_h) = render_inundation_gif(&dem, 4, &opts, &[], &mut out, |idx| {
+            calls[idx] += 1;
+            Ok(vec![idx >= 2; w * h])
+        })
+        .unwrap();
+
+        assert_eq!(dw, 32);
+        assert_eq!(nframes, 7); // 4 rising + 3 falling
+        assert_eq!(
+            calls,
+            vec![1, 1, 1, 1],
+            "ping_pong must decode each frame mask at most once"
+        );
+        assert!(out.starts_with(b"GIF89a"));
     }
 }

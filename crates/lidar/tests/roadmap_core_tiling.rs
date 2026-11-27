@@ -128,6 +128,7 @@ fn merge_tree_recovers_exact_sub_interval_saddle_and_pour_point() {
             min_size: 10,
             min_depth: 0.5,
             topology: Topology::D4,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -238,6 +239,7 @@ fn merge_tree_three_level_nested_hierarchy_and_persistence_pruning() {
             min_size: 8,
             min_depth: 0.5,
             topology: Topology::D4,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -298,6 +300,7 @@ fn merge_tree_on_sample_sink_conserves_volume_and_runs_fsm() {
             min_size: 500,
             min_depth: 0.3,
             topology: Topology::D8,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -396,6 +399,7 @@ fn merge_tree_on_sample_sink_conserves_volume_and_runs_fsm() {
             min_size: 1000,
             min_depth: 0.3,
             topology: Topology::D8,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -1052,6 +1056,7 @@ fn gpkg_enclosing_layer_covers_three_level_merge_tree_hierarchy() {
             min_size: 8,
             min_depth: 0.5,
             topology: Topology::D4,
+            ..Default::default()
         },
     )
     .unwrap();
