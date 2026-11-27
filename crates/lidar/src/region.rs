@@ -744,6 +744,19 @@ fn benkrid_crookes_perimeter_sparse(
         }
     }
 
+    benkrid_crookes_perimeter_from_border_set(&border, vx, vy)
+}
+
+/// Computes the exact affine-aware Benkrid & Crookes perimeter directly from a pre-filtered
+/// set of 4-neighborhood border cells `(row, col)`.
+pub(crate) fn benkrid_crookes_perimeter_from_border_set(
+    border: &HashSet<(isize, isize)>,
+    vx: (f64, f64),
+    vy: (f64, f64),
+) -> f64 {
+    if border.is_empty() {
+        return 0.0;
+    }
     let res_x = vx.0.hypot(vx.1);
     let res_y = vy.0.hypot(vy.1);
     let diag_pos = (vx.0 + vy.0).hypot(vx.1 + vy.1);
@@ -752,7 +765,7 @@ fn benkrid_crookes_perimeter_sparse(
 
     let get = |r: isize, c: isize| -> u8 { u8::from(border.contains(&(r, c))) };
 
-    for &(ri, ci) in &border {
+    for &(ri, ci) in border {
         let horiz = get(ri, ci - 1) + get(ri, ci + 1);
         let vert = get(ri - 1, ci) + get(ri + 1, ci);
         let d_pos = get(ri - 1, ci - 1) + get(ri + 1, ci + 1);
@@ -767,7 +780,7 @@ fn benkrid_crookes_perimeter_sparse(
 /// Computes full affine-aware [`RegionProps`] from a sparse slice of occupied `(row, col)`
 /// coordinates in `O(|cells|)` memory, avoiding dense bounding-box allocations for sparse
 /// or elongated regions.
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub(crate) fn region_props_from_sparse_cells(
     label: u32,
     cells: &[(usize, usize)],

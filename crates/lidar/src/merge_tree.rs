@@ -19,7 +19,8 @@
 //!   peak working memory per region without bounding-box-sized dense grids for sparse regions.
 
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::f64::consts::{FRAC_PI_4, PI};
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -30,7 +31,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::graph::RatingCurvePoint;
 use crate::inundation::validate_grid_alignment;
-use crate::region::{affine_basis, extended_morphometrics, region_props_from_sparse_cells};
+use crate::region::{
+    affine_basis, benkrid_crookes_perimeter_from_border_set, extended_morphometrics,
+};
 use crate::slicing::{InMemoryDepressions, NestedDepression};
 
 /// Options controlling [`delineate_depressions_merge_tree_in_memory`] and
@@ -45,6 +48,20 @@ pub struct MergeTreeOptions {
     pub min_depth: f64,
     /// Grid connectivity topology for sink grouping and bottom-up merges (`Topology::D8` by default).
     pub topology: Topology,
+    /// Set to `true` when the `source_dem` passed to
+    /// [`delineate_depressions_merge_tree_with_dem_in_memory`] is already a pit-refined DEM
+    /// (such as `InMemorySinks::dem_refined`), skipping an extra full-DEM clone and Priority-Flood
+    /// pass (default `false`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub dem_is_refined: bool,
+    /// Optional cap on emitted rating-curve points per merge-tree node (default `None`, retaining
+    /// every distinct elevation breakpoint). Set to `Some(0)` to disable rating-curve emission
+    /// completely while still computing exact per-node volumes via bottom-up elevation moments,
+    /// or `Some(k)` (`k >= 2`, values of `1` are treated as `2`) to emit at most `k` evenly
+    /// spaced breakpoints per node (always preserving floor and spill endpoints with exact
+    /// integrated storage volume).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub max_rating_curve_points: Option<usize>,
 }
 
 impl Default for MergeTreeOptions {
@@ -53,6 +70,8 @@ impl Default for MergeTreeOptions {
             min_size: 1000,
             min_depth: 0.3,
             topology: Topology::D8,
+            dem_is_refined: false,
+            max_rating_curve_points: None,
         }
     }
 }
@@ -866,13 +885,251 @@ fn build_region_merge_tree(
         });
     }
 
-    // Compute exact component-local storage volumes, exact continuous rating curves (retaining
-    // every distinct elevation breakpoint), and sparse-memory NestedDepression morphometrics.
+    // Bottom-up Chan's central-moment merge and Euler-tour border-set merge avoid
+    // `O(sum |subtree|)` coordinate rescans while preserving exact second central moments,
+    // bounding boxes, and Benkrid-Crookes perimeters.
+    #[derive(Clone, Copy)]
+    struct NodeMoments {
+        n: f64,
+        mean_r: f64,
+        mean_c: f64,
+        m20: f64,
+        m02: f64,
+        m11: f64,
+        mean_z: f64,
+        r0: usize,
+        c0: usize,
+        r1: usize,
+        c1: usize,
+    }
+    impl NodeMoments {
+        fn empty() -> Self {
+            Self {
+                n: 0.0,
+                mean_r: 0.0,
+                mean_c: 0.0,
+                m20: 0.0,
+                m02: 0.0,
+                m11: 0.0,
+                mean_z: 0.0,
+                r0: usize::MAX,
+                c0: usize::MAX,
+                r1: 0,
+                c1: 0,
+            }
+        }
+        fn merge_into(&mut self, other: &Self) {
+            if other.n <= 0.0 {
+                return;
+            }
+            if self.n <= 0.0 {
+                *self = *other;
+                return;
+            }
+            let n_ab = self.n + other.n;
+            let dr = other.mean_r - self.mean_r;
+            let dc = other.mean_c - self.mean_c;
+            let dz = other.mean_z - self.mean_z;
+            let w_ab = (self.n * other.n) / n_ab;
+            self.mean_r += dr * (other.n / n_ab);
+            self.mean_c += dc * (other.n / n_ab);
+            self.mean_z += dz * (other.n / n_ab);
+            self.m20 += other.m20 + dr * dr * w_ab;
+            self.m02 += other.m02 + dc * dc * w_ab;
+            self.m11 += other.m11 + dr * dc * w_ab;
+            self.n = n_ab;
+            self.r0 = self.r0.min(other.r0);
+            self.c0 = self.c0.min(other.c0);
+            self.r1 = self.r1.max(other.r1);
+            self.c1 = self.c1.max(other.c1);
+        }
+    }
+
+    let (vx, vy, _) = affine_basis(gt);
+    let res_x = vx.0.hypot(vx.1);
+    let res_y = vy.0.hypot(vy.1);
+    let max_side = res_x.max(res_y);
+    let min_res = if max_side > 0.0 && cell_area > 0.0 {
+        (cell_area / max_side).min(res_x.min(res_y))
+    } else {
+        res_x.min(res_y)
+    };
+
+    // Because `nodes` are already in DFS preorder (1-based IDs `1..=num_nodes`), subtree
+    // membership for node `u` is a contiguous half-open ID range `[u_id, subtree_end[u])`.
+    let mut subtree_end = vec![0u32; num_nodes];
+    for u in (0..num_nodes).rev() {
+        let mut end = nodes[u].id + 1;
+        for &cid in &nodes[u].children_ids {
+            end = end.max(subtree_end[(cid - 1) as usize]);
+        }
+        subtree_end[u] = end;
+    }
+
+    // Map each region cell's `(row, col)` to its owned preorder node ID for O(1) 4-neighbor
+    // interior/border checks during bottom-up border-set merging.
+    let bbox_cells = bw.saturating_mul(bh);
+    let use_dense_owner = bbox_cells <= m.saturating_mul(4).max(256);
+    let mut dense_owner: Vec<u32> = if use_dense_owner {
+        vec![0u32; bbox_cells]
+    } else {
+        Vec::new()
+    };
+    let mut sparse_owner: HashMap<(usize, usize), u32> = if use_dense_owner {
+        HashMap::new()
+    } else {
+        HashMap::with_capacity(m)
+    };
+    for (u, owned) in node_owned_cells.iter().enumerate() {
+        let nid = (u + 1) as u32;
+        for &ci in owned {
+            let cell = cells[ci];
+            if use_dense_owner {
+                dense_owner[(cell.r - r0) * bw + (cell.c - c0)] = nid;
+            } else {
+                sparse_owner.insert((cell.r, cell.c), nid);
+            }
+        }
+    }
+    let owner_at = |r: isize, c: isize| -> u32 {
+        if r < r0 as isize || c < c0 as isize || r >= r1 as isize || c >= c1 as isize {
+            return 0;
+        }
+        let ru = r as usize;
+        let cu = c as usize;
+        if use_dense_owner {
+            dense_owner[(ru - r0) * bw + (cu - c0)]
+        } else {
+            sparse_owner.get(&(ru, cu)).copied().unwrap_or(0)
+        }
+    };
+
+    // Initialize owned-cell moments (shifted relative to region bbox origin `(r0, c0)` to
+    // prevent catastrophic cancellation) and merge bottom-up using Chan's formula.
+    let mut moments: Vec<NodeMoments> = Vec::with_capacity(num_nodes);
+    let mut perimeters: Vec<f64> = vec![0.0; num_nodes];
+    let mut borders: Vec<HashSet<(isize, isize)>> =
+        (0..num_nodes).map(|_| HashSet::new()).collect();
+    let r0_f = r0 as f64;
+    let c0_f = c0 as f64;
+    for owned in &node_owned_cells {
+        let mut nm = NodeMoments::empty();
+        if !owned.is_empty() {
+            let mut sum_r = 0.0f64;
+            let mut sum_c = 0.0f64;
+            let mut sum_z = 0.0f64;
+            let mut lr0 = usize::MAX;
+            let mut lc0 = usize::MAX;
+            let mut lr1 = 0usize;
+            let mut lc1 = 0usize;
+            for &ci in owned {
+                let cell = cells[ci];
+                let dr = cell.r as f64 - r0_f;
+                let dc = cell.c as f64 - c0_f;
+                let cf = dc * vx.0 + dr * vy.0;
+                let rf = -(dc * vx.1 + dr * vy.1);
+                sum_r += rf;
+                sum_c += cf;
+                sum_z += cell.z;
+                lr0 = lr0.min(cell.r);
+                lc0 = lc0.min(cell.c);
+                lr1 = lr1.max(cell.r + 1);
+                lc1 = lc1.max(cell.c + 1);
+            }
+            let nf = owned.len() as f64;
+            let mean_r = sum_r / nf;
+            let mean_c = sum_c / nf;
+            let mean_z = sum_z / nf;
+            let mut m20 = 0.0f64;
+            let mut m02 = 0.0f64;
+            let mut m11 = 0.0f64;
+            for &ci in owned {
+                let cell = cells[ci];
+                let dr = cell.r as f64 - r0_f;
+                let dc = cell.c as f64 - c0_f;
+                let cf = dc * vx.0 + dr * vy.0 - mean_c;
+                let rf = -(dc * vx.1 + dr * vy.1) - mean_r;
+                m20 += rf * rf;
+                m02 += cf * cf;
+                m11 += rf * cf;
+            }
+            nm = NodeMoments {
+                n: nf,
+                mean_r,
+                mean_c,
+                m20,
+                m02,
+                m11,
+                mean_z,
+                r0: lr0,
+                c0: lc0,
+                r1: lr1,
+                c1: lc1,
+            };
+        }
+        moments.push(nm);
+    }
+
+    // Single bottom-up pass (reverse preorder): merge moments in O(1) per edge and merge
+    // border sets small-to-large while pruning cells whose 4-neighbors all lie inside the
+    // node's preorder interval `[u_id, u_end)`.
+    for u in (0..num_nodes).rev() {
+        let u_id = nodes[u].id;
+        let u_end = subtree_end[u];
+        let is_border = |ri: isize, ci: isize| -> bool {
+            let n1 = owner_at(ri - 1, ci);
+            let n2 = owner_at(ri + 1, ci);
+            let n3 = owner_at(ri, ci - 1);
+            let n4 = owner_at(ri, ci + 1);
+            !(n1 >= u_id
+                && n1 < u_end
+                && n2 >= u_id
+                && n2 < u_end
+                && n3 >= u_id
+                && n3 < u_end
+                && n4 >= u_id
+                && n4 < u_end)
+        };
+
+        // Pick largest child border set as base (small-to-large merge).
+        let mut cur_border: HashSet<(isize, isize)> = HashSet::new();
+        for &cid in &nodes[u].children_ids {
+            let cidx = (cid - 1) as usize;
+            let child_m = moments[cidx];
+            moments[u].merge_into(&child_m);
+            let child_b = std::mem::take(&mut borders[cidx]);
+            if child_b.len() > cur_border.len() {
+                let prev = std::mem::replace(&mut cur_border, child_b);
+                cur_border.extend(prev);
+            } else {
+                cur_border.extend(child_b);
+            }
+        }
+        if !nodes[u].children_ids.is_empty() {
+            cur_border.retain(|&(ri, ci)| is_border(ri, ci));
+        }
+        for &ci in &node_owned_cells[u] {
+            let cell = cells[ci];
+            let ri = cell.r as isize;
+            let cj = cell.c as isize;
+            if is_border(ri, cj) {
+                cur_border.insert((ri, cj));
+            }
+        }
+        perimeters[u] = benkrid_crookes_perimeter_from_border_set(&cur_border, vx, vy);
+        borders[u] = cur_border;
+    }
+
+    // Compute exact component-local storage volumes, optional (and optionally capped) exact
+    // continuous rating curves, and NestedDepression morphometrics directly from the bottom-up
+    // Chan moments + perimeters.
     let mut depressions = Vec::with_capacity(num_nodes);
     let mut rating_curves = Vec::new();
-    let mut subtree_coords: Vec<(usize, usize)> = Vec::new();
+    let emit_curves = options.max_rating_curve_points != Some(0);
+    let curve_cap = options.max_rating_curve_points.map(|c| c.max(2));
     let mut subtree_elevs: Vec<f64> = Vec::new();
     let mut stages: Vec<f64> = Vec::new();
+    let mut desc_stack: Vec<u32> = Vec::new();
 
     for node_idx in 0..num_nodes {
         let node_id = nodes[node_idx].id;
@@ -881,70 +1138,99 @@ fn build_region_merge_tree(
         let node_level = nodes[node_idx].level;
         let node_area = nodes[node_idx].area;
         let node_max_depth = nodes[node_idx].max_depth;
+        let nm = moments[node_idx];
 
-        subtree_coords.clear();
-        subtree_elevs.clear();
-        stages.clear();
-        stages.push(node_min);
-        stages.push(node_saddle);
+        let node_volume = if !emit_curves {
+            // Exact storage volume below `node_saddle` from bottom-up Chan elevation mean
+            // (all subtree cells have z <= node_saddle; clamp to >= 0.0 for floating-point safety).
+            ((node_saddle - nm.mean_z).max(0.0) * nm.n * cell_area).max(0.0)
+        } else {
+            subtree_elevs.clear();
+            stages.clear();
+            stages.push(node_min);
+            stages.push(node_saddle);
 
-        let mut desc_stack = vec![node_id];
-        while let Some(cur_id) = desc_stack.pop() {
-            let cur = &nodes[(cur_id - 1) as usize];
-            if cur_id != node_id {
-                stages.push(cur.min_elev.clamp(node_min, node_saddle));
-                stages.push(cur.saddle_elev.clamp(node_min, node_saddle));
+            desc_stack.clear();
+            desc_stack.push(node_id);
+            while let Some(cur_id) = desc_stack.pop() {
+                let cur = &nodes[(cur_id - 1) as usize];
+                if cur_id != node_id {
+                    stages.push(cur.min_elev.clamp(node_min, node_saddle));
+                    stages.push(cur.saddle_elev.clamp(node_min, node_saddle));
+                }
+                for &ci in &node_owned_cells[(cur_id - 1) as usize] {
+                    subtree_elevs.push(cells[ci].z);
+                }
+                for &cid in &cur.children_ids {
+                    desc_stack.push(cid);
+                }
             }
-            for &ci in &node_owned_cells[(cur_id - 1) as usize] {
-                let c = cells[ci];
-                subtree_coords.push((c.r, c.c));
-                subtree_elevs.push(c.z);
-            }
-            for &cid in &cur.children_ids {
-                desc_stack.push(cid);
-            }
-        }
 
-        // Sort subtree elevations and stages, deduplicating numerically equal stages
-        // (`*a == *b`, collapsing -0.0 and +0.0 while retaining distinct tight saddles).
-        subtree_elevs.sort_unstable_by(f64::total_cmp);
-        stages.extend_from_slice(&subtree_elevs);
-        stages.sort_unstable_by(f64::total_cmp);
-        stages.dedup_by(|a, b| *a == *b);
+            // Sort subtree elevations and stages, deduplicating numerically equal stages
+            // (`*a == *b`, collapsing -0.0 and +0.0 while retaining distinct tight saddles).
+            subtree_elevs.sort_unstable_by(f64::total_cmp);
+            stages.extend_from_slice(&subtree_elevs);
+            stages.sort_unstable_by(f64::total_cmp);
+            stages.dedup_by(|a, b| *a == *b);
 
-        // Accumulate storage interval-by-interval across consecutive sorted stages using
-        // a monotone pointer so extreme elevations (e.g. [0, 1e308]) never overflow
-        // `k * depth - prefix_sum[k]`, and reuse the spill-stage volume for the node itself.
-        let mut cum_vol = 0.0f64;
-        let mut node_volume = 0.0f64;
-        let mut k = 0usize;
-        let mut prev_stage = stages[0];
-        let mut prev_k = 0usize;
-        for (s_idx, &stage) in stages.iter().enumerate() {
-            if s_idx > 0 {
-                let dz = (stage - prev_stage).max(0.0);
-                cum_vol += (prev_k as f64) * dz * cell_area;
+            let n_stages = stages.len();
+            let emit_stride_cap = curve_cap.filter(|&cap| n_stages > cap);
+            let mut next_emit_slot = 0usize;
+            let mut next_emit_idx = 0usize;
+
+            // Accumulate storage interval-by-interval across EVERY consecutive sorted stage
+            // so even capped rating curves preserve exact integrated cumulative volume.
+            let mut cum_vol = 0.0f64;
+            let mut vol_at_saddle = 0.0f64;
+            let mut k = 0usize;
+            let mut prev_stage = stages[0];
+            let mut prev_k = 0usize;
+            for (s_idx, &stage) in stages.iter().enumerate() {
+                if s_idx > 0 {
+                    let dz = (stage - prev_stage).max(0.0);
+                    cum_vol += (prev_k as f64) * dz * cell_area;
+                }
+                while k < subtree_elevs.len() && subtree_elevs[k] <= stage {
+                    k += 1;
+                }
+                if stage <= node_saddle {
+                    vol_at_saddle = cum_vol;
+                }
+                let should_emit = match emit_stride_cap {
+                    None => true,
+                    Some(cap) => {
+                        if s_idx == next_emit_idx || s_idx + 1 == n_stages {
+                            next_emit_slot += 1;
+                            if next_emit_slot < cap {
+                                next_emit_idx = (next_emit_slot * (n_stages - 1)) / (cap - 1);
+                            } else {
+                                next_emit_idx = usize::MAX;
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                };
+                if should_emit {
+                    let area = k as f64 * cell_area;
+                    let depth = (stage - node_min).max(0.0);
+                    rating_curves.push(RatingCurvePoint {
+                        dep_id: node_id,
+                        level: node_level,
+                        region_id,
+                        stage,
+                        depth,
+                        area,
+                        volume: cum_vol,
+                    });
+                }
+                prev_stage = stage;
+                prev_k = k;
             }
-            while k < subtree_elevs.len() && subtree_elevs[k] <= stage {
-                k += 1;
-            }
-            let area = k as f64 * cell_area;
-            let depth = (stage - node_min).max(0.0);
-            if stage <= node_saddle {
-                node_volume = cum_vol;
-            }
-            rating_curves.push(RatingCurvePoint {
-                dep_id: node_id,
-                level: node_level,
-                region_id,
-                stage,
-                depth,
-                area,
-                volume: cum_vol,
-            });
-            prev_stage = stage;
-            prev_k = k;
-        }
+            vol_at_saddle
+        };
+
         let node_avg_depth = if node_area > 0.0 {
             node_volume / node_area
         } else {
@@ -953,25 +1239,56 @@ fn build_region_merge_tree(
         nodes[node_idx].volume = node_volume;
         nodes[node_idx].avg_depth = node_avg_depth;
 
-        let props = region_props_from_sparse_cells(
-            node_id,
-            &subtree_coords,
-            gt,
-            node_area,
-            node_volume,
-            node_avg_depth,
-            node_max_depth,
-            node_min,
-            node_saddle,
-        );
+        let (
+            perimeter,
+            major_axis,
+            minor_axis,
+            elongatedness,
+            eccentricity,
+            orientation,
+            area_bbox_ratio,
+        ) = if nm.n > 0.0 {
+            let mu20 = (nm.m20 / nm.n).max(0.0);
+            let mu02 = (nm.m02 / nm.n).max(0.0);
+            let mu11 = nm.m11 / nm.n;
+            let common = ((mu20 - mu02).powi(2) + 4.0 * mu11 * mu11).sqrt();
+            let l1 = (0.5 * (mu20 + mu02 + common)).max(0.0);
+            let l2 = (0.5 * (mu20 + mu02 - common)).max(0.0);
+            let maj = 4.0 * l1.sqrt();
+            let min_ax = (4.0 * l2.sqrt()).max(min_res);
+            let elong = if min_ax > 0.0 { maj / min_ax } else { 0.0 };
+            let ecc = if l1 > 0.0 {
+                (1.0 - l2 / l1).max(0.0).sqrt()
+            } else {
+                0.0
+            };
+            let orient_rad = if (mu20 - mu02).abs() == 0.0 {
+                if mu11 < 0.0 { -FRAC_PI_4 } else { FRAC_PI_4 }
+            } else {
+                0.5 * (2.0 * mu11).atan2(mu20 - mu02)
+            };
+            let orient = orient_rad / PI * 180.0;
+            let bw_n = nm.c1.saturating_sub(nm.c0) as f64;
+            let bh_n = nm.r1.saturating_sub(nm.r0) as f64;
+            let bbox_area = bw_n * bh_n;
+            let abr = if bbox_area > 0.0 {
+                nm.n / bbox_area
+            } else {
+                0.0
+            };
+            (perimeters[node_idx], maj, min_ax, elong, ecc, orient, abr)
+        } else {
+            (0.0, 0.0, min_res, 0.0, 0.0, 0.0, 0.0)
+        };
+
         let (circularity, depth_diam_ratio, hypsometric_integral, rim_slope_deg, artifact_flag) =
             extended_morphometrics(
                 node_area,
-                props.perimeter,
+                perimeter,
                 node_avg_depth,
                 node_max_depth,
-                props.elongatedness,
-                props.area_bbox_ratio,
+                elongatedness,
+                area_bbox_ratio,
             );
         depressions.push(NestedDepression {
             id: node_id,
@@ -985,13 +1302,13 @@ fn build_region_merge_tree(
             max_elev: node_saddle,
             children_ids: nodes[node_idx].children_ids.clone(),
             region_id,
-            perimeter: props.perimeter,
-            major_axis: props.major_axis,
-            minor_axis: props.minor_axis,
-            elongatedness: props.elongatedness,
-            eccentricity: props.eccentricity,
-            orientation: props.orientation,
-            area_bbox_ratio: props.area_bbox_ratio,
+            perimeter,
+            major_axis,
+            minor_axis,
+            elongatedness,
+            eccentricity,
+            orientation,
+            area_bbox_ratio,
             parent_id: nodes[node_idx].parent_id,
             circularity,
             depth_diam_ratio,
@@ -1090,16 +1407,21 @@ fn delineate_merge_tree_impl(
     // When the source DEM is provided, identify the exact lowest exterior rim/outlet neighbor
     // at or above the region's maximum interior elevation so root spill elevation and storage
     // volume reflect the true topographic pour point without being hijacked by pruned exterior
-    // pits. Running Priority-Flood on `source_dem` separates true unfilled rim cells
-    // (`filled == dz`) from pruned depression cells (`filled > dz`) regardless of elevation.
+    // pits. When `options.dem_is_refined` is true (e.g., `InMemorySinks::dem_refined`), all
+    // pruned exterior pits are already filled so we avoid cloning and re-filling `source_dem`.
     if let Some(dem) = source_dem
         && k > 0
     {
-        let mut filled = dem.clone();
-        richdem::fill_depressions(&mut filled, options.topology);
+        let filled_opt = if options.dem_is_refined {
+            None
+        } else {
+            let mut filled = dem.clone();
+            richdem::fill_depressions(&mut filled, options.topology);
+            Some(filled)
+        };
         let ddata = dem.data();
         let d_nd = dem.no_data();
-        let fdata = filled.data();
+        let fdata = filled_opt.as_ref().map(Array2D::data);
         let mut fallback_outlets: Vec<Option<RootOutlet>> = vec![None; k];
 
         for (idx, cells) in region_cells.iter().enumerate() {
@@ -1122,7 +1444,10 @@ fn delineate_merge_tree_impl(
                     if !dz.is_finite() || dz.rd_eq(d_nd) || dz < max_z {
                         continue;
                     }
-                    let is_unfilled_rim = fdata[nidx].is_finite() && fdata[nidx] <= dz + 1e-12;
+                    let is_unfilled_rim = match fdata {
+                        Some(fd) => fd[nidx].is_finite() && fd[nidx] <= dz + 1e-12,
+                        None => true,
+                    };
                     let slot = if is_unfilled_rim {
                         &mut region_outlets[idx]
                     } else {
@@ -1345,6 +1670,7 @@ mod tests {
             min_size: 5,
             min_depth: 0.5,
             topology: Topology::D4,
+            ..Default::default()
         };
         let res = delineate_depressions_merge_tree_in_memory(&sink, &opts).unwrap();
         assert_eq!(res.depressions.max_level, 2);
@@ -1391,6 +1717,7 @@ mod tests {
                 min_size: 1,
                 min_depth: 1.0,
                 topology: Topology::D4,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1428,6 +1755,7 @@ mod tests {
                 min_size: 1,
                 min_depth: 1.0,
                 topology: Topology::D4,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1463,6 +1791,7 @@ mod tests {
                 min_size: 1,
                 min_depth: 1.0,
                 topology: Topology::D4,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1481,6 +1810,7 @@ mod tests {
                 min_size: 1,
                 min_depth: 0.5,
                 topology: Topology::D4,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1520,6 +1850,7 @@ mod tests {
                 min_size: 1,
                 min_depth: 1.0,
                 topology: Topology::D8,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1549,6 +1880,7 @@ mod tests {
                 min_size: 1,
                 min_depth: 1.0,
                 topology: Topology::D4,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1572,6 +1904,7 @@ mod tests {
                 min_size: 1,
                 min_depth: 2.0f64.powi(-42),
                 topology: Topology::D4,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1594,5 +1927,105 @@ mod tests {
             assert_eq!(pts[0].stage, 1.0);
             assert_eq!(pts[1].stage, saddle);
         }
+    }
+
+    #[test]
+    fn rating_curve_cap_and_dem_is_refined_preserve_exact_volumes_and_morphometrics() {
+        let vals: Vec<f64> = (1..=65).map(|v| v as f64).collect();
+        let mut sink65 = Array2D::from_vec(65, 1, vals).unwrap();
+        sink65.set_no_data(-9999.0);
+        sink65.geotransform = [0.0, 1.0, 0.0, 1.0, 0.0, -1.0];
+
+        let full = delineate_depressions_merge_tree_in_memory(
+            &sink65,
+            &MergeTreeOptions {
+                min_size: 1,
+                min_depth: 1.0,
+                topology: Topology::D4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let capped = delineate_depressions_merge_tree_in_memory(
+            &sink65,
+            &MergeTreeOptions {
+                min_size: 1,
+                min_depth: 1.0,
+                topology: Topology::D4,
+                max_rating_curve_points: Some(10),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let disabled = delineate_depressions_merge_tree_in_memory(
+            &sink65,
+            &MergeTreeOptions {
+                min_size: 1,
+                min_depth: 1.0,
+                topology: Topology::D4,
+                max_rating_curve_points: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(capped.rating_curves.len(), 10);
+        assert_eq!(capped.rating_curves.first().unwrap().stage, 1.0);
+        assert_eq!(capped.rating_curves.last().unwrap().stage, 65.0);
+        assert!((capped.rating_curves.last().unwrap().volume - full.nodes[0].volume).abs() < 1e-9);
+        assert!(disabled.rating_curves.is_empty());
+        assert!((disabled.nodes[0].volume - full.nodes[0].volume).abs() < 1e-9);
+        assert!(
+            (disabled.depressions.depressions[0].major_axis
+                - full.depressions.depressions[0].major_axis)
+                .abs()
+                < 1e-9
+        );
+        assert!(
+            (disabled.depressions.depressions[0].perimeter
+                - full.depressions.depressions[0].perimeter)
+                .abs()
+                < 1e-9
+        );
+
+        // Verify `dem_is_refined: true` produces identical root outlet & volume on a refined DEM.
+        let mut dem = Array2D::from_vec(5, 5, vec![12.0; 25]).unwrap();
+        dem.set_no_data(-9999.0);
+        dem.geotransform = [0.0, 1.0, 0.0, 5.0, 0.0, -1.0];
+        dem.set(2, 0, 10.0);
+        for r in 1..4 {
+            for c in 1..4 {
+                dem.set(c, r, 4.0);
+            }
+        }
+        dem.set(2, 2, 1.0);
+        let sinks = crate::extract_sinks_in_memory(&dem, 1, Topology::D8).unwrap();
+        let r_unrefined = delineate_depressions_merge_tree_with_dem_in_memory(
+            &sinks.sink,
+            &sinks.dem_refined,
+            &MergeTreeOptions {
+                min_size: 1,
+                min_depth: 1.0,
+                topology: Topology::D8,
+                dem_is_refined: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let r_refined = delineate_depressions_merge_tree_with_dem_in_memory(
+            &sinks.sink,
+            &sinks.dem_refined,
+            &MergeTreeOptions {
+                min_size: 1,
+                min_depth: 1.0,
+                topology: Topology::D8,
+                dem_is_refined: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(r_refined.nodes.len(), r_unrefined.nodes.len());
+        assert!((r_refined.nodes[0].saddle_elev - r_unrefined.nodes[0].saddle_elev).abs() < 1e-12);
+        assert!((r_refined.nodes[0].volume - r_unrefined.nodes[0].volume).abs() < 1e-12);
     }
 }

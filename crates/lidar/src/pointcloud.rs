@@ -10,7 +10,7 @@
 //! filtering, Height Above Ground (HAG) normalization, COPC octree LOD/spatial
 //! windowing, bare-earth DTM generation, and Canopy Height Model (CHM) creation.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -26,6 +26,8 @@ pub use terrio::pointcloud::{
     grid::{GridMethod, GridOptions, GridStat},
 };
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 use richdem::{Array2D, DemNum, array2d_to_dataset};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -978,7 +980,11 @@ pub fn filter_outliers_ror(
     // so floor-quantized grid coordinates never suffer floating-point rounding.
     const MAX_EXACT_GRID_SPAN: f64 = (1u64 << 52) as f64;
     if max_span_cells.is_finite() && max_span_cells < MAX_EXACT_GRID_SPAN {
-        let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::with_capacity(n);
+        // Intrusive flat hash grid: `head[cell]` stores the first point index and `next[i]`
+        // links subsequent points in the same cell, eliminating per-cell `Vec<usize>` heap
+        // allocations.
+        let mut head: HashMap<(i64, i64, i64), usize> = HashMap::with_capacity(n);
+        let mut next: Vec<usize> = vec![usize::MAX; n];
         let mut cell_of: Vec<Option<(i64, i64, i64)>> = Vec::with_capacity(n);
         for i in 0..n {
             let (x, y, z) = (xs[i], ys[i], zs[i]);
@@ -988,44 +994,51 @@ pub fn filter_outliers_ror(
                     ((y - min_y) * inv_r).floor() as i64,
                     ((z - min_z) * inv_r).floor() as i64,
                 );
-                grid.entry(key).or_default().push(i);
+                let prev = head.insert(key, i).unwrap_or(usize::MAX);
+                next[i] = prev;
                 cell_of.push(Some(key));
             } else {
                 cell_of.push(None);
             }
         }
 
-        let mut keep = vec![false; n];
-        for i in 0..n {
+        let check_point = |i: usize| -> bool {
             let Some((cx, cy, cz)) = cell_of[i] else {
-                continue;
+                return false;
             };
             let (xi, yi, zi) = (xs[i], ys[i], zs[i]);
             let mut count = 0usize;
-            'neighbor_search: for dz in -1..=1 {
+            for dz in -1..=1 {
                 for dy in -1..=1 {
                     for dx in -1..=1 {
-                        if let Some(bucket) = grid.get(&(cx + dx, cy + dy, cz + dz)) {
-                            for &j in bucket {
-                                if j == i {
-                                    continue;
-                                }
-                                let ddx = xs[j] - xi;
-                                let ddy = ys[j] - yi;
-                                let ddz = zs[j] - zi;
-                                if ddx * ddx + ddy * ddy + ddz * ddz <= r2 {
-                                    count += 1;
-                                    if count >= min_neighbors {
-                                        keep[i] = true;
-                                        break 'neighbor_search;
+                        if let Some(&first) = head.get(&(cx + dx, cy + dy, cz + dz)) {
+                            let mut j = first;
+                            while j != usize::MAX {
+                                if j != i {
+                                    let ddx = xs[j] - xi;
+                                    let ddy = ys[j] - yi;
+                                    let ddz = zs[j] - zi;
+                                    if ddx * ddx + ddy * ddy + ddz * ddz <= r2 {
+                                        count += 1;
+                                        if count >= min_neighbors {
+                                            return true;
+                                        }
                                     }
                                 }
+                                j = next[j];
                             }
                         }
                     }
                 }
             }
-        }
+            false
+        };
+
+        #[cfg(feature = "parallel")]
+        let keep: Vec<bool> = (0..n).into_par_iter().map(check_point).collect();
+        #[cfg(not(feature = "parallel"))]
+        let keep: Vec<bool> = (0..n).map(check_point).collect();
+
         return Ok(cloud.select(&keep));
     }
 
@@ -1927,7 +1940,12 @@ fn delaunay_triangulate_2d(pts: &[(f64, f64, f64)]) -> Vec<[usize; 3]> {
     });
     let mut last_tri: usize = 0;
 
-    let mut bad_set: BTreeSet<usize> = BTreeSet::new();
+    // Reusable flat cavity buffers + generation stamp array replace BTreeSet per-node
+    // heap allocations with O(1) membership queries.
+    let mut bad_list: Vec<usize> = Vec::with_capacity(32);
+    let mut bad_stamp: Vec<u32> = vec![0u32; 2 * n + 4];
+    let mut bad_gen: u32 = 0;
+    let mut to_add: Vec<usize> = Vec::with_capacity(16);
     let mut queue: VecDeque<usize> = VecDeque::new();
     // Each boundary edge stores `(a, b, outer_tri, outer_adj_slot)`.
     let mut boundary: Vec<(usize, usize, Option<usize>, Option<usize>)> = Vec::new();
@@ -2012,19 +2030,29 @@ fn delaunay_triangulate_2d(pts: &[(f64, f64, f64)]) -> Vec<[usize; 3]> {
             };
 
             // 2. BFS from `start_tri` to collect all triangles whose circumcircle strictly contains `p`.
-            bad_set.clear();
+            bad_gen = bad_gen.wrapping_add(1);
+            if bad_gen == 0 {
+                bad_stamp.fill(0);
+                bad_gen = 1;
+            }
+            if bad_stamp.len() < tris.len() {
+                bad_stamp.resize(tris.len(), 0);
+            }
+            bad_list.clear();
             queue.clear();
-            bad_set.insert(start_tri);
+            bad_stamp[start_tri] = bad_gen;
+            bad_list.push(start_tri);
             queue.push_back(start_tri);
             while let Some(ti) = queue.pop_front() {
                 for nb in tris[ti].adj.into_iter().flatten() {
-                    if !tris[nb].alive || bad_set.contains(&nb) {
+                    if !tris[nb].alive || bad_stamp[nb] == bad_gen {
                         continue;
                     }
                     let tv = tris[nb].v;
                     if in_circumcircle_strict(coords[tv[0]], coords[tv[1]], coords[tv[2]], (px, py))
                     {
-                        bad_set.insert(nb);
+                        bad_stamp[nb] = bad_gen;
+                        bad_list.push(nb);
                         queue.push_back(nb);
                     }
                 }
@@ -2034,12 +2062,12 @@ fn delaunay_triangulate_2d(pts: &[(f64, f64, f64)]) -> Vec<[usize; 3]> {
             let mut expanded = true;
             while expanded {
                 expanded = false;
-                let mut to_add = Vec::new();
-                for &ti in &bad_set {
+                to_add.clear();
+                for &ti in &bad_list {
                     let tv = tris[ti].v;
                     for k in 0..3 {
                         let nb = tris[ti].adj[k];
-                        if nb.is_some_and(|n_idx| bad_set.contains(&n_idx)) {
+                        if nb.is_some_and(|n_idx| bad_stamp[n_idx] == bad_gen) {
                             continue;
                         }
                         let a = tv[(k + 1) % 3];
@@ -2054,8 +2082,10 @@ fn delaunay_triangulate_2d(pts: &[(f64, f64, f64)]) -> Vec<[usize; 3]> {
                         }
                     }
                 }
-                for outer in to_add {
-                    if bad_set.insert(outer) {
+                for &outer in &to_add {
+                    if bad_stamp[outer] != bad_gen {
+                        bad_stamp[outer] = bad_gen;
+                        bad_list.push(outer);
                         expanded = true;
                     }
                 }
@@ -2064,11 +2094,11 @@ fn delaunay_triangulate_2d(pts: &[(f64, f64, f64)]) -> Vec<[usize; 3]> {
             // 4. Extract boundary edges `(a, b, outer_neighbor, outer_adj_slot)`.
             boundary.clear();
             let mut all_positive = true;
-            for &ti in &bad_set {
+            for &ti in &bad_list {
                 let tv = tris[ti].v;
                 for k in 0..3 {
                     let nb = tris[ti].adj[k];
-                    if nb.is_some_and(|n_idx| bad_set.contains(&n_idx)) {
+                    if nb.is_some_and(|n_idx| bad_stamp[n_idx] == bad_gen) {
                         continue;
                     }
                     let a = tv[(k + 1) % 3];
@@ -2089,7 +2119,7 @@ fn delaunay_triangulate_2d(pts: &[(f64, f64, f64)]) -> Vec<[usize; 3]> {
             }
 
             // 5. Remove bad triangles into the free list and stitch new triangles around `p`.
-            for &ti in &bad_set {
+            for &ti in &bad_list {
                 tris[ti].alive = false;
                 free_slots.push(ti);
             }
@@ -2450,16 +2480,27 @@ pub fn points_to_chm_pit_free(
     thresholds.sort_by(f64::total_cmp);
     thresholds.dedup();
 
-    for hk in thresholds {
+    type PartialTinLevel = (Vec<(f64, f64, f64)>, Vec<[usize; 3]>);
+    let build_level = |&hk: &f64| -> Option<PartialTinLevel> {
         let partial_pts: Vec<(f64, f64, f64)> = base_pts
             .iter()
             .copied()
             .filter(|&(_, _, hag)| hag >= hk)
             .collect();
         if partial_pts.len() < 3 {
-            continue;
+            return None;
         }
         let partial_tris = delaunay_triangulate_2d(&partial_pts);
+        Some((partial_pts, partial_tris))
+    };
+
+    #[cfg(feature = "parallel")]
+    let partial_levels: Vec<PartialTinLevel> =
+        thresholds.par_iter().filter_map(build_level).collect();
+    #[cfg(not(feature = "parallel"))]
+    let partial_levels: Vec<PartialTinLevel> = thresholds.iter().filter_map(build_level).collect();
+
+    for (partial_pts, partial_tris) in partial_levels {
         rasterize_tin_max(
             &partial_pts,
             &partial_tris,

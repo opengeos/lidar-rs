@@ -239,6 +239,7 @@ fn main() -> lidar::Result<()> {
                     min_size: 1000,
                     min_depth: 0.3,
                     topology: Topology::D8,
+                    ..Default::default()
                 },
             )
             .unwrap()
@@ -461,6 +462,7 @@ fn main() -> lidar::Result<()> {
                         min_size: 200,
                         min_depth: 0.2,
                         topology: Topology::D8,
+                        ..Default::default()
                     },
                 )
                 .unwrap()
