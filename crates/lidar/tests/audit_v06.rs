@@ -527,15 +527,30 @@ fn effective_runoff_scale_averages_full_contributing_dem_domain() {
 
 #[test]
 fn end_to_end_crs_metric_scaling_matches_across_foot_and_meter_projections() {
-    // Same physical bowl in EPSG:2263 (US survey feet, 10 ft cells) vs EPSG:32618 (meters).
+    // Same physical two-basin cascade (upper bowl spilling overland into lower bowl)
+    // in EPSG:2263 (US survey feet, 10 ft cells) vs EPSG:32618 (meters).
     let us_ft = 1200.0 / 3937.0;
-    let (w, h) = (11, 11);
-    let mut z = vec![20.0f64; w * h];
-    for r in 2..9 {
-        for c in 2..9 {
+    let (w, h) = (17, 11);
+    let mut z = vec![0.0f64; w * h];
+    for r in 0..h {
+        for c in 0..w {
+            z[r * w + c] = 30.0 - 0.5 * (c as f64) + 0.2 * ((r as isize - 5).abs() as f64);
+        }
+    }
+    // Upper bowl centered at (r=5, c=4)
+    for r in 3..8 {
+        for c in 2..7 {
             let dr = (r as isize - 5).abs() as f64;
-            let dc = (c as isize - 5).abs() as f64;
-            z[r * w + c] = 15.0 + dr.max(dc);
+            let dc = (c as isize - 4).abs() as f64;
+            z[r * w + c] = 24.0 + 0.5 * dr.max(dc);
+        }
+    }
+    // Lower bowl centered at (r=5, c=12)
+    for r in 3..8 {
+        for c in 10..15 {
+            let dr = (r as isize - 5).abs() as f64;
+            let dc = (c as isize - 12).abs() as f64;
+            z[r * w + c] = 19.0 + 0.5 * dr.max(dc);
         }
     }
     let gt_ft = [1_000_000.0, 10.0, 0.0, 200_000.0, 0.0, -10.0];
@@ -559,8 +574,8 @@ fn end_to_end_crs_metric_scaling_matches_across_foot_and_meter_projections() {
             min_size: 2,
             min_depth: 0.3,
             interval: 0.5,
-            rain_intensity_cm_h: 10.0,
-            rain_duration_h: 5.0,
+            rain_intensity_cm_h: 20.0,
+            rain_duration_h: 50.0,
             time_step_h: 1.0,
             compress: false,
         },
@@ -605,12 +620,33 @@ fn end_to_end_crs_metric_scaling_matches_across_foot_and_meter_projections() {
         );
     }
 
-    for (ef, em) in pipe_ft
+    assert_eq!(
+        pipe_ft.connectivity_graph.edges.len(),
+        pipe_m.connectivity_graph.edges.len(),
+        "foot and meter graphs must have equal edge counts"
+    );
+    let spill_ft: Vec<_> = pipe_ft
         .connectivity_graph
         .edges
         .iter()
-        .zip(pipe_m.connectivity_graph.edges.iter())
-    {
+        .filter(|e| e.edge_type == "spill")
+        .collect();
+    let spill_m: Vec<_> = pipe_m
+        .connectivity_graph
+        .edges
+        .iter()
+        .filter(|e| e.edge_type == "spill")
+        .collect();
+    assert!(
+        !spill_ft.is_empty() && spill_ft.iter().any(|e| e.length_m > 0.0),
+        "expected at least one positive-length spill edge in foot graph, got {spill_ft:?}"
+    );
+    assert_eq!(spill_ft.len(), spill_m.len());
+    for ef in &spill_ft {
+        let em = spill_m
+            .iter()
+            .find(|e| e.from_id == ef.from_id && e.to_id == ef.to_id && e.edge_type == ef.edge_type)
+            .expect("matching spill edge in meter graph");
         assert!(
             (ef.length_m - em.length_m).abs() < 1e-5,
             "graph length_m mismatch: ft={} vs m={}",

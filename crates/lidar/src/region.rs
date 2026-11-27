@@ -170,6 +170,21 @@ pub(crate) fn safe_crs_metric_basis(
     width: usize,
     height: usize,
 ) -> ((f64, f64), (f64, f64), f64, f64, f64) {
+    // Reject degenerate/zero-size raw geotransforms before CRS unit conversion so
+    // geographic CRSs do not scale fallback unit vectors by meters-per-degree.
+    let raw_rx = geotransform[1].hypot(geotransform[4]);
+    let raw_ry = geotransform[2].hypot(geotransform[5]);
+    let raw_det = (geotransform[1] * geotransform[5] - geotransform[2] * geotransform[4]).abs();
+    if !raw_rx.is_finite()
+        || raw_rx <= 0.0
+        || !raw_ry.is_finite()
+        || raw_ry <= 0.0
+        || !raw_det.is_finite()
+        || raw_det <= 0.0
+    {
+        return ((1.0, 0.0), (0.0, -1.0), 1.0, 1.0, 1.0);
+    }
+
     let (vx_m, vy_m, scale) = crs_metric_basis(projection, geotransform, width, height);
     if scale.cell_width_m.is_finite()
         && scale.cell_width_m > 0.0
@@ -190,20 +205,13 @@ pub(crate) fn safe_crs_metric_basis(
             scale.cell_area_m2,
         )
     } else {
-        let (vx, vy, raw_area) = affine_basis(geotransform);
-        let rx = vx.0.hypot(vx.1);
-        let ry = vy.0.hypot(vy.1);
-        if rx.is_finite()
-            && rx > 0.0
-            && ry.is_finite()
-            && ry > 0.0
-            && raw_area.is_finite()
-            && raw_area > 0.0
-        {
-            (vx, vy, rx, ry, raw_area)
-        } else {
-            ((1.0, 0.0), (0.0, -1.0), 1.0, 1.0, 1.0)
-        }
+        (
+            (geotransform[1], geotransform[4]),
+            (geotransform[2], geotransform[5]),
+            raw_rx,
+            raw_ry,
+            raw_det,
+        )
     }
 }
 

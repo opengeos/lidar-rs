@@ -181,29 +181,6 @@ pub(crate) fn validate_options_with_hyetograph(
     Ok(n_steps_f as usize)
 }
 
-#[allow(dead_code)]
-pub(crate) fn affine_metrics(gt: &[f64; 6]) -> (f64, f64, f64) {
-    let res_x = gt[1].hypot(gt[4]);
-    let res_y = gt[2].hypot(gt[5]);
-    let det = (gt[1] * gt[5] - gt[2] * gt[4]).abs();
-    let rx = if res_x > 0.0 && res_x.is_finite() {
-        res_x
-    } else {
-        1.0
-    };
-    let ry = if res_y > 0.0 && res_y.is_finite() {
-        res_y
-    } else {
-        1.0
-    };
-    let area = if det > 0.0 && det.is_finite() {
-        det
-    } else {
-        rx * ry
-    };
-    (rx, ry, area)
-}
-
 struct RegionFillTask {
     bbox: (usize, usize, usize, usize),
     roi_elev: Vec<f64>,

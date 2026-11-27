@@ -1092,6 +1092,32 @@ pub fn write_spill_paths_vector(
         layer.schema.add_field(FieldDef::new(name, ftype));
     }
 
+    // Hoist CRS parsing and metric basis evaluation outside the per-path loop. For geographic
+    // CRSs, evaluate at the cell-center midpoint of all spill paths (+0.5 pixel-center offset).
+    let (sum_c, sum_r, total_pts) = spill_paths
+        .iter()
+        .fold((0.0f64, 0.0f64, 0usize), |acc, sp| {
+            sp.cells.iter().fold(acc, |(sc, sr, n), &(c, r)| {
+                (sc + c as f64 + 0.5, sr + r as f64 + 0.5, n + 1)
+            })
+        });
+    let (vx_m, vy_m, _, _, _) = if total_pts > 0 {
+        let mid_c = sum_c / total_pts as f64;
+        let mid_r = sum_r / total_pts as f64;
+        let shifted_gt = [
+            geotransform[0] + mid_c * geotransform[1] + mid_r * geotransform[2],
+            geotransform[1],
+            geotransform[2],
+            geotransform[3] + mid_c * geotransform[4] + mid_r * geotransform[5],
+            geotransform[4],
+            geotransform[5],
+        ];
+        // Width/height = 0 evaluates `crs_metric_basis` directly at the shifted midpoint origin.
+        crate::region::safe_crs_metric_basis(projection, &shifted_gt, 0, 0)
+    } else {
+        crate::region::safe_crs_metric_basis(projection, geotransform, 0, 0)
+    };
+
     for (idx, sp) in spill_paths.iter().enumerate() {
         if sp.cells.len() < 2 {
             continue;
@@ -1104,18 +1130,6 @@ pub fn write_spill_paths_vector(
                 Coord::xy(x, y)
             })
             .collect();
-        let mid_c = sp.cells.iter().map(|&(c, _)| c as f64).sum::<f64>() / sp.cells.len() as f64;
-        let mid_r = sp.cells.iter().map(|&(_, r)| r as f64).sum::<f64>() / sp.cells.len() as f64;
-        let shifted_gt = [
-            geotransform[0] + mid_c * geotransform[1] + mid_r * geotransform[2],
-            geotransform[1],
-            geotransform[2],
-            geotransform[3] + mid_c * geotransform[4] + mid_r * geotransform[5],
-            geotransform[4],
-            geotransform[5],
-        ];
-        let (vx_m, vy_m, _, _, _) =
-            crate::region::safe_crs_metric_basis(projection, &shifted_gt, 0, 0);
         let mut length_m = 0.0f64;
         for pair in sp.cells.windows(2) {
             let dc = pair[1].0 as f64 - pair[0].0 as f64;

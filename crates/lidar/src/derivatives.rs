@@ -683,8 +683,7 @@ pub fn compute_twi(dem: &Array2D<f64>, flow_acc: Option<&Array2D<f64>>) -> Resul
     let zdata = dem.data();
     let z_nd = dem.no_data();
     let out_nd = safe_nodata(z_nd, -1000.0);
-    // Validate derivative cell spacing and compute SI metric SCA via crs_metric_scale.
-    let _ = checked_derivative_cell_scale(dem)?;
+    // Compute SI metric SCA via crs_metric_scale (dinf solver validates native/geographic spacing).
     let metric = crs_metric_scale(&dem.projection, &dem.geotransform, w, h);
     if !metric.cell_width_m.is_finite()
         || !metric.cell_height_m.is_finite()
