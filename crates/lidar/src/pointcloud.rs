@@ -2694,8 +2694,19 @@ fn lidar_to_tiled_grid_impl(
     drop(reader);
 
     let res = options.dtm.resolution;
-    let width = ((max_x - min_x) / res).ceil().max(1.0) as usize;
-    let height = ((max_y - min_y) / res).ceil().max(1.0) as usize;
+    let width_f = ((max_x - min_x) / res).ceil().max(1.0);
+    let height_f = ((max_y - min_y) / res).ceil().max(1.0);
+    if !width_f.is_finite()
+        || !height_f.is_finite()
+        || width_f > u32::MAX as f64
+        || height_f > u32::MAX as f64
+    {
+        return Err(Error::InvalidArgument(format!(
+            "tiled raster dimensions ({width_f}x{height_f}) exceed maximum supported grid size"
+        )));
+    }
+    let width = width_f as usize;
+    let height = height_f as usize;
     // Align grid origin to `(min_x, top_y)` where `top_y = min_y + height * res` so bottom row
     // aligns with `min_y` and north-up cell centers sit at `(min_x + (c+0.5)*res, top_y - (r+0.5)*res)`.
     let top_y = min_y + height as f64 * res;
@@ -2902,9 +2913,6 @@ fn lidar_to_tiled_grid_impl(
     writer.finish()?;
 
     control.check_cancelled()?;
-    if out_raster.exists() {
-        let _ = std::fs::remove_file(out_raster);
-    }
     std::fs::rename(&temp_stage, out_raster)?;
     temp_guard.disarm();
 

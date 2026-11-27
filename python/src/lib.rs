@@ -3892,6 +3892,7 @@ fn simulate_inundation_array<'py>(
                 },
                 scalar_runoff_coeff: 1.0,
                 stream_vector: None,
+                ..Default::default()
             };
             let mut pipe = lidar::run_full_pipeline_in_memory(&raw_dem, &opts)?;
 

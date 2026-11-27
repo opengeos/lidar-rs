@@ -24,8 +24,8 @@ Hydrologic models (SWAT+, HEC-HMS, GSSHA, MODFLOW, and custom Python/NetworkX ro
 | `region_id` | 1-based ID | Enclosing top-level sink region |
 | `stage` | DEM vertical units | Water surface elevation |
 | `depth` | DEM vertical units | Depth above depression floor (`stage - min_elev`) |
-| `area` | map units squared | Inundated surface area at `stage` |
-| `volume` | horizontal map units² × DEM vertical units | Cumulative stored volume below `stage` (cubic map units when horizontal and vertical units match) |
+| `area` | SI m^2 (or map units^2 without CRS) | Inundated surface area at `stage` |
+| `volume` | horizontal m^2 × DEM vertical units | Cumulative stored volume below `stage` (cubic meters when DEM elevation is in meters) |
 
 ## Directed Connectivity Graph Schema
 
