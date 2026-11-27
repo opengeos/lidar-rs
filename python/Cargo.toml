@@ -16,9 +16,9 @@ test = false
 doctest = false
 
 [dependencies]
-lidar = { path = "../crates/lidar", features = ["parallel", "pointcloud", "serde", "download"] }
-lidar-cli = { path = "../crates/lidar-cli", features = ["download"] }
-terrio = { version = "0.9", default-features = false, features = ["pointcloud"] }
+lidar = { path = "../crates/lidar", features = ["parallel", "pointcloud", "serde", "download", "parquet", "flatgeobuf", "lerc", "tiles"] }
+lidar-cli = { path = "../crates/lidar-cli", features = ["download", "parquet", "flatgeobuf", "lerc", "tiles"] }
+terrio = { version = "0.9", default-features = false, features = ["pointcloud", "parquet", "flatgeobuf", "lerc", "tiles"] }
 pyo3 = { version = "0.29", features = ["extension-module", "abi3-py311"] }
 numpy = "0.29"
 
