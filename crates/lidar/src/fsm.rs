@@ -48,11 +48,11 @@ use crate::catchment::d8_flow_directions_resolved;
 use crate::error::{Error, Result};
 use crate::inundation::{
     GreenAmptParams, HeapCell, InundationForcing, SimulateInundationOptions, SpillFlowPath,
-    affine_metrics, compute_exterior_nodata_mask, green_ampt_infiltration_rate_cm_h,
-    solve_green_ampt_ponded, trace_downstream_away_from_source, validate_forcing_grids,
-    validate_grid_alignment, validate_options_with_hyetograph,
+    compute_exterior_nodata_mask, green_ampt_infiltration_rate_cm_h, solve_green_ampt_ponded,
+    trace_downstream_away_from_source, validate_forcing_grids, validate_grid_alignment,
+    validate_options_with_hyetograph,
 };
-use crate::region::crs_metric_basis;
+use crate::region::{crs_metric_basis, safe_crs_metric_basis};
 use crate::slicing::{InMemoryDepressions, NestedDepression};
 
 /// Time tolerance in hours for deciding whether an event falls within the storm duration.
@@ -1059,7 +1059,8 @@ fn simulate_fill_spill_merge_impl(
     validate_grid_alignment(dem_refined, &depressions.depression_id, "depression_id")?;
     validate_forcing_grids(sink, forcing)?;
 
-    let (_, _, cell_area) = affine_metrics(&dem_refined.geotransform);
+    let (_, _, _, _, cell_area) =
+        safe_crs_metric_basis(&dem_refined.projection, &dem_refined.geotransform, w, h);
     let mut fill_time_data = vec![-1.0f64; n];
 
     let storm_duration_h = if let Some(hyeto) = forcing.hyetograph {
@@ -3227,7 +3228,7 @@ pub fn compute_fsm_hazard_rasters(
     let ft_data = fill_time.data();
     let ft_nd = fill_time.no_data();
     let dep_ids = depressions.depression_id.data();
-    let (_, _, cell_area) = affine_metrics(&dem.geotransform);
+    let (_, _, _, _, cell_area) = safe_crs_metric_basis(&dem.projection, &dem.geotransform, w, h);
 
     let depth_nd = -9999.0f64;
     let wse_nd = if z_nd.is_finite() { z_nd } else { -9999.0f64 };
@@ -3671,7 +3672,7 @@ pub fn simulate_post_storm_recession(
     let zdata = dem.data();
     let z_nd = dem.no_data();
     let dep_ids = depressions.depression_id.data();
-    let (_, _, cell_area) = affine_metrics(&dem.geotransform);
+    let (_, _, _, _, cell_area) = safe_crs_metric_basis(&dem.projection, &dem.geotransform, w, h);
 
     let mut drain_data = vec![-1.0f64; n];
     if n == 0 || depressions.depressions.is_empty() || fsm.basins.is_empty() {

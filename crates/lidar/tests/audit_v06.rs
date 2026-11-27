@@ -454,13 +454,205 @@ fn projected_feet_and_meters_dems_match_dinf_angles_and_slopes() {
 
     let twi_ft = compute_twi(&dem_ft, None).unwrap();
     let twi_m = compute_twi(&dem_m, None).unwrap();
-    // With identical dimensionless tan(beta) and native-unit SCA (ft vs m),
-    // twi_ft - twi_m = ln(1 / 0.3048) rather than -ln(1 / 0.3048).
-    let expected_twi_diff = (1.0 / ft_to_m).ln();
+    // With identical dimensionless tan(beta) and consistent SI metric SCA (m^2 / m = m)
+    // scaled via crs_metric_scale, EPSG:2263 (US survey ft, ~0.3048006096 m/ft) vs
+    // EPSG:32618 (exact 0.3048 m/ft) differ only by ln(us_ft / 0.3048) (~2e-6).
     assert!(
-        ((twi_ft.get(3, 3) - twi_m.get(3, 3)) - expected_twi_diff).abs() < 1e-6,
-        "TWI difference must reflect native SCA units only (identical slope): got {}, expected {}",
-        twi_ft.get(3, 3) - twi_m.get(3, 3),
-        expected_twi_diff
+        (twi_ft.get(3, 3) - twi_m.get(3, 3)).abs() < 1e-5,
+        "TWI with consistent metric SCA must match between feet and meters DEMs: ft={}, m={}",
+        twi_ft.get(3, 3),
+        twi_m.get(3, 3)
     );
+}
+
+#[test]
+fn pipeline_defaults_align_with_delineate_and_cli() {
+    let run_opts = lidar::RunPipelineOptions::default();
+    let mem_opts = lidar::InMemoryFullPipelineOptions::default();
+    let delin_opts = lidar::DelineateOptions::default();
+    assert_eq!(run_opts.simulation.min_depth, delin_opts.min_depth);
+    assert_eq!(run_opts.simulation.interval, delin_opts.interval);
+    assert_eq!(mem_opts.simulation.min_depth, delin_opts.min_depth);
+    assert_eq!(mem_opts.simulation.interval, delin_opts.interval);
+    assert!((run_opts.simulation.min_depth - 0.3).abs() < 1e-12);
+    assert!((run_opts.simulation.interval - 0.3).abs() < 1e-12);
+}
+
+#[test]
+fn effective_runoff_scale_averages_full_contributing_dem_domain() {
+    // 10x10 DEM with a small 2x2 pit (4 cells) surrounded by 96 upland cells.
+    // Upland runoff_coeff = 0.25, depression-floor runoff_coeff = 0.95.
+    // Averaging over the full valid DEM gives (96 * 0.25 + 4 * 0.95) / 100 = 0.278,
+    // whereas averaging only over the depression floor would give 0.95.
+    let (w, h) = (10, 10);
+    let mut z = vec![10.0f64; w * h];
+    let mut rc_data = vec![0.25f64; w * h];
+    for r in 4..6 {
+        for c in 4..6 {
+            z[r * w + c] = 8.0;
+            rc_data[r * w + c] = 0.95;
+        }
+    }
+    let gt = [0.0, 1.0, 0.0, 10.0, 0.0, -1.0];
+    let dem = make_dem(w, h, z, -9999.0, gt);
+    let rc = make_dem(w, h, rc_data, -9999.0, gt);
+    let opts = lidar::InMemoryFullPipelineOptions {
+        kernel_size: 1,
+        simulation: lidar::SimulateInundationOptions {
+            min_size: 1,
+            min_depth: 0.1,
+            interval: 0.5,
+            rain_intensity_cm_h: 10.0,
+            rain_duration_h: 1.0,
+            time_step_h: 1.0,
+            compress: false,
+        },
+        forcing: lidar::InundationForcing {
+            runoff_coeff: Some(&rc),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let pipe = lidar::run_full_pipeline_in_memory(&dem, &opts).unwrap();
+    // Step 1 at t=1h with 10 cm/h = 100 mm/h gross rainfall -> expected ~27.8 mm runoff.
+    let lines: Vec<&str> = pipe.inundation_curve_csv.lines().collect();
+    assert!(lines.len() >= 2);
+    let cols: Vec<&str> = lines[1].split(',').collect();
+    let reported_mm: f64 = cols[2].parse().unwrap();
+    let expected_mm = 100.0 * (96.0 * 0.25 + 4.0 * 0.95) / 100.0;
+    assert!(
+        (reported_mm - expected_mm).abs() < 1e-3,
+        "expected full-DEM averaged runoff_mm={expected_mm:.3}, got {reported_mm:.3}"
+    );
+}
+
+#[test]
+fn end_to_end_crs_metric_scaling_matches_across_foot_and_meter_projections() {
+    // Same physical two-basin cascade (upper bowl spilling overland into lower bowl)
+    // in EPSG:2263 (US survey feet, 10 ft cells) vs EPSG:32618 (meters).
+    let us_ft = 1200.0 / 3937.0;
+    let (w, h) = (17, 11);
+    let mut z = vec![0.0f64; w * h];
+    for r in 0..h {
+        for c in 0..w {
+            z[r * w + c] = 30.0 - 0.5 * (c as f64) + 0.2 * ((r as isize - 5).abs() as f64);
+        }
+    }
+    // Upper bowl centered at (r=5, c=4)
+    for r in 3..8 {
+        for c in 2..7 {
+            let dr = (r as isize - 5).abs() as f64;
+            let dc = (c as isize - 4).abs() as f64;
+            z[r * w + c] = 24.0 + 0.5 * dr.max(dc);
+        }
+    }
+    // Lower bowl centered at (r=5, c=12)
+    for r in 3..8 {
+        for c in 10..15 {
+            let dr = (r as isize - 5).abs() as f64;
+            let dc = (c as isize - 12).abs() as f64;
+            z[r * w + c] = 19.0 + 0.5 * dr.max(dc);
+        }
+    }
+    let gt_ft = [1_000_000.0, 10.0, 0.0, 200_000.0, 0.0, -10.0];
+    let gt_m = [
+        500_000.0,
+        10.0 * us_ft,
+        0.0,
+        4_500_000.0,
+        0.0,
+        -10.0 * us_ft,
+    ];
+    let mut dem_ft = make_dem(w, h, z.clone(), -9999.0, gt_ft);
+    dem_ft.projection = "EPSG:2263".to_string();
+    let mut dem_m = make_dem(w, h, z, -9999.0, gt_m);
+    dem_m.projection = "EPSG:32618".to_string();
+
+    let opts = lidar::InMemoryFullPipelineOptions {
+        kernel_size: 1,
+        routing: lidar::RoutingMode::FillSpillMerge,
+        simulation: lidar::SimulateInundationOptions {
+            min_size: 2,
+            min_depth: 0.3,
+            interval: 0.5,
+            rain_intensity_cm_h: 20.0,
+            rain_duration_h: 50.0,
+            time_step_h: 1.0,
+            compress: false,
+        },
+        ..Default::default()
+    };
+
+    let pipe_ft = lidar::run_full_pipeline_in_memory(&dem_ft, &opts).unwrap();
+    let pipe_m = lidar::run_full_pipeline_in_memory(&dem_m, &opts).unwrap();
+
+    assert_eq!(
+        pipe_ft.depressions.depressions.len(),
+        pipe_m.depressions.depressions.len()
+    );
+    for (df, dm) in pipe_ft
+        .depressions
+        .depressions
+        .iter()
+        .zip(pipe_m.depressions.depressions.iter())
+    {
+        assert!(
+            (df.area - dm.area).abs() / dm.area.max(1e-9) < 1e-6,
+            "slicing area mismatch: ft={} vs m={}",
+            df.area,
+            dm.area
+        );
+        assert!(
+            (df.perimeter - dm.perimeter).abs() / dm.perimeter.max(1e-9) < 1e-6,
+            "slicing perimeter mismatch: ft={} vs m={}",
+            df.perimeter,
+            dm.perimeter
+        );
+    }
+
+    let fsm_ft = pipe_ft.fsm_basins.as_ref().unwrap();
+    let fsm_m = pipe_m.fsm_basins.as_ref().unwrap();
+    for (bf, bm) in fsm_ft.iter().zip(fsm_m.iter()) {
+        assert!(
+            (bf.capacity_m3 - bm.capacity_m3).abs() / bm.capacity_m3.max(1e-9) < 1e-6,
+            "FSM capacity_m3 mismatch: ft={} vs m={}",
+            bf.capacity_m3,
+            bm.capacity_m3
+        );
+    }
+
+    assert_eq!(
+        pipe_ft.connectivity_graph.edges.len(),
+        pipe_m.connectivity_graph.edges.len(),
+        "foot and meter graphs must have equal edge counts"
+    );
+    let spill_ft: Vec<_> = pipe_ft
+        .connectivity_graph
+        .edges
+        .iter()
+        .filter(|e| e.edge_type == "spill")
+        .collect();
+    let spill_m: Vec<_> = pipe_m
+        .connectivity_graph
+        .edges
+        .iter()
+        .filter(|e| e.edge_type == "spill")
+        .collect();
+    assert!(
+        !spill_ft.is_empty() && spill_ft.iter().any(|e| e.length_m > 0.0),
+        "expected at least one positive-length spill edge in foot graph, got {spill_ft:?}"
+    );
+    assert_eq!(spill_ft.len(), spill_m.len());
+    for ef in &spill_ft {
+        let em = spill_m
+            .iter()
+            .find(|e| e.from_id == ef.from_id && e.to_id == ef.to_id && e.edge_type == ef.edge_type)
+            .expect("matching spill edge in meter graph");
+        assert!(
+            (ef.length_m - em.length_m).abs() < 1e-5,
+            "graph length_m mismatch: ft={} vs m={}",
+            ef.length_m,
+            em.length_m
+        );
+    }
 }
