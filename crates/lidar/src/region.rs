@@ -721,29 +721,16 @@ pub(crate) fn extended_morphometrics(
 /// Computes Benkrid & Crookes affine-aware perimeter over an arbitrary sparse set of
 /// occupied `(row, col)` cells in `O(|cells|)` memory and expected `O(|cells|)` time,
 /// matching [`benkrid_crookes_perimeter_affine`] without allocating a dense bbox mask.
-fn benkrid_crookes_perimeter_sparse(
-    cells: &[(usize, usize)],
+/// Computes the exact affine-aware Benkrid & Crookes perimeter directly from a pre-filtered
+/// set of 4-neighborhood border cells `(row, col)`.
+pub(crate) fn benkrid_crookes_perimeter_from_border_set(
+    border: &HashSet<(isize, isize)>,
     vx: (f64, f64),
     vy: (f64, f64),
 ) -> f64 {
-    if cells.is_empty() {
+    if border.is_empty() {
         return 0.0;
     }
-    let occ: HashSet<(isize, isize)> = cells
-        .iter()
-        .map(|&(r, c)| (r as isize, c as isize))
-        .collect();
-    let mut border: HashSet<(isize, isize)> = HashSet::with_capacity(cells.len());
-    for &(r, c) in &occ {
-        let interior = occ.contains(&(r - 1, c))
-            && occ.contains(&(r + 1, c))
-            && occ.contains(&(r, c - 1))
-            && occ.contains(&(r, c + 1));
-        if !interior {
-            border.insert((r, c));
-        }
-    }
-
     let res_x = vx.0.hypot(vx.1);
     let res_y = vy.0.hypot(vy.1);
     let diag_pos = (vx.0 + vy.0).hypot(vx.1 + vy.1);
@@ -752,7 +739,7 @@ fn benkrid_crookes_perimeter_sparse(
 
     let get = |r: isize, c: isize| -> u8 { u8::from(border.contains(&(r, c))) };
 
-    for &(ri, ci) in &border {
+    for &(ri, ci) in border {
         let horiz = get(ri, ci - 1) + get(ri, ci + 1);
         let vert = get(ri - 1, ci) + get(ri + 1, ci);
         let d_pos = get(ri - 1, ci - 1) + get(ri + 1, ci + 1);
@@ -762,165 +749,6 @@ fn benkrid_crookes_perimeter_sparse(
         );
     }
     perim
-}
-
-/// Computes full affine-aware [`RegionProps`] from a sparse slice of occupied `(row, col)`
-/// coordinates in `O(|cells|)` memory, avoiding dense bounding-box allocations for sparse
-/// or elongated regions.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn region_props_from_sparse_cells(
-    label: u32,
-    cells: &[(usize, usize)],
-    gt: &[f64; 6],
-    area: f64,
-    volume: f64,
-    mean_depth: f64,
-    max_depth: f64,
-    min_elev: f64,
-    max_elev: f64,
-) -> RegionProps {
-    let (vx, vy, cell_area) = affine_basis(gt);
-    let res_x = vx.0.hypot(vx.1);
-    let res_y = vy.0.hypot(vy.1);
-    let max_side = res_x.max(res_y);
-    let min_res = if max_side > 0.0 && cell_area > 0.0 {
-        (cell_area / max_side).min(res_x.min(res_y))
-    } else {
-        res_x.min(res_y)
-    };
-
-    if cells.is_empty() {
-        return RegionProps {
-            label,
-            count: 0,
-            bbox: (0, 0, 0, 0),
-            first_pixel: (0, 0),
-            area,
-            volume,
-            mean_depth,
-            max_depth,
-            min_elev,
-            max_elev,
-            perimeter: 0.0,
-            major_axis: 0.0,
-            minor_axis: min_res,
-            elongatedness: 0.0,
-            eccentricity: 0.0,
-            orientation: 0.0,
-            area_bbox_ratio: 0.0,
-        };
-    }
-
-    let mut r0 = usize::MAX;
-    let mut c0 = usize::MAX;
-    let mut r1 = 0usize;
-    let mut c1 = 0usize;
-    let mut first_pixel = (usize::MAX, usize::MAX);
-    for &(r, c) in cells {
-        if r < r0 {
-            r0 = r;
-        }
-        if c < c0 {
-            c0 = c;
-        }
-        if r + 1 > r1 {
-            r1 = r + 1;
-        }
-        if c + 1 > c1 {
-            c1 = c + 1;
-        }
-        if (r, c) < first_pixel {
-            first_pixel = (r, c);
-        }
-    }
-
-    let bh = r1 - r0;
-    let bw = c1 - c0;
-    let fr_f = first_pixel.0 as f64;
-    let fc_f = first_pixel.1 as f64;
-    let mut sum_r = 0.0f64;
-    let mut sum_c = 0.0f64;
-    let mut sum_rr = 0.0f64;
-    let mut sum_cc = 0.0f64;
-    let mut sum_rc = 0.0f64;
-
-    for &(r, c) in cells {
-        let dr_pix = r as f64 - fr_f;
-        let dc_pix = c as f64 - fc_f;
-        let cf = dc_pix * vx.0 + dr_pix * vy.0;
-        let rf = -(dc_pix * vx.1 + dr_pix * vy.1);
-        sum_r += rf;
-        sum_c += cf;
-        sum_rr += rf * rf;
-        sum_cc += cf * cf;
-        sum_rc += rf * cf;
-    }
-
-    // Use the dense fast path only when the bounding box is compact relative to cell count;
-    // otherwise use sparse HashSet Benkrid-Crookes so memory stays strictly O(|cells|).
-    let bbox_cells = bw.saturating_mul(bh);
-    let perimeter = if bbox_cells <= cells.len().saturating_mul(4).max(256) {
-        let mut mask = vec![false; bbox_cells];
-        for &(r, c) in cells {
-            mask[(r - r0) * bw + (c - c0)] = true;
-        }
-        benkrid_crookes_perimeter_affine(&mask, bw, bh, vx, vy)
-    } else {
-        benkrid_crookes_perimeter_sparse(cells, vx, vy)
-    };
-
-    let nf = cells.len() as f64;
-    let r_bar = sum_r / nf;
-    let c_bar = sum_c / nf;
-    let mu20 = (sum_rr / nf - r_bar * r_bar).max(0.0);
-    let mu02 = (sum_cc / nf - c_bar * c_bar).max(0.0);
-    let mu11 = sum_rc / nf - r_bar * c_bar;
-
-    let common = ((mu20 - mu02).powi(2) + 4.0 * mu11 * mu11).sqrt();
-    let l1 = (0.5 * (mu20 + mu02 + common)).max(0.0);
-    let l2 = (0.5 * (mu20 + mu02 - common)).max(0.0);
-
-    let major_axis = 4.0 * l1.sqrt();
-    let minor_axis = (4.0 * l2.sqrt()).max(min_res);
-    let elongatedness = if minor_axis > 0.0 {
-        major_axis / minor_axis
-    } else {
-        0.0
-    };
-    let eccentricity = if l1 > 0.0 {
-        (1.0 - l2 / l1).max(0.0).sqrt()
-    } else {
-        0.0
-    };
-    let orientation_rad = if (mu20 - mu02).abs() == 0.0 {
-        if mu11 < 0.0 { -FRAC_PI_4 } else { FRAC_PI_4 }
-    } else {
-        0.5 * (2.0 * mu11).atan2(mu20 - mu02)
-    };
-    let orientation = orientation_rad / PI * 180.0;
-
-    let bbox_area = (bw as f64) * (bh as f64);
-    let area_bbox_ratio = if bbox_area > 0.0 { nf / bbox_area } else { 0.0 };
-
-    RegionProps {
-        label,
-        count: cells.len(),
-        bbox: (r0, c0, r1, c1),
-        first_pixel,
-        area,
-        volume,
-        mean_depth,
-        max_depth,
-        min_elev,
-        max_elev,
-        perimeter,
-        major_axis,
-        minor_axis,
-        elongatedness,
-        eccentricity,
-        orientation,
-        area_bbox_ratio,
-    }
 }
 
 /// Promotes a single [`RegionBasicStats`] entry to full [`RegionProps`] by computing

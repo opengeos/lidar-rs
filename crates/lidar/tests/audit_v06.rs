@@ -103,6 +103,7 @@ fn merge_tree_root_outlet_not_hijacked_by_pruned_exterior_pit() {
                 min_size: 2,
                 min_depth: 0.5,
                 topology: Topology::D8,
+                ..Default::default()
             },
         )
         .unwrap();
