@@ -1,6 +1,6 @@
 {
   "name": "lidar-wasm",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "WebAssembly bindings for lidar-rs: nested surface depression and mount delineation, hydro-conditioning, and inundation simulation in browsers and Node.js (zero GDAL)",
   "type": "module",
   "main": "./pkg-node/lidar_js.js",
