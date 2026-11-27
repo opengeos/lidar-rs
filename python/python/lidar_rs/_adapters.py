@@ -404,8 +404,24 @@ def depressions_to_geodataframe(
     )
 
 
-def connectivity_to_networkx(graph: ConnectivityGraph | Mapping[str, Any]) -> Any:
-    """Convert a `ConnectivityGraph` dict into a `networkx.DiGraph`.
+def connectivity_to_networkx(
+    graph: ConnectivityGraph | Mapping[str, Any],
+    *,
+    multi: bool = False,
+) -> Any:
+    """Convert a `ConnectivityGraph` dict into a NetworkX directed graph.
+
+    By default (`multi=False`), returns a `networkx.DiGraph`. When both a `"spill"`
+    and a `"merge"` edge connect the same `(from_id, to_id)` pair (for example when a
+    child depression spills directly into its enclosing parent), attributes from both
+    edges are merged without overwriting non-None `"spill"` attributes: `edge_type`
+    becomes `"spill+merge"`, `edge_types` lists all merged edge types, type-prefixed
+    attributes (e.g. `spill_merge_time_h`, `merge_merge_time_h`, `spill_spill_elev`,
+    `merge_spill_elev`) preserve per-edge values, and `parallel_edges` holds the raw
+    attribute dicts for all edges between `(u, v)`.
+
+    Pass `multi=True` to return a `networkx.MultiDiGraph` where parallel `"spill"` and
+    `"merge"` edges are kept as separate keyed edges (`key=edge_type`).
 
     Every node carries `min_elev`, `spill_elev`, `area`, `volume`, `level` (plus all
     other node fields), and every edge carries `pour_row`, `pour_col`, `spill_elev`
@@ -419,9 +435,9 @@ def connectivity_to_networkx(graph: ConnectivityGraph | Mapping[str, Any]) -> An
             "install it with `pip install networkx`"
         ) from exc
 
-    digraph = nx.DiGraph()
+    g = nx.MultiDiGraph() if multi else nx.DiGraph()
     if "rain_intensity_cm_h" in graph:
-        digraph.graph["rain_intensity_cm_h"] = graph["rain_intensity_cm_h"]
+        g.graph["rain_intensity_cm_h"] = graph["rain_intensity_cm_h"]
 
     for node in graph.get("nodes", []):
         node_id = node["id"]
@@ -431,8 +447,9 @@ def connectivity_to_networkx(graph: ConnectivityGraph | Mapping[str, Any]) -> An
         attrs.setdefault("area", None)
         attrs.setdefault("volume", None)
         attrs.setdefault("level", None)
-        digraph.add_node(node_id, **attrs)
+        g.add_node(node_id, **attrs)
 
+    existing_edges: dict[tuple[Any, Any], dict[str, Any]] = {}
     for edge in graph.get("edges", []):
         u = edge["from_id"]
         v = edge["to_id"]
@@ -440,9 +457,57 @@ def connectivity_to_networkx(graph: ConnectivityGraph | Mapping[str, Any]) -> An
         attrs.setdefault("pour_row", None)
         attrs.setdefault("pour_col", None)
         attrs.setdefault("spill_elev", None)
-        digraph.add_edge(u, v, **attrs)
 
-    return digraph
+        if multi:
+            edge_key = attrs.get("edge_type")
+            if edge_key is not None:
+                g.add_edge(u, v, key=edge_key, **attrs)
+            else:
+                g.add_edge(u, v, **attrs)
+            continue
+
+        pair = (u, v)
+        if pair not in existing_edges:
+            merged = dict(attrs)
+            existing_edges[pair] = merged
+            g.add_edge(u, v, **merged)
+        else:
+            prev = existing_edges[pair]
+            prev_raw = prev.get("parallel_edges")
+            if prev_raw is None:
+                prev_snapshot = dict(prev)
+                prev_types = [prev.get("edge_type", "unknown")]
+                parallel_list: list[dict[str, Any]] = [prev_snapshot]
+                # Preserve prefixed fields from the first edge on first collision.
+                first_prefix = str(prev_types[0])
+                for pk, pv in prev_snapshot.items():
+                    if pk not in ("edge_type", "edge_types", "parallel_edges") and pv is not None:
+                        prev[f"{first_prefix}_{pk}"] = pv
+            else:
+                prev_types = list(prev.get("edge_types", []))
+                parallel_list = list(prev_raw)
+
+            new_type = str(attrs.get("edge_type", "unknown"))
+            parallel_list.append(dict(attrs))
+            if new_type not in prev_types:
+                prev_types.append(new_type)
+
+            # Merge non-None attributes without clobbering existing non-None values;
+            # store prefixed copies for the incoming edge so neither edge loses data.
+            for k, val in attrs.items():
+                if k in ("edge_type", "edge_types", "parallel_edges"):
+                    continue
+                if val is not None:
+                    prev[f"{new_type}_{k}"] = val
+                    if prev.get(k) is None or (k == "merge_time_h" and new_type == "merge"):
+                        prev[k] = val
+
+            prev["edge_type"] = "+".join(prev_types)
+            prev["edge_types"] = prev_types
+            prev["parallel_edges"] = parallel_list
+            g.add_edge(u, v, **prev)
+
+    return g
 
 
 def array_to_xarray(
