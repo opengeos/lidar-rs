@@ -150,21 +150,38 @@ jobs:
       # npm OIDC trusted publishing requires npm >= 11.5.1 and a Trusted Publisher configured on
       # npmjs.com for `lidar-wasm` (owner: opengeos, repo: lidar-rs, workflow: release.yml,
       # environment: npm). Versions already on npm are skipped cleanly.
+      - name: Verify lidar-wasm has been bootstrapped on npm
+        working-directory: js
+        run: |
+          name=$(jq -r '.name' package.json)
+          if ! curl --fail --silent --show-error "https://registry.npmjs.org/${name}" > /dev/null; then
+            echo "::error::Publish ${name} manually once (cd js && npm publish --access public) and configure its npm trusted publisher (opengeos/lidar-rs, release.yml, environment npm) before tagging."
+            exit 1
+          fi
       - name: Ensure npm supports OIDC trusted publishing (>= 11.5.1)
         run: |
           if ! node -e 'const [a,b,c] = process.argv[1].split(".").map(Number); process.exit((a > 11 || (a === 11 && (b > 5 || (b === 5 && c >= 1)))) ? 0 : 1);' "$(npm --version)"; then
-            npm install -g npm@latest
+            npm install -g npm@11.11.0
           fi
           npm --version
       - name: Publish lidar-wasm to npm
         working-directory: js
         run: |
+          set -euo pipefail
           name=$(jq -r '.name' package.json)
           version=$(jq -r '.version' package.json)
-          if curl -sf "https://registry.npmjs.org/${name}/${version}" > /dev/null; then
+          status=$(curl -s -o /dev/null -w '%{http_code}' "https://registry.npmjs.org/${name}/${version}")
+          if [ "$status" = "200" ]; then
             echo "${name}@${version} is already on npm"
+          elif [ "$status" = "404" ]; then
+            dist_tag="latest"
+            if [[ "$version" == *-* ]]; then
+              dist_tag="next"
+            fi
+            npm publish --provenance --access public --tag "$dist_tag"
           else
-            npm publish --provenance --access public
+            echo "::error::Unexpected HTTP ${status} checking https://registry.npmjs.org/${name}/${version}"
+            exit 1
           fi
 
   github-release:
